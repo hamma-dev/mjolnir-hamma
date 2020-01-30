@@ -1,0 +1,7 @@
+config_version = 1
+
+[general]
+na_marker = "NA"
+
+[monitor]
+output_path = "~/brokkr/monitoring"

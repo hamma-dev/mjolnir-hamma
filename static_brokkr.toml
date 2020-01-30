@@ -1,0 +1,11 @@
+config_version = 1
+
+[general]
+ip_sensor = "10.10.10.1"
+
+[monitor]
+hs_port = 8084
+sunsaver_pid_list = [24597,]
+sunsaver_port = ""
+sunsaver_start_offset = 8
+sunsaver_unit = 1

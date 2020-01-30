@@ -1,0 +1,13 @@
+config_version = 1
+
+name = "hamma"
+
+name_full = "HAMMA Sensor System"
+author = "C.A.M. Gerlach and the UAH HAMMA group"
+description = "System configuration for the Huntsville AL Marx Meter Array"
+homepage = "https://hamma.dev/"
+repo = "https://github.com/hamma-dev/mjolnir-system-hamma"
+
+version = "0.1.0.dev0"
+brokkr_version_min = "0.3.0"
+sindri_version_min = "0.3.0"

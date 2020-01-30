@@ -1,0 +1,5 @@
+config_version = 1
+
+[monitor]
+
+monitor_interval_s = 60
