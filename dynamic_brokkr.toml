@@ -3,4 +3,3 @@ config_version = 1
 [monitor]
 
 hs_timeout_s = 2
-ping_timeout_s = 1

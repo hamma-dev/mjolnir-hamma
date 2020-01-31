@@ -3,6 +3,9 @@ config_version = 1
 [general]
 ip_sensor = "10.10.10.1"
 
+[link]
+local_port = 22
+
 [monitor]
 hs_port = 8084
 sunsaver_pid_list = [24597,]

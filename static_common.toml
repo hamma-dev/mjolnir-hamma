@@ -2,6 +2,15 @@ config_version = 1
 
 [general]
 na_marker = "NA"
+output_path_client = "~/brokkr"
+output_filename_client = "{output_type}_{system_name}_{unit_number:0>2}_{utc_date!s}.csv"
+
+[link]
+server_hostname = "proxy.nsstc.uah.edu"
+server_port = 22
+server_username = "mjolnir"
+tunnel_port_offset = 10000
 
 [monitor]
-output_path = "~/brokkr/monitoring"
+client_output_path = "telemetry"
+filename_args = { output_type = "telemetry" }
