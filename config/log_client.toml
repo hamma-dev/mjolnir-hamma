@@ -1,3 +1,5 @@
+# Client-specific Python logging system configuration
+
 config_version = 1
 
 [handlers.file]

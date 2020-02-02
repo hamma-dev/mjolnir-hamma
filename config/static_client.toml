@@ -1,3 +1,5 @@
+# Client-specific static system configuration, not updated during runtime
+
 config_version = 1
 
 [general]

@@ -1,3 +1,5 @@
+# System-level defaults for the local per-unit configuration file
+
 config_version = 1
 
 network_interface = "wlan0"
