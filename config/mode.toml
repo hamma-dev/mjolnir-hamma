@@ -1,0 +1,15 @@
+# Shared config mode preset configuration
+
+config_version = 1
+
+[realtime.bootstrap]
+output_path_client = "~/brokkr/realtime"
+
+[realtime.dynamic.monitor]
+monitor_interval_s = 1
+
+[test.bootstrap]
+output_path_client = "~/brokkr/test"
+
+[test.dynamic.monitor]
+monitor_interval_s = 5

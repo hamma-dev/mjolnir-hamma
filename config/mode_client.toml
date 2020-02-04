@@ -1,0 +1,6 @@
+# Client-specific config mode preset configuration
+
+config_version = 1
+
+[realtime.dynamic.monitor]
+hs_timeout_s = 1
