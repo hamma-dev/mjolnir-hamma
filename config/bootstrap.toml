@@ -1,0 +1,6 @@
+# Shared bootstrap configuration, not updated during runtime
+
+config_version = 1
+
+output_path_client = "~/brokkr"
+system_prefix = "hamma"

@@ -1,0 +1,3 @@
+# Client-specific bootstrap configuration, not updated during runtime
+
+config_version = 1

@@ -4,8 +4,7 @@ config_version = 1
 
 [general]
 na_marker = "NA"
-output_path_client = "~/brokkr"
-output_filename_client = "{output_type}_{system_name}_{unit_number:0>2}_{utc_date!s}.csv"
+output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>2}_{utc_date!s}.csv"
 
 [link]
 server_hostname = "proxy.nsstc.uah.edu"
