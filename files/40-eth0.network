@@ -1,0 +1,10 @@
+[Match]
+Name=eth0
+
+[Network]
+Address=10.10.10.2/24
+DNS=10.10.10.1
+
+[Route]
+Gateway=10.10.10.1
+Metric=40

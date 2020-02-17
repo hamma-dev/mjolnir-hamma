@@ -1,0 +1,13 @@
+Host proxy
+    HostName proxy.nsstc.uah.edu
+    User mjolnir
+    StrictHostKeyChecking no
+    CheckHostIP no
+    UserKnownHostsFile /dev/null
+
+Host hamma
+    HostName 10.10.10.1
+    User root
+    StrictHostKeyChecking no
+    CheckHostIP no
+    UserKnownHostsFile /dev/null
