@@ -69,7 +69,7 @@ def _hex(x):
     return int(x, 0)
 
 
-def _setup_mppt_client(port=None):
+def _setup_mppt_client(port="COM3"):
     # Setup modbus connection
     if port is None:
         try:
@@ -82,8 +82,11 @@ def _setup_mppt_client(port=None):
                 port = "/dev/ttyUSB1"
             else:
                 raise RuntimeError("Could not find serial port.")
+    serial_params = getattr(sunsaver, "SERIAL_PARAMS_MPPT15L",
+                            getattr(sunsaver, "SERIAL_PARAMS_SUNSAVERMPPT15L",
+                                    None))
     mppt_client = pymodbus.client.sync.ModbusSerialClient(
-        port=port, **sunsaver.SERIAL_PARAMS_SUNSAVERMPPT15L)
+        port=port, **serial_params)
     mppt_client.connect()
     return mppt_client
 
@@ -295,9 +298,9 @@ if __name__ == "__main__":
     parser_reset = subparsers.add_parser(
         "reset", help="Reset the device, clearing faults and updating EEPROM")
 
-    parser_load = subparsers.add_parser(
-        "load", help="Power the load on or off, and check its load status")
-    parser_load.add_argument(
+    parser_power = subparsers.add_parser(
+        "power", help="Power the load on or off, and check its load status")
+    parser_power.add_argument(
         "new_state", choices={None, "on", "off"}, nargs="?", default=None,
         help="Whether to turn the load on or off; omit for current status")
 
@@ -323,7 +326,7 @@ if __name__ == "__main__":
             )
     elif getattr(parsed_args, SUBCOMMAND_PARAM, None) == "reset":
         reset_device(verbose=True)
-    elif getattr(parsed_args, SUBCOMMAND_PARAM, None) == "load":
+    elif getattr(parsed_args, SUBCOMMAND_PARAM, None) == "power":
         get_set_load_power(new_state=parsed_args.new_state, verbose=True)
     elif getattr(parsed_args, SUBCOMMAND_PARAM, None) == "log":
         write_log_data(output_path=parsed_args.output_path, verbose=True)
