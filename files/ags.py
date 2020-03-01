@@ -8,10 +8,9 @@ import socket
 import time
 
 
-SOCKET_BUFFER = 4096
-
 AGS_COMMAND_PORT = 8082
 SENSOR_IP = "10.10.10.1"
+SOCKET_BUFFER = 4096
 
 
 def netcat(content, host, port, recieve_reply=True, timeout=1):
@@ -24,8 +23,8 @@ def netcat(content, host, port, recieve_reply=True, timeout=1):
         sock.sendall(content.encode())
         sock.shutdown(socket.SHUT_WR)
 
-        recieved_chunks = []
         if recieve_reply:
+            recieved_chunks = []
             while not timeout or time.monotonic() <= (time_start + timeout):
                 try:
                     recieved_data = sock.recv(SOCKET_BUFFER)
@@ -36,6 +35,8 @@ def netcat(content, host, port, recieve_reply=True, timeout=1):
                 recieved_chunks.append(recieved_data)
             recieved_data = b"".join(recieved_chunks)
 
+        sock.shutdown(socket.SHUT_RD)
+
     return recieved_data
 
 
@@ -44,7 +45,7 @@ def send_ags_command(command, host=SENSOR_IP, port=AGS_COMMAND_PORT):
     return reply_text
 
 
-if __name__ == "__main__":
+def main():
     parser_main = argparse.ArgumentParser(
         description=(
             "Send an AGS command to a HAMMA2 sensor."
@@ -61,3 +62,7 @@ if __name__ == "__main__":
 
     parsed_args = parser_main.parse_args()
     print(send_ags_command(**vars(parsed_args)))
+
+
+if __name__ == "__main__":
+    main()
