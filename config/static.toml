@@ -3,6 +3,7 @@
 config_version = 1
 
 [general]
+ip_local = "10.10.10.2"
 na_marker = "NA"
 output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>2}_{utc_date!s}.csv"
 
