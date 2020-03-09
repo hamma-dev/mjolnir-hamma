@@ -1,7 +1,0 @@
-# Client-specific dynamic configuration designed to be updated during runtime
-
-config_version = 1
-
-[monitor]
-
-hs_timeout_s = 2

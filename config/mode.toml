@@ -2,14 +2,15 @@
 
 config_version = 1
 
-[realtime.bootstrap]
+[realtime.main.general]
 output_path_client = "~/brokkr/realtime"
 
-[realtime.dynamic.monitor]
-monitor_interval_s = 1
+[realtime.main.monitor]
+hs_timeout_s = 1
+interval_s = 1
 
-[test.bootstrap]
+[test.main.general]
 output_path_client = "~/brokkr/test"
 
-[test.dynamic.monitor]
-monitor_interval_s = 5
+[test.main.monitor]
+interval_s = 5

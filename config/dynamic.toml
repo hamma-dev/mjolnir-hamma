@@ -1,7 +1,0 @@
-# Shared dynamic configuration designed to be updated during runtime
-
-config_version = 1
-
-[monitor]
-
-monitor_interval_s = 60
