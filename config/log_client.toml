@@ -4,6 +4,6 @@ config_version = 1
 
 [handlers.file]
 
-filename = "log/brokkr_{system_prefix}_{unit_number:0>2}.log"
+filename = "log/brokkr_{system_prefix}_{unit_number:0>3}.log"
 maxBytes = 10000000
 backupCount = 10
