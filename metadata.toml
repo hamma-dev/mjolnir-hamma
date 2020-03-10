@@ -10,6 +10,6 @@ description = "System configuration for the Huntsville AL Marx Meter Array"
 homepage = "https://hamma.dev/"
 repo = "https://github.com/hamma-dev/mjolnir-hamma"
 
-version = "0.1.0.a2"
+version = "0.1.0.dev2"
 brokkr_version_min = "0.3.0"
 sindri_version_min = "0.3.0"
