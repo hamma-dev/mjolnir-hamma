@@ -6,7 +6,7 @@ config_version = 1
 ip_local = "10.10.10.2"
 ip_sensor = "10.10.10.1"
 na_marker = "NA"
-output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.csv"
+output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.{extension}"
 output_path_client = "~/brokkr/{system_name}"
 
 [link]
@@ -16,11 +16,12 @@ server_username = "mjolnir"
 tunnel_port_offset = 10000
 
 [monitor]
-client_output_path = "telemetry"
-filename_args = { output_type = "telemetry" }
+output_path_client = "telemetry"
+filename_kwargs = { output_type = "telemetry" }
 hs_port = 8084
 hs_timeout_s = 2
 interval_s = 60
+ping_timeout_s = 1
 sunsaver_pid_list = [24597,]
 sunsaver_port = ""
 sunsaver_start_offset = 8
