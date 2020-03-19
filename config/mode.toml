@@ -5,12 +5,11 @@ config_version = 1
 [realtime.main.general]
 output_path_client = "~/brokkr/realtime"
 
-[realtime.main.monitor]
-hs_timeout_s = 1
-interval_s = 1
+[realtime.main.pipelines.telemetry]
+monitor_interval_s = 1
 
 [test.main.general]
 output_path_client = "~/brokkr/test"
 
-[test.main.monitor]
-interval_s = 5
+[test.main.pipelines.telemetry]
+monitor_interval_s = 5

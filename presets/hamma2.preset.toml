@@ -1,0 +1,52 @@
+config_version = 1
+name = "hamma2"
+type = "device"
+
+[metadata]
+name_full = "HAMMA2 Sensor"
+author = "C.A.M. Gerlach and the UAH HAMMA group"
+description = "Device preset for the Huntsville AL Marx Meter Array version 2 sensor"
+homepage = "https://hamma.dev/"
+repo = "https://github.com/hamma-dev/mjolnir-hamma"
+preset_version = "0.1.0"
+brokkr_version_min = "0.3.0"
+
+[variables]
+marker_val = { raw_type = "8s", output_type = "none" }
+sequence_count = { raw_type = "I" }
+timestamp = { raw_type = "q", output_type = "time_posix_ms" }
+crc_errors = { raw_type = "I" }
+valid_packets = { raw_type = "I" }
+bytes_read = { raw_type = "Q" }
+bytes_written = { raw_type = "Q" }
+bytes_remaining = { raw_type = "Q" }
+packets_sent = { raw_type = "I" }
+packets_dropped = { raw_type = "I" }
+
+[inputs.ping]
+_module_path = "brokkr.inputs.ping"
+_class_name = "PingInput"
+name = "Sensor Ping"
+host = "10.10.10.1"
+timeout_s = 1
+
+[inputs.hs]
+_module_path = "brokkr.inputs.udp"
+_class_name = "UDPInput"
+name = "Sensor Health & Status Packet"
+host = "10.10.10.2"
+port = 8084
+timeout_s = 2
+custom_types = {}
+variables = [
+    "marker_val",
+    "sequence_count",
+    "timestamp",
+    "crc_errors",
+    "valid_packets",
+    "bytes_read",
+    "bytes_written",
+    "bytes_remaining",
+    "packets_sent",
+    "packets_dropped",
+]

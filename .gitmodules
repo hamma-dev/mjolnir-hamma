@@ -1,0 +1,3 @@
+[submodule "presets/mjolnir-presets"]
+	path = presets/mjolnir-presets
+	url = https://github.com/hamma-dev/mjolnir-presets.git

@@ -1,28 +1,33 @@
-# Shared static system configuration, not updated during runtime
+# Shared static system configuration
 
 config_version = 1
 
 [general]
-ip_local = "10.10.10.2"
-ip_sensor = "10.10.10.1"
-na_marker = "NA"
+monitoring_pipeline_default = "telemetry"
 output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.{extension}"
 output_path_client = "~/brokkr/{system_name}"
+worker_shutdown_wait_s = 10
 
-[link]
+[autossh]
 server_hostname = "proxy.nsstc.uah.edu"
-server_port = 22
 server_username = "mjolnir"
 tunnel_port_offset = 10000
 
-[monitor]
-output_path_client = "telemetry"
+[steps.telemetry_csv_output]
+_preset = "builtins.outputs.csv_file"
+name = "Telemetry Data CSV Output"
+output_path = "telemetry"
 filename_kwargs = { output_type = "telemetry" }
-hs_port = 8084
-hs_timeout_s = 2
-interval_s = 60
-ping_timeout_s = 1
-sunsaver_pid_list = [24597,]
-sunsaver_port = ""
-sunsaver_start_offset = 8
-sunsaver_unit = 1
+
+[pipelines.telemetry]
+_builder = "monitor"
+name = "Telemetry Data"
+monitor_interval_s = 60
+monitor_input_steps = [
+    "builtins.inputs.current_time",
+    "builtins.inputs.run_time",
+    "sunsaver_mppt_15l.inputs.ram",
+    "hamma2.inputs.ping",
+    "hamma2.inputs.hs",
+]
+monitor_output_steps = [ "telemetry_csv_output" ]
