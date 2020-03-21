@@ -1,6 +1,15 @@
 # Mjolnir-Hamma Changelog
 
 
+## Version 0.1.0a3 (2020-03-20)
+
+Test deployment release with the following changes:
+
+* Comprehensively overhaul main config format and add presets for pipeline arch
+* Add message of the day to files
+* Make numerous fixes, improvements and cleanup for preliminary test deploy
+
+
 ## Version 0.1.0a2 (2020-03-09)
 
 Development release with the following changes:
