@@ -1,4 +1,4 @@
-#!/home/thor/dev/brokkrenv/bin/python
+#!/home/pi/dev/brokkrenv/bin/python
 
 """Monitor, program and control a Sunsaver MPPT-15L charge controller."""
 

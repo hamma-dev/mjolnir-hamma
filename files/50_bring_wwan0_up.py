@@ -15,5 +15,3 @@ modem_number = modem_list.stdout.strip().split(" ")[0].split("/")[-1]
 subprocess.run(["mmcli", "-m", modem_number, "--simple-connect=apn=NXTGENPHONE"], check=True)
 print("Connected to wwan0")
 sys.exit()
-
-

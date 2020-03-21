@@ -15,13 +15,13 @@ tunnel_port_offset = 10000
 
 [steps.telemetry_csv_output]
 _preset = "builtins.outputs.csv_file"
-name = "Telemetry Data CSV Output"
+name = "Telemetry CSV Output"
 output_path = "telemetry"
 filename_kwargs = { output_type = "telemetry" }
 
 [pipelines.telemetry]
 _builder = "monitor"
-name = "Telemetry Data"
+name = "Telemetry"
 monitor_interval_s = 60
 monitor_input_steps = [
     "builtins.inputs.current_time",
