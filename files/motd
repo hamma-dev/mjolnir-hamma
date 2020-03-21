@@ -1,0 +1,11 @@
+
+Welcome to Mjolnir!
+Currently running: Brokkr X.X.X | Sindri X.X.X
+You can leave messages for other users logging in here in /etc/motd
+
+Getting Help:
+Activate brokkr/sindri env: source ~/brokkrenv or source ~/sindrienv
+Then use brokkr --help or sindri --help for full help.
+For numerous functions for the charge controller, see ~/sunsaver.py --help
+To send AGS commands, simply run ~/ags.py "Command", e.g. ~/ags.py help
+
