@@ -1,4 +1,4 @@
-#!/home/pi/dev/brokkrenv/bin/python
+#!~/dev/brokkrenv/bin/python
 
 """Monitor, program and control a Sunsaver MPPT-15L charge controller."""
 
@@ -14,16 +14,42 @@ import time
 import pymodbus.client.sync
 import pymodbus.constants
 import pymodbus.payload
+import serial.tools.list_ports
 
 # Local imports
-import brokkr.output
 try:
-    import brokkr.monitoring.sunsaver as sunsaver
-except ModuleNotFoundError:
-    import brokkr.sunsaver as sunsaver
+    import brokkr.utils.ports
+except ImportError:
+    print("Could not import brokkr.utils.ports, falling back to basic detect")
 
 
 __version__ = "0.2.0"
+
+
+CONVERSION_FUNCTIONS = {
+    None: lambda val: None,
+    "HI": lambda val: None,
+    "S": lambda val: str(val),
+    "I": lambda val: int(val),
+    "F": lambda val: float(val),
+    "T": lambda val: float(val) - 2**16 if val > 2**8 else float(val),
+    "B": lambda val: format(val, "b").zfill(16),
+    "BL": lambda hi, lo: format(hi << 16 | lo, "b").zfill(32),
+    "V": lambda val: round(val * 100 * 2 ** -15, 3),
+    "A": lambda val: round(val * 79.16 * 2 ** -15, 3),
+    "Ah": lambda val: round(val * 0.1, 1),
+    "AhL": lambda hi, lo: round(((hi << 16) | lo) * 0.1, 1),
+    "hL": lambda hi, lo: int((hi << 16) | lo),
+    "W": lambda val: round(val * 989.5 * 2 ** -16, 3),
+    }
+
+CSV_PARAMS = {
+    "extrasaction": "ignore",
+    "dialect": "unix",
+    "delimiter": ",",
+    "quoting": csv.QUOTE_MINIMAL,
+    "strict": False,
+    }
 
 LOAD_COIL_STATES = {True: "Off", False: "On"}
 LOAD_INPUT_STATES = {None: None, "off": True, "on": False}
@@ -62,18 +88,28 @@ RESET_REGISTER = LOAD_STATE_REGISTER
 
 SUBCOMMAND_PARAM = "subcommand_name"
 
+SERIAL_PARAMS_SUNSAVERMPPT15L = {
+    "method": "rtu",
+    "stopbits": 2,
+    "bytesize": 8,
+    "parity": "N",
+    "baudrate": 9600,
+    "strict": False,
+    }
+
 UNIT_ID = 1
 
 
-def _hex(x):
-    return int(x, 0)
+def _hex(val):
+    return int(val, 0)
 
 
-def _setup_mppt_client(port="COM3"):
+def _setup_mppt_client(port=None):
     # Setup modbus connection
     if port is None:
         try:
-            port_object = sunsaver.get_serial_port()
+            port_list = serial.tools.list_ports.comports()
+            port_object = brokkr.utils.ports.get_serial_port(port_list)
             port = port_object.device
         except Exception:
             if Path("/dev/ttyUSB0").exists():
@@ -81,12 +117,9 @@ def _setup_mppt_client(port="COM3"):
             elif Path("/dev/ttyUSB1").exists():
                 port = "/dev/ttyUSB1"
             else:
-                raise RuntimeError("Could not find serial port.")
-    serial_params = getattr(sunsaver, "SERIAL_PARAMS_MPPT15L",
-                            getattr(sunsaver, "SERIAL_PARAMS_SUNSAVERMPPT15L",
-                                    None))
+                port = "COM3"
     mppt_client = pymodbus.client.sync.ModbusSerialClient(
-        port=port, **serial_params)
+        port=port, **SERIAL_PARAMS_SUNSAVERMPPT15L)
     mppt_client.connect()
     return mppt_client
 
@@ -149,11 +182,11 @@ def get_log_data(sort=True, filter_bad=True, verbose=False):
         for variable_name, variable_type in LOG_VARIABLES:
             if variable_name == "alarm_daily":
                 log_data_block[variable_name] = (
-                    sunsaver.CONVERSION_FUNCTIONS[variable_type](
+                    CONVERSION_FUNCTIONS[variable_type](
                         decoder.decode_32bit_uint()))
             else:
                 log_data_block[variable_name] = (
-                    sunsaver.CONVERSION_FUNCTIONS[variable_type](
+                    CONVERSION_FUNCTIONS[variable_type](
                         decoder.decode_16bit_uint()))
         log_data.append(log_data_block)
 
@@ -180,7 +213,7 @@ def write_log_data(
 
     with open(output_path, "w", encoding="utf-8", newline="") as data_csv:
         csv_writer = csv.DictWriter(
-            data_csv, log_data[0].keys(), **brokkr.output.CSV_PARAMS)
+            data_csv, log_data[0].keys(), **CSV_PARAMS)
         csv_writer.writeheader()
         csv_writer.writerows(log_data)
 
@@ -250,7 +283,6 @@ def reset_device(verbose=False):
         write_value=1,
         write_address=RESET_COIL,
         write_address_type="coil",
-        print_fn=_pretty_print_load_state,
         verbose=verbose,
         )
     return states
@@ -270,7 +302,14 @@ def get_set_load_power(new_state=None, verbose=False):
     return states
 
 
-if __name__ == "__main__":
+def main():
+    """Main function for sunsaver script."""
+    register_desc = "Get or set the value of a register"
+    coil_desc = "Get or set the value of a coil"
+    reset_desc = "Reset the device, clearing faults and updating EEPROM"
+    power_desc = "Power the load on or off, and check its load status"
+    log_desc = "Get the sensor logging data, and print or write to CSV"
+
     parser_main = argparse.ArgumentParser(
         description=("Monitor, program and control a Sunsaver MPPT-15L."))
     parser_main.add_argument(
@@ -284,9 +323,9 @@ if __name__ == "__main__":
         metavar="Subcommand", dest=SUBCOMMAND_PARAM)
 
     parser_register = subparsers.add_parser(
-        "register", help="Get or set the value of a register")
+        "register", help=register_desc, description=register_desc)
     parser_coil = subparsers.add_parser(
-        "coil", help="Get or set the value of a coil")
+        "coil", help=coil_desc, description=coil_desc)
     for parser in [parser_coil, parser_register]:
         parser.add_argument(
             "address", type=_hex,
@@ -295,17 +334,17 @@ if __name__ == "__main__":
             "write_value", type=int, nargs="?", default=None,
             help="Value to write to the specified address, in decimal")
 
-    parser_reset = subparsers.add_parser(
-        "reset", help="Reset the device, clearing faults and updating EEPROM")
+    subparsers.add_parser(
+        "reset", help=reset_desc, description=reset_desc)
 
     parser_power = subparsers.add_parser(
-        "power", help="Power the load on or off, and check its load status")
+        "power", help=power_desc, description=power_desc)
     parser_power.add_argument(
         "new_state", choices={None, "on", "off"}, nargs="?", default=None,
         help="Whether to turn the load on or off; omit for current status")
 
     parser_log = subparsers.add_parser(
-        "log", help="Get the sensor logging data, and print or write to CSV")
+        "log", help=log_desc, description=log_desc)
     parser_log.add_argument(
         "--output-path", default=None,
         help=("Write the data as CSV to the passed path, otherwise print it"))
@@ -332,3 +371,7 @@ if __name__ == "__main__":
         write_log_data(output_path=parsed_args.output_path, verbose=True)
     else:
         parser_main.print_usage()
+
+
+if __name__ == "__main__":
+    main()
