@@ -11,17 +11,17 @@ repo = "https://github.com/hamma-dev/mjolnir-hamma"
 preset_version = "0.1.0"
 brokkr_version_min = "0.3.0"
 
-[variables]
-marker_val = { raw_type = "8s", output_type = "none" }
-sequence_count = { raw_type = "I" }
-timestamp = { raw_type = "q", output_type = "time_posix_ms" }
-crc_errors = { raw_type = "I" }
-valid_packets = { raw_type = "I" }
-bytes_read = { raw_type = "Q" }
-bytes_written = { raw_type = "Q" }
-bytes_remaining = { raw_type = "Q" }
-packets_sent = { raw_type = "I" }
-packets_dropped = { raw_type = "I" }
+[data_types]
+marker_val = { input_type = "8s", conversion = false }
+sequence_count = { binary_type = "I" }
+timestamp = { binary_type = "q", conversion = "time_posix_ms" }
+crc_errors = { binary_type = "I" }
+valid_packets = { binary_type = "I" }
+bytes_read = { binary_type = "Q" }
+bytes_written = { binary_type = "Q" }
+bytes_remaining = { binary_type = "Q" }
+packets_sent = { binary_type = "I" }
+packets_dropped = { binary_type = "I" }
 
 [inputs.ping]
 _module_path = "brokkr.inputs.ping"
@@ -37,8 +37,7 @@ name = "Sensor Health & Status Packet"
 host = "10.10.10.2"
 port = 8084
 timeout_s = 2
-custom_types = {}
-variables = [
+data_types = [
     "marker_val",
     "sequence_count",
     "timestamp",
