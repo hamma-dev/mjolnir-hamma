@@ -11,17 +11,20 @@ repo = "https://github.com/hamma-dev/mjolnir-hamma"
 preset_version = "0.1.0"
 brokkr_version_min = "0.3.0"
 
+[type_presets]
+gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
+
 [data_types]
 marker_val = { input_type = "8s", conversion = false }
-sequence_count = { binary_type = "I" }
-timestamp = { binary_type = "q", conversion = "time_posix_ms" }
-crc_errors = { binary_type = "I" }
-valid_packets = { binary_type = "I" }
-bytes_read = { binary_type = "Q" }
-bytes_written = { binary_type = "Q" }
-bytes_remaining = { binary_type = "Q" }
-packets_sent = { binary_type = "I" }
-packets_dropped = { binary_type = "I" }
+sequence_count = { binary_type = "I", unit = "", uncertainty = false }
+timestamp = { binary_type = "q", conversion = "time_posix_ms", unit = "s", uncertainty = 0.001 }
+crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
+valid_packets = { binary_type = "I", unit = "", uncertainty = false }
+bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
+bytes_written = { full_name = "Data Written", type_presets = "gigabytes" }
+bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
+packets_sent = { binary_type = "I", unit = "", uncertainty = false }
+packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
 
 [inputs.ping]
 _module_path = "brokkr.inputs.ping"
