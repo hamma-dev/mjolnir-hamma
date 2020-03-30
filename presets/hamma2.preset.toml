@@ -1,7 +1,12 @@
+# Preset for the inputs offered by a UAH/Bitzer HAMMA2 LF/VLF lightning sensor
+
 config_version = 1
+# Name of this device preset, used for lookup
 name = "hamma2"
+# Type of this preset
 type = "device"
 
+# Preset-level metadata
 [metadata]
 name_full = "HAMMA2 Sensor"
 author = "C.A.M. Gerlach and the UAH HAMMA group"
@@ -11,9 +16,11 @@ repo = "https://github.com/hamma-dev/mjolnir-hamma"
 preset_version = "0.1.0"
 brokkr_version_min = "0.3.0"
 
+# Data type presets to use for the data types that follow
 [type_presets]
 gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
 
+# Data types referenced in individual presets
 [data_types]
 marker_val = { input_type = "8s", conversion = false }
 sequence_count = { binary_type = "I", unit = "", uncertainty = false }
@@ -26,6 +33,7 @@ bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
 packets_sent = { binary_type = "I", unit = "", uncertainty = false }
 packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
 
+# Input preset that simply pings the HAMMA sensor
 [inputs.ping]
 _module_path = "brokkr.inputs.ping"
 _class_name = "PingInput"
@@ -33,6 +41,7 @@ name = "Sensor Ping"
 host = "10.10.10.1"
 timeout_s = 1
 
+# Input preset that reads a H&S UDP packet from the sensor
 [inputs.hs]
 _module_path = "brokkr.inputs.udp"
 _class_name = "UDPInput"

@@ -2,6 +2,9 @@
 
 config_version = 1
 
+# Override any settings in the default log configuration here
+# Settings are those accepted by dictConfig for Python's stdlib logging module
+
 [handlers.file]
 
 filename = "log/brokkr_{system_prefix}_{unit_number:0>3}.log"

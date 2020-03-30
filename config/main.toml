@@ -3,26 +3,47 @@
 config_version = 1
 
 [general]
+# The default pipeline to use when running the brokkr status and brokkr monitor commands
 monitoring_pipeline_default = "telemetry"
+# How to format the output filename on the client.
+# Items in {} are replaced with their corresponding value
 output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.{extension}"
+# The path the client should use when storing output data files
 output_path_client = "~/brokkr/{system_name}"
+# How long to wait for the workers to shut down after sending the command
 worker_shutdown_wait_s = 10
 
+# Configuration for the built-in AutoSSH functionality for remote access and data upload.
 [autossh]
+# Hostname of the server to connect to
 server_hostname = "proxy.nsstc.uah.edu"
+# Username to use on the server
 server_username = "mjolnir"
+# Base offset to the tunnel port to expose on the server (port = offset + unit_number)
 tunnel_port_offset = 10000
 
+# List custom steps or override default preset settings here under the [steps] key
+
+# Step for outputting telemetry data to a standard CSV
 [steps.telemetry_csv_output]
+# Preset for this step, in the format "{device_name}.{input/output/command/etc}.{preset_name}"
 _preset = "builtins.outputs.csv_file"
+# Step name, for use in UI text and log messages
 name = "Telemetry CSV Output"
+# Step-specific settings; here lists the output path and filename kwargs
 output_path = "telemetry"
 filename_kwargs = { output_type = "telemetry" }
 
+# List pipelines to run here under the [pipelines] key
 [pipelines.telemetry]
+# Custom builder for this pipeline
 _builder = "monitor"
+# Name of this pipeline for UI text and log messages
 name = "Telemetry"
-monitor_interval_s = 60
+# Custom settings for this pipeline type: here, the interval in s to run monitoring
+monitor_interval_s = 10
+# Most pipeline builders will need one or more lists of steps.
+# These are either names of steps in the [steps] table, or preset names as above
 monitor_input_steps = [
     "builtins.inputs.current_time",
     "builtins.inputs.run_time",
