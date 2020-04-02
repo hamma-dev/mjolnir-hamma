@@ -5,6 +5,8 @@ config_version = 1
 [general]
 # The default pipeline to use when running the brokkr status and brokkr monitor commands
 monitoring_pipeline_default = "telemetry"
+# The value to use to designate NA values when data is serialized
+na_marker = "NA"
 # How to format the output filename on the client.
 # Items in {} are replaced with their corresponding value
 output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.{extension}"
