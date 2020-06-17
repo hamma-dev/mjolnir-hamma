@@ -43,7 +43,9 @@ _builder = "monitor"
 # Name of this pipeline for UI text and log messages
 name = "Telemetry"
 # Custom settings for this pipeline type: here, the interval in s to run monitoring
-monitor_interval_s = 10
+monitor_interval_s = 60
+# Whether to inject NAs when starting, so that jumps in data continuity are apparent
+na_on_start = true
 # Most pipeline builders will need one or more lists of steps.
 # These are either names of steps in the [steps] table, or preset names as above
 monitor_input_steps = [
