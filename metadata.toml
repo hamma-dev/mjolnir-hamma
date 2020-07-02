@@ -1,4 +1,4 @@
-# Metadata for this specific system configuration preset
+# Metadata for this specific system configuration package
 
 config_version = 1
 
@@ -8,7 +8,7 @@ name = "hamma"
 # Full "pretty" name of the system, e.g. for UI text
 name_full = "HAMMA Sensor System"
 # The author, authors or sponsoring organization of the system
-author = "C.A.M. Gerlach and the UAH HAMMA group"
+author = "UAH HAMMA group"
 # Freeform description of the system's intended function and purpose
 description = "System configuration for the Huntsville AL Marx Meter Array"
 # Official website for this specific system
@@ -18,7 +18,7 @@ repo = "https://github.com/hamma-dev/mjolnir-hamma"
 # SPDX license identifier for the this configuration package (TBD)
 license = ""
 
-# Version of the coqnfig package; should follow SemVer and PEP 396
+# Version of the config package; should follow SemVer and PEP 396
 version = "0.2.0dev0"
 # Minimum Brokkr version this version of the config package needs to work
 brokkr_version_min = "0.4.0dev0"
