@@ -3,19 +3,22 @@
 config_version = 1
 
 # Preset for real-time use, e.g. coupled with Sindri
-[realtime.main.general]
-output_path_client = "~/brokkr/realtime"
+[realtime]
+    [realtime.main.general]
+        output_path_client = "~/brokkr/realtime"
 
-[realtime.main.pipelines.telemetry]
-monitor_interval_s = 1
+    [realtime.main.pipelines.telemetry]
+        monitor_interval_s = 1
 
 # Preset for real-time use with Sindri 0.2.x
-[sindri02x.main.pipelines.telemetry]
-monitor_interval_s = 10
+[sindri02x]
+    [sindri02x.main.pipelines.telemetry]
+        monitor_interval_s = 10
 
 # Preset for core and system testing without disturbing the production data
-[test.main.general]
-output_path_client = "~/brokkr/test"
+[test]
+    [test.main.general]
+        output_path_client = "~/brokkr/test"
 
-[test.main.pipelines.telemetry]
-monitor_interval_s = 5
+    [test.main.pipelines.telemetry]
+        monitor_interval_s = 5

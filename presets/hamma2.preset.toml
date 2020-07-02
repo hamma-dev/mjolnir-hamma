@@ -8,56 +8,57 @@ type = "device"
 
 # Preset-level metadata
 [metadata]
-name_full = "HAMMA2 Sensor"
-author = "C.A.M. Gerlach and the UAH HAMMA group"
-description = "Device preset for the Huntsville AL Marx Meter Array version 2 sensor"
-homepage = "https://hamma.dev/"
-repo = "https://github.com/hamma-dev/mjolnir-hamma"
-preset_version = "0.1.0"
-brokkr_version_min = "0.3.0"
+    name_full = "HAMMA2 Sensor"
+    author = "C.A.M. Gerlach and the UAH HAMMA group"
+    description = "Device preset for the Huntsville AL Marx Meter Array version 2 sensor"
+    homepage = "https://hamma.dev/"
+    repo = "https://github.com/hamma-dev/mjolnir-hamma"
+    preset_version = "0.1.0"
+    brokkr_version_min = "0.3.0"
 
 # Data type presets to use for the data types that follow
 [type_presets]
-gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
+    gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
 
 # Data types referenced in individual presets
 [data_types]
-marker_val = { input_type = "8s", conversion = false }
-sequence_count = { binary_type = "I", unit = "", uncertainty = false }
-timestamp = { binary_type = "q", conversion = "time_posix_ms", unit = "s", uncertainty = 0.001 }
-crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
-valid_packets = { binary_type = "I", unit = "", uncertainty = false }
-bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
-bytes_written = { full_name = "Data Written", type_presets = "gigabytes" }
-bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
-packets_sent = { binary_type = "I", unit = "", uncertainty = false }
-packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
+    marker_val = { input_type = "8s", conversion = false }
+    sequence_count = { binary_type = "I", unit = "", uncertainty = false }
+    timestamp = { binary_type = "q", conversion = "time_posix_ms", unit = "s", uncertainty = 0.001 }
+    crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
+    valid_packets = { binary_type = "I", unit = "", uncertainty = false }
+    bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
+    bytes_written = { full_name = "Data Written", type_presets = "gigabytes" }
+    bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
+    packets_sent = { binary_type = "I", unit = "", uncertainty = false }
+    packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
 
-# Input preset that simply pings the HAMMA sensor
-[inputs.ping]
-_module_path = "brokkr.inputs.ping"
-_class_name = "PingInput"
-name = "Sensor Ping"
-host = "10.10.10.1"
-timeout_s = 1
+[inputs]
+    # Input preset that simply pings the HAMMA sensor
+    [inputs.ping]
+        _module_path = "brokkr.inputs.ping"
+        _class_name = "PingInput"
+        name = "Sensor Ping"
+        host = "10.10.10.1"
+        timeout_s = 1
 
-# Input preset that reads a H&S UDP packet from the sensor
-[inputs.hs]
-_module_path = "brokkr.inputs.udp"
-_class_name = "UDPInput"
-name = "Sensor Health & Status Packet"
-host = "10.10.10.2"
-port = 8084
-timeout_s = 2
-data_types = [
-    "marker_val",
-    "sequence_count",
-    "timestamp",
-    "crc_errors",
-    "valid_packets",
-    "bytes_read",
-    "bytes_written",
-    "bytes_remaining",
-    "packets_sent",
-    "packets_dropped",
-]
+    # Input preset that reads a H&S UDP packet from the sensor
+    [inputs.hs]
+        _module_path = "brokkr.inputs.udp"
+        _class_name = "UDPInput"
+        name = "Sensor Health & Status Packet"
+        host = "10.10.10.2"
+        port = 8084
+        timeout_s = 2
+        data_types = [
+            "marker_val",
+            "sequence_count",
+            "timestamp",
+            "crc_errors",
+            "valid_packets",
+            "bytes_read",
+            "bytes_written",
+            "bytes_remaining",
+            "packets_sent",
+            "packets_dropped",
+        ]
