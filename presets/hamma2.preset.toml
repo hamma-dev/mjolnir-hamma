@@ -44,11 +44,14 @@ type = "device"
 
     # Input preset that reads a H&S UDP packet from the sensor
     [inputs.hs]
-        _module_path = "brokkr.inputs.udp"
-        _class_name = "UDPInput"
+        _module_path = "brokkr.inputs.network"
+        _class_name = "NetworkInput"
         name = "Sensor Health & Status Packet"
         host = "10.10.10.2"
         port = 8084
+        action = "bind"
+        socket_family = "IPV4"
+        socket_type = "UDP"
         timeout_s = 2
         data_types = [
             "marker_val",
