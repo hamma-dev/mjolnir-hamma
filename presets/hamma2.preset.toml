@@ -24,7 +24,7 @@ type = "device"
 [data_types]
     marker_val = { input_type = "8s", conversion = false }
     sequence_count = { binary_type = "I", unit = "", uncertainty = false }
-    timestamp = { binary_type = "q", conversion = "time_posix_ms", unit = "s", uncertainty = 0.001 }
+    timestamp = { binary_type = "q", conversion = "time_posix", divisor_to_s = 1000, unit = "s", uncertainty = 0.001 }
     crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
     valid_packets = { binary_type = "I", unit = "", uncertainty = false }
     bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
