@@ -38,6 +38,7 @@ config_version = 1
 
 # List pipelines to run here under the [pipelines] key
 [pipelines]
+    # Engineering telemetry data from Pi, charge controller and sensor
     [pipelines.telemetry]
         # Custom builder for this pipeline
         _builder = "monitor"
@@ -56,4 +57,14 @@ config_version = 1
             "hamma2.inputs.ping",
             "hamma2.inputs.hs",
         ]
-        monitor_output_steps = [ "telemetry_csv_output" ]
+        monitor_output_steps = [
+            "telemetry_csv_output",
+        ]
+
+    # AGS science data packets from sensor
+    [pipelines.science_data_ingest]
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Ingest"
+        input_steps = [
+            "hamma2.inputs.science_data",
+        ]
