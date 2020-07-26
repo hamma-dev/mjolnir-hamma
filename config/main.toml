@@ -36,6 +36,15 @@ config_version = 1
         output_path = "telemetry"
         filename_kwargs = { output_type = "telemetry" }
 
+    # Step to output the HAMMA2 AGS science data packets to a binary file
+    [steps.science_binary_output]
+        _preset = "builtins.outputs.binary_file"
+        name = "HAMMA AGS Science Data Binary File Output"
+        filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S-%f}.{extension}"
+        output_path = "science"
+        extension = "bin"
+        skip_na = true
+
 # List pipelines to run here under the [pipelines] key
 [pipelines]
     # Engineering telemetry data from Pi, charge controller and sensor
@@ -62,9 +71,12 @@ config_version = 1
         ]
 
     # AGS science data packets from sensor
-    [pipelines.science_data_ingest]
+    [pipelines.science_ingest]
         _builder = "pipeline"
         name = "HAMMA2 AGS Science Data Ingest"
         input_steps = [
             "hamma2.inputs.science_data",
+        ]
+        output_steps = [
+            "science_binary_output",
         ]
