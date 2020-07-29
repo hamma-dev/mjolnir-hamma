@@ -72,6 +72,8 @@ type = "device"
         _module_path = "brokkr.inputs.network"
         _class_name = "NetworkInput"
         name = "HAMMA2 Sensor AGS Science Packet"
+        binary_decoder = false
+        passthrough_none = true
         host = "10.10.10.1"
         port = 8080
         action = "connect"
@@ -79,7 +81,6 @@ type = "device"
         socket_type = "TCP"
         timeout_s = 2
         network_kwargs.data_length = 22000132
-        binary_decoder = false
         data_types = [
             "science_packet",
         ]

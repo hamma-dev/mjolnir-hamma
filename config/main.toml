@@ -43,7 +43,6 @@ config_version = 1
         filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S-%f}.{extension}"
         output_path = "science"
         extension = "bin"
-        skip_na = true
 
 # List pipelines to run here under the [pipelines] key
 [pipelines]
