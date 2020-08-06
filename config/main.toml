@@ -24,6 +24,11 @@ config_version = 1
     # Base offset to the tunnel port to expose on the server (port = offset + unit_number)
     tunnel_port_offset = 10000
 
+# Lookup table of data queues for inter-pipeline communication via QueueSteps
+[queues]
+    # Queue for the binary AGS science data packets from the HAMMA2 sensors
+    science_data_packets = { maxsize = 128 }
+
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
     # Step for outputting telemetry data to a standard CSV
@@ -43,6 +48,18 @@ config_version = 1
         filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S}-{milliseconds:0>3}"
         output_path = "science"
         extension = "bin"
+
+    # Step to output the HAMMA2 AGS science data packets to a queue
+    [steps.science_output_queue]
+        _preset = "builtins.outputs.queue"
+        _queue_name = "science_data_packets"
+        name = "HAMMA2 AGS science data output queue"
+
+    # Step to get the HAMMA2 AGS science data packets from a queue
+    [steps.science_input_queue]
+        _preset = "builtins.inputs.queue"
+        _queue_name = "science_data_packets"
+        name = "HAMMA2 AGS science data input queue"
 
 # List pipelines to run here under the [pipelines] key
 [pipelines]
@@ -75,6 +92,17 @@ config_version = 1
         name = "HAMMA2 AGS Science Data Ingest"
         input_steps = [
             "hamma2.inputs.science_data",
+        ]
+        output_steps = [
+            "science_output_queue",
+        ]
+
+    # AGS binary science data packet output to local HDDs
+    [pipelines.science_disk_write]
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Binary File Output"
+        input_steps = [
+            "science_input_queue",
         ]
         output_steps = [
             "science_binary_output",
