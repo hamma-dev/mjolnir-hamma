@@ -13,7 +13,7 @@ config_version = 1
     # The path the client should use when storing output data files
     output_path_client = "~/brokkr/{system_name}"
     # How long to wait for the workers to shut down after sending the command
-    worker_shutdown_wait_s = 10
+    worker_shutdown_wait_s = 60
 
 # Configuration for the built-in AutoSSH functionality for remote access and data upload.
 [autossh]
@@ -45,9 +45,13 @@ config_version = 1
     [steps.science_binary_output]
         _preset = "builtins.outputs.binary_file"
         name = "HAMMA AGS Science Data Binary File Output"
+        output_path = "{drive_path}"
         filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S}-{milliseconds:0>3}"
-        output_path = "science"
         extension = "bin"
+        drive_kwargs.drive_glob = "DATA??"
+        drive_kwargs.mount_glob = true
+        drive_kwargs.fallback_path = "~/brokkr/{system_name}/science"
+        drive_kwargs.min_free_gb = 0.1
 
     # Step to output the HAMMA2 AGS science data packets to a queue
     [steps.science_output_queue]
