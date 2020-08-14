@@ -19,9 +19,9 @@ repo = "https://github.com/hamma-dev/mjolnir-hamma"
 license = ""
 
 # Version of the config package; should follow SemVer and PEP 396
-version = "0.2.0dev0"
+version = "0.2.0a1"
 # Minimum Brokkr version this version of the config package needs to work
-brokkr_version_min = "0.4.0dev0"
+brokkr_version_min = "0.4.0a1"
 # As above, but maximum version (e.g. "0.3.99" for < 0.4.x)
 brokkr_version_max = ""
 # Ibid, for Sindri
