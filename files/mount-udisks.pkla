@@ -1,0 +1,4 @@
+[Allow users to mount drives using udisksctl]
+Identity=unix-group:users
+Action=org.freedesktop.udisks2.filesystem-mount-other-seat;org.freedesktop.udisks2.filesystem-mount;org.freedesktop.udisks2.eject-media;org.freedesktop.udisks2.eject-media-other-seat;org.freedesktop.udisks2.filesystem-unmount-others;org.freedesktop.udisks2.eject-media;org.freedesktop.udisks2.eject-media-other-seat;org.freedesktop.udisks2.power-off-drive;org.freedesktop.udisks2.power-off-drive-other-seat
+ResultAny=yes

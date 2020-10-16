@@ -37,9 +37,9 @@ def main():
     arg_parser.add_argument("--pin", help="The BCM pin to use",
                             default=argparse.SUPPRESS)
     onoff = arg_parser.add_mutually_exclusive_group(required=True)
-    onoff.add_argument("--on", action="store_true", dest="state",
+    onoff.add_argument("--on", action="store_true", dest="new_state",
                        help="Turn relay on")
-    onoff.add_argument("--off", action="store_false", dest="state",
+    onoff.add_argument("--off", action="store_false", dest="new_state",
                        help="Turn relay off")
     parsed_args = arg_parser.parse_args()
     toggle_relay(**vars(parsed_args))

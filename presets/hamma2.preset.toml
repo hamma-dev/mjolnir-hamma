@@ -24,7 +24,7 @@ type = "device"
 [data_types]
     marker_val = { input_type = "8s", conversion = false }
     sequence_count = { binary_type = "I", unit = "", uncertainty = false }
-    timestamp = { binary_type = "q", conversion = "time_posix_ms", unit = "s", uncertainty = 0.001 }
+    timestamp = { binary_type = "q", conversion = "time_posix", divisor_to_s = 1000, unit = "s", uncertainty = 0.001 }
     crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
     valid_packets = { binary_type = "I", unit = "", uncertainty = false }
     bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
@@ -32,6 +32,7 @@ type = "device"
     bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
     packets_sent = { binary_type = "I", unit = "", uncertainty = false }
     packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
+    science_packet = { full_name = "AGS Science Data", binary_type = "s", conversion = true }
 
 [inputs]
     # Input preset that simply pings the HAMMA sensor
@@ -44,11 +45,14 @@ type = "device"
 
     # Input preset that reads a H&S UDP packet from the sensor
     [inputs.hs]
-        _module_path = "brokkr.inputs.udp"
-        _class_name = "UDPInput"
-        name = "Sensor Health & Status Packet"
+        _module_path = "brokkr.inputs.network"
+        _class_name = "NetworkInput"
+        name = "HAMMA2 Sensor Health & Status Packet"
         host = "10.10.10.2"
         port = 8084
+        action = "bind"
+        socket_family = "IPV4"
+        socket_type = "UDP"
         timeout_s = 2
         data_types = [
             "marker_val",
@@ -61,4 +65,24 @@ type = "device"
             "bytes_remaining",
             "packets_sent",
             "packets_dropped",
+        ]
+
+    # AGS science data packets from sensor
+    [inputs.science_data]
+        _module_path = "brokkr.inputs.network"
+        _class_name = "NetworkInput"
+        name = "HAMMA2 Sensor AGS Science Packet"
+        binary_decoder = false
+        passthrough_none = true
+        persist_socket = true
+        reinit_on_null_data = true
+        host = "10.10.10.1"
+        port = 8080
+        action = "connect"
+        socket_family = "IPV4"
+        socket_type = "TCP"
+        timeout_s = 2
+        network_kwargs.data_length = 22000132
+        data_types = [
+            "science_packet",
         ]

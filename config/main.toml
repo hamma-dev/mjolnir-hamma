@@ -9,11 +9,11 @@ config_version = 1
     na_marker = "NA"
     # How to format the output filename on the client.
     # Items in {} are replaced with their corresponding value
-    output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}.{extension}"
+    output_filename_client = "{output_type}_{system_prefix}_{unit_number:0>3}_{utc_date!s}"
     # The path the client should use when storing output data files
     output_path_client = "~/brokkr/{system_name}"
     # How long to wait for the workers to shut down after sending the command
-    worker_shutdown_wait_s = 10
+    worker_shutdown_wait_s = 60
 
 # Configuration for the built-in AutoSSH functionality for remote access and data upload.
 [autossh]
@@ -23,6 +23,11 @@ config_version = 1
     server_username = "mjolnir"
     # Base offset to the tunnel port to expose on the server (port = offset + unit_number)
     tunnel_port_offset = 10000
+
+# Lookup table of data queues for inter-pipeline communication via QueueSteps
+[queues]
+    # Queue for the binary AGS science data packets from the HAMMA2 sensors
+    science_data_packets = { maxsize = 128 }
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
@@ -36,8 +41,33 @@ config_version = 1
         output_path = "telemetry"
         filename_kwargs = { output_type = "telemetry" }
 
+    # Step to output the HAMMA2 AGS science data packets to a binary file
+    [steps.science_binary_output]
+        _preset = "builtins.outputs.binary_file"
+        name = "HAMMA AGS Science Data Binary File Output"
+        output_path = "{drive_path}"
+        filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S}-{milliseconds:0>3}"
+        extension = "bin"
+        drive_kwargs.drive_glob = "DATA??"
+        drive_kwargs.mount_glob = true
+        drive_kwargs.fallback_path = "~/brokkr/{system_name}/science"
+        drive_kwargs.min_free_gb = 0.1
+
+    # Step to output the HAMMA2 AGS science data packets to a queue
+    [steps.science_output_queue]
+        _preset = "builtins.outputs.queue"
+        _queue_name = "science_data_packets"
+        name = "HAMMA2 AGS science data output queue"
+
+    # Step to get the HAMMA2 AGS science data packets from a queue
+    [steps.science_input_queue]
+        _preset = "builtins.inputs.queue"
+        _queue_name = "science_data_packets"
+        name = "HAMMA2 AGS science data input queue"
+
 # List pipelines to run here under the [pipelines] key
 [pipelines]
+    # Engineering telemetry data from Pi, charge controller and sensor
     [pipelines.telemetry]
         # Custom builder for this pipeline
         _builder = "monitor"
@@ -56,4 +86,28 @@ config_version = 1
             "hamma2.inputs.ping",
             "hamma2.inputs.hs",
         ]
-        monitor_output_steps = [ "telemetry_csv_output" ]
+        monitor_output_steps = [
+            "telemetry_csv_output",
+        ]
+
+    # AGS science data packets from sensor
+    [pipelines.science_ingest]
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Ingest"
+        input_steps = [
+            "hamma2.inputs.science_data",
+        ]
+        output_steps = [
+            "science_output_queue",
+        ]
+
+    # AGS binary science data packet output to local HDDs
+    [pipelines.science_disk_write]
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Binary File Output"
+        input_steps = [
+            "science_input_queue",
+        ]
+        output_steps = [
+            "science_binary_output",
+        ]
