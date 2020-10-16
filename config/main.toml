@@ -18,9 +18,9 @@ config_version = 1
 # Configuration for the built-in AutoSSH functionality for remote access and data upload.
 [autossh]
     # Hostname of the server to connect to
-    server_hostname = "proxy.nsstc.uah.edu"
+    server_hostname = "104.131.44.197"
     # Username to use on the server
-    server_username = "mjolnir"
+    server_username = "pi"
     # Base offset to the tunnel port to expose on the server (port = offset + unit_number)
     tunnel_port_offset = 10000
 
