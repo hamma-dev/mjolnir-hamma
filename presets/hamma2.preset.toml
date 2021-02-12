@@ -19,11 +19,12 @@ type = "device"
 # Data type presets to use for the data types that follow
 [type_presets]
     bitfield = { conversion = "bitfield", unit = false, uncertainty = false }
-    count = { unit = "", uncertainty = false }
+    count_byte = { binary_type = "B", unit = "", uncertainty = false }
     count_packet = { binary_type = "I", unit = "", uncertainty = false }
     count_word = { binary_type = "H", unit = "", uncertainty = false }
     gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
     id_val = { binary_type = "B", unit = "", uncertainty = false }
+    padding_byte = { input_type = "1s", conversion = false }
     size_words = { conversion = "custom", scale = 2, unit = "B", uncertainty = false }
     threashold = { binary_type = "H", unit = "", uncertainty = false }
 
@@ -40,16 +41,16 @@ type = "device"
     packets_sent = { type_presets = "count_packet" }
     packets_dropped = {  type_presets = "count_packet" }
     science_packet = { full_name = "AGS Science Data", binary_type = "s", conversion = true }
-    padding_byte = { input_type = "1s", conversion = false }
-    padding_seq = { input_type = "16s", conversion = false }
     board_id = { full_name = "Board ID", type_presets = "id_val" }
     firmware_version = { type_presets = "id_val" }
     payload_size = { binary_type = "I", type_presets = "size_words" }
-    channel_count = { type_presets = "count_word" }
-    temperature = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 165, offset = -40, unit = "C", uncertainty = 1 }
-    humidity = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 100, unit = "%", uncertainty = 1 }
+    channel_count = { type_presets = "count_byte" }
+    padding_byte_1 = { type_presets = "padding_byte" }
+    temperature = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 165, offset = -40, digits = 3, unit = "C", uncertainty = 1 }
+    humidity = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 100, digits = 3, unit = "%", uncertainty = 1 }
     watchdog_counter = { type_presets = "count_word" }
-    fifo_counter = { full_name = "FIFO Overflow Counter", binary_type = "B", type_presets = "count" }
+    fifo_counter = { full_name = "FIFO Overflow Counter", type_presets = "count_byte" }
+    padding_byte_2 = { type_presets = "padding_byte" }
     threashold_1 = { type_presets = "threashold" }
     threashold_2 = { type_presets = "threashold" }
     threashold_3 = { type_presets = "threashold" }
@@ -60,9 +61,10 @@ type = "device"
     threashold_8 = { type_presets = "threashold" }
     block_type = { type_presets = "id_val" }
     block_size = { binary_type = "B", type_presets = "size_words" }
-    trigger_position = { full_name = "Trigger Block Position", binary_type = "I", type_presets = "count" }
-    sub_position = { full_name = "Trigger Sub-Block Position", binary_type = "B", type_presets = "count" }
-    retrigger_position = { full_name = "Retrigger Enable Block Position", binary_type = "I", type_presets = "count" }
+    trigger_position = { full_name = "Trigger Block Position", type_presets = "count_packet" }
+    sub_position = { full_name = "Trigger Sub-Block Position", type_presets = "count_byte" }
+    padding_byte_3 = { type_presets = "padding_byte" }
+    retrigger_position = { full_name = "Retrigger Enable Block Position", type_presets = "count_packet" }
     trigger_channel = { binary_type = "I", type_presets = "bitfield" }
     gps_lat = { full_name = "GPS Latitude", binary_type = "d", unit = "deg" }
     gps_lon = { full_name = "GPS Longitude", binary_type = "d", unit = "deg" }
@@ -73,10 +75,12 @@ type = "device"
     gps_status_code = { full_name = "GPS Byte 0x46 Status Code", type_presets = "id_val" }
     gps_health = { full_name = "GPS Byte 0x46 Health Bits", binary_type = "B", type_presets = "bitfield" }
     gps_satellites = { full_name = "GPS Byte 0x6D Satellite Bits", binary_type = "B", type_presets = "bitfield" }
+    padding_byte_4 = { type_presets = "padding_byte" }
     gps_subsecond = { full_name = "GPS Subsecond", binary_type = "I", unit = "ns" }
     gps_ecc = { full_name = "GPS Subsecond ECC", binary_type = "I", unit = "ns" }
-    time_tag_position = { full_name = "Time Tag Block Position", binary_type = "I", type_presets = "count" }
+    time_tag_position = { full_name = "Time Tag Block Position", type_presets = "count_packet" }
     trigger_mask = { binary_type = "I", type_presets = "bitfield" }
+    padding_seq = { input_type = "16s", conversion = false }
     packet_sequence =  { type_presets = "count_word" }
 
 [inputs]
@@ -145,12 +149,12 @@ type = "device"
                 "firmware_version",
                 "payload_size",
                 "channel_count",
-                "padding_byte",
+                "padding_byte_1",
                 "temperature",
                 "humidity",
                 "watchdog_counter",
                 "fifo_counter",
-                "padding_byte",
+                "padding_byte_2",
                 "threashold_1",
                 "threashold_2",
                 "threashold_3",
@@ -163,7 +167,7 @@ type = "device"
                 "block_size",
                 "trigger_position",
                 "sub_position",
-                "padding_byte",
+                "padding_byte_3",
                 "retrigger_position",
                 "trigger_channel",
                 "gps_lat",
@@ -175,7 +179,7 @@ type = "device"
                 "gps_status_code",
                 "gps_health",
                 "gps_satellites",
-                "padding_byte",
+                "padding_byte_4",
                 "gps_subsecond",
                 "gps_ecc",
                 "time_tag_position",
