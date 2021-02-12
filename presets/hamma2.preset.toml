@@ -143,6 +143,7 @@ type = "device"
         name = "HAMMA2 Sensor AGS Science Packet Header Decode"
         binary_decoder = true
         truncate_after = 128
+        decode_kwargs.byte_order = "<"
         data_types = [
                 "marker_val",
                 "board_id",
