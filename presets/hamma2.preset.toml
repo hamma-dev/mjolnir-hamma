@@ -18,21 +18,66 @@ type = "device"
 
 # Data type presets to use for the data types that follow
 [type_presets]
+    bitfield = { conversion = "bitfield", unit = false, uncertainty = false }
+    count = { unit = "", uncertainty = false }
+    count_packet = { binary_type = "I", unit = "", uncertainty = false }
+    count_word = { binary_type = "H", unit = "", uncertainty = false }
     gigabytes = { conversion = "custom", binary_type = "Q", unit = "GB", uncertainty = false, base = 10, power = -9, digits = 9 }
+    id_val = { binary_type = "B", unit = "", uncertainty = false }
+    size_words = { conversion = "custom", scale = 2, unit = "B", uncertainty = false }
+    threashold = { binary_type = "H", unit = "", uncertainty = false }
 
 # Data types referenced in individual presets
 [data_types]
     marker_val = { input_type = "8s", conversion = false }
-    sequence_count = { binary_type = "I", unit = "", uncertainty = false }
+    sequence_count = { type_presets = "count_packet" }
     timestamp = { binary_type = "q", conversion = "time_posix", divisor_to_s = 1000, unit = "s", uncertainty = 0.001 }
-    crc_errors = { full_name = "CRC Errors", binary_type = "I", unit = "", uncertainty = false }
-    valid_packets = { binary_type = "I", unit = "", uncertainty = false }
+    crc_errors = { full_name = "CRC Errors", type_presets = "count_packet" }
+    valid_packets = { type_presets = "count_packet" }
     bytes_read = { full_name = "Data Read", type_presets = "gigabytes" }
     bytes_written = { full_name = "Data Written", type_presets = "gigabytes" }
     bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
-    packets_sent = { binary_type = "I", unit = "", uncertainty = false }
-    packets_dropped = { binary_type = "I", unit = "", uncertainty = false }
+    packets_sent = { type_presets = "count_packet" }
+    packets_dropped = {  type_presets = "count_packet" }
     science_packet = { full_name = "AGS Science Data", binary_type = "s", conversion = true }
+    padding_byte = { input_type = "1s", conversion = false }
+    padding_seq = { input_type = "16s", conversion = false }
+    board_id = { full_name = "Board ID", type_presets = "id_val" }
+    firmware_version = { type_presets = "id_val" }
+    payload_size = { binary_type = "I", type_presets = "size_words" }
+    channel_count = { type_presets = "count_word" }
+    temperature = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 165, offset = -40, unit = "C", uncertainty = 1 }
+    humidity = { binary_type = "H", conversion = "custom", base = 2, power = -14, scale = 100, unit = "%", uncertainty = 1 }
+    watchdog_counter = { type_presets = "count_word" }
+    fifo_counter = { full_name = "FIFO Overflow Counter", binary_type = "B", type_presets = "count" }
+    threashold_1 = { type_presets = "threashold" }
+    threashold_2 = { type_presets = "threashold" }
+    threashold_3 = { type_presets = "threashold" }
+    threashold_4 = { type_presets = "threashold" }
+    threashold_5 = { type_presets = "threashold" }
+    threashold_6 = { type_presets = "threashold" }
+    threashold_7 = { type_presets = "threashold" }
+    threashold_8 = { type_presets = "threashold" }
+    block_type = { type_presets = "id_val" }
+    block_size = { binary_type = "B", type_presets = "size_words" }
+    trigger_position = { full_name = "Trigger Block Position", binary_type = "I", type_presets = "count" }
+    sub_position = { full_name = "Trigger Sub-Block Position", binary_type = "B", type_presets = "count" }
+    retrigger_position = { full_name = "Retrigger Enable Block Position", binary_type = "I", type_presets = "count" }
+    trigger_channel = { binary_type = "I", type_presets = "bitfield" }
+    gps_lat = { full_name = "GPS Latitude", binary_type = "d", unit = "deg" }
+    gps_lon = { full_name = "GPS Longitude", binary_type = "d", unit = "deg" }
+    gps_alt = { full_name = "GPS Altitude", binary_type = "d", unit = "m" }
+    gps_time_week = { full_name = "GPS Time of Week", binary_type = "f", unit = "s" }
+    gps_week = { full_name = "GPS Week", binary_type = "h", unit = "week", uncertainty = false }
+    gps_utc_offset = { full_name = "GPS UTC Offset", binary_type = "f", unit = "s" }
+    gps_status_code = { full_name = "GPS Byte 0x46 Status Code", type_presets = "id_val" }
+    gps_health = { full_name = "GPS Byte 0x46 Health Bits", binary_type = "B", type_presets = "bitfield" }
+    gps_satellites = { full_name = "GPS Byte 0x6D Satellite Bits", binary_type = "B", type_presets = "bitfield" }
+    gps_subsecond = { full_name = "GPS Subsecond", binary_type = "I", unit = "ns" }
+    gps_ecc = { full_name = "GPS Subsecond ECC", binary_type = "I", unit = "ns" }
+    time_tag_position = { full_name = "Time Tag Block Position", binary_type = "I", type_presets = "count" }
+    trigger_mask = { binary_type = "I", type_presets = "bitfield" }
+    packet_sequence =  { type_presets = "count_word" }
 
 [inputs]
     # Input preset that simply pings the HAMMA sensor
@@ -85,4 +130,56 @@ type = "device"
         network_kwargs.data_length = 22000132
         data_types = [
             "science_packet",
+        ]
+
+    # AGS science data packet header decoder
+    [inputs.science_header]
+        _module_path = "brokkr.pipeline.baseinput"
+        _class_name = "DecodeInputStep"
+        name = "HAMMA2 Sensor AGS Science Packet Header Decode"
+        binary_decoder = true
+        truncate_after = 128
+        data_types = [
+                "marker_val",
+                "board_id",
+                "firmware_version",
+                "payload_size",
+                "channel_count",
+                "padding_byte",
+                "temperature",
+                "humidity",
+                "watchdog_counter",
+                "fifo_counter",
+                "padding_byte",
+                "threashold_1",
+                "threashold_2",
+                "threashold_3",
+                "threashold_4",
+                "threashold_5",
+                "threashold_6",
+                "threashold_7",
+                "threashold_8",
+                "block_type",
+                "block_size",
+                "trigger_position",
+                "sub_position",
+                "padding_byte",
+                "retrigger_position",
+                "trigger_channel",
+                "gps_lat",
+                "gps_lon",
+                "gps_alt",
+                "gps_time_week",
+                "gps_week",
+                "gps_utc_offset",
+                "gps_status_code",
+                "gps_health",
+                "gps_satellites",
+                "padding_byte",
+                "gps_subsecond",
+                "gps_ecc",
+                "time_tag_position",
+                "trigger_mask",
+                "padding_seq",
+                "packet_sequence",
         ]
