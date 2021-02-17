@@ -28,6 +28,8 @@ config_version = 1
 [queues]
     # Queue for the binary AGS science data packets from the HAMMA2 sensors
     science_data_packets = { maxsize = 128 }
+    # Queue for the binary AGS science data headers from the HAMMA2 sensors
+    science_data_headers = { maxsize = 1000000 }
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
@@ -72,6 +74,19 @@ config_version = 1
         _queue_name = "science_data_packets"
         name = "HAMMA2 AGS science data input queue"
 
+    # Step to output the HAMMA2 AGS science data headers to a queue
+    [steps.header_output_queue]
+        _preset = "builtins.outputs.queue"
+        _queue_name = "science_data_headers"
+        name = "HAMMA2 AGS science data header output queue"
+
+    # Step to get the HAMMA2 AGS science data headers from a queue
+    [steps.header_input_queue]
+        _preset = "builtins.inputs.queue"
+        _queue_name = "science_data_headers"
+        name = "HAMMA2 AGS science data header input queue"
+
+
 # List pipelines to run here under the [pipelines] key
 [pipelines]
     # Engineering telemetry data from Pi, charge controller and sensor
@@ -106,6 +121,7 @@ config_version = 1
         ]
         output_steps = [
             "science_output_queue",
+            "header_output_queue",
         ]
 
     # AGS binary science data packet output to local HDDs
@@ -117,6 +133,20 @@ config_version = 1
         ]
         output_steps = [
             "science_binary_output",
+        ]
+
+    # AGS science data header decode and write
+    [pipelines.science_header_decode]
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Header Decode and Write"
+        input_steps = [
+            "header_input_queue",
+        ]
+        process_steps = [
+            "hamma2.inputs.science_header",
+        ]
+        output_steps = [
+            "science_csv_output",
         ]
 
     # AGS science data header monitoring
