@@ -41,6 +41,13 @@ config_version = 1
         output_path = "telemetry"
         filename_kwargs = { output_type = "telemetry" }
 
+    # Step for outputting decoded headers of AGS science packets as CSV
+    [steps.science_csv_output]
+        _preset = "builtins.outputs.csv_file"
+        name = "Science CSV Output"
+        output_path = "headers"
+        filename_kwargs = { output_type = "headers" }
+
     # Step to output the HAMMA2 AGS science data packets to a binary file
     [steps.science_binary_output]
         _preset = "builtins.outputs.binary_file"
@@ -110,4 +117,19 @@ config_version = 1
         ]
         output_steps = [
             "science_binary_output",
+        ]
+
+    # AGS science data header monitoring
+    [pipelines.science_header_monitor]
+        _enabled = false
+        _builder = "pipeline"
+        name = "HAMMA2 AGS Science Data Header Monitor"
+        input_steps = [
+            "hamma2.inputs.science_data",
+        ]
+        process_steps = [
+            "hamma2.inputs.science_header",
+        ]
+        output_steps = [
+            "science_csv_output",
         ]

@@ -142,6 +142,7 @@ type = "device"
         _class_name = "DecodeInputStep"
         name = "HAMMA2 Sensor AGS Science Packet Header Decode"
         binary_decoder = true
+        key_name = "science_packet"
         truncate_after = 128
         decode_kwargs.byte_order = "<"
         data_types = [
