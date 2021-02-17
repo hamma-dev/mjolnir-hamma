@@ -40,7 +40,7 @@ type = "device"
     bytes_remaining = { full_name = "Disk Remaining", type_presets = "gigabytes" }
     packets_sent = { type_presets = "count_packet" }
     packets_dropped = {  type_presets = "count_packet" }
-    science_packet = { full_name = "AGS Science Data", binary_type = "s", conversion = true }
+    science_packet = { full_name = "AGS Science Data", binary_type = "s", conversion = true, header_bytes = 128 }
     board_id = { full_name = "Board ID", type_presets = "id_val" }
     firmware_version = { type_presets = "id_val" }
     payload_size = { binary_type = "I", type_presets = "size_words" }

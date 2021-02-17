@@ -54,9 +54,11 @@ config_version = 1
     [steps.science_binary_output]
         _preset = "builtins.outputs.binary_file"
         name = "HAMMA AGS Science Data Binary File Output"
+        key_name = "science_packet"
         output_path = "{drive_path}"
-        filename_template = "{system_prefix}{unit_number}_{utc_date!s}_{utc_time:%H-%M-%S}-{milliseconds:0>3}"
+        filename_template = "{system_prefix}{unit_number}_{time:%Y-%m-%d_%H-%M-%S}-{time_ms:0>3}"
         extension = "bin"
+        filename_datavalues = [ "time" ]
         drive_kwargs.drive_glob = "DATA??"
         drive_kwargs.mount_glob = true
         drive_kwargs.fallback_path = "~/brokkr/{system_name}/science"
@@ -79,6 +81,7 @@ config_version = 1
         _preset = "builtins.outputs.queue"
         _queue_name = "science_data_headers"
         name = "HAMMA2 AGS science data header output queue"
+        truncate_to_headers = true
 
     # Step to get the HAMMA2 AGS science data headers from a queue
     [steps.header_input_queue]
@@ -119,6 +122,9 @@ config_version = 1
         input_steps = [
             "hamma2.inputs.science_data",
         ]
+        process_steps = [
+            "builtins.inputs.current_time",
+        ]
         output_steps = [
             "science_output_queue",
             "header_output_queue",
@@ -158,6 +164,7 @@ config_version = 1
             "hamma2.inputs.science_data",
         ]
         process_steps = [
+            "builtins.inputs.current_time",
             "hamma2.inputs.science_header",
         ]
         output_steps = [
