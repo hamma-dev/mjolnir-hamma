@@ -1,20 +1,23 @@
 """
-Plugin to monitor state varaibles from the charge controller
+Plugin to monitor state varaibles from the charge controller.
 """
+
+# Standard library imports
+import subprocess
+import sys
+from pathlib import Path
 
 # Local imports
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
-import subprocess
-import os.path
 
 # Provide the script that will be called to send the messages about the states
-SCRIPT = os.path.expanduser("~/dev/mjolnir-hamma/scripts/status_bot.py")
+SCRIPT = Path("~/dev/mjolnir-hamma/scripts/status_bot.py").expanduser()
 POWER_DELIM = 20  # Delimiter between normal power and low power
 
 
 class StateNotifier(brokkr.pipeline.base.OutputStep):
-    """Demo a Mjolnir  output plugin, executing an action on a condition."""
+    """Demo a Mjolnir output plugin, executing an action on a condition."""
 
     def __init__(self, **output_step_kwargs):
         """
@@ -35,7 +38,7 @@ class StateNotifier(brokkr.pipeline.base.OutputStep):
 
     def execute(self, input_data=None):
         """
-        Executing an action upon detection an arbitrary condition in the data.
+        Execute an action upon detection an arbitrary condition in the data.
         Parameters
         ----------
         input_data : any, optional
@@ -64,7 +67,7 @@ class StateNotifier(brokkr.pipeline.base.OutputStep):
             load_now, load_pre = now_then('adc_vl_f')
             curr_now, curr_pre = now_then('adc_il_f')
             
-            power_now, power_pre = [load_now*curr_now, load_pre*curr_pre]
+            power_now, power_pre = (load_now * curr_now, load_pre * curr_pre)
 
             if (power_now < POWER_DELIM) and (power_pre > POWER_DELIM):
                 msg = f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
