@@ -43,6 +43,13 @@ config_version = 1
         output_path = "telemetry"
         filename_kwargs = { output_type = "telemetry" }
 
+    [steps.state_monitor]
+        _preset = "state_monitor.outputs.plugin"
+        power_delim = 20  # delimiter between normal power and low power
+        method = "slack"  # the method how we're going to send notifications
+        slack_channel = "testing"  # the channel in slack the notifications will be posted
+        slack_key_file = "/home/pi/.slack"  # The path the slack key file
+
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
         _preset = "builtins.outputs.csv_file"
@@ -113,6 +120,7 @@ config_version = 1
         ]
         monitor_output_steps = [
             "telemetry_csv_output",
+            "state_monitor"
         ]
 
     # AGS science data packets from sensor
