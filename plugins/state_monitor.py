@@ -88,43 +88,42 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             # Go through several state variables.
             # If something is hinky, log it and send a message
 
-            # # Power drops
-            # load_now, load_pre = now_then('adc_vl_f')
-            # curr_now, curr_pre = now_then('adc_il_f')
-            #
-            # power_now, power_pre = [load_now*curr_now, load_pre*curr_pre]
-            power_now = 10; power_pre = 25
+            # Power drops
+            load_now, load_pre = now_then('adc_vl_f')
+            curr_now, curr_pre = now_then('adc_il_f')
+
+            power_now, power_pre = [load_now*curr_now, load_pre*curr_pre]
             if (power_now < self.power_delim) and (power_pre > self.power_delim):
                 msg = f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
                 self.logger.info(msg)
                 self.send_message(msg)
 
-            # # Sensor communication
-            # comm_now, comm_pre = now_then('ping')
-            # # If the ping !=0, then we can't reach the sensor
-            # if (comm_now != 0) and (comm_pre == 0):
-            #     msg = "No communication with sensor!"
+            # Sensor communication
+            comm_now, comm_pre = now_then('ping')
+            # If the ping !=0, then we can't reach the sensor
+            if (comm_now != 0) and (comm_pre == 0):
+                msg = "No communication with sensor!"
+                self.logger.info(msg)
+                self.send_message(msg)
+
+            # todo: Remaining triggers
+            # input_data['bytes_remaining']
+
+            # todo: Low voltage
+            # CRITICAL_VOLTAGE = input_data['v_lvd'].value + 0.1
+            # batt_now, batt_pre = now_then('adc_vb_f')
+            # if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
+            #     msg = f"Battery voltage critically low {batt_now:.3f}"
             #     self.logger.info(msg)
             #     self.send_message(msg)
-            #
-            # # todo: Remaining triggers
-            # # input_data['bytes_remaining']
-            #
-            # # todo: Low voltage
-            # # CRITICAL_VOLTAGE = input_data['v_lvd'].value + 0.1
-            # # batt_now, batt_pre = now_then('adc_vb_f')
-            # # if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
-            # #     msg = f"Battery voltage critically low {batt_now:.3f}"
-            # #     self.logger.info(msg)
-            # #     self.send_message(msg)
-            #
-            # # LED state
-            # # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
-            # state_now, state_pre = now_then('led_state')
-            # if (state_now >= 12) and (state_now != state_pre):
-            #     msg = f"Critical failure with charge controller. LED state: {state_now}."
-            #     self.logger.info(msg)
-            #     self.send_message(msg)
+
+            # LED state
+            # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
+            state_now, state_pre = now_then('led_state')
+            if (state_now >= 12) and (state_now != state_pre):
+                msg = f"Critical failure with charge controller. LED state: {state_now}."
+                self.logger.info(msg)
+                self.send_message(msg)
 
         # If expression evaluation fails, presumably due to bad data values
         except Exception as e:
