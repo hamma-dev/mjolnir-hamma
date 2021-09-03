@@ -3,8 +3,8 @@ Plugin to monitor state variables from the charge controller.
 """
 
 # Standard library imports
-import abc  # For the MessageSender ABC
-import logging  # For getting the logger from SlackSender
+import abc
+import logging
 import urllib.parse 
 import urllib.request
 from configparser import ConfigParse
@@ -27,7 +27,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         **output_step_kwargs,
         ):
         """
-Handle notifications for changes in state variables.
+        Handle notifications for changes in state variables.
 
         Parameters
         ----------
@@ -60,7 +60,6 @@ Handle notifications for changes in state variables.
             try:
                 self.method_cls = SlackSender(slack_key_file, slack_channel,
                                               logger=self.logger)
-                # todo: pass in logger instance or use logging.getLogger(__name__)?
             except FileNotFoundError as e:
                 self.logger.error(
                     "%e initializing Slack sender: %s Is the Slack key file in the right place?",
@@ -72,7 +71,7 @@ Handle notifications for changes in state variables.
 
     def execute(self, input_data=None):
         """
-        Executing an action upon detection an arbitrary condition in the data.
+        Execute an action upon detection an arbitrary condition in the data.
 
         Parameters
         ----------
