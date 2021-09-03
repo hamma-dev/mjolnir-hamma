@@ -14,6 +14,7 @@ from pathlib import Path
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
 
+HTTP_STATUS_OK = 200  # This is the code returned from Slack when posting a message is OK.
 
 class StateMonitor(brokkr.pipeline.base.OutputStep):
     """Handle notifications for changes in state variables."""
@@ -249,7 +250,7 @@ class SlackSender(MessageSender):
 
         resp = urllib.request.urlopen(self.request)
 
-        if resp.status != 200:
+        if resp.status != HTTP_STATUS_OK:
             warning_msg = f"Sending to slack failed. Message: {msg}"
 
             if self.logger:
