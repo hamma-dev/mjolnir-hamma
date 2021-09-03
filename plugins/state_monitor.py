@@ -55,10 +55,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # Setup simpleeval parser and class initial state
         self._previous_data = None
         self.power_delim = power_delim
-        self.method_cls = None  # Make sure we "initialize" the attribute
+        self.sender = None  # Make sure we "initialize" the attribute
         if method == 'slack':
             try:
-                self.method_cls = SlackSender(slack_key_file, slack_channel,
+                self.sender = SlackSender(slack_key_file, slack_channel,
                                               logger=self.logger)
             except FileNotFoundError as e:
                 self.logger.error(
@@ -172,8 +172,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         """
         msg = self.construct_message(msg)
 
-        if self.method_cls is not None:
-            self.method_cls.send(msg)
+        if self.sender is not None:
+            self.sender.send(msg)
 
     @staticmethod
     def construct_message(msg):
