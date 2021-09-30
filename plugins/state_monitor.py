@@ -3,30 +3,24 @@ Plugin to monitor state variables from the charge controller.
 """
 
 # Standard library imports
-import abc
-import logging
-import urllib.parse 
-import urllib.request
-from configparser import ConfigParse
-from pathlib import Path
 
 # Local imports
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
 
-HTTP_STATUS_OK = 200  # This is the code returned from Slack when posting a message is OK.
+from notifiers.slack import SlackSender
+
 
 class StateMonitor(brokkr.pipeline.base.OutputStep):
     """Handle notifications for changes in state variables."""
 
-    def __init__(
-        self,
-        method=None,
-        power_delim=1,
-        slack_channel=None,
-        slack_key_file=None,
-        **output_step_kwargs,
-        ):
+    def __init__(self,
+                 method=None,
+                 power_delim=1,
+                 slack_channel=None,
+                 slack_key_file=None,
+                 **output_step_kwargs,
+                 ):
         """
         Handle notifications for changes in state variables.
 
@@ -59,8 +53,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.sender = None  # Make sure we "initialize" the attribute
         if method == 'slack':
             try:
-                self.sender = SlackSender(slack_key_file, slack_channel,
-                                              logger=self.logger)
+                self.sender = SlackSender(slack_key_file, slack_channel,  # todo how to import?
+                                          logger=self.logger)
             except FileNotFoundError as e:
                 self.logger.error(
                     "%e initializing Slack sender: %s Is the Slack key file in the right place?",
@@ -104,7 +98,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             load_now, load_pre = now_then('adc_vl_f')
             curr_now, curr_pre = now_then('adc_il_f')
 
-            power_now, power_pre = load_now*curr_now, load_pre*curr_pre
+            power_now, power_pre = load_now * curr_now, load_pre * curr_pre
             if (power_now < self.power_delim) and (power_pre > self.power_delim):
                 msg = f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
                 self.logger.info(msg)
@@ -189,71 +183,3 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         msg = '\n'.join([header, msg])
 
         return msg
-
-
-class MessageSender(metaclass=abc.ABCMeta):
-    """An abstract message sender for the state monitor."""
-    # Methods, attributes and code common to all senders go here.
-    # For example, the logger
-    @abc.abstractmethod
-    def send(self, msg):
-        pass
-
-
-class SlackSender(MessageSender):
-    def __init__(self, key_file, channel, logger=None):
-        """ 
-        Handle sending messages in Slack. 
-        
-        Parameters
-        ----------
-        key_file : str or pathlib.Path
-            The path to the file that contains the Slack key for the
-            workspace to send the message.
-        channel : str
-            The channel to send the message to. It should be defined in file
-            provided by `key_file`.
-        logger : logging.Logger or False, optional
-            If not False and message send fails, log it to the passed logger
-            or the default logger, if not passed.
-
-        """
-        self.logger = logging.getLogger(__name__) if logger is None else logger
-
-        slack_key_file = Path(key_file).expanduser()
-
-        if not slack_key_file.exists():
-            raise FileNotFoundError
-
-        config = ConfigParser()
-        config.read(slack_key_file)
-
-        # This should be constant...
-        BASE_URL = 'https://hooks.slack.com/services/'
-
-        # Define the url, including the channel....
-        slack_url = urllib.parse.urljoin(BASE_URL, config['channel'][channel])
-
-        self.request = urllib.request.Request(url=str(slack_url),
-                                              headers={'Content-type': 'application/json'},
-                                              method='POST')
-
-    def send(self, msg):
-        """
-        Send a Slack message.
-
-        If the message sending fails and there is a logger associated with
-        the class, log it. Otherwise, raise a `RuntimeWarning`.
-        """
-
-        self.request.data = f'{{"text": "{msg}"}}'.encode('utf-8')
-
-        resp = urllib.request.urlopen(self.request)
-
-        if resp.status != HTTP_STATUS_OK:
-            warning_msg = f"Sending to slack failed. Message: {msg}"
-
-            if self.logger:
-                self.logger.warning(warning_msg)
-            else:
-                raise RuntimeWarning(warning_msg)
