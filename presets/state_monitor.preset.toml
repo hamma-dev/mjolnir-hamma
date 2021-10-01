@@ -1,0 +1,23 @@
+# Preset for the state monitor
+
+config_version = 1
+# Name of this device preset, used for lookup
+name = "state_monitor"
+# Type of this preset
+type = "non"
+
+# Preset-level metadata
+[metadata]
+name_full = "State Monitor"
+author = "Phillip Bitzer, C.A.M. Gerlach, and the UAH HAMMA group"
+description = "Monitor for state variables for HAMMA2 sensors"
+homepage = "https://hamma.dev/"
+repo = "https://github.com/hamma-dev/mjolnir-hamma"
+preset_version = "0.1.0"
+brokkr_version_min = "0.4.0"
+
+[outputs.plugin]
+_module_path = "state_monitor"
+_class_name = "StateMonitor"
+_is_plugin = true
+name = "State Monitor"
