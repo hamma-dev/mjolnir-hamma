@@ -17,6 +17,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self,
         method=None,
         power_delim=1,
+        low_space=100,
         slack_channel=None,
         slack_key_file=None,
         **output_step_kwargs,
@@ -33,6 +34,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             The delimiter between normal power and low power.
             If power falls below this value, it is considered low
             and a notification will be generated.
+        low_space : numeric, optional
+            If the number of gigabytes remaining falls below this threshold, generate
+            a notification.
         slack_channel : str, optional
             If `method=='slack'`, then this is the channel in Slack to post notifications.
         slack_key_file : str or pathlib.Path, optional
@@ -50,6 +54,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # Setup simpleeval parser and class initial state
         self._previous_data = None
         self.power_delim = power_delim
+        self.low_space = low_space
         self.sender = None  # Make sure we "initialize" the attribute
         if method == 'slack':
             try:
@@ -112,8 +117,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 self.logger.info(msg)
                 self.send_message(msg)
 
-            # todo: Remaining triggers
-            # input_data['bytes_remaining']
+            # Remaining triggers
+            space_now, space_pre = now_then('bytes_remaining')
+            if (space_now < self.low_space) and (space_pre > self.low_space):
+                msg = f"Remaining GB on drive is {space_now:.1f}"
+                self.logger.info(msg)
+                self.send_message(msg)
 
             # todo: Low voltage
             # CRITICAL_VOLTAGE = input_data['v_lvd'].value + 0.1
