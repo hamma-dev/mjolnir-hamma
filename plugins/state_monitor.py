@@ -2,25 +2,25 @@
 Plugin to monitor state variables from the charge controller.
 """
 
-# Standard library imports
+# Third party imports
+from notifiers.slack import SlackSender
 
 # Local imports
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
 
-from notifiers.slack import SlackSender
-
 
 class StateMonitor(brokkr.pipeline.base.OutputStep):
     """Handle notifications for changes in state variables."""
 
-    def __init__(self,
-                 method=None,
-                 power_delim=1,
-                 slack_channel=None,
-                 slack_key_file=None,
-                 **output_step_kwargs,
-                 ):
+    def __init__(
+        self,
+        method=None,
+        power_delim=1,
+        slack_channel=None,
+        slack_key_file=None,
+        **output_step_kwargs,
+        ):
         """
         Handle notifications for changes in state variables.
 
@@ -35,7 +35,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             and a notification will be generated.
         slack_channel : str, optional
             If `method=='slack'`, then this is the channel in Slack to post notifications.
-        slack_key_file : str, optional
+        slack_key_file : str or pathlib.Path, optional
             If `method=='slack'`, then the path to the file that contains the Slack key
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
@@ -53,8 +53,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.sender = None  # Make sure we "initialize" the attribute
         if method == 'slack':
             try:
-                self.sender = SlackSender(slack_key_file, slack_channel,  # todo how to import?
-                                          logger=self.logger)
+                self.sender = SlackSender(  # todo how to import?
+                    slack_key_file, slack_channel, logger=self.logger)
             except FileNotFoundError as e:
                 self.logger.error(
                     "%e initializing Slack sender: %s Is the Slack key file in the right place?",
