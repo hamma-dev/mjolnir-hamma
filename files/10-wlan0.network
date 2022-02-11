@@ -6,6 +6,6 @@ DHCP=ipv4
 
 [DHCP]
 SendHostname=true
-Hostname=mjolnirpiNN
+Hostname=mjolnirNN
 RouteMetric=10
 UseDNS=true
