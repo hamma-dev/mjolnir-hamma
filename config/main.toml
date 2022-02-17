@@ -30,6 +30,8 @@ config_version = 1
     science_data_packets = { maxsize = 128 }
     # Queue for the binary AGS science data headers from the HAMMA2 sensors
     science_data_headers = { maxsize = 1000000 }
+    # Queue for processing AGS science data for real time information
+    realtime_data_packets = { maxsize = 50 }
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
@@ -50,6 +52,26 @@ config_version = 1
         method = "slack"  # the method how we're going to send notifications
         slack_channel = "testing"  # the channel in slack the notifications will be posted
         slack_key_file = "/home/pi/.slack"  # The path the slack key file
+
+    # Step to create HAMMA plot
+    [steps.hamma_plot]
+        _module_path = "hamma_plot"
+        _class_name = "HammaPlot"
+        _is_plugin = true
+        name = "Make HAMMA Plot"
+        save_path = '/home/pi/brokkr/hamma'
+        min_update_time = 10  # How often do we generate a new plot?
+
+    # Step to rsync HAMMA plot to server
+    [steps.hamma_plot_rsync]
+        _preset = "rsync_server.outputs.plugin"
+        name = "Rsync HAMMA plot"
+        server = "104.131.44.197"  # also in autossh
+        local_path = '/home/pi/brokkr/hamma/'
+        server_path = '/var/www/hamma.dev/public_html/latest'
+        update_time = 120  # seconds
+        include = '*.png'
+        time_key = 'rsync_time_hamma_plot'
 
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
@@ -83,6 +105,18 @@ config_version = 1
         _preset = "builtins.inputs.queue"
         _queue_name = "science_data_packets"
         name = "HAMMA2 AGS science data input queue"
+
+    # Step to get AGS science packet from a queue for real time processing
+    [steps.realtime_output_queue]
+        _preset = "builtins.outputs.queue"
+        _queue_name = "realtime_data_packets"
+        name = "HAMMA2 AGS Real Time output queue"
+
+    # Step to put AGS science packet in a queue for real time processing
+    [steps.realtime_input_queue]
+        _preset = "builtins.inputs.queue"
+        _queue_name = "realtime_data_packets"
+        name = "HAMMA2 AGS Real Time input queue"
 
     # Step to output the HAMMA2 AGS science data headers to a queue
     [steps.header_output_queue]
@@ -146,8 +180,41 @@ config_version = 1
         input_steps = [
             "science_input_queue",
         ]
+        process_steps = [
+        ]
         output_steps = [
             "science_binary_output",
+            "realtime_output_queue",
+        ]
+
+    # Do real time processing of HAMMA data
+    [pipelines.realtime]
+        _builder = "pipeline"
+        _enabled = true
+        name = "Real time HAMMA processing"
+        input_steps = [
+            "realtime_input_queue",
+            "builtins.inputs.run_time",
+        ]
+        process_steps = [
+            "hamma_plot",
+        ]
+        output_steps = [
+        ]
+
+    # Run rsync to the HAMMA server
+    [pipelines.rsync_hamma_realtime]
+        _builder = "pipeline"
+        _enabled = true
+        period_s = 60
+        name = "Rsync HAMMA realtime info to server"
+        input_steps = [
+            "builtins.inputs.current_time",
+        ]
+        process_steps = [
+            "hamma_plot_rsync",
+        ]
+        output_steps = [
         ]
 
     # AGS science data header decode and write
