@@ -60,7 +60,7 @@ config_version = 1
         _is_plugin = true
         name = "Make HAMMA Plot"
         save_path = '/home/pi/brokkr/hamma'
-        min_update_time = 10  # How often do we generate a new plot?
+        min_update_time = 30  # seconds
 
     # Step to rsync HAMMA plot to server
     [steps.hamma_plot_rsync]
