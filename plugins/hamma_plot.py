@@ -3,7 +3,7 @@ Plugin to generate a plot of HAMMA data and save it locally.
 """
 
 # Third party imports
-import matplotlib
+import matplotlib  # Do this first to ensure backend
 matplotlib.use('Agg')
 from matplotlib.pyplot import close as mpl_close
 from matplotlib.pyplot import subplots as mpl_subplots
