@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/pi/dev/ltgenv/bin/python
 
 """
 Control a generic relay with a GPIO pin.
