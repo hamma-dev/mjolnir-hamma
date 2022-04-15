@@ -21,7 +21,7 @@ source "/home/pi/$VENV_NAME"
 
 brokkr configure-system hamma $INSTALL_PATH"mjolnir-hamma"
 
-brokkr configure-unit $number
+brokkr configure-unit $number --site-description "Deployed site description - unit.toml"
 
 brokkr install-dependencies
 sudo $INSTALL_PATH/$VENV_NAME"/bin/brokkr" install-all
