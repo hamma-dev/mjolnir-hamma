@@ -26,7 +26,7 @@ if $do_key;
 	ssh-keygen -f /home/pi/.ssh/id_ed25519 -t ed25519 -C "bitzerp@uah.edu" -N ''
 
 	config_file="/home/pi/.ssh/config"
-	cat <<\EOT >> $config_file
+	sudo tee -a $config_file > /dev/null <<EOT
 	
 Host github-hamma
    HostName github.com 
