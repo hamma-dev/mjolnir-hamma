@@ -15,6 +15,8 @@ from sindri.website.templates import (
     )
 
 
+MODE = globals().get("MODE", "test")
+
 STATUS_UPDATE_INTERVAL_SECONDS = 10
 STATUS_UPDATE_INTERVAL_FAST_SECONDS = 1
 STATUS_UPDATE_INTERVAL_SLOW_SECONDS = 600
@@ -1008,8 +1010,16 @@ DAILY_PAGE_BLOCKS = {
         },
     }
 
+OVERVIEW_PAGE_BLOCKS = {
+    "status": {
+        "type": "dashboard",
+        "metadata": STATUS_DASHBOARD_METADATA,
+        "args": STATUS_DASHBOARD_ARGS,
+        },
+    }
 
-CONTENT_PAGES = {
+
+CONTENT_PAGES_SENSOR = {
     "": {
         "type": "singlepage",
         "blocks": SENSOR_PAGE_BLOCKS,
@@ -1028,3 +1038,16 @@ CONTENT_PAGES = {
         "args": DAILY_PAGE_ARGS,
         },
     }
+
+CONTENT_PAGES_SERVER = {
+    "": {
+        "type": "singlepage",
+        "blocks": OVERVIEW_PAGE_BLOCKS,
+        },
+    }
+
+
+if MODE == "server":
+    CONTENT_PAGES = CONTENT_PAGES_SERVER
+else:
+    CONTENT_PAGES = CONTENT_PAGES_SENSOR
