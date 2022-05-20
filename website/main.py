@@ -4,6 +4,7 @@
 import datetime
 
 # Third party imports
+import brokkr.utils.misc
 import pandas as pd
 
 # Local imports
@@ -17,7 +18,18 @@ from sindri.website.templates import (
 
 MODE = globals().get("MODE", "test")
 
+SENSORS = [
+    "hamma1",
+    "hamma2",
+    "hamma3",
+    "hamma4",
+    "hamma5",
+    "hamma6",
+    "hamma7",
+    ]
+
 STATUS_UPDATE_INTERVAL_SECONDS = 10
+STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 5
 STATUS_UPDATE_INTERVAL_FAST_SECONDS = 1
 STATUS_UPDATE_INTERVAL_SLOW_SECONDS = 600
 
@@ -946,6 +958,52 @@ DAILY_TABLE_ARGS = {
     }
 
 
+# --- Unit overview page ---
+
+OVERVIEW_DASHBOARD_PLOTS = {}
+for sensor in SENSORS:
+    overview_overrides = {
+        "plot_data": {
+            "unit_id": sensor,
+            },
+        "plot_metadata": {
+            "plot_title": sensor.upper(),
+            },
+        "plot_params": {
+            "plot_mode": "number+delta",
+            },
+        }
+    OVERVIEW_DASHBOARD_PLOTS[sensor] = brokkr.utils.misc.update_dict_recursive(
+        base=STATUS_DASHBOARD_PLOTS["datalatency"],
+        update=overview_overrides,
+        inplace=False,
+        )
+
+OVERVIEW_DASHBOARD_METADATA = {
+    "section_title": "Sensor Overview Dashboard",
+    "section_description": (
+        "Live status of all HAMMA sensors, "
+        f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
+        " Click a sensor for detailed information."
+        ),
+    "section_nav_label": "Overview",
+    }
+
+OVERVIEW_DASHBOARD_DATA_ARGS = {
+    "dashboard_plots": OVERVIEW_DASHBOARD_PLOTS,
+    }
+
+OVERVIEW_DASHBOARD_ARGS = {
+    "data_args": OVERVIEW_DASHBOARD_DATA_ARGS,
+    "layout_map": LAYOUT_MAP,
+    "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SERVER_SECONDS,
+    "update_interval_fast_seconds": (
+        STATUS_UPDATE_INTERVAL_FAST_SECONDS),
+    }
+
+
+
 # --- Page and site assembly ---
 
 SENSOR_PAGE_BLOCKS = {
@@ -1011,10 +1069,10 @@ DAILY_PAGE_BLOCKS = {
     }
 
 OVERVIEW_PAGE_BLOCKS = {
-    "status": {
+    "overview": {
         "type": "dashboard",
-        "metadata": STATUS_DASHBOARD_METADATA,
-        "args": STATUS_DASHBOARD_ARGS,
+        "metadata": OVERVIEW_DASHBOARD_METADATA,
+        "args": OVERVIEW_DASHBOARD_ARGS,
         },
     }
 
