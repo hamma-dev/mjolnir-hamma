@@ -2,13 +2,14 @@
 
 # Standard library imports
 import datetime
+import itertools
 
 # Third party imports
-import brokkr.utils.misc
 import pandas as pd
 
 # Local imports
 from sindri.utils.misc import WEBSITE_UPDATE_INTERVAL_S as UPDATE_INT
+import sindri.website.generate
 from sindri.website.templates import (
     GAUGE_PLOT_UPDATE_CODE,
     GAUGE_PLOT_UPDATE_CODE_VALUE,
@@ -17,6 +18,7 @@ from sindri.website.templates import (
 
 
 MODE = globals().get("MODE", "test")
+# MODE = "server"
 
 SENSORS = [
     "hamma1",
@@ -29,7 +31,7 @@ SENSORS = [
     ]
 
 STATUS_UPDATE_INTERVAL_SECONDS = 10
-STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 5
+STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 10
 STATUS_UPDATE_INTERVAL_FAST_SECONDS = 1
 STATUS_UPDATE_INTERVAL_SLOW_SECONDS = 600
 
@@ -960,24 +962,49 @@ DAILY_TABLE_ARGS = {
 
 # --- Unit overview page ---
 
+OVERVIEW_SUBPLOT_KEYS = [
+    "weblatency", "datalatency", "sensoruptime",
+    "battvoltage", "ledstate", "chargecurrent",
+    "triggerrate", "triggersremaining", "crcerrors",
+    ]
+OVERVIEW_ROWS = 3
+OVERVIEW_COLUMNS = 3
+OVERVIEW_COORDS = itertools.product(
+    range(OVERVIEW_ROWS), range(OVERVIEW_COLUMNS))
+
+OVERVIEW_SUBPLOTS = {
+    plot_key: {
+        **sindri.website.generate.preprocess_subplot_params(
+            plot=STATUS_DASHBOARD_PLOTS[plot_key], subplot_params={}),
+        "plot_mode": "number+delta",
+        "subplot_row": row,
+        "subplot_column": column,
+        }
+    for plot_key, (row, column) in zip(OVERVIEW_SUBPLOT_KEYS, OVERVIEW_COORDS)}
+if "weblatency" in OVERVIEW_SUBPLOTS:
+    OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"] = (
+        OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"].replace(
+            "_status", "_overview"))
+
 OVERVIEW_DASHBOARD_PLOTS = {}
 for sensor in SENSORS:
-    overview_overrides = {
+    OVERVIEW_DASHBOARD_PLOTS[sensor] = {
+        "plot_type": "numeric",
         "plot_data": {
             "unit_id": sensor,
             },
         "plot_metadata": {
             "plot_title": sensor.upper(),
+            "plot_description": "",
             },
         "plot_params": {
-            "plot_mode": "number+delta",
+            "subplot_rows": OVERVIEW_ROWS,
+            "subplot_columns": OVERVIEW_COLUMNS,
+            "subplots": OVERVIEW_SUBPLOTS,
             },
+        "fast_update": False,
         }
-    OVERVIEW_DASHBOARD_PLOTS[sensor] = brokkr.utils.misc.update_dict_recursive(
-        base=STATUS_DASHBOARD_PLOTS["datalatency"],
-        update=overview_overrides,
-        inplace=False,
-        )
+
 
 OVERVIEW_DASHBOARD_METADATA = {
     "section_title": "Sensor Overview Dashboard",
@@ -1001,7 +1028,6 @@ OVERVIEW_DASHBOARD_ARGS = {
     "update_interval_fast_seconds": (
         STATUS_UPDATE_INTERVAL_FAST_SECONDS),
     }
-
 
 
 # --- Page and site assembly ---
