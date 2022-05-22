@@ -1,6 +1,7 @@
 """Configuration for the plots and tables on the main HAMMA website."""
 
 # Standard library imports
+import copy
 import datetime
 import itertools
 
@@ -963,31 +964,36 @@ DAILY_TABLE_ARGS = {
 # --- Unit overview page ---
 
 OVERVIEW_SUBPLOT_KEYS = [
-    "weblatency", "datalatency", "sensoruptime",
+    "weblatency", "sourcelatency", "datalatency",
     "battvoltage", "ledstate", "chargecurrent",
-    "triggerrate", "triggersremaining", "crcerrors",
+    "sensoruptime", "triggerrate", "triggersremaining",
     ]
 OVERVIEW_ROWS = 3
 OVERVIEW_COLUMNS = 3
 OVERVIEW_COORDS = itertools.product(
     range(OVERVIEW_ROWS), range(OVERVIEW_COLUMNS))
 
+SOURCE_PLOTS = {**STATUS_DASHBOARD_PLOTS}
+SOURCE_PLOTS["sourcelatency"] = copy.deepcopy(SOURCE_PLOTS["weblatency"])
 OVERVIEW_SUBPLOTS = {
     plot_key: {
         **sindri.website.generate.preprocess_subplot_params(
-            plot=STATUS_DASHBOARD_PLOTS[plot_key], subplot_params={}),
+            plot=SOURCE_PLOTS[plot_key], subplot_params={}),
         "plot_mode": "number+delta",
         "subplot_row": row,
         "subplot_column": column,
         }
     for plot_key, (row, column) in zip(OVERVIEW_SUBPLOT_KEYS, OVERVIEW_COORDS)}
-if "weblatency" in OVERVIEW_SUBPLOTS:
-    OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"] = (
-        OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"].replace(
-            "_status", "_overview"))
+OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"] = (
+    OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"].replace(
+        "_status", "_overview"))
 
 OVERVIEW_DASHBOARD_PLOTS = {}
 for sensor in SENSORS:
+    overview_subplots_sensor = copy.deepcopy(OVERVIEW_SUBPLOTS)
+    overview_subplots_sensor["sourcelatency"]["plot_update_code"] = (
+        f"data['value'] = (new Date() - lastUpdateSources_overview.{sensor}) / (1000);\n"
+        + GAUGE_PLOT_UPDATE_CODE_COLOR)
     OVERVIEW_DASHBOARD_PLOTS[sensor] = {
         "plot_type": "numeric",
         "plot_data": {
@@ -1000,7 +1006,7 @@ for sensor in SENSORS:
         "plot_params": {
             "subplot_rows": OVERVIEW_ROWS,
             "subplot_columns": OVERVIEW_COLUMNS,
-            "subplots": OVERVIEW_SUBPLOTS,
+            "subplots": overview_subplots_sensor,
             },
         "fast_update": False,
         }
