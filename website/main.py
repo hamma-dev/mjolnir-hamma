@@ -7,6 +7,7 @@ import itertools
 from pathlib import Path
 
 # Third party imports
+from brokkr.config.unit import UNIT_CONFIG
 import pandas as pd
 
 # Local imports
@@ -250,6 +251,7 @@ COLOR_TABLE_MAP_ARCHIVE = {
 # --- Data ingest configuration ---
 
 POWER_IDLE_W = 2.8
+UNIT_N = UNIT_CONFIG["number"]
 
 ###############################################################################
 # READ BY SINDRI
@@ -263,6 +265,8 @@ DATA_SUBDIR_SERVER = Path() / "daily"
 GLOB_PATTERN_SERVER = "hamma*_????-??-??.csv"
 
 OUTPUT_DIR_SERVER = DATA_DIR_SERVER
+OUTPUT_TARGET_CLIENT = (
+    "rsync://pi@hamma.dev" + (DATA_DIR_SERVER / f"hamma{UNIT_N}").as_posix())
 
 
 DATETIME_COLNAME = "time"
