@@ -253,7 +253,7 @@ STATUS_DASHBOARD_PLOTS = {
         "plot_type": None,
         "plot_data": {},
         "plot_metadata": {
-            "plot_title": "Website Latency",
+            "plot_title": "Sindri Latency",
             "plot_description": "",
             },
         "plot_params": {
@@ -293,7 +293,7 @@ STATUS_DASHBOARD_PLOTS = {
                          .total_seconds())
             },
         "plot_metadata": {
-            "plot_title": "Data Latency",
+            "plot_title": "Brokkr Latency",
             "plot_description": "",
             },
         "plot_params": {
@@ -409,7 +409,7 @@ STATUS_DASHBOARD_PLOTS = {
             "variable": "adc_ic_f",
             },
         "plot_metadata": {
-            "plot_title": "Charging Current",
+            "plot_title": "Charge Current",
             "plot_description": "",
             },
         "plot_params": {
@@ -517,7 +517,7 @@ STATUS_DASHBOARD_PLOTS = {
             "variable": "trigger_rate_5min",
             },
         "plot_metadata": {
-            "plot_title": "Triggers Per Minute",
+            "plot_title": "Triggers/Min",
             "plot_description": "",
             },
         "plot_params": {
@@ -544,7 +544,7 @@ STATUS_DASHBOARD_PLOTS = {
             "variable": "triggers_remaining",
             },
         "plot_metadata": {
-            "plot_title": "Triggers Remaining",
+            "plot_title": "Triggers Left",
             "plot_description": "",
             },
         "plot_params": {
@@ -965,7 +965,7 @@ DAILY_TABLE_ARGS = {
 
 OVERVIEW_SUBPLOT_KEYS = [
     "weblatency", "sourcelatency", "datalatency",
-    "battvoltage", "ledstate", "chargecurrent",
+    "battvoltage", "ledstate", "loadpower",
     "sensoruptime", "triggerrate", "triggersremaining",
     ]
 OVERVIEW_ROWS = 3
@@ -979,14 +979,18 @@ OVERVIEW_SUBPLOTS = {
     plot_key: {
         **sindri.website.generate.preprocess_subplot_params(
             plot=SOURCE_PLOTS[plot_key], subplot_params={}),
-        "plot_mode": "number+delta",
+        "subplot_title": SOURCE_PLOTS[plot_key]["plot_metadata"].get(
+            "plot_title", ""),
+        "subplot_titlesize": 10,
         "subplot_row": row,
         "subplot_column": column,
+        "plot_mode": "number+delta",
         }
     for plot_key, (row, column) in zip(OVERVIEW_SUBPLOT_KEYS, OVERVIEW_COORDS)}
 OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"] = (
     OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"].replace(
         "_status", "_overview"))
+OVERVIEW_SUBPLOTS["weblatency"]["subplot_title"] = "Site Latency"
 
 OVERVIEW_DASHBOARD_PLOTS = {}
 for sensor in SENSORS:
@@ -1001,7 +1005,7 @@ for sensor in SENSORS:
             },
         "plot_metadata": {
             "plot_title": sensor.upper(),
-            "plot_description": "",
+            "card_url": sensor,
             },
         "plot_params": {
             "subplot_rows": OVERVIEW_ROWS,
