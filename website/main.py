@@ -4,13 +4,15 @@
 import copy
 import datetime
 import itertools
+from pathlib import Path
 
 # Third party imports
 import pandas as pd
 
 # Local imports
+from sindri.utils.misc import TRIGGER_SIZE_MB
 from sindri.utils.misc import WEBSITE_UPDATE_INTERVAL_S as UPDATE_INT
-import sindri.website.generate
+from sindri.website.preprocess import preprocess_subplot_params
 from sindri.website.templates import (
     GAUGE_PLOT_UPDATE_CODE,
     GAUGE_PLOT_UPDATE_CODE_VALUE,
@@ -18,8 +20,7 @@ from sindri.website.templates import (
     )
 
 
-MODE = globals().get("MODE", "test")
-# MODE = "server"
+# --- Top-level constants ---
 
 SENSORS = [
     "hamma1",
@@ -244,6 +245,72 @@ COLOR_TABLE_MAP_ARCHIVE = {
     "Ncrc": STANDARD_COLOR_TABLES["crc_errors"],
     "GByt": STANDARD_COLOR_TABLES["bytes_remaining"],
     }
+
+
+# --- Data ingest configuration ---
+
+POWER_IDLE_W = 2.8
+
+###############################################################################
+# READ BY SINDRI
+
+DATA_DIR_CLIENT = Path.home() / "brokkr" / "hamma" / "telemetry"
+GLOB_PATTERN_CLIENT = "telemetry_hamma_???_????-??-??.csv"
+
+DATA_DIR_SERVER = Path("/") / "var" / "www" / "hamma.dev" / "public_html"
+GLOB_PATTERN_SUBDIR = "hamma[0-9]*"
+DATA_SUBDIR_SERVER = Path() / "daily"
+GLOB_PATTERN_SERVER = "hamma*_????-??-??.csv"
+
+OUTPUT_DIR_SERVER = DATA_DIR_SERVER
+
+
+DATETIME_COLNAME = "time"
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+CALCULATED_COLUMNS = (
+    ("power_load", "power_out",
+     lambda full_data: full_data["adc_vl_f"] * full_data["adc_il_f"]),
+    ("power_net", "power_load",
+     lambda full_data:
+         (full_data["power_out"] - full_data["power_load"] - POWER_IDLE_W)),
+    ("ahnet_daily", "ahl_daily",
+     lambda full_data:
+         (full_data["ahc_daily"] - full_data["ahl_daily"])),
+    ("sensor_uptime", "vb_max",
+     lambda full_data: full_data["sequence_count"] / (60 * 60)),
+    ("crc_errors_delta", "crc_errors",
+     lambda full_data: full_data["crc_errors"].diff(1).clip(lower=0)),
+    ("crc_errors_hourly", "crc_errors_delta",
+     lambda full_data:
+         full_data["crc_errors_delta"].rolling(60, min_periods=2).sum()
+         / (round(full_data["time"].diff(60).dt.total_seconds()) / (60 * 60))),
+    ("crc_errors_daily", "crc_errors_hourly",
+     lambda full_data:
+         full_data["crc_errors_delta"].rolling(60 * 24, min_periods=2).sum()
+         / (round(full_data["time"].diff(60 * 24).dt.total_seconds())
+            / (60 * 60 * 24))),
+    ("trigger_delta", "valid_packets",
+     (lambda full_data: round(
+         -1e3 * full_data["bytes_remaining"].diff(1)
+         / TRIGGER_SIZE_MB).clip(lower=0))),
+    ("trigger_rate_1min", "trigger_delta",
+     lambda full_data: full_data["trigger_delta"]
+     / (round(full_data["time"].diff(1).dt.total_seconds()) / 60)),
+    ("trigger_rate_5min", "trigger_rate_1min",
+     lambda full_data:
+     full_data["trigger_delta"].rolling(5, min_periods=2).mean()
+     / (round(full_data["time"].diff(5).dt.total_seconds()) / (60 * 5))),
+    ("trigger_rate_1hr", "trigger_rate_5min",
+     lambda full_data:
+     full_data["trigger_delta"].rolling(60, min_periods=6).mean()
+     / (round(full_data["time"].diff(60).dt.total_seconds()) / (60 * 60))),
+    ("triggers_remaining", "bytes_remaining",
+     lambda full_data: (
+         round(full_data["bytes_remaining"] * 1e3 / TRIGGER_SIZE_MB))),
+    )
+
+###############################################################################
 
 
 # --- Status dashboard section ---
@@ -977,7 +1044,7 @@ SOURCE_PLOTS = {**STATUS_DASHBOARD_PLOTS}
 SOURCE_PLOTS["sourcelatency"] = copy.deepcopy(SOURCE_PLOTS["weblatency"])
 OVERVIEW_SUBPLOTS = {
     plot_key: {
-        **sindri.website.generate.preprocess_subplot_params(
+        **preprocess_subplot_params(
             plot=SOURCE_PLOTS[plot_key], subplot_params={}),
         "subplot_title": SOURCE_PLOTS[plot_key]["plot_metadata"].get(
             "plot_title", ""),
@@ -1113,7 +1180,12 @@ OVERVIEW_PAGE_BLOCKS = {
     }
 
 
-CONTENT_PAGES_SENSOR = {
+# --- Final content pages configuration ---
+
+###############################################################################
+# READ BY SINDRI
+
+CONTENT_PAGES_CLIENT = {
     "": {
         "type": "singlepage",
         "blocks": SENSOR_PAGE_BLOCKS,
@@ -1140,8 +1212,4 @@ CONTENT_PAGES_SERVER = {
         },
     }
 
-
-if MODE == "server":
-    CONTENT_PAGES = CONTENT_PAGES_SERVER
-else:
-    CONTENT_PAGES = CONTENT_PAGES_SENSOR
+###############################################################################
