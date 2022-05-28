@@ -23,15 +23,16 @@ from sindri.website.templates import (
 
 # --- Top-level constants ---
 
-SENSORS = [
-    "hamma1",
-    "hamma2",
-    "hamma3",
-    "hamma4",
-    "hamma5",
-    "hamma6",
-    "hamma7",
+SENSOR_NUMBERS = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
     ]
+SENSORS = [f"hamma{sensor_number}" for sensor_number in SENSOR_NUMBERS]
 
 STATUS_UPDATE_INTERVAL_SECONDS = 10
 STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 10
@@ -260,8 +261,8 @@ DATA_DIR_CLIENT = Path.home() / "brokkr" / "hamma" / "telemetry"
 GLOB_PATTERN_CLIENT = "telemetry_hamma_???_????-??-??.csv"
 
 DATA_DIR_SERVER = Path("/") / "var" / "www" / "hamma.dev" / "public_html"
-GLOB_PATTERN_SUBDIR = "hamma[0-9]*"
-DATA_SUBDIR_SERVER = Path() / "daily"
+UNIT_DIRS_SERVER = [Path(sensor) for sensor in SENSORS]
+DATA_SUBDIR_SERVER = Path("daily")
 GLOB_PATTERN_SERVER = "hamma*_????-??-??.csv"
 
 OUTPUT_DIR_SERVER = DATA_DIR_SERVER
