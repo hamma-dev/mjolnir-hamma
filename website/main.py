@@ -670,7 +670,7 @@ STATUS_DASHBOARD_PLOTS = {
     }
 
 STATUS_DASHBOARD_METADATA = {
-    "section_title": "Status Dashboard",
+    "section_title": f"HAMMA{UNIT_N} Status Dashboard",
     "section_description": (
         "Live status of this HAMMA sensor and the Mjolnir system, "
         f"updated dynamically every {STATUS_UPDATE_INTERVAL_SECONDS} s."),
