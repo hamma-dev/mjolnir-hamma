@@ -25,7 +25,7 @@ cp $INSTALL_PATH$VENV_NAME"/bin/activate" "/home/pi/$VENV_NAME"
 source "/home/pi/$VENV_NAME"
 
 # Note: not sure if this is needed
-pip install --upgrade setuptools wheel
+pip install --upgrade pip setuptools wheel
 
 # Download the needed software
 git -C $INSTALL_PATH clone --recursive "https://github.com/project-mjolnir/sindri.git"

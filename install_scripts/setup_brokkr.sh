@@ -12,9 +12,9 @@ INSTALL_PATH="/home/pi/dev/"  # Trailing slash, please
 VENV_NAME="ltgenv"
 
 # Make sure everything is updated
-sudo apt update
-sudo apt full-upgrade
-sudo apt autoremove
+sudo apt-get update
+sudo apt-get dist-upgrade
+sudo apt-get autoremove
 
 # Start up the right python
 source "/home/pi/$VENV_NAME"

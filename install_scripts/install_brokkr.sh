@@ -6,7 +6,7 @@ VENV_NAME="ltgenv"
 
 # Set up the environment
 python3 -m venv $INSTALL_PATH$VENV_NAME
-cp $INSTALL_PATH$VENV_NAME"/bin/activate" "/home/pi/$VENV_NAME"
+ln -s $INSTALL_PATH$VENV_NAME"/bin/activate" "/home/pi/$VENV_NAME"
 
 source "/home/pi/$VENV_NAME"
 
