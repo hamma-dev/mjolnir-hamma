@@ -22,3 +22,6 @@ config_version = 1
 
     [test.main.pipelines.telemetry]
         monitor_interval_s = 5
+
+    [test.main.steps.state_monitor]
+        _enabled = false
