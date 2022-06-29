@@ -212,9 +212,9 @@ config_version = 1
             "builtins.inputs.current_time",
         ]
         process_steps = [
-            "hamma_plot_rsync",
         ]
         output_steps = [
+            "hamma_plot_rsync",
         ]
 
     # AGS science data header decode and write
