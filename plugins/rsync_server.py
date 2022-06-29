@@ -7,9 +7,7 @@ import brokkr.pipeline.base
 import brokkr.pipeline.decode
 
 # Standard library imports
-import sys
 import subprocess
-import os.path
 
 
 class RsyncServer(brokkr.pipeline.base.OutputStep):
