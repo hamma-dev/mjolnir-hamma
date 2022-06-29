@@ -31,7 +31,7 @@ config_version = 1
     # Queue for the binary AGS science data headers from the HAMMA2 sensors
     science_data_headers = { maxsize = 1000000 }
     # Queue for processing AGS science data for real time information
-    realtime_data_packets = { maxsize = 50 }
+    realtime_data_packets = { maxsize = 4 }
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
