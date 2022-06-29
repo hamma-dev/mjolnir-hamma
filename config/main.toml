@@ -66,7 +66,7 @@ config_version = 1
     [steps.hamma_plot_rsync]
         _preset = "rsync_server.outputs.plugin"
         name = "Rsync HAMMA plot"
-        server = "104.131.44.197"  # also in autossh
+        server = "hamma.dev"  # also in autossh
         local_path = '/home/pi/brokkr/hamma/'
         server_path = '/var/www/hamma.dev/public_html/latest'
         update_time = 120  # seconds
