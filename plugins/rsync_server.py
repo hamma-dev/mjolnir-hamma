@@ -25,12 +25,6 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         """
         Sync files to a server via rsync.
 
-        This class will "inject" a new entry into the dictionary Brokkr passes
-        in pipelines that tracks the last time the rsync was performed.
-
-        If you want to rsync two different paths in the same pipeline, you
-        would provide two different steps and unique `time_key`s for each step.
-
         Parameters
         ----------
         server : str
@@ -47,8 +41,6 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         include : str
             Typically, a pattern of files to be synced. Passed to the `include` option
             of rsync.
-        time_key : str
-            The key corresponding to the time to track the last update.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -56,7 +48,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         # Pass arguments to superclass init
         super().__init__(**output_step_kwargs)
 
-        self._previous_data = None
+        self._last_save_time = None
 
         self.server = server
         self.local_path = brokkr.utils.output.render_output_filename(
@@ -66,7 +58,6 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         self.username = username
         self.update_time = update_time
         self.include = include
-        self.time_key = time_key
 
     def execute(self, input_data=None):
         """
@@ -88,13 +79,12 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         """
 
         # Handle first iteration
-        if self._previous_data is None:
-            input_data[self.time_key] = input_data['time']
-            self._previous_data = input_data
+        if self._last_save_time is None:
+            self._last_save_time = input_data['time']
 
         try:
             # How long since we last updated?
-            dt = input_data['time'].value-self._previous_data[self.time_key].value
+            dt = input_data['time'].value - self._last_save_time.value
 
             if dt.total_seconds() > self.update_time:
                 # Now, sync the files to the server
@@ -102,7 +92,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
                 self.logger.info(out)
 
                 # Update the last run time before leaving
-                self._previous_data[self.time_key].value = input_data['time'].value
+                self._last_save_time = input_data['time']
 
         # If expression evaluation fails, presumably due to bad data values
         except Exception as e:
