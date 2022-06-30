@@ -51,7 +51,8 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
         self._previous_data = None
 
         self.min_update_time = min_update_time
-        self.save_path = save_path
+        self.output_path = output_path
+        self.filename_template = filename_template
 
         # Pass arguments to superclass init
         super().__init__(**output_step_kwargs)
