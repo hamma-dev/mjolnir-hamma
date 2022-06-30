@@ -29,9 +29,6 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
         """
         Make a plot of HAMMA data.
 
-        This step will "inject" a new entry into the dictionary Brokkr passes
-        in pipelines that tracks the last time a plot was made.
-
         Parameters
         ----------
         min_update_time : numeric
@@ -48,7 +45,7 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
 
         """
 
-        self._previous_data = None
+        self._last_save_time = None
 
         self.min_update_time = min_update_time
         self.output_path = output_path
@@ -78,13 +75,12 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
         """
 
         # Handle first iteration
-        if self._previous_data is None:
-            # Inject a entry to track the last time we saved a plot
-            input_data['last_save_time'] = input_data['time']
-            self._previous_data = input_data
+        if self._last_save_time is None:
+            # Track the last time we saved a plot
+            self._last_save_time = input_data['time']
         try:
             # How long since we last updated?
-            dt = input_data['time'].value-self._previous_data['last_save_time'].value
+            dt = input_data['time'].value - self._last_save_time.value
 
             if dt.total_seconds() > self.min_update_time:
 
@@ -105,7 +101,7 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
                 mpl_close(line.axes.figure)
 
                 # Update the last run time before leaving
-                self._previous_data['last_save_time'].value = input_data['time'].value
+                self._last_save_time = input_data['time']
 
                 self.logger.debug('Created HAMMA Plot %r', save_file.as_posix())
 
