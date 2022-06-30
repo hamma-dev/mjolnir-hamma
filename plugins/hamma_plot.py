@@ -111,11 +111,6 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
                 "%s evaluating in %s on step %s: %s",
                 type(e).__name__, type(self), self.name, e)
             self.logger.info("Error details:", exc_info=True)
-            for pretty_name, data in [("Current", input_data),
-                                      ]:
-                self.logger.info(
-                    "%s data: %r", pretty_name,
-                    {key: str(value) for key, value in data.items()})
 
             # todo: also a status bot error message?
 
