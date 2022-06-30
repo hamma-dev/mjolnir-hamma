@@ -72,7 +72,6 @@ config_version = 1
         server_path = '/var/www/hamma.dev/public_html/latest'
         update_time = 120  # seconds
         include = '*.png'
-        time_key = 'rsync_time_hamma_plot'
 
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
