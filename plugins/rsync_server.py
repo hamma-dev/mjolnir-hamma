@@ -89,7 +89,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
             if dt.total_seconds() > self.update_time:
                 # Now, sync the files to the server
                 out = self.rsync()
-                self.logger.info(out)
+                self.logger.info("Rsync output: %s", out)
 
                 # Update the last run time before leaving
                 self._last_save_time = input_data['time']
