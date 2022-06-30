@@ -4,7 +4,7 @@ Plugin to run rsync to sync files to a server.
 
 # Local imports
 import brokkr.pipeline.base
-import brokkr.pipeline.decode
+import brokkr.utils.output
 
 # Standard library imports
 import subprocess
@@ -59,7 +59,9 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         self._previous_data = None
 
         self.server = server
-        self.local_path = local_path
+        self.local_path = brokkr.utils.output.render_output_filename(
+            output_path=local_path,
+            filename_template="")
         self.server_path = server_path
         self.username = username
         self.update_time = update_time
@@ -139,7 +141,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
 
         # Finish building the command for rsync
         cmd = cmd + [
-            f"{self.local_path}",
+            f"{self.local_path.as_posix()}",
             f"{self.username}@{self.server}:{self.server_path}",
         ]
 

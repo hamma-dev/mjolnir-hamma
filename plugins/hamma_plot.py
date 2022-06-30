@@ -12,9 +12,7 @@ import hamma
 from hamma.plotting import plot as hamma_plot
 
 # Local imports
-import brokkr.pipeline.decode
-from brokkr.config.unit import UNIT_CONFIG
-from brokkr.config.metadata import METADATA
+import brokkr.utils.output
 
 # Standard library imports
 from pathlib import Path
@@ -25,7 +23,8 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
 
     def __init__(self,
                  min_update_time,
-                 save_path,
+                 output_path=Path(),
+                 filename_template=None,
                  **output_step_kwargs):
         """
         Make a plot of HAMMA data.
@@ -38,8 +37,12 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
         min_update_time : numeric
             The minimum time (in seconds) that should elapse before a new plot
             is saved.
-        save_path : str
+        output_path : str or pathlib.Path, optional
             The path to which the plot is saved.
+            By default, the system base data directory.
+        filename_template : str, optional
+            Template to use to generate the output file name.
+            By default, the configured default filename template.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -85,8 +88,10 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
             if dt.total_seconds() > self.min_update_time:
 
                 # Build the filename to save the plot to
-                sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
-                save_file = Path(self.save_path).joinpath(f'{sensor_name}.png')
+                save_file = brokkr.utils.output.render_output_filename(
+                    output_path=self.output_path,
+                    filename_template=self.filename_template)
+                save_file.parent.mkdir(parents=True, exist_ok=True)
 
                 # Read in this file and save the plot
                 _, ax = mpl_subplots(figsize=(8, 4))
@@ -101,7 +106,7 @@ class HammaPlot(brokkr.pipeline.base.OutputStep):
                 # Update the last run time before leaving
                 self._previous_data['last_save_time'].value = input_data['time'].value
 
-                self.logger.debug('Created HAMMA Plot')
+                self.logger.debug('Created HAMMA Plot %r', save_file.as_posix())
 
         # If expression evaluation fails, presumably due to bad data values
         except Exception as e:
