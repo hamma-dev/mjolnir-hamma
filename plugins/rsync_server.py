@@ -128,7 +128,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
 
         # Finish building the command for rsync
         cmd = cmd + [
-            f"{self.local_path.as_posix()}",
+            f"{self.local_path.as_posix()}/",
             f"{self.username}@{self.server}:{self.server_path}",
         ]
 
