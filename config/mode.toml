@@ -25,3 +25,21 @@ config_version = 1
 
     [test.main.steps.state_monitor]
         _enabled = false
+
+    [test.main.steps.hamma_plot]
+        _enabled = false
+
+    [test.main.steps.hamma_plot_rsync]
+        _enabled = false
+
+    [test.main.steps.realtime_output_queue]
+        _enabled = false
+
+    [test.main.steps.realtime_input_queue]
+        _enabled = false
+
+    [test.main.pipelines.realtime]
+        _enabled = false
+
+    [test.main.pipelines.rsync_hamma_realtime]
+        _enabled = false

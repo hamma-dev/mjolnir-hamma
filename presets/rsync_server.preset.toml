@@ -1,0 +1,23 @@
+# Preset for the state monitor
+
+config_version = 1
+# Name of this device preset, used for lookup
+name = "rsync_server"
+# Type of this preset
+type = "non"
+
+# Preset-level metadata
+[metadata]
+name_full = "Rsync to Server"
+author = "Phillip Bitzer, C.A.M. Gerlach, and the UAH HAMMA group"
+description = "Rsync files to a server"
+homepage = "https://hamma.dev/"
+repo = "https://github.com/hamma-dev/mjolnir-hamma"
+preset_version = "0.1.0"
+brokkr_version_min = "0.4.0"
+
+[outputs.plugin]
+_module_path = "rsync_server"
+_class_name = "RsyncServer"
+_is_plugin = true
+name = "Rsync to server"
