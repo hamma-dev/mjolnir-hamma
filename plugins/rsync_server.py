@@ -19,7 +19,6 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
                  server_path,
                  update_time,
                  include=None,
-                 time_key='rsync_time',
                  username='pi',
                  **output_step_kwargs):
         """
