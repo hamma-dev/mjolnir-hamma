@@ -4,6 +4,7 @@ Plugin to monitor state variables from the charge controller.
 
 # Third party imports
 from notifiers.slack import SlackSender
+from notifiers.google_chat import GoogleChatSender
 
 # Local imports
 import brokkr.pipeline.base
@@ -20,6 +21,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_space=100,
         slack_channel=None,
         slack_key_file=None,
+        google_chat_channel=None,
+        google_chat_key_file=None,
         **output_step_kwargs,
         ):
         """
@@ -41,6 +44,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             If `method=='slack'`, then this is the channel in Slack to post notifications.
         slack_key_file : str or pathlib.Path, optional
             If `method=='slack'`, then the path to the file that contains the Slack key
+        google_chat_channel : str, optional
+            If `method=='google chat'`, then this is the channel in Google Chat to post notifications.
+        google_chat_key_file : str or pathlib.Path, optional
+            If `method=='google chat'`, then the path to the file that contains the Google Chat webhook key
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -67,6 +74,18 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 self.logger.info("Error details:", exc_info=True)
             except Exception as e:  # if anything goes wrong, don't set the sender class
                 self.logger.error("Unexpected %s initializing SlackSender: %s", type(e).__name__, e)
+                self.logger.info("Error details:", exc_info=True)
+        elif method == 'google chat':
+            try:
+                self.sender = GoogleChatSender(  # todo how to import?
+                    google_chat_key_file, channel=google_chat_channel, logger=self.logger)
+            except FileNotFoundError as e:
+                self.logger.error(
+                    "%e initializing GoogleChat sender: %s Is the Google Chat key file in the right place?",
+                    type(e).__name__, e)
+                self.logger.info("Error details:", exc_info=True)
+            except Exception as e:  # if anything goes wrong, don't set the sender class
+                self.logger.error("Unexpected %s initializing GoogleChatSender: %s", type(e).__name__, e)
                 self.logger.info("Error details:", exc_info=True)
 
     def execute(self, input_data=None):
