@@ -187,7 +187,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
 
-        header = f"Message from sensor {sensor_name}"
+        header = f"Message from sensor {sensor_name} at {UNIT_CONFIG['site_description']}"
 
         msg = '\n'.join([header, msg])
 
