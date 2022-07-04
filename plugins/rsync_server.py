@@ -140,5 +140,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
             encoding="utf-8",
             timeout=TIMEOUT,
         )
-
+        
+        if output.returncode != 0:
+            self.logger.info("Rsync failure: %s", output.stdout)
+        
         return output.stdout
