@@ -49,9 +49,9 @@ config_version = 1
         _preset = "state_monitor.outputs.plugin"
         power_delim = 20  # delimiter between normal power and low power
         low_space = 100  # if # of GB is less than this, generate a notification
-        method = "slack"  # the method how we're going to send notifications
-        slack_channel = "testing"  # the channel in slack the notifications will be posted
-        slack_key_file = "/home/pi/.slack"  # The path the slack key file
+        method = "gchat"  # the method how we're going to send notifications
+        channel = "status"
+        key_file = "/home/pi/.googlechat"
 
     # Step to create HAMMA plot
     [steps.hamma_plot]
