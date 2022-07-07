@@ -4,6 +4,7 @@ Plugin to monitor state variables from the charge controller.
 
 # Third party imports
 from notifiers.slack import SlackSender
+from notifiers.google_chat import GoogleChatSender
 
 # Local imports
 import brokkr.pipeline.base
@@ -18,8 +19,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         method=None,
         power_delim=1,
         low_space=100,
-        slack_channel=None,
-        slack_key_file=None,
+        channel=None,
+        key_file=None,
         **output_step_kwargs,
         ):
         """
@@ -37,10 +38,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_space : numeric, optional
             If the number of gigabytes remaining falls below this threshold, generate
             a notification.
-        slack_channel : str, optional
-            If `method=='slack'`, then this is the channel in Slack to post notifications.
-        slack_key_file : str or pathlib.Path, optional
-            If `method=='slack'`, then the path to the file that contains the Slack key
+        channel : str, optional
+            The chat channel in which to post notifications.
+        key_file : str or pathlib.Path, optional
+            The path to the file that contains the secret/webhook key for the given `method`.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -56,18 +57,19 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.power_delim = power_delim
         self.low_space = low_space
         self.sender = None  # Make sure we "initialize" the attribute
-        if method == 'slack':
-            try:
-                self.sender = SlackSender(  # todo how to import?
-                    slack_key_file, slack_channel, logger=self.logger)
-            except FileNotFoundError as e:
-                self.logger.error(
-                    "%e initializing Slack sender: %s Is the Slack key file in the right place?",
-                    type(e).__name__, e)
-                self.logger.info("Error details:", exc_info=True)
-            except Exception as e:  # if anything goes wrong, don't set the sender class
-                self.logger.error("Unexpected %s initializing SlackSender: %s", type(e).__name__, e)
-                self.logger.info("Error details:", exc_info=True)
+
+        sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
+        try:
+            self.sender = sender_class(key_file, channel=channel, logger=self.logger)
+        except FileNotFoundError as e:
+            self.logger.error(
+                "%s initializing %s: %s\nIs the key file in the right place?",
+                type(e).__name__, sender_class.__name__, e)
+            self.logger.info("Error details:", exc_info=True)
+        except Exception as e:  # if anything goes wrong, don't set the sender class
+            self.logger.error(
+                "Unexpected %s initializing %s: %s", type(e).__name__, e, sender_class>__name__)
+            self.logger.info("Error details:", exc_info=True)
 
     def execute(self, input_data=None):
         """
@@ -187,7 +189,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
 
-        header = f"Message from sensor {sensor_name}"
+        header = f"Message from sensor {sensor_name} at {UNIT_CONFIG['site_description']}"
 
         msg = '\n'.join([header, msg])
 
