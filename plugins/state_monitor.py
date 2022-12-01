@@ -19,6 +19,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         method=None,
         power_delim=1,
         low_space=100,
+        ping_max=3,
         channel=None,
         key_file=None,
         **output_step_kwargs,
@@ -38,6 +39,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_space : numeric, optional
             If the number of gigabytes remaining falls below this threshold, generate
             a notification.
+        ping_max : int, optional
+            The maximum number of consecutive ping errors before we send an error message
+            via `method`. Any ping errors are still logged locally.
         channel : str, optional
             The chat channel in which to post notifications.
         key_file : str or pathlib.Path, optional
@@ -56,6 +60,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self._previous_data = None
         self.power_delim = power_delim
         self.low_space = low_space
+        self.ping_max = ping_max
+        self.bad_ping = 0  # Track the number of bad pings
         self.sender = None  # Make sure we "initialize" the attribute
 
         sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
@@ -112,12 +118,23 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 self.send_message(msg)
 
             # Sensor communication
-            comm_now, comm_pre = now_then('ping')
+            no_comm_now, no_comm_pre = now_then('ping')
             # If the ping !=0, then we can't reach the sensor
-            if comm_now and not comm_pre:
-                msg = "No communication with sensor!"
+            if no_comm_now and not no_comm_pre:
+                # If we pinged fine before, but not now, log it.
+                msg = f"Sensor unable to be pinged!"
                 self.logger.info(msg)
-                self.send_message(msg)
+
+            if no_comm_now:
+                # If any bad ping, increment the counter.
+                self.bad_ping += 1
+                # Once we reach the critical value, send an alert and log it.
+                if self.bad_ping == self.ping_max:
+                    msg = f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
+                    self.logger.info(msg)
+                    self.send_message(msg)
+            else:  # if we can communicate now, reset the counter
+                self.bad_ping = 0
 
             # Remaining triggers
             space_now, space_pre = now_then('bytes_remaining')
