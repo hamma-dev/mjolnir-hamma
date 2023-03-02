@@ -2,6 +2,8 @@
 Plugin to monitor state variables from the charge controller.
 """
 
+from math import nan
+
 # Third party imports
 from notifiers.slack import SlackSender
 from notifiers.google_chat import GoogleChatSender
