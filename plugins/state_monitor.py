@@ -98,18 +98,97 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if self._previous_data is None:
             self._previous_data = input_data
 
-        def now_then(key):
-            # Simple little helper to extract current and previous value for
-            # a single attribute. Variable input_data shadows outer scope
-            return input_data[key].value, self._previous_data[key].value
-
         try:
             # Go through several state variables.
             # If something is hinky, log it and send a message
 
-            # Power drops
-            load_now, load_pre = now_then('adc_vl_f')
-            curr_now, curr_pre = now_then('adc_il_f')
+            self.check_power(input_data)
+
+            self.check_ping(input_data)
+
+            self.check_sensor_drive(input_data)
+
+            self.check_battery_voltage(input_data)
+
+            # LED state
+            # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
+            state_now, state_pre = self.now_then(input_data, 'led_state')
+            if (state_now >= 12) and (state_now != state_pre):
+                msg = f"Critical failure with charge controller. LED state: {state_now}."
+                self.logger.info(msg)
+                self.send_message(msg)
+
+        # If expression evaluation fails, presumably due to bad data values
+        except Exception as e:
+            self.log_error(input_data, e)
+
+        # Update state for next pass through the pipeline
+        self._previous_data = input_data
+
+        # Pass through the input for consumption by any further steps
+        return input_data
+
+    def now_then(self, input_data, key):
+        """
+        Simple method to extract the current (now) value and previous (then)
+        value for the data structure passed around.
+
+        Useful for getting any value from `input_data`, since this we turn
+        to sting 'NA's to numeric NaNs.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue], optional
+            Same as argument of `execute`.
+        key : str
+            The key of `input_data` you want the value of.
+
+        Returns
+        -------
+        now_then_values : tuple
+            Two element tuple of the (now value, then value)
+
+        """
+
+        now_val = input_data[key].value
+        then_val = self._previous_data[key].value
+
+        if now_val == 'NA':
+            now_val = nan
+
+        if then_val == 'NA':
+            then_val = nan
+
+        return now_val, then_val
+
+    def log_error(self, input_data, exception_inst):
+        """
+        Use this method to log an error when an Exception occurs.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue], optional
+            Same as argument of `execute`.
+
+        exception_inst : Exception
+            The exception you wish to log.
+
+        """
+
+        self.logger.error(
+            "%s evaluating in %s on step %s: %s",
+            type(exception_inst).__name__, type(self), self.name, exception_inst)
+        self.logger.info("Error details:", exc_info=True)
+        for pretty_name, data in [("Current", input_data),
+                                  ("Previous", self._previous_data)]:
+            self.logger.info(
+                "%s data: %r", pretty_name,
+                {key: str(value) for key, value in data.items()})
+
+    def check_power(self, input_data):
+        try:
+            load_now, load_pre = self.now_then(input_data, 'adc_vl_f')
+            curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
 
             power_now, power_pre = load_now * curr_now, load_pre * curr_pre
             if (power_now < self.power_delim) and (power_pre > self.power_delim):
