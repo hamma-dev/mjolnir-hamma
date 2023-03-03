@@ -198,8 +198,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 self.logger.info(msg)
                 self.send_message(msg)
 
-            # Sensor communication
-            no_comm_now, no_comm_pre = now_then('ping')
+    def check_ping(self, input_data):
+        try:
+            no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
             # If the ping !=0, then we can't reach the sensor
             if no_comm_now and not no_comm_pre:
                 # If we pinged fine before, but not now, log it.
@@ -216,13 +217,18 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                     self.send_message(msg)
             else:  # if we can communicate now, reset the counter
                 self.bad_ping = 0
+        except Exception as e:
+            self.log_error(input_data, e)
 
-            # Remaining triggers
-            space_now, space_pre = now_then('bytes_remaining')
+    def check_sensor_drive(self, input_data):
+        try:
+            space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
             if (space_now < self.low_space) and (space_pre > self.low_space):
                 msg = f"Remaining GB on drive is {space_now:.1f}"
                 self.logger.info(msg)
                 self.send_message(msg)
+        except Exception as e:
+            self.log_error(input_data, e)
 
             # todo: Low voltage
             # CRITICAL_VOLTAGE = input_data['v_lvd'].value + 0.1
