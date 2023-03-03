@@ -232,19 +232,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         except Exception as e:
             self.log_error(input_data, e)
 
-            # todo: Low voltage
-            # CRITICAL_VOLTAGE = input_data['v_lvd'].value + 0.1
-            # batt_now, batt_pre = now_then('adc_vb_f')
-            # if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
-            #     msg = f"Battery voltage critically low {batt_now:.3f}"
-            #     self.logger.info(msg)
-            #     self.send_message(msg)
+    def check_battery_voltage(self, input_data):
+        try:
 
-            # LED state
-            # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
-            state_now, state_pre = now_then('led_state')
-            if (state_now >= 12) and (state_now != state_pre):
-                msg = f"Critical failure with charge controller. LED state: {state_now}."
+            low_voltage_val, _ = self.now_then(input_data, 'v_lvd')
+            CRITICAL_VOLTAGE = low_voltage_val + 0.5
+
+            batt_now, batt_pre = self.now_then(input_data, 'adc_vb_f')
+            if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
+                msg = f"Battery voltage critically low {batt_now:.3f}"
                 self.logger.info(msg)
                 self.send_message(msg)
         except Exception as e:
