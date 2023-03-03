@@ -197,6 +197,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 msg = f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
                 self.logger.info(msg)
                 self.send_message(msg)
+        except Exception as e:
+            self.log_error(input_data, e)
 
     def check_ping(self, input_data):
         try:
@@ -245,24 +247,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 msg = f"Critical failure with charge controller. LED state: {state_now}."
                 self.logger.info(msg)
                 self.send_message(msg)
-
-        # If expression evaluation fails, presumably due to bad data values
         except Exception as e:
-            self.logger.error(
-                "%s evaluating in %s on step %s: %s",
-                type(e).__name__, type(self), self.name, e)
-            self.logger.info("Error details:", exc_info=True)
-            for pretty_name, data in [("Current", input_data),
-                                      ("Previous", self._previous_data)]:
-                self.logger.info(
-                    "%s data: %r", pretty_name,
-                    {key: str(value) for key, value in data.items()})
-
-        # Update state for next pass through the pipeline
-        self._previous_data = input_data
-
-        # Pass through the input for consumption by any further steps
-        return input_data
+            self.log_error(input_data, e)
 
     def send_message(self, msg):
         """
