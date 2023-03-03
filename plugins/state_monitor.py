@@ -112,13 +112,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
             self.check_battery_voltage(input_data)
 
-            # LED state
             # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
-            state_now, state_pre = self.now_then(input_data, 'led_state')
-            if (state_now >= 12) and (state_now != state_pre):
-                msg = f"Critical failure with charge controller. LED state: {state_now}."
-                self.logger.info(msg)
-                self.send_message(msg)
 
         # If expression evaluation fails, presumably due to bad data values
         except Exception as e:
