@@ -76,7 +76,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             self.logger.info("Error details:", exc_info=True)
         except Exception as e:  # if anything goes wrong, don't set the sender class
             self.logger.error(
-                "Unexpected %s initializing %s: %s", type(e).__name__, e, sender_class>__name__)
+                "Unexpected %s initializing %s: %s", type(e).__name__, e, sender_class.__name__)
             self.logger.info("Error details:", exc_info=True)
 
     def execute(self, input_data=None):
