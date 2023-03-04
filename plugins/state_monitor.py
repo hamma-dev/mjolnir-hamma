@@ -134,7 +134,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         Parameters
         ----------
-        input_data : Mapping[str, DataValue], optional
+        input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
         key : str
             The key of `input_data` you want the value of.
@@ -159,11 +159,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
     def log_error(self, input_data, exception_inst):
         """
-        Use this method to log an error when an Exception occurs.
+        Log an error.
+
+        Use this when catching Exceptions, especially in the methods of the class.
 
         Parameters
         ----------
-        input_data : Mapping[str, DataValue], optional
+        input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
 
         exception_inst : Exception
@@ -182,6 +184,18 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 {key: str(value) for key, value in data.items()})
 
     def check_power(self, input_data):
+        """
+        Check the power of the sensor.
+
+        This will check to see of the power load of a sensor drops below
+        the value given by the class attribute `power_delim`.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        """
         try:
             load_now, load_pre = self.now_then(input_data, 'adc_vl_f')
             curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
@@ -195,6 +209,19 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             self.log_error(input_data, e)
 
     def check_ping(self, input_data):
+        """
+        Check the ping status of the sensor.
+
+        This will check to see if can communicate with a sensor.
+        If we can't an error is logged. If we can't communicate several
+        consecutive times, given by the class attribute `bad_ping`, send a message.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        """
         try:
             no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
             # If the ping !=0, then we can't reach the sensor
@@ -217,6 +244,19 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             self.log_error(input_data, e)
 
     def check_sensor_drive(self, input_data):
+        """
+        Check the remaining space on sensor.
+
+        This will check to see how much space is remaining on a sensor USB drive.
+        If it falls below the value given by the class attribute `low_space`, log
+        an error and send a message.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        """
         try:
             space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
             if (space_now < self.low_space) and (space_pre > self.low_space):
@@ -227,6 +267,20 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             self.log_error(input_data, e)
 
     def check_battery_voltage(self, input_data):
+        """
+        Check the battery voltage.
+
+        This will check to see if the battery voltage falls below a critical value.
+        Right now, this is hardwired to be 0.5V above the low voltage disconnect
+        defined by the charge controller. If it falls below this value, log
+        an error and send a message.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        """
         try:
 
             low_voltage_val, _ = self.now_then(input_data, 'v_lvd')
@@ -242,7 +296,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
     def send_message(self, msg):
         """
-        Send a message via the given method.
+        Send a message via the method defined the class attribute `method`.
 
         This is a shepherd method. Given a generic message, we'll send it
         using the method specified when initializing the class. Before sending, we'll
