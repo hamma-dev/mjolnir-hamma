@@ -100,23 +100,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if self._previous_data is None:
             self._previous_data = input_data
 
-        try:
-            # Go through several state variables.
-            # If something is hinky, log it and send a message
+        # Go through several state variables.
+        # If something is hinky, log it and send a message
+        self.run_checks(input_data)
 
-            self.check_power(input_data)
-
-            self.check_ping(input_data)
-
-            self.check_sensor_drive(input_data)
-
-            self.check_battery_voltage(input_data)
-
-            # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
-
-        # If expression evaluation fails, presumably due to bad data values
-        except Exception as e:
-            self.log_error(input_data, e)
+        # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
 
         # Update state for next pass through the pipeline
         self._previous_data = input_data
@@ -183,6 +171,31 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "%s data: %r", pretty_name,
                 {key: str(value) for key, value in data.items()})
 
+
+    def run_checks(self, input_data):
+        """
+        Run the monitoring checks and log/send messages for the results.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        """
+        for check_fn in [
+                self.check_power,
+                self.check_ping,
+                self.check_sensor_drive,
+                self.check_battery_voltage,
+                ]:
+            try:
+                msg = check_fn(input_data)
+                if msg:
+                    self.logger.info(msg)
+                    self.send_message(msg)
+            except Exception as e:
+                self.log_error(input_data, e)
+
     def check_power(self, input_data):
         """
         Check the power of the sensor.
@@ -195,18 +208,19 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
 
-        """
-        try:
-            load_now, load_pre = self.now_then(input_data, 'adc_vl_f')
-            curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
+        Returns
+        -------
+        str | None
+            Message to send depending on the check, or None if no message.
 
-            power_now, power_pre = load_now * curr_now, load_pre * curr_pre
-            if (power_now < self.power_delim) and (power_pre > self.power_delim):
-                msg = f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
-                self.logger.info(msg)
-                self.send_message(msg)
-        except Exception as e:
-            self.log_error(input_data, e)
+        """
+        load_now, load_pre = self.now_then(input_data, 'adc_vl_f')
+        curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
+
+        power_now, power_pre = load_now * curr_now, load_pre * curr_pre
+        if (power_now < self.power_delim) and (power_pre > self.power_delim):
+            return f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
+        return None
 
     def check_ping(self, input_data):
         """
@@ -221,78 +235,78 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
 
-        """
-        try:
-            no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
-            # If the ping !=0, then we can't reach the sensor
-            if no_comm_now and not no_comm_pre:
-                # If we pinged fine before, but not now, log it.
-                msg = f"Sensor unable to be pinged!"
-                self.logger.info(msg)
+        Returns
+        -------
+        str | None
+            Message to send depending on the check, or None if no message.
 
-            if no_comm_now:
-                # If any bad ping, increment the counter.
-                self.bad_ping += 1
-                # Once we reach the critical value, send an alert and log it.
-                if self.bad_ping == self.ping_max:
-                    msg = f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
-                    self.logger.info(msg)
-                    self.send_message(msg)
-            else:  # if we can communicate now, reset the counter
-                self.bad_ping = 0
-        except Exception as e:
-            self.log_error(input_data, e)
+        """
+        no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
+        # If the ping !=0, then we can't reach the sensor
+        if no_comm_now:
+            # If any bad ping, increment the counter.
+            self.bad_ping += 1
+            if not no_comm_pre:
+                # If we pinged fine before, but not now, log it.
+                self.logger.info("Sensor unable to be pinged!")
+            # Once we reach the critical value, send an alert and log it.
+            if self.bad_ping == self.ping_max:
+                return f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
+        else:  # if we can communicate now, reset the counter
+            self.bad_ping = 0
+        return None
 
     def check_sensor_drive(self, input_data):
         """
         Check the remaining space on sensor.
 
         This will check to see how much space is remaining on a sensor USB drive.
-        If it falls below the value given by the class attribute `low_space`, log
-        an error and send a message.
+        If it falls below the value given by the class attribute `low_space`,
+        send a message.
 
         Parameters
         ----------
         input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
 
+        Returns
+        -------
+        str | None
+            Message to send depending on the check, or None if no message.
+
         """
-        try:
-            space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
-            if (space_now < self.low_space) and (space_pre > self.low_space):
-                msg = f"Remaining GB on drive is {space_now:.1f}"
-                self.logger.info(msg)
-                self.send_message(msg)
-        except Exception as e:
-            self.log_error(input_data, e)
+        space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
+        if (space_now < self.low_space) and (space_pre > self.low_space):
+            return f"Remaining GB on drive is {space_now:.1f}"
+        return None
 
     def check_battery_voltage(self, input_data):
         """
         Check the battery voltage.
 
         This will check to see if the battery voltage falls below a critical value.
-        Right now, this is hardwired to be 0.5V above the low voltage disconnect
-        defined by the charge controller. If it falls below this value, log
-        an error and send a message.
+        Right now, this is hardwired to be 0.5 V above the low voltage disconnect
+        defined by the charge controller. If it falls below this value,
+        send a message.
 
         Parameters
         ----------
         input_data : Mapping[str, DataValue]
             Same as argument of `execute`.
 
+        Returns
+        -------
+        str | None
+            Message to send depending on the check, or None if no message.
+
         """
-        try:
+        low_voltage_val, _ = self.now_then(input_data, 'v_lvd')
+        CRITICAL_VOLTAGE = low_voltage_val + 0.5
 
-            low_voltage_val, _ = self.now_then(input_data, 'v_lvd')
-            CRITICAL_VOLTAGE = low_voltage_val + 0.5
-
-            batt_now, batt_pre = self.now_then(input_data, 'adc_vb_f')
-            if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
-                msg = f"Battery voltage critically low {batt_now:.3f}"
-                self.logger.info(msg)
-                self.send_message(msg)
-        except Exception as e:
-            self.log_error(input_data, e)
+        batt_now, batt_pre = self.now_then(input_data, 'adc_vb_f')
+        if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
+            return f"Battery voltage critically low ({batt_now:.3f} V)"
+        return None
 
     def send_message(self, msg):
         """
