@@ -118,7 +118,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         value for the data structure passed around.
 
         Useful for getting any value from `input_data`, since this we turn
-        to sting 'NA's to numeric NaNs.
+        string 'NA's to numeric NaNs.
 
         Parameters
         ----------
@@ -226,7 +226,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         """
         Check the ping status of the sensor.
 
-        This will check to see if can communicate with a sensor.
+        This will check to see if we can communicate with a sensor.
         If we can't an error is logged. If we can't communicate several
         consecutive times, given by the class attribute `bad_ping`, send a message.
 
