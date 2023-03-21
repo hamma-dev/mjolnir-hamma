@@ -104,7 +104,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # If something is hinky, log it and send a message
         self.run_checks(input_data)
 
-        # todo detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
+        # TODO detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
 
         # Update state for next pass through the pipeline
         self._previous_data = input_data
