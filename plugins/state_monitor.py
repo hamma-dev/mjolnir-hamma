@@ -130,7 +130,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         value for the data structure passed around.
 
         Useful for getting any value from `input_data`, since this we turn
-        to sting 'NA's to numeric NaNs.
+        string 'NA's to numeric NaNs.
 
         Parameters
         ----------
