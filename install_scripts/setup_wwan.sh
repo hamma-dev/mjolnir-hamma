@@ -5,7 +5,7 @@
 FILES_PATH="/home/pi/dev/mjolnir-hamma/files/"
 
 # Paths to where the files should go
-DEGRADED_PATH="//etc/networkd-dispatcher/degraded.d/"
+DEGRADED_PATH="/etc/networkd-dispatcher/degraded.d/"
 NETWORK_PATH="/etc/systemd/network/"
 
 WWAN_UP_FILE="50_bring_wwan0_up.py"
@@ -21,8 +21,3 @@ cp $FILES_PATH$WWAN_CONFIG_FILE $NETWORK_PATH
 chgrp root $DEGRADED_PATH$WWAN_UP_FILE
 chown root $DEGRADED_PATH$WWAN_UP_FILE
 chmod a+x $DEGRADED_PATH$WWAN_UP_FILE
-
-
-# Change some permissions
-#sudo chmod 0755 /etc/systemd/system/wpa_supplicant@wlan0.service.d/
-#sudo chmod 0644 /etc/systemd/system/wpa_supplicant@wlan0.service.d/override.conf
