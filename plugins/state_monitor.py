@@ -154,11 +154,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                     "%s data: %r", pretty_name,
                     {key: str(value) for key, value in data.items()})
 
-        # Update state for next pass through the pipeline
-        self._previous_data = input_data
+        finally:
+            # Update state for next pass through the pipeline
+            self._previous_data = input_data
 
-        # Pass through the input for consumption by any further steps
-        return input_data
+            # Pass through the input for consumption by any further steps
+            return input_data
 
     def send_message(self, msg):
         """
