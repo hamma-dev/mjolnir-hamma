@@ -168,8 +168,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         for pretty_name, data in [("Current", input_data),
                                   ("Previous", self._previous_data)]:
             self.logger.info(
-                "%s data: %r", pretty_name,
-                {key: str(value) for key, value in data.items()})
+                "%s data: %r", pretty_name, data)
 
 
     def run_checks(self, input_data):
