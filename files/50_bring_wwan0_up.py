@@ -18,7 +18,7 @@ subprocess.run(["ip", "link", "set", "wwan0", "down"], check=True)
 with open("/sys/class/net/wwan0/qmi/raw_ip", "w") as f:
 	subprocess.run(["echo", "Y"], stdout=f, check=True)
 subprocess.run(["ip", "link", "set", "wwan0", "up"], check=True)
-subprocess.run(["udhcpc", "-i", "wwan0"], check=True)
+subprocess.run(["udhcpc", "-i", "wwan0", "-q"], check=True)
 
 print("Connected to wwan0")
 sys.exit()
