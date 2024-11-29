@@ -106,11 +106,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         # TODO detect this more reliably by checking array_fault and load_fault bitfields are non-zero,
 
-        # Update state for next pass through the pipeline
-        self._previous_data = input_data
+        finally:
+            # Update state for next pass through the pipeline
+            self._previous_data = input_data
 
-        # Pass through the input for consumption by any further steps
-        return input_data
+            # Pass through the input for consumption by any further steps
+            return input_data
 
     def now_then(self, input_data, key):
         """
