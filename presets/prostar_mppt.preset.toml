@@ -1,0 +1,221 @@
+# Preset for Morningstar ProStar MPPT Solar Charge Controller
+
+config_version = 1
+# Name of this device preset, used for lookup
+name = "prostar_mppt"
+# Type of this preset
+type = "device"
+
+# Preset-level metadata
+[metadata]
+    name_full = "Morningstar ProStar MPPT"
+    author = "Generated from MStar-WLAN register definitions"
+    description = "Device preset for Morningstar ProStar MPPT solar charge controller with Modbus RTU support"
+    homepage = "https://www.morningstarcorp.com/products/prostar-mppt/"
+    preset_version = "0.1.0"
+    brokkr_version_min = "0.4.0"
+
+# Data type presets to use for the data types that follow
+[type_presets]
+    # Voltage conversion: n * 96.667 * 2^-15
+    voltage = { binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 3, unit = "V", uncertainty = 0.1 }
+    # Current conversion: n * 79.16 * 2^-15
+    current = { binary_type = "H", conversion = "custom", scale = 79.16, power = -15, base = 2, digits = 3, unit = "A", uncertainty = 0.1 }
+    # Power conversion: n * 989.5 * 2^-16
+    power = { binary_type = "H", conversion = "custom", scale = 989.5, power = -16, base = 2, digits = 3, unit = "W", uncertainty = 1 }
+    # Temperature conversion (same as voltage scaling)
+    temperature = { binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 1, unit = "C", uncertainty = 1 }
+    # Amp-hours with 0.1 scaling
+    amphours = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
+    # Kilowatt-hours with 0.1 scaling (using 32-bit)
+    kwh_resettable = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "kWh", uncertainty = 0.1 }
+    # Double precision values (32-bit)
+    amphours_32bit = { binary_type = "I", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
+    hours_32bit = { binary_type = "I", unit = "h", uncertainty = false }
+    # Status values
+    state_uint = { binary_type = "H", unit = "", uncertainty = false }
+    bitfield_16 = { binary_type = "H", conversion = "bitfield", unit = false, uncertainty = false }
+    bitfield_32 = { binary_type = "I", conversion = "bitfield", unit = false, uncertainty = false }
+    # BCD encoded version
+    version_bcd = { binary_type = "H", unit = "", uncertainty = false }
+    # Time in seconds
+    time_seconds = { binary_type = "H", unit = "s", uncertainty = false }
+
+# Data types for ProStar MPPT registers
+[data_types]
+    # System information
+    sw_ver = { full_name = "Software Version", type_presets = "version_bcd" }
+    n_sys_v = { full_name = "Battery Voltage Settings Multiplier", binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 3, unit = "", uncertainty = false }
+
+    # Supply voltages
+    vdd_actual = { full_name = "3.3V Supply Voltage", type_presets = "voltage" }
+    adc_p12 = { full_name = "12V Supply Voltage", type_presets = "voltage" }
+    adc_p5 = { full_name = "5V Supply Voltage", type_presets = "voltage" }
+    adc_fgdrive = { full_name = "Gate Drive Voltage", type_presets = "voltage" }
+    adc_vmeter = { full_name = "MeterBus Supply Voltage", type_presets = "voltage" }
+
+    # Current and voltage measurements
+    adc_ic = { full_name = "Charge Current", type_presets = "current" }
+    adc_ia = { full_name = "Array Current", type_presets = "current" }
+    adc_vbterm = { full_name = "Battery Terminal Voltage", type_presets = "voltage" }
+    adc_va = { full_name = "Array Voltage", type_presets = "voltage" }
+    adc_vl = { full_name = "Load Voltage", type_presets = "voltage" }
+    adc_ib = { full_name = "Battery Current (Net)", type_presets = "current" }
+    adc_il = { full_name = "Load Current", type_presets = "current" }
+    adc_vbsense = { full_name = "Battery Sense Voltage", type_presets = "voltage" }
+    adc_vb_f_1m = { full_name = "Battery Voltage (60s Filter)", type_presets = "voltage" }
+    adc_ib_f_1m = { full_name = "Battery Current (60s Filter)", type_presets = "current" }
+
+    # Temperature sensors
+    T_hs = { full_name = "Heatsink Temperature", type_presets = "temperature" }
+    T_batt = { full_name = "Battery Temperature", type_presets = "temperature" }
+    T_amb = { full_name = "Ambient Temperature", type_presets = "temperature" }
+    T_rts = { full_name = "Remote Temperature Sensor", type_presets = "temperature" }
+    T_ind_u = { full_name = "Phase U Inductor Temperature", type_presets = "temperature" }
+    T_ind_v = { full_name = "Phase V Inductor Temperature", type_presets = "temperature" }
+    T_ind_w = { full_name = "Phase W Inductor Temperature", type_presets = "temperature" }
+
+    # Status and control
+    charge_state = { full_name = "Charge State", type_presets = "state_uint" }
+    array_fault = { full_name = "Array Fault Bitfield", type_presets = "bitfield_16" }
+    vb_f = { full_name = "Battery Voltage (25s Filter)", type_presets = "voltage" }
+    vb_ref = { full_name = "Battery Regulator Reference Voltage", type_presets = "voltage" }
+    vb_ref_charge_slave = { full_name = "Battery Regulator Slave Voltage", type_presets = "voltage" }
+
+    # Accumulation registers (resettable)
+    Ahc_r = { full_name = "Ah Charge Resettable", type_presets = "amphours_32bit" }
+    Ahc_t = { full_name = "Ah Charge Total", type_presets = "amphours_32bit" }
+    kWhc_r = { full_name = "kWh Charge Resettable", type_presets = "kwh_resettable" }
+    kWhc_t = { full_name = "kWh Charge Total", type_presets = "kwh_resettable" }
+
+    # Load control
+    Tb_lo_limit_100 = { full_name = "Battery Temp 100% Output Limit", type_presets = "temperature" }
+    Tb_lo_limit_0 = { full_name = "Battery Temp 0% Output Limit", type_presets = "temperature" }
+    load_state = { full_name = "Load State", type_presets = "state_uint" }
+    load_fault = { full_name = "Load Fault Bitfield", type_presets = "bitfield_16" }
+    V_lvd = { full_name = "Load Compensated LVD Voltage", type_presets = "voltage" }
+    V_lhvd = { full_name = "Load HVD Voltage", type_presets = "voltage" }
+
+    # Load accumulation
+    Ahl_r = { full_name = "Ah Load Resettable", type_presets = "amphours_32bit" }
+    Ahl_t = { full_name = "Ah Load Total", type_presets = "amphours_32bit" }
+
+    # Hourmeter and alarms
+    hourmeter = { full_name = "Hourmeter", type_presets = "hours_32bit" }
+    alarm = { full_name = "Alarm Bitfield", type_presets = "bitfield_32" }
+
+    # DIP switch and LED
+    dip_switch = { full_name = "DIP Switch Settings", type_presets = "bitfield_16" }
+    led_state = { full_name = "SOC LED State", type_presets = "state_uint" }
+
+    # Power and sweep data
+    Power_out = { full_name = "Charger Output Power", type_presets = "power" }
+    Sweep_Vmp = { full_name = "Array Vmp (Sweep)", type_presets = "voltage" }
+    Sweep_Pmax = { full_name = "Array Max Power (Sweep)", type_presets = "power" }
+    Sweep_Voc = { full_name = "Array Voc (Sweep)", type_presets = "voltage" }
+    va_ref = { full_name = "Array Target Voltage", type_presets = "voltage" }
+
+    # Daily statistics
+    Vb_min_daily = { full_name = "Min Battery Voltage (Daily)", type_presets = "voltage" }
+    Vb_max_daily = { full_name = "Max Battery Voltage (Daily)", type_presets = "voltage" }
+    Ahc_daily = { full_name = "Ah Charge (Daily)", type_presets = "amphours" }
+    Ahl_daily = { full_name = "Ah Load (Daily)", type_presets = "amphours" }
+    array_fault_daily = { full_name = "Array Fault (Daily)", type_presets = "bitfield_16" }
+    load_fault_daily = { full_name = "Load Fault (Daily)", type_presets = "bitfield_16" }
+    alarm_daily = { full_name = "Alarm (Daily)", type_presets = "bitfield_32" }
+    time_ab_daily = { full_name = "Time in Absorption (Daily)", type_presets = "time_seconds" }
+    time_eq_daily = { full_name = "Time in Equalization (Daily)", type_presets = "time_seconds" }
+    time_fl_daily = { full_name = "Time in Float (Daily)", type_presets = "time_seconds" }
+    Va_max_daily = { full_name = "Max Array Voltage (Daily)", type_presets = "voltage" }
+
+    # Additional status
+    charge_led_state = { full_name = "Charge Status LED State", type_presets = "state_uint" }
+    lighting_should_be_on = { full_name = "Lighting Mode Load State", type_presets = "state_uint" }
+    va_ref_fixed = { full_name = "Fixed Vmp", type_presets = "voltage" }
+    va_ref_fixed_pct = { full_name = "Vmp as Fraction of Voc", binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 3, unit = "", uncertainty = false }
+    alarm_on_setting_change = { full_name = "EEPROM Write Behavior", type_presets = "state_uint" }
+
+# Input presets for reading data from the ProStar MPPT
+[inputs]
+    # Input preset that reads primary monitoring RAM registers via Modbus RTU
+    # This reads a contiguous block from address 0x0010 (16) to 0x0051 (81)
+    # covering all the main voltage, current, temperature, and status registers
+    [inputs.ram]
+        _module_path = "brokkr.inputs.modbus"
+        _class_name = "ModbusSerialInput"
+        name = "ProStar MPPT RAM Registers"
+        # Start at register 16 (0x0010) for main monitoring data
+        start_address = 0x0010
+        unit = 1
+        modbus_command = "read_holding_registers"
+        # Serial port settings for ProStar MPPT (same as SunSaver)
+        [inputs.ram.modbus_kwargs]
+            method = "rtu"
+            stopbits = 2
+            bytesize = 8
+            parity = "N"
+            baudrate = 9600
+            strict = false
+        # Data to read from registers 16-81
+        # Reading contiguous block: addresses 0x10-0x51 (16-81 decimal)
+        data_names = [
+            "adc_ic",              # 16 (0x10)
+            "adc_ia",              # 17
+            "adc_vbterm",          # 18
+            "adc_va",              # 19
+            "adc_vl",              # 20
+            "adc_ib",              # 21
+            "adc_il",              # 22
+            "adc_vbsense",         # 23
+            "adc_vb_f_1m",         # 24
+            "adc_ib_f_1m",         # 25
+            "T_hs",                # 26
+            "T_batt",              # 27
+            "T_amb",               # 28
+            "T_rts",               # 29
+            "T_ind_u",             # 30
+            "T_ind_v",             # 31
+            "T_ind_w",             # 32
+            "charge_state",        # 33
+            "array_fault",         # 34
+            "vb_f",                # 35
+            "vb_ref",              # 36
+            "vb_ref_charge_slave", # 37
+            "Ahc_r",               # 38-39 (32-bit, takes 2 registers)
+            "Ahc_t",               # 40-41 (32-bit)
+            "kWhc_r",              # 42
+            "kWhc_t",              # 43
+            "Tb_lo_limit_100",     # 44
+            "Tb_lo_limit_0",       # 45
+            "load_state",          # 46
+            "load_fault",          # 47
+            "V_lvd",               # 48
+            "V_lhvd",              # 49
+            "Ahl_r",               # 50-51 (32-bit)
+            "Ahl_t",               # 52-53 (32-bit)
+            "hourmeter",           # 54-55 (32-bit)
+            "alarm",               # 56-57 (32-bit)
+            "dip_switch",          # 58
+            "led_state",           # 59
+            "Power_out",           # 60
+            "Sweep_Vmp",           # 61
+            "Sweep_Pmax",          # 62
+            "Sweep_Voc",           # 63
+            "va_ref",              # 64
+            "Vb_min_daily",        # 65
+            "Vb_max_daily",        # 66
+            "Ahc_daily",           # 67
+            "Ahl_daily",           # 68
+            "array_fault_daily",   # 69
+            "load_fault_daily",    # 70
+            "alarm_daily",         # 71-72 (32-bit)
+            "time_ab_daily",       # 73
+            "time_eq_daily",       # 74
+            "time_fl_daily",       # 75
+            "Va_max_daily",        # 76
+            "charge_led_state",    # 77
+            "lighting_should_be_on", # 78
+            "va_ref_fixed",        # 79
+            "va_ref_fixed_pct",    # 80
+            "alarm_on_setting_change", # 81
+        ]
