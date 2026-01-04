@@ -2,9 +2,12 @@
 Name=wwan0
 
 [Network]
-DHCP=ipv4
+DHCP=no
 DNS=8.8.8.8
 DNS=8.8.4.4
 
 [DHCP]
 RouteMetric=20
+
+[Link]
+Unmanaged=yes

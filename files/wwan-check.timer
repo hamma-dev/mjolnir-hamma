@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WWAN connectivity check periodically
+
+[Timer]
+# Run 30 seconds after boot
+OnBootSec=30s
+# Run every 5 minutes thereafter
+OnUnitActiveSec=5min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
