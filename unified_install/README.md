@@ -52,15 +52,22 @@ Main installation after bootstrap and reboot.
 Usage: install.sh <sensor_number> --wifi|--cellular [options]
 
 Network modes (required, choose one):
-  --wifi          Use WiFi network (UAH/NSSTC)
-  --cellular      Use Cellular network (modem)
+  --wifi              Use WiFi network (UAH/NSSTC)
+  --cellular          Use Cellular network (modem)
 
 Options:
-  --dry-run       Show what would be done without executing
-  --skip-packages Skip system package installation
-  --skip-brokkr   Skip Brokkr installation
-  --skip-hardware Skip hardware setup
-  --skip-extras   Skip sindri/pyltg/hamma installation
+  --dry-run           Show what would be done without executing
+  --skip-packages     Skip system package installation
+  --skip-brokkr       Skip Brokkr installation
+  --skip-hardware     Skip hardware setup
+  --skip-extras       Skip sindri/pyltg/hamma installation
+
+Cellular options:
+  --apn APN           Set cellular APN (default: h2g2)
+
+HAMMA private repo options:
+  --generate-hamma-key  Generate SSH key for GitHub and exit
+  --hamma-only          Only install hamma (skip everything else)
 ```
 
 ## Network Modes
@@ -92,6 +99,38 @@ For cellular modem connectivity using timer-based approach.
 ```bash
 sudo bash install.sh 1 --cellular --apn vzwinternet
 ```
+
+## HAMMA Private Repository
+
+The `hamma` package is in a private GitHub repository and requires SSH key authentication.
+
+### Two-Step Installation
+
+**Step 1: Generate SSH key**
+```bash
+sudo bash install.sh <sensor_number> --generate-hamma-key
+```
+This generates an ed25519 key and prints the public key.
+
+**Step 2: Add key to GitHub**
+1. Copy the public key output
+2. Go to https://github.com/pbitzer/hamma/settings/keys
+3. Click "Add deploy key"
+4. Paste the public key and save
+
+**Step 3: Install hamma**
+```bash
+sudo bash install.sh <sensor_number> --hamma-only
+```
+
+### During Full Installation
+
+If running the full install and the SSH key is already configured:
+- hamma will be installed automatically as part of the extras phase
+
+If the key is not configured:
+- The hamma install step will fail
+- Run `--generate-hamma-key`, add to GitHub, then `--hamma-only`
 
 ## Dry-Run Mode
 

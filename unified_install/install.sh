@@ -43,21 +43,31 @@ SKIP_PACKAGES=false
 SKIP_BROKKR=false
 SKIP_HARDWARE=false
 SKIP_EXTRAS=false
+CELLULAR_APN=""
+GENERATE_HAMMA_KEY=false
+HAMMA_ONLY=false
 
 print_usage() {
     echo "Usage: $0 <sensor_number> --wifi|--cellular [options]"
     echo ""
     echo "Network modes (required, choose one):"
-    echo "  --wifi          Use WiFi network (UAH/NSSTC)"
-    echo "  --cellular      Use Cellular network (modem)"
+    echo "  --wifi              Use WiFi network (UAH/NSSTC)"
+    echo "  --cellular          Use Cellular network (modem)"
     echo ""
     echo "Options:"
-    echo "  --dry-run       Show what would be done without executing"
-    echo "  --skip-packages Skip system package installation"
-    echo "  --skip-brokkr   Skip Brokkr installation"
-    echo "  --skip-hardware Skip hardware setup"
-    echo "  --skip-extras   Skip sindri/pyltg/hamma installation"
-    echo "  -h, --help      Show this help message"
+    echo "  --dry-run           Show what would be done without executing"
+    echo "  --skip-packages     Skip system package installation"
+    echo "  --skip-brokkr       Skip Brokkr installation"
+    echo "  --skip-hardware     Skip hardware setup"
+    echo "  --skip-extras       Skip sindri/pyltg/hamma installation"
+    echo "  -h, --help          Show this help message"
+    echo ""
+    echo "Cellular options:"
+    echo "  --apn APN           Set cellular APN (default: h2g2)"
+    echo ""
+    echo "HAMMA private repo options:"
+    echo "  --generate-hamma-key  Generate SSH key for GitHub and exit"
+    echo "  --hamma-only          Only install hamma (skip everything else)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -90,6 +100,18 @@ while [[ $# -gt 0 ]]; do
             SKIP_EXTRAS=true
             shift
             ;;
+        --apn)
+            CELLULAR_APN="$2"
+            shift 2
+            ;;
+        --generate-hamma-key)
+            GENERATE_HAMMA_KEY=true
+            shift
+            ;;
+        --hamma-only)
+            HAMMA_ONLY=true
+            shift
+            ;;
         -h|--help)
             print_usage
             exit 0
@@ -118,7 +140,8 @@ if ! validate_sensor_num "$SENSOR_NUM"; then
     exit 1
 fi
 
-if [[ -z "$NETWORK_PATH" ]]; then
+# Network path not required for --generate-hamma-key or --hamma-only
+if [[ -z "$NETWORK_PATH" && "$GENERATE_HAMMA_KEY" != "true" && "$HAMMA_ONLY" != "true" ]]; then
     log_error "Network path is required: --wifi or --cellular"
     print_usage
     exit 1
@@ -130,6 +153,34 @@ HOSTNAME="mjolnir$SENSOR_FORMATTED"
 # --- Initialize ---
 init_common $(if [[ "$DRY_RUN" == "true" ]]; then echo "--dry-run"; fi)
 
+# ============================================================================
+# Special mode: --generate-hamma-key (generate key and exit)
+# ============================================================================
+if [[ "$GENERATE_HAMMA_KEY" == "true" ]]; then
+    log_info "=== Generate HAMMA SSH Key ==="
+    echo ""
+    source "$SCRIPT_DIR/lib/software.sh"
+    install_hamma --generate-key
+    echo ""
+    log_info "Next steps:"
+    echo "  1. Add the public key above to GitHub as a deploy key:"
+    echo "     https://github.com/pbitzer/hamma/settings/keys"
+    echo "  2. Run: sudo bash install.sh $SENSOR_NUM --hamma-only"
+    exit 0
+fi
+
+# ============================================================================
+# Special mode: --hamma-only (install just hamma)
+# ============================================================================
+if [[ "$HAMMA_ONLY" == "true" ]]; then
+    log_info "=== Install HAMMA Only ==="
+    echo ""
+    source "$SCRIPT_DIR/lib/software.sh"
+    install_hamma
+    log_success "HAMMA installation complete!"
+    exit 0
+fi
+
 # --- Display configuration ---
 log_info "=== HAMMA Pi Installation ==="
 log_info "Sensor: $HOSTNAME"
@@ -140,6 +191,9 @@ log_info "Skip packages: $SKIP_PACKAGES"
 log_info "Skip brokkr: $SKIP_BROKKR"
 log_info "Skip hardware: $SKIP_HARDWARE"
 log_info "Skip extras: $SKIP_EXTRAS"
+if [[ -n "$CELLULAR_APN" ]]; then
+    log_info "Cellular APN: $CELLULAR_APN"
+fi
 echo ""
 
 # --- Verify prerequisites ---
@@ -215,7 +269,11 @@ if [[ "$NETWORK_PATH" == "wifi" ]]; then
 else
     # --- Cellular Path ---
     source "$SCRIPT_DIR/lib/network_wwan.sh"
-    setup_cellular_network "$SENSOR_NUM"
+    if [[ -n "$CELLULAR_APN" ]]; then
+        setup_cellular_network "$SENSOR_NUM" --apn "$CELLULAR_APN"
+    else
+        setup_cellular_network "$SENSOR_NUM"
+    fi
 fi
 
 echo ""
