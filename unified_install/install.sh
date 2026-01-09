@@ -229,25 +229,31 @@ log_step "Updating mjolnir-hamma repository..."
 
 REPO_PATH="/home/pi/dev/mjolnir-hamma"
 REPO_URL="https://github.com/hamma-dev/mjolnir-hamma.git"
+# TODO: Update this branch when releasing or changing version branches
 REPO_BRANCH="0.3.x"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "git -C $REPO_PATH remote set-url origin $REPO_URL"
-    log_dry_run "git -C $REPO_PATH fetch origin && git checkout $REPO_BRANCH && git pull"
+    log_dry_run "git -C $REPO_PATH pull (if on $REPO_BRANCH)"
     manifest_add "command" "cmd" "git remote set-url origin $REPO_URL" "cwd" "$REPO_PATH"
-    manifest_add "command" "cmd" "git fetch origin && git checkout $REPO_BRANCH && git pull" "cwd" "$REPO_PATH"
+    manifest_add "command" "cmd" "git pull (if on $REPO_BRANCH)" "cwd" "$REPO_PATH"
 else
     if [[ -d "$REPO_PATH/.git" ]]; then
         # Set remote to hamma-dev (in case USB copy had different origin)
         git -C "$REPO_PATH" remote set-url origin "$REPO_URL" 2>/dev/null || \
             git -C "$REPO_PATH" remote add origin "$REPO_URL"
 
-        # Fetch, checkout branch, and pull latest
-        git -C "$REPO_PATH" fetch origin
-        if git -C "$REPO_PATH" checkout "$REPO_BRANCH" && git -C "$REPO_PATH" pull; then
-            log_success "Repository updated from GitHub (branch: $REPO_BRANCH)"
+        # Only pull if already on the expected branch (don't switch branches mid-install)
+        CURRENT_BRANCH=$(git -C "$REPO_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [[ "$CURRENT_BRANCH" == "$REPO_BRANCH" ]]; then
+            git -C "$REPO_PATH" fetch origin
+            if git -C "$REPO_PATH" pull; then
+                log_success "Repository updated from GitHub (branch: $REPO_BRANCH)"
+            else
+                log_warn "Could not pull latest (continuing with current version)"
+            fi
         else
-            log_warn "Could not pull latest (continuing with current version)"
+            log_warn "On branch '$CURRENT_BRANCH', not '$REPO_BRANCH' - skipping pull to avoid switching branches"
         fi
     else
         log_warn "Repository not found at $REPO_PATH - was bootstrap.sh run?"
