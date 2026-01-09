@@ -129,10 +129,10 @@ install_sindri() {
     log_step "[Sindri 3/4] Installing sindri..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "git clone --recursive https://github.com/project-mjolnir/sindri.git"
+        log_dry_run "git clone -b 0.3.x --recursive https://github.com/hamma-dev/sindri.git"
         log_dry_run "pip install -e $INSTALL_PATH/sindri"
         log_dry_run "pip install -e $INSTALL_PATH/serviceinstaller"
-        manifest_add "git_clone" "repo" "https://github.com/project-mjolnir/sindri.git" "dest" "$INSTALL_PATH/sindri" "recursive" "true"
+        manifest_add "git_clone" "repo" "https://github.com/hamma-dev/sindri.git" "dest" "$INSTALL_PATH/sindri" "branch" "0.3.x" "recursive" "true"
         manifest_add "pip_install" "package" "$INSTALL_PATH/sindri" "editable" "true" "venv" "$venv_name"
         manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "editable" "true" "venv" "$venv_name"
     else
@@ -140,7 +140,7 @@ install_sindri() {
 
         if [[ ! -d "$INSTALL_PATH/sindri" ]]; then
             log_info "Cloning sindri (this may take a while)..."
-            git -C "$INSTALL_PATH" clone --recursive "https://github.com/project-mjolnir/sindri.git"
+            git -C "$INSTALL_PATH" clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
         else
             log_warn "Sindri already exists, skipping clone"
         fi
@@ -297,10 +297,10 @@ EOT
         log_step "Installing HAMMA..."
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_dry_run "git clone git@github-hamma:pbitzer/hamma.git"
+            log_dry_run "git clone -b 0.3.x git@github-hamma:pbitzer/hamma.git"
             log_dry_run "pip install -e $INSTALL_PATH/hamma"
             log_dry_run "pip install future"
-            manifest_add "git_clone" "repo" "git@github-hamma:pbitzer/hamma.git" "dest" "$INSTALL_PATH/hamma"
+            manifest_add "git_clone" "repo" "git@github-hamma:pbitzer/hamma.git" "dest" "$INSTALL_PATH/hamma" "branch" "0.3.x"
             manifest_add "pip_install" "package" "$INSTALL_PATH/hamma" "editable" "true" "venv" "$venv_name"
             manifest_add "pip_install" "package" "future" "venv" "$venv_name"
         else
@@ -308,7 +308,7 @@ EOT
 
             if [[ ! -d "$INSTALL_PATH/hamma" ]]; then
                 log_info "Cloning hamma from GitHub..."
-                git -C "$INSTALL_PATH" clone git@github-hamma:pbitzer/hamma.git
+                git -C "$INSTALL_PATH" clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
             else
                 log_warn "HAMMA already exists, skipping clone"
             fi

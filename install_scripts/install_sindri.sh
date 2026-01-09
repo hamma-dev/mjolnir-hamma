@@ -28,7 +28,7 @@ source "/home/pi/$VENV_NAME"
 pip install --upgrade pip setuptools wheel
 
 # Download the needed software
-git -C $INSTALL_PATH clone --recursive "https://github.com/project-mjolnir/sindri.git"
+git -C $INSTALL_PATH clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
 
 # Now, we install
 echo "********* Installing sindri. This might take a while..."

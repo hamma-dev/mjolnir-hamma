@@ -169,6 +169,40 @@ log_success "Prerequisites OK"
 echo ""
 
 # ============================================================================
+# Update mjolnir-hamma repository
+# ============================================================================
+log_step "Updating mjolnir-hamma repository..."
+
+REPO_PATH="/home/pi/dev/mjolnir-hamma"
+REPO_URL="https://github.com/hamma-dev/mjolnir-hamma.git"
+REPO_BRANCH="0.3.x"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_dry_run "git -C $REPO_PATH remote set-url origin $REPO_URL"
+    log_dry_run "git -C $REPO_PATH fetch origin && git checkout $REPO_BRANCH && git pull"
+    manifest_add "command" "cmd" "git remote set-url origin $REPO_URL" "cwd" "$REPO_PATH"
+    manifest_add "command" "cmd" "git fetch origin && git checkout $REPO_BRANCH && git pull" "cwd" "$REPO_PATH"
+else
+    if [[ -d "$REPO_PATH/.git" ]]; then
+        # Set remote to hamma-dev (in case USB copy had different origin)
+        git -C "$REPO_PATH" remote set-url origin "$REPO_URL" 2>/dev/null || \
+            git -C "$REPO_PATH" remote add origin "$REPO_URL"
+
+        # Fetch, checkout branch, and pull latest
+        git -C "$REPO_PATH" fetch origin
+        if git -C "$REPO_PATH" checkout "$REPO_BRANCH" && git -C "$REPO_PATH" pull; then
+            log_success "Repository updated from GitHub (branch: $REPO_BRANCH)"
+        else
+            log_warn "Could not pull latest (continuing with current version)"
+        fi
+    else
+        log_warn "Repository not found at $REPO_PATH - was bootstrap.sh run?"
+    fi
+fi
+
+echo ""
+
+# ============================================================================
 # PHASE 2: Network Setup
 # ============================================================================
 log_info "=== Phase 2: Network Setup ($NETWORK_PATH) ==="

@@ -69,18 +69,23 @@ echo "[3/6] Cloning/updating repositories..."
 clone_or_update() {
     local repo_url=$1
     local repo_name=$2
+    local repo_branch=${3:-}  # Optional branch
     local repo_path="$INSTALL_PATH/$repo_name"
 
     if [[ -d "$repo_path" ]]; then
         echo "  $repo_name: already exists (run 'git pull' manually to update)"
     else
         echo "  $repo_name: cloning..."
-        git -C "$INSTALL_PATH" clone "$repo_url"
+        if [[ -n "$repo_branch" ]]; then
+            git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
+        else
+            git -C "$INSTALL_PATH" clone "$repo_url"
+        fi
     fi
 }
 
-clone_or_update "https://github.com/project-mjolnir/brokkr.git" "brokkr"
-clone_or_update "https://github.com/project-mjolnir/serviceinstaller.git" "serviceinstaller"
+clone_or_update "https://github.com/hamma-dev/brokkr.git" "brokkr" "0.4.x"
+clone_or_update "https://github.com/hamma-dev/serviceinstaller.git" "serviceinstaller"
 clone_or_update "https://github.com/pbitzer/notifiers.git" "notifiers"
 
 # Note: mjolnir-hamma should already exist from bootstrap.sh

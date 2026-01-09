@@ -44,7 +44,7 @@ else
 	source "/home/pi/$VENV_NAME"
 	
 	# Download the needed software
-	git -C $INSTALL_PATH clone git@github-hamma:pbitzer/hamma.git
+	git -C $INSTALL_PATH clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
 	
 	# Now, we install
 	pip install -e $INSTALL_PATH"hamma"

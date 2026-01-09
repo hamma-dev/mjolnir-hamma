@@ -74,23 +74,33 @@ install_brokkr() {
     clone_repo() {
         local repo_url=$1
         local repo_name=$2
+        local repo_branch=${3:-}  # Optional branch
         local repo_path="$INSTALL_PATH/$repo_name"
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_dry_run "git clone $repo_url $repo_path"
-            manifest_add "git_clone" "repo" "$repo_url" "dest" "$repo_path"
+            if [[ -n "$repo_branch" ]]; then
+                log_dry_run "git clone -b $repo_branch $repo_url $repo_path"
+                manifest_add "git_clone" "repo" "$repo_url" "dest" "$repo_path" "branch" "$repo_branch"
+            else
+                log_dry_run "git clone $repo_url $repo_path"
+                manifest_add "git_clone" "repo" "$repo_url" "dest" "$repo_path"
+            fi
         else
             if [[ -d "$repo_path" ]]; then
                 log_info "  $repo_name: already exists"
             else
                 log_info "  $repo_name: cloning..."
-                git -C "$INSTALL_PATH" clone "$repo_url"
+                if [[ -n "$repo_branch" ]]; then
+                    git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
+                else
+                    git -C "$INSTALL_PATH" clone "$repo_url"
+                fi
             fi
         fi
     }
 
-    clone_repo "https://github.com/project-mjolnir/brokkr.git" "brokkr"
-    clone_repo "https://github.com/project-mjolnir/serviceinstaller.git" "serviceinstaller"
+    clone_repo "https://github.com/hamma-dev/brokkr.git" "brokkr" "0.4.x"
+    clone_repo "https://github.com/hamma-dev/serviceinstaller.git" "serviceinstaller"
     clone_repo "https://github.com/pbitzer/notifiers.git" "notifiers"
 
     if [[ "$DRY_RUN" != "true" ]]; then

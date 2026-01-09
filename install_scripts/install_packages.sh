@@ -20,7 +20,7 @@ apt-get autoremove -y
 
 # Core utilities
 apt-get install -y imagemagick    # Needed for sindri
-apt-get install -y eject          # Automount drives
+c          # Automount drives
 apt-get install -y udisks2        # Automount drives
 
 # Development tools (should already be on image, but ensure present)
