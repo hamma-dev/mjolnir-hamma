@@ -131,7 +131,33 @@ if [[ -f "/boot/firmware/config.txt" ]]; then
     CONFIG_FILE="/boot/firmware/config.txt"
 fi
 
-# --- Step 0: Fix Buster EOL repos ---
+# --- Step 0a: Fix system clock if wrong ---
+# Pi has no RTC; if clock is years off, DNSSEC fails and NTP can't sync.
+# Use USB file timestamp as approximate current time.
+CURRENT_YEAR=$(date +%Y)
+if [[ "$CURRENT_YEAR" -lt 2024 ]]; then
+    log_step "[0/7] Fixing system clock (was $CURRENT_YEAR)..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "Set system clock from USB file timestamp"
+        manifest_add "command" "cmd" "date -s @<usb_timestamp>" "sudo" "true"
+    else
+        # Get modification time of this script (recently copied to USB)
+        if [[ "$(uname)" == "Linux" ]]; then
+            USB_TIME=$(stat -c %Y "${BASH_SOURCE[0]}" 2>/dev/null)
+        else
+            USB_TIME=$(stat -f %m "${BASH_SOURCE[0]}" 2>/dev/null)
+        fi
+        if [[ -n "$USB_TIME" ]]; then
+            sudo date -s "@$USB_TIME"
+            log_success "Clock set to approximately: $(date)"
+        else
+            log_warn "Could not get USB timestamp, clock may be wrong"
+        fi
+    fi
+    echo ""
+fi
+
+# --- Step 0b: Fix Buster EOL repos ---
 # Debian Buster is EOL; deb.debian.org no longer serves it.
 # This must happen before any apt commands.
 if grep -q "deb.debian.org" /etc/apt/sources.list 2>/dev/null; then
@@ -140,8 +166,9 @@ if grep -q "deb.debian.org" /etc/apt/sources.list 2>/dev/null; then
         log_dry_run "sed sources.list: deb.debian.org -> archive.debian.org"
         manifest_add "sed" "path" "/etc/apt/sources.list" "pattern" "deb.debian.org" "replacement" "archive.debian.org"
     else
-        sudo sed -i 's|deb.debian.org/debian |archive.debian.org/debian |g' /etc/apt/sources.list
-        sudo sed -i 's|deb.debian.org/debian-security |archive.debian.org/debian-security |g' /etc/apt/sources.list
+        # Replace all occurrences of deb.debian.org with archive.debian.org
+        sudo sed -i 's|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list
+        # Remove buster-updates (no longer exists)
         sudo sed -i '/buster-updates/d' /etc/apt/sources.list
         log_success "Repositories updated to archive.debian.org"
     fi
