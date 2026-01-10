@@ -2,12 +2,13 @@
 # Bootstrap script for HAMMA Pi initial setup
 #
 # This script handles Phase 1 from the "Pi Setup [Working]" documentation:
-#   1. Set timezone to UTC
-#   2. Setup temporary WiFi for connectivity (external USB antenna)
-#   3. Mount USB drive
-#   4. Copy repository from USB to /home/pi/dev/
-#   5. Disable internal WiFi radio
-#   6. Set hostname (mjolnirNN format)
+#   1. Change default password
+#   2. Set timezone to UTC
+#   3. Setup temporary WiFi for connectivity (external USB antenna)
+#   4. Mount USB drive
+#   5. Copy repository from USB to /home/pi/dev/
+#   6. Disable internal WiFi radio
+#   7. Set hostname (mjolnirNN format)
 #
 # Usage:
 #   ./bootstrap.sh <sensor_number> --wifi-ssid "NetworkName" [options]
@@ -130,8 +131,26 @@ if [[ -f "/boot/firmware/config.txt" ]]; then
     CONFIG_FILE="/boot/firmware/config.txt"
 fi
 
-# --- Step 1: Set timezone to UTC ---
-log_step "[1/6] Setting timezone to UTC..."
+# --- Step 1: Change default password ---
+log_step "[1/7] Password setup..."
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_dry_run "passwd (interactive)"
+    manifest_add "command" "cmd" "passwd" "interactive" "true"
+else
+    read -p "  Change default password now? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        passwd
+        log_success "Password changed"
+    else
+        log_warn "Skipping password change (remember to change it later!)"
+    fi
+fi
+echo ""
+
+# --- Step 2: Set timezone to UTC ---
+log_step "[2/7] Setting timezone to UTC..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "timedatectl set-timezone UTC"
@@ -141,8 +160,8 @@ else
     log_success "Timezone set to UTC"
 fi
 
-# --- Step 2: Setup temporary WiFi ---
-log_step "[2/6] Setting up temporary WiFi..."
+# --- Step 3: Setup temporary WiFi ---
+log_step "[3/7] Setting up temporary WiFi..."
 
 if [[ -n "$WIFI_SSID" ]]; then
     # Prompt for password if not provided
@@ -247,7 +266,7 @@ else
 fi
 
 # --- Step 3: Mount USB if needed ---
-log_step "[3/6] Checking USB mount..."
+log_step "[4/7] Checking USB mount..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "Check/mount USB at $USB_MOUNT"
@@ -280,7 +299,7 @@ else
 fi
 
 # --- Step 4: Copy repository from USB ---
-log_step "[4/6] Copying repository to $INSTALL_PATH..."
+log_step "[5/7] Copying repository to $INSTALL_PATH..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "mkdir -p $INSTALL_PATH"
@@ -313,7 +332,7 @@ else
 fi
 
 # --- Step 5: Disable internal WiFi radio ---
-log_step "[5/6] Disabling internal WiFi radio..."
+log_step "[6/7] Disabling internal WiFi radio..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "Append 'dtoverlay=disable-wifi' to $CONFIG_FILE"
@@ -329,7 +348,7 @@ else
 fi
 
 # --- Step 6: Set hostname ---
-log_step "[6/6] Setting hostname to $HOSTNAME..."
+log_step "[7/7] Setting hostname to $HOSTNAME..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "Write '$HOSTNAME' to /etc/hostname"
