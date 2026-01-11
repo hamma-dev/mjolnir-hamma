@@ -227,7 +227,7 @@ if [[ -n "$WIFI_SSID" ]]; then
         manifest_add "command" "cmd" "rfkill unblock wifi" "sudo" "true"
         manifest_add "write" "path" "/etc/wpa_supplicant/wpa_supplicant-wlan0.conf" "contains" "ssid=\"$WIFI_SSID\""
         manifest_add "copy" "src" "10-wlan0.network" "dst" "/etc/systemd/network/10-wlan0.network"
-        manifest_add "symlink" "target" "/run/systemd/resolve/stub-resolv.conf" "link" "/etc/resolv.conf"
+        manifest_add "symlink" "target" "/run/systemd/resolve/resolv.conf" "link" "/etc/resolv.conf"
         manifest_add "systemctl" "action" "enable" "service" "systemd-networkd"
         manifest_add "systemctl" "action" "enable" "service" "systemd-resolved"
         manifest_add "systemctl" "action" "enable" "service" "wpa_supplicant@wlan0.service"
@@ -273,7 +273,8 @@ EOF
         sudo systemctl enable systemd-networkd
         sudo systemctl enable systemd-resolved
         sudo systemctl start systemd-resolved || true
-        sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        sudo rm -f /etc/resolv.conf
+        sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
         sudo systemctl enable wpa_supplicant@wlan0.service
         sudo systemctl start wpa_supplicant@wlan0.service || true
         sudo systemctl restart systemd-networkd || true
