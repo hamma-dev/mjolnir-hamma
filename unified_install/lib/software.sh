@@ -99,14 +99,15 @@ install_sindri() {
     log_step "[Sindri 1/4] Creating virtual environment..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "python3 -m venv $venv_path"
+        log_dry_run "python3 -m venv $venv_path (as pi user)"
         log_dry_run "cp $venv_path/bin/activate /home/pi/$venv_name"
-        manifest_add "command" "cmd" "python3 -m venv $venv_path"
+        manifest_add "command" "cmd" "python3 -m venv $venv_path" "user" "pi"
         manifest_add "copy" "src" "$venv_path/bin/activate" "dst" "/home/pi/$venv_name"
     else
         if [[ ! -d "$venv_path" ]]; then
-            python3 -m venv "$venv_path"
-            cp "$venv_path/bin/activate" "/home/pi/$venv_name"
+            # Run as pi user to ensure correct ownership
+            sudo -u pi HOME=/home/pi python3 -m venv "$venv_path"
+            sudo -u pi HOME=/home/pi cp "$venv_path/bin/activate" "/home/pi/$venv_name"
             log_success "Created $venv_path"
         else
             log_warn "Virtual environment already exists"
@@ -117,11 +118,11 @@ install_sindri() {
     log_step "[Sindri 2/4] Upgrading pip..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "pip install --upgrade pip setuptools wheel"
-        manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true" "venv" "$venv_name"
+        log_dry_run "pip install --upgrade pip setuptools wheel (as pi user)"
+        manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true" "venv" "$venv_name" "user" "pi"
     else
-        source "$venv_path/bin/activate"
-        pip install --upgrade pip setuptools wheel
+        # Run as pi user to ensure correct ownership
+        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install --upgrade pip setuptools wheel"
         log_success "pip upgraded"
     fi
 
@@ -129,25 +130,25 @@ install_sindri() {
     log_step "[Sindri 3/4] Installing sindri..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "git clone -b 0.3.x --recursive https://github.com/hamma-dev/sindri.git"
-        log_dry_run "pip install -e $INSTALL_PATH/sindri"
-        log_dry_run "pip install -e $INSTALL_PATH/serviceinstaller"
-        manifest_add "git_clone" "repo" "https://github.com/hamma-dev/sindri.git" "dest" "$INSTALL_PATH/sindri" "branch" "0.3.x" "recursive" "true"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/sindri" "editable" "true" "venv" "$venv_name"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "editable" "true" "venv" "$venv_name"
+        log_dry_run "git clone -b 0.3.x --recursive https://github.com/hamma-dev/sindri.git (as pi user)"
+        log_dry_run "pip install $INSTALL_PATH/sindri (as pi user)"
+        log_dry_run "pip install $INSTALL_PATH/serviceinstaller (as pi user)"
+        manifest_add "git_clone" "repo" "https://github.com/hamma-dev/sindri.git" "dest" "$INSTALL_PATH/sindri" "branch" "0.3.x" "recursive" "true" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/sindri" "venv" "$venv_name" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "venv" "$venv_name" "user" "pi"
     else
-        source "$venv_path/bin/activate"
-
         if [[ ! -d "$INSTALL_PATH/sindri" ]]; then
             log_info "Cloning sindri (this may take a while)..."
-            git -C "$INSTALL_PATH" clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
+            # Run as pi user to ensure correct ownership
+            sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
         else
             log_warn "Sindri already exists, skipping clone"
         fi
 
         log_info "Installing sindri (this may take a while)..."
-        pip install -e "$INSTALL_PATH/sindri"
-        pip install -e "$INSTALL_PATH/serviceinstaller"
+        # Run as pi user, use non-editable install
+        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/sindri'"
+        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
         log_success "Sindri installed"
     fi
 
@@ -196,11 +197,11 @@ install_pyltg() {
     log_step "[PyLtg 2/3] Installing cartopy..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "pip install cartopy==0.19.0.post1"
-        manifest_add "pip_install" "package" "cartopy==0.19.0.post1" "venv" "$venv_name"
+        log_dry_run "pip install cartopy==0.19.0.post1 (as pi user)"
+        manifest_add "pip_install" "package" "cartopy==0.19.0.post1" "venv" "$venv_name" "user" "pi"
     else
-        source "$venv_path/bin/activate"
-        pip install cartopy==0.19.0.post1
+        # Run as pi user to ensure correct ownership
+        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install cartopy==0.19.0.post1"
         log_success "Cartopy installed"
     fi
 
@@ -208,20 +209,20 @@ install_pyltg() {
     log_step "[PyLtg 3/3] Installing pyltg..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "git clone https://github.com/pbitzer/pyltg"
-        log_dry_run "pip install -e $INSTALL_PATH/pyltg"
-        manifest_add "git_clone" "repo" "https://github.com/pbitzer/pyltg" "dest" "$INSTALL_PATH/pyltg"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/pyltg" "editable" "true" "venv" "$venv_name"
+        log_dry_run "git clone https://github.com/pbitzer/pyltg (as pi user)"
+        log_dry_run "pip install $INSTALL_PATH/pyltg (as pi user)"
+        manifest_add "git_clone" "repo" "https://github.com/pbitzer/pyltg" "dest" "$INSTALL_PATH/pyltg" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/pyltg" "venv" "$venv_name" "user" "pi"
     else
-        source "$venv_path/bin/activate"
-
         if [[ ! -d "$INSTALL_PATH/pyltg" ]]; then
-            git -C "$INSTALL_PATH" clone "https://github.com/pbitzer/pyltg"
+            # Run as pi user to ensure correct ownership
+            sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone "https://github.com/pbitzer/pyltg"
         else
             log_warn "PyLtg already exists, skipping clone"
         fi
 
-        pip install -e "$INSTALL_PATH/pyltg"
+        # Run as pi user, use non-editable install
+        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/pyltg'"
         log_success "PyLtg installed"
     fi
 
@@ -264,23 +265,31 @@ install_hamma() {
             manifest_add "ssh-keygen" "keytype" "ed25519" "keyfile" "$ed25519_key"
             manifest_add "append" "path" "$ssh_config" "content" "Host github-hamma config"
         else
+            # Run as pi user to ensure correct ownership
+            sudo -u pi HOME=/home/pi bash -c "
+                if [[ -f '$ed25519_key' ]]; then
+                    echo 'ED25519 key already exists'
+                else
+                    ssh-keygen -f '$ed25519_key' -t ed25519 -C 'bitzerp@uah.edu' -N ''
+                fi
+            "
+
             if [[ -f "$ed25519_key" ]]; then
-                log_warn "ED25519 key already exists at $ed25519_key"
+                log_success "SSH key ready at $ed25519_key"
             else
-                ssh-keygen -f "$ed25519_key" -t ed25519 -C "bitzerp@uah.edu" -N ''
-                log_success "Generated ED25519 key"
+                log_warn "ED25519 key already exists at $ed25519_key"
             fi
 
-            # Add GitHub host to SSH config
+            # Add GitHub host to SSH config (as pi user)
             if ! grep -q "github-hamma" "$ssh_config" 2>/dev/null; then
-                cat >> "$ssh_config" <<EOT
+                sudo -u pi HOME=/home/pi bash -c "cat >> '$ssh_config' <<EOT
 
 Host github-hamma
    HostName github.com
    AddKeysToAgent yes
    PreferredAuthentications publickey
    IdentityFile $ed25519_key
-EOT
+EOT"
                 log_success "Added github-hamma to SSH config"
             else
                 log_warn "github-hamma already in SSH config"
@@ -297,24 +306,24 @@ EOT
         log_step "Installing HAMMA..."
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_dry_run "git clone -b 0.3.x git@github-hamma:pbitzer/hamma.git"
-            log_dry_run "pip install -e $INSTALL_PATH/hamma"
-            log_dry_run "pip install future"
-            manifest_add "git_clone" "repo" "git@github-hamma:pbitzer/hamma.git" "dest" "$INSTALL_PATH/hamma" "branch" "0.3.x"
-            manifest_add "pip_install" "package" "$INSTALL_PATH/hamma" "editable" "true" "venv" "$venv_name"
-            manifest_add "pip_install" "package" "future" "venv" "$venv_name"
+            log_dry_run "git clone -b 0.3.x git@github-hamma:pbitzer/hamma.git (as pi user)"
+            log_dry_run "pip install $INSTALL_PATH/hamma (as pi user)"
+            log_dry_run "pip install future (as pi user)"
+            manifest_add "git_clone" "repo" "git@github-hamma:pbitzer/hamma.git" "dest" "$INSTALL_PATH/hamma" "branch" "0.3.x" "user" "pi"
+            manifest_add "pip_install" "package" "$INSTALL_PATH/hamma" "venv" "$venv_name" "user" "pi"
+            manifest_add "pip_install" "package" "future" "venv" "$venv_name" "user" "pi"
         else
-            source "$venv_path/bin/activate"
-
             if [[ ! -d "$INSTALL_PATH/hamma" ]]; then
                 log_info "Cloning hamma from GitHub..."
-                git -C "$INSTALL_PATH" clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
+                # Run as pi user to ensure correct ownership and use pi's SSH key
+                sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
             else
                 log_warn "HAMMA already exists, skipping clone"
             fi
 
-            pip install -e "$INSTALL_PATH/hamma"
-            pip install future  # Dependency for lmfit
+            # Run as pi user, use non-editable install
+            sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/hamma'"
+            sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install future"  # Dependency for lmfit
             log_success "HAMMA installed"
         fi
 

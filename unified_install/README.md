@@ -5,10 +5,15 @@ Consolidated installation scripts for HAMMA Pi sensors, replacing the collection
 ## Quick Start
 
 ```bash
-# On fresh Pi with USB mounted at /mnt/usb:
+# On fresh Pi, first mount USB if not already mounted:
+sudo mkdir -p /mnt/usb
+sudo mount /dev/sda1 /mnt/usb
+
+# Navigate to the install scripts:
+cd /mnt/usb/mjolnir-hamma/unified_install
 
 # 1. Bootstrap (sets hostname, copies repo, disables internal WiFi)
-sudo bash bootstrap.sh <sensor_number> --wifi-ssid "YourNetwork" --wifi-pass "password"
+./bootstrap.sh <sensor_number> --wifi-ssid "YourNetwork" --wifi-pass "password"
 
 # 2. Reboot
 sudo reboot
@@ -178,26 +183,33 @@ unified_install/
 
 ## Testing
 
-### Docker Tests
+### Docker Install Test
+
+Run a complete install simulation in Docker:
 
 ```bash
-# Build test image
-docker build -t pi-test -f tests/docker/Dockerfile.pi-test .
-
-# Run pytest
-docker run --rm -v "$(pwd):/home/pi/dev/mjolnir-hamma" \
-  -e FILES_DIR=files -e SCRIPTS_DIR=scripts \
-  pi-test python3 -m pytest tests/unified/ -v
+cd unified_install/docker_test
+./run_tests.sh
 ```
+
+This builds a Debian Bullseye container (approximating Raspberry Pi OS) and tests:
+- Dry-run of all scripts
+- File presence verification
+- Syntax checking of all shell scripts
+- resolv.conf path verification
+
+**Note:** Some operations can't be tested in Docker:
+- `resolv.conf` symlink (Docker manages this file)
+- Actual WiFi/cellular connectivity
+- systemctl enable/start (no real systemd)
+- Reboot cycle
 
 ### Dry-Run on Real Pi
 
 ```bash
-# SSH to Pi and run dry-run
 ssh pi@<pi-ip>
 cd /home/pi/dev/mjolnir-hamma/unified_install
-FILES_DIR=../files SCRIPTS_DIR=../scripts \
-  sudo bash install.sh <num> --cellular --dry-run
+sudo bash install.sh <num> --cellular --dry-run
 ```
 
 ## Comparison to Original Scripts
@@ -215,6 +227,27 @@ The unified scripts replace these individual scripts:
 | `install_sindri.sh`, `install_pyltg.sh`, `install_hamma.sh` | `install.sh` (extras phase) |
 
 Archived originals are in `install_scripts/archive/`.
+
+## Architecture Notes
+
+### User Permissions
+
+All user-level operations run as `sudo -u pi HOME=/home/pi` to ensure correct ownership:
+- Virtual environments owned by pi, not root
+- Git repos owned by pi
+- SSH keys in `/home/pi/.ssh/` owned by pi
+- Brokkr config in `/home/pi/.config/` owned by pi
+
+System operations (apt-get, systemctl, writing to /etc) still run as root.
+
+### Why `HOME=/home/pi` is Required
+
+When running `sudo -u pi`, the HOME environment variable is NOT automatically changed—it stays as `/root`. This causes:
+- pip to look for cache in wrong location
+- SSH to look for keys in wrong location
+- Config files to be written to wrong location
+
+Always use: `sudo -u pi HOME=/home/pi <command>`
 
 ## Troubleshooting
 

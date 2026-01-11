@@ -372,6 +372,9 @@ else
         log_info "Skipping copy (use 'git pull' to update)"
     else
         cp -r "$REPO_SOURCE" "$INSTALL_PATH/"
+        # Remove macOS metadata files (AppleDouble) that cause issues with brokkr
+        find "$INSTALL_PATH/$REPO_NAME" -name '._*' -delete 2>/dev/null || true
+        find "$INSTALL_PATH/$REPO_NAME" -name '.DS_Store' -delete 2>/dev/null || true
         log_success "Copied $REPO_NAME to $INSTALL_PATH"
     fi
 fi

@@ -42,14 +42,15 @@ install_brokkr() {
     log_step "[Brokkr 1/4] Creating Python virtual environment..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "python3 -m venv $VENV_PATH"
+        log_dry_run "python3 -m venv $VENV_PATH (as pi user)"
         log_dry_run "ln -sf $VENV_PATH/bin/activate /home/pi/$VENV_NAME"
-        manifest_add "command" "cmd" "python3 -m venv $VENV_PATH"
+        manifest_add "command" "cmd" "python3 -m venv $VENV_PATH" "user" "pi"
         manifest_add "symlink" "target" "$VENV_PATH/bin/activate" "link" "/home/pi/$VENV_NAME"
     else
         if [[ ! -d "$VENV_PATH" ]]; then
-            python3 -m venv "$VENV_PATH"
-            ln -sf "$VENV_PATH/bin/activate" "/home/pi/$VENV_NAME"
+            # Run as pi user to ensure correct ownership
+            sudo -u pi HOME=/home/pi python3 -m venv "$VENV_PATH"
+            sudo -u pi HOME=/home/pi ln -sf "$VENV_PATH/bin/activate" "/home/pi/$VENV_NAME"
             log_success "Created $VENV_PATH"
         else
             log_warn "Virtual environment already exists"
@@ -60,11 +61,11 @@ install_brokkr() {
     log_step "[Brokkr 2/4] Upgrading pip and setuptools..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "pip install --upgrade pip setuptools wheel"
-        manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true"
+        log_dry_run "pip install --upgrade pip setuptools wheel (as pi user)"
+        manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true" "user" "pi"
     else
-        source "$VENV_PATH/bin/activate"
-        pip install --upgrade pip setuptools wheel
+        # Run as pi user to ensure correct ownership
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install --upgrade pip setuptools wheel"
         log_success "pip and setuptools upgraded"
     fi
 
@@ -90,10 +91,11 @@ install_brokkr() {
                 log_info "  $repo_name: already exists"
             else
                 log_info "  $repo_name: cloning..."
+                # Run as pi user to ensure correct ownership
                 if [[ -n "$repo_branch" ]]; then
-                    git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
+                    sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
                 else
-                    git -C "$INSTALL_PATH" clone "$repo_url"
+                    sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone "$repo_url"
                 fi
             fi
         fi
@@ -111,24 +113,23 @@ install_brokkr() {
     log_step "[Brokkr 4/4] Installing Python packages..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "pip install -e $INSTALL_PATH/brokkr"
-        log_dry_run "pip install -e $INSTALL_PATH/serviceinstaller"
-        log_dry_run "pip install -e $INSTALL_PATH/notifiers"
-        log_dry_run "pip install gpiozero RPi.GPIO"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/brokkr" "editable" "true"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "editable" "true"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/notifiers" "editable" "true"
-        manifest_add "pip_install" "package" "gpiozero RPi.GPIO"
+        log_dry_run "pip install $INSTALL_PATH/brokkr (as pi user)"
+        log_dry_run "pip install $INSTALL_PATH/serviceinstaller (as pi user)"
+        log_dry_run "pip install $INSTALL_PATH/notifiers (as pi user)"
+        log_dry_run "pip install gpiozero RPi.GPIO (as pi user)"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/brokkr" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/notifiers" "user" "pi"
+        manifest_add "pip_install" "package" "gpiozero RPi.GPIO" "user" "pi"
     else
-        # Ensure venv is activated
-        source "$VENV_PATH/bin/activate"
-
-        pip install -e "$INSTALL_PATH/brokkr"
-        pip install -e "$INSTALL_PATH/serviceinstaller"
-        pip install -e "$INSTALL_PATH/notifiers"
+        # Run as pi user to ensure correct ownership
+        # Use non-editable installs to avoid .pth file issues with sudo
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/brokkr'"
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/notifiers'"
 
         # GPIO packages for relay control
-        pip install gpiozero RPi.GPIO
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install gpiozero RPi.GPIO"
 
         log_success "Python packages installed"
     fi
@@ -158,14 +159,14 @@ configure_brokkr() {
     unset SUDO_USER
 
     # --- Step 1: Configure system ---
+    # Run as pi user to ensure config directory is owned by pi, not root
     log_step "[Brokkr Config 1/3] Configuring system..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "brokkr configure-system hamma $INSTALL_PATH/mjolnir-hamma"
         manifest_add "command" "cmd" "brokkr configure-system hamma $INSTALL_PATH/mjolnir-hamma"
     else
-        source "$VENV_PATH/bin/activate"
-        brokkr configure-system hamma "$INSTALL_PATH/mjolnir-hamma"
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-system hamma '$INSTALL_PATH/mjolnir-hamma'"
         log_success "System configured for hamma"
     fi
 
@@ -176,8 +177,7 @@ configure_brokkr() {
         log_dry_run "brokkr configure-unit $sensor_formatted --site-description 'Deployed site'"
         manifest_add "command" "cmd" "brokkr configure-unit $sensor_formatted"
     else
-        source "$VENV_PATH/bin/activate"
-        brokkr configure-unit "$sensor_formatted" --site-description "Deployed site description - unit.toml"
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-unit '$sensor_formatted' --site-description 'Deployed site description - unit.toml'"
         log_success "Unit configured for sensor $sensor_formatted"
     fi
 
@@ -188,8 +188,7 @@ configure_brokkr() {
         log_dry_run "brokkr install-dependencies"
         manifest_add "command" "cmd" "brokkr install-dependencies"
     else
-        source "$VENV_PATH/bin/activate"
-        brokkr install-dependencies
+        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr install-dependencies"
         log_success "Dependencies installed"
     fi
 

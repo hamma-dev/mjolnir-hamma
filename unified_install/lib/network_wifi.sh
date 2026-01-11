@@ -166,26 +166,30 @@ setup_wifi_network() {
         manifest_add "mkdir" "path" "$ssh_dir" "mode" "0700"
         manifest_add "ssh-keygen" "keytype" "rsa" "keyfile" "$id_rsa"
     else
-        # Create .ssh directory if needed
-        mkdir -p "$ssh_dir"
-        chmod 700 "$ssh_dir"
+        # Run as pi user to ensure correct ownership
+        sudo -u pi HOME=/home/pi bash -c "
+            mkdir -p '$ssh_dir'
+            chmod 700 '$ssh_dir'
 
-        # Generate RSA key if it doesn't exist
+            # Generate RSA key if it doesn't exist
+            if [[ -f '$id_rsa' ]]; then
+                echo 'SSH key already exists'
+            else
+                ssh-keygen -t rsa -f '$id_rsa' -N '' -q
+            fi
+        "
+
         if [[ -f "$id_rsa" ]]; then
+            if [[ -f "$id_rsa.pub" ]]; then
+                log_success "SSH key ready at $id_rsa"
+                echo ""
+                log_info "Public key (copy to server authorized_keys):"
+                cat "$id_rsa.pub"
+                echo ""
+            fi
+        else
             log_warn "SSH key already exists at $id_rsa"
             log_info "Skipping key generation"
-        else
-            # Generate key without passphrase for automated access
-            ssh-keygen -t rsa -f "$id_rsa" -N "" -q
-            log_success "Generated SSH key at $id_rsa"
-        fi
-
-        # Show public key for copying to server
-        if [[ -f "$id_rsa.pub" ]]; then
-            echo ""
-            log_info "Public key (copy to server authorized_keys):"
-            cat "$id_rsa.pub"
-            echo ""
         fi
     fi
 
