@@ -21,7 +21,7 @@
 #   setup_cellular_network <sensor_number> [--apn APN]
 
 # --- Configuration ---
-FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
+FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
 SCRIPTS_DIR="${SCRIPTS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/scripts")}"
 NETWORK_PATH="/etc/systemd/network"
 SYSTEMD_PATH="/etc/systemd/system"

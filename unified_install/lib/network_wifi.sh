@@ -17,7 +17,7 @@
 # --- Configuration ---
 USB_PATH="${USB_PATH:-/mnt/usb}"
 CERT_PATH="/home/pi/.nsstc"
-FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
+FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
 
 # --- Main Setup Function ---
 setup_wifi_network() {

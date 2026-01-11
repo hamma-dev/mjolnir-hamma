@@ -16,7 +16,7 @@
 #   setup_automount
 
 # --- Configuration ---
-FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
+FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../files" && pwd 2>/dev/null || echo "/home/pi/dev/mjolnir-hamma/files")}"
 NETWORK_PATH="/etc/systemd/network"
 POLKIT_PATH="/etc/polkit-1/localauthority/50-local.d"
 

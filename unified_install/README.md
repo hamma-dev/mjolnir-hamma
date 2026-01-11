@@ -153,17 +153,11 @@ cat /tmp/install_manifest.json | python3 -m json.tool
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FILES_DIR` | `unified_install/files/` or repo's `files/` | Source for config files |
-| `SCRIPTS_DIR` | repo's `scripts/` | Source for Python scripts |
+| `FILES_DIR` | repo's `files/` directory | Source for config files |
+| `SCRIPTS_DIR` | repo's `scripts/` directory | Source for Python scripts |
 | `USB_PATH` | `/mnt/usb` | USB mount point |
 
-**Important:** If `unified_install/files/` is empty, set `FILES_DIR` explicitly:
-
-```bash
-FILES_DIR=/home/pi/dev/mjolnir-hamma/files \
-SCRIPTS_DIR=/home/pi/dev/mjolnir-hamma/scripts \
-sudo bash install.sh 1 --cellular
-```
+The scripts automatically detect the repo's files and scripts directories. No manual configuration is typically needed.
 
 ## Directory Structure
 
