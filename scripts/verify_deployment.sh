@@ -51,22 +51,22 @@ print_section() {
 
 pass() {
     echo -e "  ${GREEN}✓ PASS${NC}: $1"
-    ((PASS_COUNT++))
+    ((PASS_COUNT++)) || true
 }
 
 fail() {
     echo -e "  ${RED}✗ FAIL${NC}: $1"
-    ((FAIL_COUNT++))
+    ((FAIL_COUNT++)) || true
 }
 
 warn() {
     echo -e "  ${YELLOW}! WARN${NC}: $1"
-    ((WARN_COUNT++))
+    ((WARN_COUNT++)) || true
 }
 
 skip() {
     echo -e "  ${YELLOW}○ SKIP${NC}: $1"
-    ((SKIP_COUNT++))
+    ((SKIP_COUNT++)) || true
 }
 
 info() {
@@ -80,11 +80,11 @@ check_service_active() {
 
     if systemctl is-active --quiet "$service" 2>/dev/null; then
         pass "$description"
-        return 0
     else
         fail "$description"
-        return 1
     fi
+    # Don't return non-zero - let script continue
+    return 0
 }
 
 # Check if a systemd service is enabled
@@ -97,14 +97,13 @@ check_service_enabled() {
 
     if [[ "$status" == "enabled" ]]; then
         pass "$description"
-        return 0
     elif [[ "$status" == "not-found" ]]; then
         skip "$description (service not found)"
-        return 2
     else
         fail "$description (status: $status)"
-        return 1
     fi
+    # Don't return non-zero - let script continue
+    return 0
 }
 
 # Check if file exists and is owned by expected user
@@ -115,7 +114,7 @@ check_file_ownership() {
 
     if [[ ! -e "$filepath" ]]; then
         fail "$description (file not found)"
-        return 1
+        return 0  # Don't exit on failure
     fi
 
     local actual_owner
@@ -123,11 +122,10 @@ check_file_ownership() {
 
     if [[ "$actual_owner" == "$expected_owner" ]]; then
         pass "$description"
-        return 0
     else
         fail "$description (owned by $actual_owner, expected $expected_owner)"
-        return 1
     fi
+    return 0
 }
 
 # --- Check Functions ---
