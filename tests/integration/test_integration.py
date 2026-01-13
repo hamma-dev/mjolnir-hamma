@@ -114,7 +114,7 @@ class TestFileOwnership:
 
     def test_brokkr_venv_owned_by_pi(self):
         """Brokkr virtual environment should be owned by pi."""
-        venv = Path("/home/pi/ltgenv")
+        venv = Path("/home/pi/dev/ltgenv")
         if venv.exists():
             owner = get_owner(venv)
             assert owner == "pi", f"ltgenv owned by {owner}, expected pi"
@@ -266,20 +266,28 @@ class TestWiFiSetup:
 class TestBrokkrSetup:
     """Verify Brokkr installation."""
 
+    # Note: The venv is at /home/pi/dev/ltgenv/
+    # /home/pi/ltgenv is a convenience symlink to the activate script
+    VENV_PATH = Path("/home/pi/dev/ltgenv")
+
     def test_venv_exists(self):
         """Virtual environment should exist."""
-        venv = Path("/home/pi/ltgenv")
-        assert venv.exists(), "ltgenv virtual environment not found"
+        assert self.VENV_PATH.exists(), f"ltgenv virtual environment not found at {self.VENV_PATH}"
 
     def test_venv_has_activate(self):
         """Venv should have activate script."""
-        activate = Path("/home/pi/ltgenv/bin/activate")
+        activate = self.VENV_PATH / "bin" / "activate"
         assert activate.exists(), "venv activate script not found"
+
+    def test_convenience_symlink_exists(self):
+        """Convenience symlink ~/ltgenv should exist."""
+        symlink = Path("/home/pi/ltgenv")
+        assert symlink.exists(), "Convenience symlink ~/ltgenv not found"
 
     def test_brokkr_installed(self):
         """Brokkr should be importable in the venv."""
         result = subprocess.run(
-            ["bash", "-c", "source /home/pi/ltgenv/bin/activate && python -c 'import brokkr'"],
+            ["bash", "-c", "source /home/pi/ltgenv && python -c 'import brokkr'"],
             capture_output=True,
             text=True,
             cwd="/home/pi"
@@ -289,7 +297,7 @@ class TestBrokkrSetup:
     def test_brokkr_cli_works(self):
         """Brokkr CLI should be available."""
         result = subprocess.run(
-            ["bash", "-c", "source /home/pi/ltgenv/bin/activate && brokkr --version"],
+            ["bash", "-c", "source /home/pi/ltgenv && brokkr --version"],
             capture_output=True,
             text=True,
             cwd="/home/pi"
@@ -340,12 +348,19 @@ class TestHardwareSetup:
 class TestSystemdServices:
     """Verify systemd services are properly installed."""
 
+    @pytest.fixture(autouse=True)
+    def check_wifi_mode(self):
+        """These tests only apply to WiFi mode."""
+        wpa_conf = Path("/etc/wpa_supplicant/wpa_supplicant-wlan0.conf")
+        if not wpa_conf.exists():
+            pytest.skip("WiFi mode not configured - networkd/resolved only enabled for WiFi")
+
     def test_networkd_enabled(self):
-        """systemd-networkd should be enabled."""
+        """systemd-networkd should be enabled (WiFi mode only)."""
         assert service_enabled("systemd-networkd"), "systemd-networkd not enabled"
 
     def test_resolved_enabled(self):
-        """systemd-resolved should be enabled."""
+        """systemd-resolved should be enabled (WiFi mode only)."""
         assert service_enabled("systemd-resolved"), "systemd-resolved not enabled"
 
 
@@ -360,7 +375,7 @@ class TestInstallSummary:
         essential = [
             "/home/pi/.ssh/id_rsa",
             "/home/pi/.ssh/id_rsa.pub",
-            "/home/pi/ltgenv/bin/activate",
+            "/home/pi/dev/ltgenv/bin/activate",  # Actual venv location
             "/home/pi/.config/brokkr/systempath.toml",
         ]
         missing = [f for f in essential if not Path(f).exists()]
@@ -370,7 +385,7 @@ class TestInstallSummary:
         """Check essential files are owned by pi."""
         paths = [
             "/home/pi/.ssh",
-            "/home/pi/ltgenv",
+            "/home/pi/dev/ltgenv",  # Actual venv location
             "/home/pi/.config/brokkr",
         ]
         wrong_owner = []
