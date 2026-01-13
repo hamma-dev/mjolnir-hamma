@@ -125,21 +125,23 @@ scp pi@www.hamma.dev:/home/pi/.googlechat /home/pi/
 
 ### Step 7: Install HAMMA (Private Repo)
 
-HAMMA is in a private GitHub repository and requires a separate SSH key.
+HAMMA is in a private GitHub repository and requires an SSH deploy key.
 
 ```bash
-# Generate GitHub deploy key
-sudo bash install.sh <sensor_number> --cellular --generate-hamma-key
+# Generate GitHub deploy key (no --wifi or --cellular needed)
+sudo bash install.sh <sensor_number> --generate-hamma-key
 ```
 
-This prints an ed25519 public key. **Contact Bitzer** to add it to GitHub:
+This prints an ed25519 public key. Add it to GitHub:
 1. Go to https://github.com/pbitzer/hamma/settings/keys
 2. Click "Add deploy key"
-3. Paste the public key and save
+3. Give it a name like "mjolnir06" and paste the public key
+4. Check "Allow write access" is NOT enabled (read-only is fine)
+5. Click "Add key"
 
 Then install HAMMA:
 ```bash
-sudo bash install.sh <sensor_number> --cellular --hamma-only
+sudo bash install.sh <sensor_number> --hamma-only
 ```
 
 ### Step 8: Verify Services

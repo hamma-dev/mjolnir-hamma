@@ -305,14 +305,15 @@ install_hamma() {
 
             # Add GitHub host to SSH config (as pi user)
             if ! grep -q "github-hamma" "$ssh_config" 2>/dev/null; then
-                sudo -H -u pi bash -c "cat >> '$ssh_config' <<EOT
+                # Use tee to append as pi user (heredoc in outer shell, tee handles permissions)
+                sudo -H -u pi tee -a "$ssh_config" > /dev/null <<EOT
 
 Host github-hamma
    HostName github.com
    AddKeysToAgent yes
    PreferredAuthentications publickey
    IdentityFile $ed25519_key
-EOT"
+EOT
                 log_success "Added github-hamma to SSH config"
             else
                 log_warn "github-hamma already in SSH config"
