@@ -313,6 +313,8 @@ Host github-hamma
    AddKeysToAgent yes
    PreferredAuthentications publickey
    IdentityFile $ed25519_key
+   StrictHostKeyChecking no
+   UserKnownHostsFile /dev/null
 EOT
                 log_success "Added github-hamma to SSH config"
             else
