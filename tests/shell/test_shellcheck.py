@@ -14,7 +14,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent.parent
 INSTALL_SCRIPTS = list((REPO_ROOT / "install_scripts").glob("*.sh"))
 FILES_SCRIPTS = list((REPO_ROOT / "files").glob("*.sh"))
-ALL_SCRIPTS = INSTALL_SCRIPTS + FILES_SCRIPTS
+UNIFIED_SCRIPTS = list((REPO_ROOT / "unified_install").glob("*.sh"))
+UNIFIED_LIB_SCRIPTS = list((REPO_ROOT / "unified_install" / "lib").glob("*.sh"))
+ALL_SCRIPTS = INSTALL_SCRIPTS + FILES_SCRIPTS + UNIFIED_SCRIPTS + UNIFIED_LIB_SCRIPTS
 
 
 def check_shellcheck_available():
