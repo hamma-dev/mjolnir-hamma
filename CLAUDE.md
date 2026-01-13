@@ -208,6 +208,29 @@ cd scripts
 - `tests/integration/test_integration.py` - Docker integration (35 tests)
 - `scripts/verify_deployment.sh` - Production verification (20 checks)
 
+### Untracked Test Helpers (in tests/integration/)
+
+These scripts are not committed but useful for manual debugging:
+
+**run-install-test.sh** - Automated install test with logging
+```bash
+# Runs install.sh in Docker and saves output to results/
+./run-install-test.sh --cellular           # Test cellular install
+./run-install-test.sh --wifi --dry-run     # Dry-run WiFi test
+./run-install-test.sh --rebuild            # Force rebuild image
+```
+Output saved to `results/install-test-<mode>-<timestamp>.log`
+
+**test-install-interactive.sh** - Interactive debugging environment
+```bash
+# Drops into Docker shell for manual testing
+./test-install-interactive.sh --rebuild    # Rebuild and enter shell
+# Inside container:
+cd /home/pi/dev/mjolnir-hamma/unified_install
+sudo bash install.sh 99 --cellular --dry-run
+```
+Useful for: run test, see failure, exit, fix code, repeat
+
 ---
 
 ## All Fixed Issues
