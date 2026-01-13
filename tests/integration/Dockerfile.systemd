@@ -1,0 +1,95 @@
+# Dockerfile for testing mjolnir-hamma install scripts WITH SYSTEMD
+# Uses jrei/systemd-debian which is configured to run systemd in Docker
+#
+# Build: docker build -f Dockerfile.systemd -t mjolnir-systemd-test .
+# Run:   docker run -d --privileged --name mjolnir-test --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw mjolnir-systemd-test
+# Exec:  docker exec -it mjolnir-test bash
+
+FROM jrei/systemd-debian:10
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+# Fix Buster EOL repositories (Buster moved to archive.debian.org)
+RUN sed -i 's|deb.debian.org/debian |archive.debian.org/debian |g' /etc/apt/sources.list && \
+    sed -i 's|deb.debian.org/debian-security |archive.debian.org/debian-security |g' /etc/apt/sources.list && \
+    sed -i '/buster-updates/d' /etc/apt/sources.list
+
+# Install systemd and other packages
+RUN apt-get update && apt-get install -y \
+    systemd \
+    systemd-sysv \
+    bash \
+    sudo \
+    python3 \
+    python3-venv \
+    python3-pip \
+    git \
+    curl \
+    wget \
+    iproute2 \
+    iputils-ping \
+    network-manager \
+    modemmanager \
+    udhcpc \
+    libqmi-utils \
+    openssh-client \
+    openssh-server \
+    udisks2 \
+    util-linux \
+    procps \
+    dbus \
+    && rm -rf /var/lib/apt/lists/*
+
+# Remove unnecessary systemd services that won't work in container
+RUN rm -f /lib/systemd/system/multi-user.target.wants/* \
+    /etc/systemd/system/*.wants/* \
+    /lib/systemd/system/local-fs.target.wants/* \
+    /lib/systemd/system/sockets.target.wants/*udev* \
+    /lib/systemd/system/sockets.target.wants/*initctl* \
+    /lib/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup* \
+    /lib/systemd/system/systemd-update-utmp* \
+    2>/dev/null || true
+
+# Create pi user (like on real Pi)
+RUN useradd -m -s /bin/bash pi && \
+    echo "pi:raspberry" | chpasswd && \
+    usermod -aG sudo pi && \
+    echo "pi ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Create expected directory structure
+RUN mkdir -p /home/pi/dev && \
+    mkdir -p /home/pi/.ssh && \
+    mkdir -p /etc/systemd/network && \
+    mkdir -p /etc/networkd-dispatcher/carrier.d && \
+    mkdir -p /etc/networkd-dispatcher/degraded.d && \
+    mkdir -p /usr/local/bin && \
+    mkdir -p /mnt/usb && \
+    mkdir -p /boot && \
+    chown -R pi:pi /home/pi
+
+# Create mock config.txt (like on Pi)
+RUN echo "# Raspberry Pi config" > /boot/config.txt
+
+# Create mock hostname
+RUN echo "raspberrypi" > /etc/hostname
+
+# Configure git to trust mounted directories (needed for Docker volumes)
+RUN git config --global --add safe.directory '*'
+
+# Set environment for testing
+ENV MJOLNIR_TESTING=1
+ENV HOME=/home/pi
+
+# Expose for potential SSH testing
+EXPOSE 22
+
+# Mount point for cgroup (required for systemd)
+VOLUME ["/sys/fs/cgroup"]
+
+# Set working directory
+WORKDIR /home/pi/dev/mjolnir-hamma
+
+# Run systemd as PID 1
+CMD ["/lib/systemd/systemd"]
