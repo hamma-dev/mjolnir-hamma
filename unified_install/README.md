@@ -294,18 +294,26 @@ Common issues:
 ### Cellular not connecting
 
 ```bash
-# Check timer
+# Check timer status
 systemctl status wwan-check.timer
 
-# Check logs
-journalctl -u wwan-check.service -f
+# Check recent logs
+journalctl -u wwan-check.service -n 20
 
-# Manual test
+# Force wwan-check to run NOW (don't wait for 5-minute timer)
+sudo systemctl start wwan-check.service
+
+# Or run the script directly
 sudo /usr/local/bin/wwan-check.sh
 
-# Modem status
+# Check modem status
 mmcli -m 0
+
+# Check if wwan0 has an IP
+ip addr show wwan0
 ```
+
+**Note:** The wwan-check timer runs every 5 minutes. If you need immediate connection, use `sudo systemctl start wwan-check.service` to trigger it manually.
 
 ### WiFi certificate not found
 
