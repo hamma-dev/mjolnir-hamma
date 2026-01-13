@@ -526,6 +526,10 @@ echo "========================================"
 
 1. **XDG_CONFIG_HOME workaround** - Why is this needed with `sudo -H -u pi`? (see Bugs section)
 
+### Documentation TODO
+
+1. **Add wwan-check troubleshooting** - Document how to force wwan-check to run outside the 5-minute timer interval (e.g., `sudo systemctl start wwan-check.service` or `sudo /usr/local/bin/wwan-check.sh`)
+
 ---
 
 ## Reference: Test Pi Information
