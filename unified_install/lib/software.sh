@@ -42,8 +42,8 @@ install_system_packages() {
         return 1
     fi
 
-    # Fix Buster EOL repos if needed
-    if grep -q "deb.debian.org" /etc/apt/sources.list 2>/dev/null; then
+    # Fix Buster EOL repos if needed (only for actual Buster systems)
+    if grep -q "buster" /etc/apt/sources.list 2>/dev/null; then
         log_info "Fixing EOL Debian Buster repositories..."
         sed -i 's|deb.debian.org/debian |archive.debian.org/debian |g' /etc/apt/sources.list
         sed -i 's|deb.debian.org/debian-security |archive.debian.org/debian-security |g' /etc/apt/sources.list
@@ -106,8 +106,8 @@ install_sindri() {
     else
         if [[ ! -d "$venv_path" ]]; then
             # Run as pi user to ensure correct ownership
-            sudo -u pi HOME=/home/pi python3 -m venv "$venv_path"
-            sudo -u pi HOME=/home/pi cp "$venv_path/bin/activate" "/home/pi/$venv_name"
+            sudo -H -u pi python3 -m venv "$venv_path"
+            sudo -H -u pi cp "$venv_path/bin/activate" "/home/pi/$venv_name"
             log_success "Created $venv_path"
         else
             log_warn "Virtual environment already exists"
@@ -122,7 +122,7 @@ install_sindri() {
         manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true" "venv" "$venv_name" "user" "pi"
     else
         # Run as pi user to ensure correct ownership
-        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install --upgrade pip setuptools wheel"
+        sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install --upgrade pip setuptools wheel"
         log_success "pip upgraded"
     fi
 
@@ -140,15 +140,15 @@ install_sindri() {
         if [[ ! -d "$INSTALL_PATH/sindri" ]]; then
             log_info "Cloning sindri (this may take a while)..."
             # Run as pi user to ensure correct ownership
-            sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
+            sudo -H -u pi git -C "$INSTALL_PATH" clone -b "0.3.x" --recursive "https://github.com/hamma-dev/sindri.git"
         else
             log_warn "Sindri already exists, skipping clone"
         fi
 
         log_info "Installing sindri (this may take a while)..."
         # Run as pi user, use non-editable install
-        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/sindri'"
-        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
+        sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/sindri'"
+        sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
         log_success "Sindri installed"
     fi
 
@@ -194,14 +194,27 @@ install_pyltg() {
     fi
 
     # --- Step 2: Install cartopy (version pinned for compatibility) ---
+    # Note: cartopy version depends on Python version
+    #   - Python 3.7 (Buster): use cartopy 0.20.3 (last 3.7-compatible)
+    #   - Python 3.8+ (Bullseye+): use cartopy 0.21.1
     log_step "[PyLtg 2/3] Installing cartopy..."
 
+    # Detect Python version to select compatible cartopy
+    # - Python 3.7 (Buster): use cartopy 0.19.0.post1 (compatible with GEOS 3.7.1)
+    # - Python 3.8+ (Bullseye+): use cartopy 0.21.1
+    local python_minor
+    python_minor=$(python3 -c "import sys; print(sys.version_info.minor)")
+    local cartopy_version="0.21.1"
+    if [[ "$python_minor" -le 7 ]]; then
+        cartopy_version="0.19.0.post1"
+        log_info "Python 3.7 detected, using cartopy $cartopy_version"
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "pip install cartopy==0.19.0.post1 (as pi user)"
-        manifest_add "pip_install" "package" "cartopy==0.19.0.post1" "venv" "$venv_name" "user" "pi"
+        log_dry_run "pip install cartopy==$cartopy_version (as pi user)"
+        manifest_add "pip_install" "package" "cartopy==$cartopy_version" "venv" "$venv_name" "user" "pi"
     else
-        # Run as pi user to ensure correct ownership
-        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install cartopy==0.19.0.post1"
+        sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install cartopy==$cartopy_version"
         log_success "Cartopy installed"
     fi
 
@@ -216,13 +229,23 @@ install_pyltg() {
     else
         if [[ ! -d "$INSTALL_PATH/pyltg" ]]; then
             # Run as pi user to ensure correct ownership
-            sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone "https://github.com/pbitzer/pyltg"
+            sudo -H -u pi git -C "$INSTALL_PATH" clone "https://github.com/pbitzer/pyltg"
         else
             log_warn "PyLtg already exists, skipping clone"
         fi
 
-        # Run as pi user, use non-editable install
-        sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/pyltg'"
+        # Fix setup.py bug: uses setuptools functions without importing setuptools
+        # This breaks with modern pip's PEP 517 build isolation
+        if ! grep -q "^import setuptools" "$INSTALL_PATH/pyltg/setup.py" 2>/dev/null; then
+            log_info "Patching pyltg setup.py for compatibility..."
+            # Add import setuptools after the first import line
+            sed -i '/^from pathlib import Path/a import setuptools' "$INSTALL_PATH/pyltg/setup.py"
+            # Change setup( to setuptools.setup( if needed
+            sed -i 's/^setup(/setuptools.setup(/g' "$INSTALL_PATH/pyltg/setup.py"
+        fi
+
+        # Run as pi user
+        sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/pyltg'"
         log_success "PyLtg installed"
     fi
 
@@ -266,7 +289,7 @@ install_hamma() {
             manifest_add "append" "path" "$ssh_config" "content" "Host github-hamma config"
         else
             # Run as pi user to ensure correct ownership
-            sudo -u pi HOME=/home/pi bash -c "
+            sudo -H -u pi bash -c "
                 if [[ -f '$ed25519_key' ]]; then
                     echo 'ED25519 key already exists'
                 else
@@ -282,7 +305,7 @@ install_hamma() {
 
             # Add GitHub host to SSH config (as pi user)
             if ! grep -q "github-hamma" "$ssh_config" 2>/dev/null; then
-                sudo -u pi HOME=/home/pi bash -c "cat >> '$ssh_config' <<EOT
+                sudo -H -u pi bash -c "cat >> '$ssh_config' <<EOT
 
 Host github-hamma
    HostName github.com
@@ -316,14 +339,14 @@ EOT"
             if [[ ! -d "$INSTALL_PATH/hamma" ]]; then
                 log_info "Cloning hamma from GitHub..."
                 # Run as pi user to ensure correct ownership and use pi's SSH key
-                sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
+                sudo -H -u pi git -C "$INSTALL_PATH" clone -b "0.3.x" git@github-hamma:pbitzer/hamma.git
             else
                 log_warn "HAMMA already exists, skipping clone"
             fi
 
             # Run as pi user, use non-editable install
-            sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/hamma'"
-            sudo -u pi HOME=/home/pi bash -c "source '$venv_path/bin/activate' && pip install future"  # Dependency for lmfit
+            sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install '$INSTALL_PATH/hamma'"
+            sudo -H -u pi bash -c "source '$venv_path/bin/activate' && pip install future"  # Dependency for lmfit
             log_success "HAMMA installed"
         fi
 

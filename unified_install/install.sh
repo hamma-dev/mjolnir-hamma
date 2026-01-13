@@ -43,6 +43,7 @@ SKIP_PACKAGES=false
 SKIP_BROKKR=false
 SKIP_HARDWARE=false
 SKIP_EXTRAS=false
+SKIP_HAMMA=false
 CELLULAR_APN=""
 GENERATE_HAMMA_KEY=false
 HAMMA_ONLY=false
@@ -60,6 +61,7 @@ print_usage() {
     echo "  --skip-brokkr       Skip Brokkr installation"
     echo "  --skip-hardware     Skip hardware setup"
     echo "  --skip-extras       Skip sindri/pyltg/hamma installation"
+    echo "  --skip-hamma        Skip HAMMA installation (requires SSH key for private repo)"
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Cellular options:"
@@ -98,6 +100,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-extras)
             SKIP_EXTRAS=true
+            shift
+            ;;
+        --skip-hamma)
+            SKIP_HAMMA=true
             shift
             ;;
         --apn)
@@ -339,7 +345,11 @@ if [[ "$SKIP_EXTRAS" != "true" ]]; then
     source "$SCRIPT_DIR/lib/software.sh"
     install_sindri "$SENSOR_NUM"
     install_pyltg
-    install_hamma
+    if [[ "$SKIP_HAMMA" != "true" ]]; then
+        install_hamma
+    else
+        log_info "Skipping HAMMA installation (--skip-hamma)"
+    fi
 else
     log_info "Skipping additional software (--skip-extras)"
 fi

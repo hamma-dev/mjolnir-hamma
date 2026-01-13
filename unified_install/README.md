@@ -1,33 +1,193 @@
 # Unified HAMMA Pi Install Scripts
 
-Consolidated installation scripts for HAMMA Pi sensors, replacing the collection of individual setup scripts.
+Consolidated installation scripts for HAMMA Pi sensors.
 
-## Quick Start
+## Complete Installation Guide
+
+### Prerequisites
+
+- Fresh Raspberry Pi with Raspberry Pi OS (Debian Buster)
+- USB drive with `mjolnir-hamma` repository copied to it
+- For WiFi: Certificate file `NSSTC-UAH-WIRELESS-mjolnirNN.p12` on USB
+- For Cellular: SIM card installed in modem
+
+### Step 1: Bootstrap (Run from USB)
+
+Insert USB and run:
 
 ```bash
-# On fresh Pi, first mount USB if not already mounted:
+# Mount USB if not already mounted
 sudo mkdir -p /mnt/usb
 sudo mount /dev/sda1 /mnt/usb
 
-# Navigate to the install scripts:
+# Run bootstrap
 cd /mnt/usb/mjolnir-hamma/unified_install
-
-# 1. Bootstrap (sets hostname, copies repo, disables internal WiFi)
-./bootstrap.sh <sensor_number> --wifi-ssid "YourNetwork" --wifi-pass "password"
-
-# 2. Reboot
-sudo reboot
-
-# 3. Install (choose --wifi OR --cellular)
-sudo bash install.sh <sensor_number> --wifi      # For UAH/NSSTC WiFi
-sudo bash install.sh <sensor_number> --cellular  # For cellular modem
+sudo bash bootstrap.sh <sensor_number> --wifi-ssid "YourNetwork" --wifi-pass "password"
 ```
 
-## Scripts
+**During bootstrap you will be prompted to:**
+- Change the default password for the `pi` user (REQUIRED - do this!)
+
+**What bootstrap does:**
+- Changes pi user password
+- Sets timezone to UTC
+- Configures temporary WiFi
+- Copies repository to `/home/pi/dev/mjolnir-hamma`
+- Disables internal WiFi radio
+- Sets hostname to `mjolnirNN`
+
+### Step 2: Reboot
+
+```bash
+sudo reboot
+```
+
+### Step 3: Install (Run after reboot)
+
+After reboot, the Pi should connect to your temporary WiFi. SSH in and run:
+
+```bash
+cd /home/pi/dev/mjolnir-hamma/unified_install
+
+# For cellular modem:
+sudo bash install.sh <sensor_number> --cellular
+
+# OR for UAH/NSSTC WiFi:
+sudo bash install.sh <sensor_number> --wifi
+```
+
+**What install does:**
+- Configures network (cellular or WiFi)
+- Generates SSH key (`id_rsa`) for server access
+- Installs system packages
+- Installs and configures Brokkr
+- Sets up hardware (relay, automount)
+- Installs Sindri, PyLtg
+- Enables systemd services
+
+### Step 4: Copy SSH Key to Server (REQUIRED)
+
+The install script generates an SSH key. You MUST copy this key to the server for autossh to work.
+
+**On the Pi:**
+```bash
+# Get the public key
+cat /home/pi/.ssh/id_rsa.pub
+# Copy this output
+```
+
+**On the server (as user pi):**
+```bash
+nano /home/pi/.ssh/authorized_keys
+# Paste the Pi's public key at the end of the file
+```
+
+**Test from Pi:**
+```bash
+ssh www.hamma.dev
+exit
+```
+
+**On server, add Pi to SSH config** (`/home/pi/.ssh/config`):
+```
+Host mjolnirNN
+    Port 100NN
+```
+
+Then from server:
+```bash
+ssh-copy-id mjolnirNN
+```
+
+For monitor user (on server):
+```bash
+su monitor
+cd ~
+ssh-copy-id pi@mjolnirNN
+exit
+```
+
+### Step 5: Storage Setup (if needed)
+
+Get the DATA number from Bitzer/Burchfield. The script creates two partitions:
+
+```bash
+cd /home/pi/dev/mjolnir-hamma/scripts/
+sudo ./format_drives.sh -m /dev/sda -n NUM
+```
+
+### Step 6: Enable Google Chat Notifications
+
+Copy the notification config from server:
+```bash
+scp pi@www.hamma.dev:/home/pi/.googlechat /home/pi/
+```
+
+### Step 7: Install HAMMA (Private Repo)
+
+HAMMA is in a private GitHub repository and requires a separate SSH key.
+
+```bash
+# Generate GitHub deploy key
+sudo bash install.sh <sensor_number> --cellular --generate-hamma-key
+```
+
+This prints an ed25519 public key. **Contact Bitzer** to add it to GitHub:
+1. Go to https://github.com/pbitzer/hamma/settings/keys
+2. Click "Add deploy key"
+3. Paste the public key and save
+
+Then install HAMMA:
+```bash
+sudo bash install.sh <sensor_number> --cellular --hamma-only
+```
+
+### Step 8: Verify Services
+
+After a reboot, check that services are running:
+
+```bash
+# Check all services
+systemctl --failed
+
+# Check individual services
+systemctl status brokkr-hamma-default.service
+systemctl status autossh-hamma-default.service
+systemctl status wwan-check.timer  # cellular only
+
+# View logs
+journalctl -u brokkr-hamma-default.service -n 50
+journalctl -u autossh-hamma-default.service -n 50
+```
+
+**Expected status after full install:**
+| Service | Should be |
+|---------|-----------|
+| brokkr-hamma-default.service | active (running) |
+| autossh-hamma-default.service | active (running) |
+| wwan-check.timer (cellular) | active (waiting) |
+
+**If autossh fails:** You forgot Step 4 (copy SSH key to server) or Step 5 (server-side config)
+
+**If brokkr fails:** Check logs - usually missing hardware or config issue
+
+### Step 9: Final Reboot and Verify
+
+```bash
+sudo reboot
+```
+
+After reboot, verify everything starts automatically:
+```bash
+systemctl status brokkr-hamma-default.service
+systemctl status autossh-hamma-default.service
+```
+
+---
+
+## Command Reference
 
 ### bootstrap.sh
-
-Initial Pi setup before network is configured.
 
 ```
 Usage: bootstrap.sh <sensor_number> --wifi-ssid SSID [options]
@@ -42,16 +202,7 @@ Options:
   --dry-run           Show what would be done without executing
 ```
 
-**What it does:**
-- Sets timezone to UTC
-- Configures temporary WiFi (for initial connectivity)
-- Mounts USB and copies repository to `/home/pi/dev/`
-- Disables internal WiFi radio (for external dongle)
-- Sets hostname to `mjolnirNN`
-
 ### install.sh
-
-Main installation after bootstrap and reboot.
 
 ```
 Usage: install.sh <sensor_number> --wifi|--cellular [options]
@@ -66,14 +217,17 @@ Options:
   --skip-brokkr       Skip Brokkr installation
   --skip-hardware     Skip hardware setup
   --skip-extras       Skip sindri/pyltg/hamma installation
+  --skip-hamma        Skip HAMMA installation only (still installs sindri/pyltg)
 
 Cellular options:
   --apn APN           Set cellular APN (default: h2g2)
 
-HAMMA private repo options:
+HAMMA options:
   --generate-hamma-key  Generate SSH key for GitHub and exit
   --hamma-only          Only install hamma (skip everything else)
 ```
+
+---
 
 ## Network Modes
 
@@ -97,7 +251,6 @@ For cellular modem connectivity using timer-based approach.
 - Disables dhcpcd (conflicts with systemd-networkd)
 - wwan0 as Unmanaged in systemd-networkd
 - Timer-based connection management (wwan-check.timer)
-- flock wrapper to prevent concurrent connections
 - SSH key generation (id_rsa) for server access
 
 **APN:** Default is `h2g2` (T-Mobile). Override with `--apn`:
@@ -105,128 +258,65 @@ For cellular modem connectivity using timer-based approach.
 sudo bash install.sh 1 --cellular --apn vzwinternet
 ```
 
-## HAMMA Private Repository
+---
 
-The `hamma` package is in a private GitHub repository and requires SSH key authentication.
+## Troubleshooting
 
-### Two-Step Installation
+### Services not starting after reboot
 
-**Step 1: Generate SSH key**
+Check what failed:
 ```bash
-sudo bash install.sh <sensor_number> --generate-hamma-key
-```
-This generates an ed25519 key and prints the public key.
-
-**Step 2: Add key to GitHub**
-1. Copy the public key output
-2. Go to https://github.com/pbitzer/hamma/settings/keys
-3. Click "Add deploy key"
-4. Paste the public key and save
-
-**Step 3: Install hamma**
-```bash
-sudo bash install.sh <sensor_number> --hamma-only
+systemctl --failed
+journalctl -u <service-name> -n 50
 ```
 
-### During Full Installation
+### autossh not connecting
 
-If running the full install and the SSH key is already configured:
-- hamma will be installed automatically as part of the extras phase
+1. Verify SSH key exists: `ls -la /home/pi/.ssh/id_rsa`
+2. Verify key is in server's `/home/pi/.ssh/authorized_keys`
+3. Test SSH manually: `ssh -i /home/pi/.ssh/id_rsa www.hamma.dev`
+4. Check logs: `journalctl -u autossh-hamma-default.service`
 
-If the key is not configured:
-- The hamma install step will fail
-- Run `--generate-hamma-key`, add to GitHub, then `--hamma-only`
+### brokkr failing to start
 
-## Dry-Run Mode
+Usually hardware-related:
+```bash
+journalctl -u brokkr-hamma-default.service -n 50
+```
 
-Use `--dry-run` to see what would be done without making changes:
+Common issues:
+- Sensor not connected
+- Relay board not connected
+- Config file issues
+
+### Cellular not connecting
 
 ```bash
-sudo bash install.sh 1 --wifi --dry-run
+# Check timer
+systemctl status wwan-check.timer
+
+# Check logs
+journalctl -u wwan-check.service -f
+
+# Manual test
+sudo /usr/local/bin/wwan-check.sh
+
+# Modem status
+mmcli -m 0
 ```
 
-This outputs:
-- Step-by-step description of operations
-- JSON manifest at `/tmp/install_manifest.json`
+### WiFi certificate not found
 
-View the manifest:
+Ensure certificate is on USB at `/mnt/usb/NSSTC-UAH-WIRELESS-mjolnirNN.p12`
+
+### Password wasn't changed
+
+If you skipped the password prompt during bootstrap, change it now:
 ```bash
-cat /tmp/install_manifest.json | python3 -m json.tool
+sudo passwd pi
 ```
 
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FILES_DIR` | repo's `files/` directory | Source for config files |
-| `SCRIPTS_DIR` | repo's `scripts/` directory | Source for Python scripts |
-| `USB_PATH` | `/mnt/usb` | USB mount point |
-
-The scripts automatically detect the repo's files and scripts directories. No manual configuration is typically needed.
-
-## Directory Structure
-
-```
-unified_install/
-├── bootstrap.sh      # Initial Pi setup
-├── install.sh        # Main installation driver
-├── lib/
-│   ├── common.sh     # Shared functions, logging, manifest
-│   ├── brokkr.sh     # Brokkr installation and configuration
-│   ├── hardware.sh   # Sensor connection, automount setup
-│   ├── network_wifi.sh   # WiFi/UAH network setup
-│   ├── network_wwan.sh   # Cellular/WWAN network setup
-│   └── software.sh   # System packages, sindri, pyltg, hamma
-├── files/            # (empty - uses repo's files/ directory)
-└── README.md
-```
-
-## Testing
-
-### Docker Install Test
-
-Run a complete install simulation in Docker:
-
-```bash
-cd unified_install/docker_test
-./run_tests.sh
-```
-
-This builds a Debian Bullseye container (approximating Raspberry Pi OS) and tests:
-- Dry-run of all scripts
-- File presence verification
-- Syntax checking of all shell scripts
-- resolv.conf path verification
-
-**Note:** Some operations can't be tested in Docker:
-- `resolv.conf` symlink (Docker manages this file)
-- Actual WiFi/cellular connectivity
-- systemctl enable/start (no real systemd)
-- Reboot cycle
-
-### Dry-Run on Real Pi
-
-```bash
-ssh pi@<pi-ip>
-cd /home/pi/dev/mjolnir-hamma/unified_install
-sudo bash install.sh <num> --cellular --dry-run
-```
-
-## Comparison to Original Scripts
-
-The unified scripts replace these individual scripts:
-
-| Original Script | Unified Equivalent |
-|-----------------|-------------------|
-| `update_host.sh` | `bootstrap.sh` |
-| `disable_wifi_radio.sh` | `bootstrap.sh` |
-| `setup_uah_wireless.sh` | `install.sh --wifi` |
-| `setup_wwan.sh` | `install.sh --cellular` |
-| `install_brokkr.sh` + `setup_brokkr.sh` | `install.sh` (brokkr phase) |
-| `setup_sensor_connect.sh` + `enable_automount.sh` | `install.sh` (hardware phase) |
-| `install_sindri.sh`, `install_pyltg.sh`, `install_hamma.sh` | `install.sh` (extras phase) |
-
-Archived originals are in `install_scripts/archive/`.
+---
 
 ## Architecture Notes
 
@@ -240,43 +330,48 @@ All user-level operations run as `sudo -u pi HOME=/home/pi` to ensure correct ow
 
 System operations (apt-get, systemctl, writing to /etc) still run as root.
 
-### Why `HOME=/home/pi` is Required
+### Directory Structure
 
-When running `sudo -u pi`, the HOME environment variable is NOT automatically changed—it stays as `/root`. This causes:
-- pip to look for cache in wrong location
-- SSH to look for keys in wrong location
-- Config files to be written to wrong location
-
-Always use: `sudo -u pi HOME=/home/pi <command>`
-
-## Troubleshooting
-
-### "Files not found" errors
-
-Set `FILES_DIR` to the repo's files directory:
-```bash
-export FILES_DIR=/home/pi/dev/mjolnir-hamma/files
-export SCRIPTS_DIR=/home/pi/dev/mjolnir-hamma/scripts
+```
+unified_install/
+├── bootstrap.sh      # Initial Pi setup (run from USB)
+├── install.sh        # Main installation (run after reboot)
+├── lib/
+│   ├── common.sh     # Shared functions, logging
+│   ├── brokkr.sh     # Brokkr installation and configuration
+│   ├── hardware.sh   # Sensor connection, automount setup
+│   ├── network_wifi.sh   # WiFi/UAH network setup
+│   ├── network_wwan.sh   # Cellular/WWAN network setup
+│   └── software.sh   # System packages, sindri, pyltg, hamma
+└── README.md
 ```
 
-### WiFi certificate not found
+### SSH Keys
 
-Ensure the certificate is on the USB at `/mnt/usb/NSSTC-UAH-WIRELESS-mjolnirNN.p12`
+Two different SSH keys are used:
 
-### Cellular not connecting
+| Key | Purpose | Generated by |
+|-----|---------|--------------|
+| `/home/pi/.ssh/id_rsa` | Server access (autossh tunnel) | install.sh (network phase) |
+| `/home/pi/.ssh/id_ed25519` | GitHub private repo (hamma) | install.sh --generate-hamma-key |
 
-Check timer status:
+---
+
+## Testing
+
+### Docker Test (with systemd)
+
 ```bash
-systemctl status wwan-check.timer
-journalctl -u wwan-check.service -f
+cd tests/integration
+./test-with-systemd.sh --run-install
 ```
 
-Manual connection test:
+This runs a complete install in a Debian Buster container with systemd.
+
+### Dry-Run on Real Pi
+
 ```bash
-sudo /usr/local/bin/wwan-check.sh
+sudo bash install.sh <num> --cellular --dry-run
 ```
 
-Modem status:
-```bash
-mmcli -m 0
-```
+Outputs step-by-step operations and JSON manifest at `/tmp/install_manifest.json`.

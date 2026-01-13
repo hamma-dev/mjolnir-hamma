@@ -1,7 +1,7 @@
-# Dockerfile for testing mjolnir-hamma install scripts
-# Uses Debian Bookworm as a close approximation to Raspberry Pi OS
-
-FROM debian:bookworm-slim
+# Dockerfile for testing mjolnir-hamma install scripts (no systemd)
+# Uses Debian Bullseye (11) - closest supported version to your Pis
+# Note: Buster (10) repos are EOL. For systemd testing, use Dockerfile.systemd
+FROM debian:bullseye-slim
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -47,10 +47,15 @@ RUN mkdir -p /home/pi/dev && \
     mkdir -p /boot && \
     chown -R pi:pi /home/pi
 
-# Create mock network interfaces (can't create real ones in container)
-RUN mkdir -p /sys/class/net/wwan0/qmi && \
-    echo "N" > /sys/class/net/wwan0/qmi/raw_ip && \
-    chmod 644 /sys/class/net/wwan0/qmi/raw_ip
+# Note: Can't mock /sys/class/net in Docker (read-only)
+# Install scripts should handle missing wwan0 gracefully or use dry-run mode
+# For integration testing, we create a mock directory elsewhere
+RUN mkdir -p /tmp/mock-sys/class/net/wwan0/qmi && \
+    echo "N" > /tmp/mock-sys/class/net/wwan0/qmi/raw_ip && \
+    chmod 644 /tmp/mock-sys/class/net/wwan0/qmi/raw_ip
+
+# Set environment to indicate testing mode
+ENV MJOLNIR_TESTING=1
 
 # Create mock config.txt
 RUN echo "# Raspberry Pi config" > /boot/config.txt

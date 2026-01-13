@@ -212,7 +212,7 @@ setup_cellular_network() {
         manifest_add "ssh-keygen" "keytype" "rsa" "keyfile" "$id_rsa"
     else
         # Run as pi user to ensure correct ownership
-        sudo -u pi HOME=/home/pi bash -c "
+        sudo -H -u pi bash -c "
             mkdir -p '$ssh_dir'
             chmod 700 '$ssh_dir'
 

@@ -179,14 +179,14 @@ fi
 log_step "[1/7] Password setup..."
 
 if [[ "$DRY_RUN" == "true" ]]; then
-    log_dry_run "passwd (interactive)"
-    manifest_add "command" "cmd" "passwd" "interactive" "true"
+    log_dry_run "passwd pi (interactive)"
+    manifest_add "command" "cmd" "passwd pi" "interactive" "true"
 else
     read -p "  Change default password now? (Y/n): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        passwd
-        log_success "Password changed"
+        passwd pi
+        log_success "Password changed for pi user"
     else
         log_warn "Skipping password change (remember to change it later!)"
     fi
@@ -368,15 +368,16 @@ else
     fi
 
     if [[ -d "$INSTALL_PATH/$REPO_NAME" ]]; then
-        log_warn "$REPO_NAME already exists at $INSTALL_PATH"
-        log_info "Skipping copy (use 'git pull' to update)"
-    else
-        cp -r "$REPO_SOURCE" "$INSTALL_PATH/"
-        # Remove macOS metadata files (AppleDouble) that cause issues with brokkr
-        find "$INSTALL_PATH/$REPO_NAME" -name '._*' -delete 2>/dev/null || true
-        find "$INSTALL_PATH/$REPO_NAME" -name '.DS_Store' -delete 2>/dev/null || true
-        log_success "Copied $REPO_NAME to $INSTALL_PATH"
+        log_warn "$REPO_NAME already exists at $INSTALL_PATH - updating..."
+        # Remove old copy and recopy fresh to avoid stale/corrupted files
+        rm -rf "$INSTALL_PATH/$REPO_NAME"
     fi
+
+    cp -r "$REPO_SOURCE" "$INSTALL_PATH/"
+    # Remove macOS metadata files (AppleDouble) that cause issues with brokkr
+    find "$INSTALL_PATH/$REPO_NAME" -name '._*' -delete 2>/dev/null || true
+    find "$INSTALL_PATH/$REPO_NAME" -name '.DS_Store' -delete 2>/dev/null || true
+    log_success "Copied $REPO_NAME to $INSTALL_PATH"
 fi
 
 # --- Step 5: Disable internal WiFi radio ---

@@ -49,8 +49,8 @@ install_brokkr() {
     else
         if [[ ! -d "$VENV_PATH" ]]; then
             # Run as pi user to ensure correct ownership
-            sudo -u pi HOME=/home/pi python3 -m venv "$VENV_PATH"
-            sudo -u pi HOME=/home/pi ln -sf "$VENV_PATH/bin/activate" "/home/pi/$VENV_NAME"
+            sudo -H -u pi python3 -m venv "$VENV_PATH"
+            sudo -H -u pi ln -sf "$VENV_PATH/bin/activate" "/home/pi/$VENV_NAME"
             log_success "Created $VENV_PATH"
         else
             log_warn "Virtual environment already exists"
@@ -65,7 +65,7 @@ install_brokkr() {
         manifest_add "pip_install" "package" "pip setuptools wheel" "upgrade" "true" "user" "pi"
     else
         # Run as pi user to ensure correct ownership
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install --upgrade pip setuptools wheel"
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install --upgrade pip setuptools wheel"
         log_success "pip and setuptools upgraded"
     fi
 
@@ -93,9 +93,9 @@ install_brokkr() {
                 log_info "  $repo_name: cloning..."
                 # Run as pi user to ensure correct ownership
                 if [[ -n "$repo_branch" ]]; then
-                    sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
+                    sudo -H -u pi git -C "$INSTALL_PATH" clone -b "$repo_branch" "$repo_url"
                 else
-                    sudo -u pi HOME=/home/pi git -C "$INSTALL_PATH" clone "$repo_url"
+                    sudo -H -u pi git -C "$INSTALL_PATH" clone "$repo_url"
                 fi
             fi
         fi
@@ -124,12 +124,12 @@ install_brokkr() {
     else
         # Run as pi user to ensure correct ownership
         # Use non-editable installs to avoid .pth file issues with sudo
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/brokkr'"
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/notifiers'"
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/brokkr'"
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/notifiers'"
 
         # GPIO packages for relay control
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && pip install gpiozero RPi.GPIO"
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install gpiozero RPi.GPIO"
 
         log_success "Python packages installed"
     fi
@@ -158,6 +158,13 @@ configure_brokkr() {
     export HOME=/home/pi
     unset SUDO_USER
 
+    # Clean up any leftover root config that could cause permission errors
+    # (brokkr reads from /root/.config/brokkr if it exists, even when running as pi)
+    if [[ -d /root/.config/brokkr ]]; then
+        log_info "Cleaning up leftover root config..."
+        rm -rf /root/.config/brokkr
+    fi
+
     # --- Step 1: Configure system ---
     # Run as pi user to ensure config directory is owned by pi, not root
     log_step "[Brokkr Config 1/3] Configuring system..."
@@ -166,7 +173,8 @@ configure_brokkr() {
         log_dry_run "brokkr configure-system hamma $INSTALL_PATH/mjolnir-hamma"
         manifest_add "command" "cmd" "brokkr configure-system hamma $INSTALL_PATH/mjolnir-hamma"
     else
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-system hamma '$INSTALL_PATH/mjolnir-hamma'"
+        # Set HOME, XDG_CONFIG_HOME and SUDO_USER to ensure brokkr looks in pi's config dir
+        sudo -H -u pi HOME=/home/pi XDG_CONFIG_HOME=/home/pi/.config SUDO_USER=pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-system hamma '$INSTALL_PATH/mjolnir-hamma'"
         log_success "System configured for hamma"
     fi
 
@@ -177,7 +185,7 @@ configure_brokkr() {
         log_dry_run "brokkr configure-unit $sensor_formatted --site-description 'Deployed site'"
         manifest_add "command" "cmd" "brokkr configure-unit $sensor_formatted"
     else
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-unit '$sensor_formatted' --site-description 'Deployed site description - unit.toml'"
+        sudo -H -u pi HOME=/home/pi XDG_CONFIG_HOME=/home/pi/.config SUDO_USER=pi bash -c "source '$VENV_PATH/bin/activate' && brokkr configure-unit '$sensor_formatted' --site-description 'Deployed site description - unit.toml'"
         log_success "Unit configured for sensor $sensor_formatted"
     fi
 
@@ -188,7 +196,7 @@ configure_brokkr() {
         log_dry_run "brokkr install-dependencies"
         manifest_add "command" "cmd" "brokkr install-dependencies"
     else
-        sudo -u pi HOME=/home/pi bash -c "source '$VENV_PATH/bin/activate' && brokkr install-dependencies"
+        sudo -H -u pi HOME=/home/pi XDG_CONFIG_HOME=/home/pi/.config SUDO_USER=pi bash -c "source '$VENV_PATH/bin/activate' && brokkr install-dependencies"
         log_success "Dependencies installed"
     fi
 
@@ -199,8 +207,8 @@ configure_brokkr() {
         log_dry_run "sudo brokkr install-all"
         manifest_add "command" "cmd" "brokkr install-all" "sudo" "true"
     else
-        # Need to preserve HOME so brokkr reads the right config
-        sudo HOME=/home/pi "$VENV_PATH/bin/brokkr" install-all
+        # Need to preserve HOME, XDG_CONFIG_HOME and SUDO_USER so brokkr reads the right config
+        sudo HOME=/home/pi XDG_CONFIG_HOME=/home/pi/.config SUDO_USER=pi bash -c "$VENV_PATH/bin/brokkr install-all"
         log_success "Brokkr services installed"
     fi
 
