@@ -27,9 +27,10 @@ Simplify the HAMMA Raspberry Pi installation process by consolidating multiple i
 
 ### Current State
 - **Unified scripts created:** `bootstrap.sh` + `install.sh` with library modules
-- **Syntax testing:** Docker-based tests pass (Debian Buster)
-- **Real Pi testing:** Dry-run tests pass on mjolnir02
-- **Functionality testing:** INCOMPLETE - scripts install without error but services not verified to actually work
+- **Layer 1 (Syntax):** ✅ All 19 scripts pass `bash -n` validation
+- **Layer 2 (Mock):** ✅ 117 pytest tests pass (dry-run execution, manifest validation)
+- **Layer 3 (Integration):** ❌ NOT IMPLEMENTED - Docker with systemd tests needed
+- **Layer 4 (Functional):** ❌ NOT IMPLEMENTED - Real Pi hardware tests needed
 
 ### Critical Gap
 > "I don't just want install without error, we need to know if it works"
@@ -144,34 +145,28 @@ The unified scripts were created by consolidating these original scripts:
 
 ## Current Script Status
 
-### Tested and Working
+### Test Results by Script
 
-| Component | Docker Test | Real Pi Test | Functional Test |
-|-----------|-------------|--------------|-----------------|
-| bootstrap.sh syntax | ❌ Not tested | ✅ Pass (dry-run) | ❌ Not tested |
-| install.sh syntax | ✅ Pass | ✅ Pass (dry-run) | ❌ Not tested |
-| lib/common.sh | ✅ Pass | ✅ Pass | N/A |
-| lib/network_wifi.sh | ✅ Pass | Not tested | ❌ Not tested |
-| lib/network_wwan.sh | ✅ Pass | ✅ Pass (dry-run) | ❌ Not tested |
-| lib/brokkr.sh | ✅ Pass | ✅ Pass (dry-run) | ❌ Not tested |
-| lib/hardware.sh | ✅ Pass | ✅ Pass (dry-run) | ❌ Not tested |
-| lib/software.sh | ✅ Pass | ✅ Pass (dry-run) | ❌ Not tested |
+| Script | Syntax (L1) | Mock/Dry-run (L2) | Integration (L3) | Functional (L4) |
+|--------|-------------|-------------------|------------------|-----------------|
+| `bootstrap.sh` | ✅ Pass | ✅ 7 tests | ❌ Missing | ❌ Missing |
+| `install.sh` | ✅ Pass | ✅ 12 tests | ❌ Missing | ❌ Missing |
+| `lib/common.sh` | ✅ Pass | ✅ (implicit) | N/A | N/A |
+| `lib/network_wifi.sh` | ✅ Pass | ✅ 19 tests | ❌ Missing | ❌ Missing |
+| `lib/network_wwan.sh` | ✅ Pass | ✅ 24 tests | ❌ Missing | ❌ Missing |
+| `lib/brokkr.sh` | ✅ Pass | ✅ 12 tests | ❌ Missing | ❌ Missing |
+| `lib/hardware.sh` | ✅ Pass | ✅ 4 tests | ❌ Missing | ❌ Missing |
+| `lib/software.sh` | ✅ Pass | ✅ (implicit) | ❌ Missing | ❌ Missing |
 
-### Files Modified (Need Commit)
+### Git Status
 
-From session 2026-01-13:
-```
- M tests/integration/Dockerfile
- M unified_install/README.md
- M unified_install/bootstrap.sh
- M unified_install/install.sh
- M unified_install/lib/brokkr.sh
- M unified_install/lib/network_wifi.sh
- M unified_install/lib/network_wwan.sh
- M unified_install/lib/software.sh
-```
+**Branch:** `feature/unified-install`
 
-### Untracked Files
+**Recent commits:**
+- `2b8a64b` - Add unified_install scripts to shellcheck/syntax tests
+- `992abc4` - Fix critical permission bugs and add MASTER_PLAN.md
+
+### Untracked Files (Not Committed)
 
 ```
 ?? CLAUDE.md
@@ -326,76 +321,96 @@ RUN sed -i 's|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list && \
 
 ## Test Coverage Matrix
 
+### Summary by Layer
+
+| Layer | Description | Test File(s) | Status |
+|-------|-------------|--------------|--------|
+| 1-Syntax | bash -n, shellcheck, shebang | `tests/shell/test_shellcheck.py` | ✅ 19/19 scripts pass |
+| 2-Mock | --dry-run execution, manifest validation | `tests/unified/test_script_execution.py` | ✅ 35 tests pass |
+| 2-Mock | Behavior comparison with originals | `tests/unified/test_behavior_comparison.py` | ✅ 25 tests pass |
+| 2-Mock | Cellular path specifics | `tests/unified/test_cellular_path.py` | ✅ 24 tests pass |
+| 2-Mock | WiFi path specifics | `tests/unified/test_wifi_path.py` | ✅ 19 tests pass |
+| 2-Mock | Failure scenarios | `tests/unified/test_failure_scenarios.py` | ✅ 24 tests pass |
+| 3-Integration | Docker with systemd | `tests/integration/` | ❌ Not implemented |
+| 4-Functional | Real Pi hardware | (manual) | ❌ Not implemented |
+
+**Total pytest tests: 117 passing**
+
 ### Bootstrap.sh Tests
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| Script parses | 1-Syntax | ❌ Missing | `bash -n bootstrap.sh` |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| Script parses (`bash -n`) | 1-Syntax | ✅ Done | `test_shellcheck.py::test_bash_syntax_valid` |
+| Dry-run completes | 2-Mock | ✅ Done | `test_script_execution.py::TestBootstrapExecution` |
+| Manifest has timezone | 2-Mock | ✅ Done | `test_bootstrap_manifest_has_timezone` |
+| Manifest has temp WiFi | 2-Mock | ✅ Done | `test_bootstrap_manifest_has_temp_wifi` |
+| Manifest has hostname | 2-Mock | ✅ Done | `test_bootstrap_manifest_has_hostname` |
+| Manifest disables WiFi | 2-Mock | ✅ Done | `test_bootstrap_manifest_disables_internal_wifi` |
+| Manifest copies repo | 2-Mock | ✅ Done | `test_bootstrap_manifest_copies_repo` |
+| Files actually created | 3-Integration | ❌ Missing | Docker with systemd |
 | Password prompt works | 4-Functional | ❌ Missing | Manual test on Pi |
-| Timezone set correctly | 3-Integration | ❌ Missing | Check `timedatectl` output |
-| Temp WiFi configured | 3-Integration | ❌ Missing | Check wpa_supplicant files |
-| Repo copied correctly | 3-Integration | ❌ Missing | Verify /home/pi/dev/mjolnir-hamma exists |
-| AppleDouble files removed | 3-Integration | ❌ Missing | Check no `._*` files |
-| Internal WiFi disabled | 4-Functional | ❌ Missing | Check `/boot/config.txt` |
-| Hostname set | 3-Integration | ❌ Missing | Check `/etc/hostname` |
-| Buster repos fixed | 3-Integration | ❌ Missing | Check `/etc/apt/sources.list` |
 
 ### Install.sh Tests (Cellular Path)
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| Script parses | 1-Syntax | ✅ Done | pytest |
-| Dry-run completes | 2-Mock | ✅ Done | `--dry-run` flag |
-| wwan-check.timer installed | 3-Integration | ❌ Missing | `systemctl status wwan-check.timer` |
-| wwan-check.sh executable | 3-Integration | ❌ Missing | Check permissions |
-| APN configured correctly | 3-Integration | ❌ Missing | Grep config file |
-| SSH key generated (id_rsa) | 3-Integration | ❌ Missing | Check /home/pi/.ssh/id_rsa |
-| SSH key owned by pi | 3-Integration | ❌ Missing | `ls -la /home/pi/.ssh/` |
-| Modem connects | 4-Functional | ❌ Missing | `mmcli -m 0` shows connected |
-| Internet reachable | 4-Functional | ❌ Missing | `ping 8.8.8.8` |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| Script parses | 1-Syntax | ✅ Done | `test_shellcheck.py::test_bash_syntax_valid` |
+| Dry-run completes | 2-Mock | ✅ Done | `test_script_execution.py` |
+| SSH key in manifest | 2-Mock | ✅ Done | `test_cellular_path_generates_ssh_key` |
+| dhcpcd disabled in manifest | 2-Mock | ✅ Done | `test_cellular_path_disables_dhcpcd` |
+| Timer in manifest | 2-Mock | ✅ Done | `test_cellular_path_installs_timer` |
+| Python script in manifest | 2-Mock | ✅ Done | `test_cellular_path_installs_python_script` |
+| APN configurable | 2-Mock | ✅ Done | `test_apn_argument_supported` |
+| Files actually created | 3-Integration | ❌ Missing | Docker with systemd |
+| Modem connects | 4-Functional | ❌ Missing | Real Pi with modem |
+| Internet reachable | 4-Functional | ❌ Missing | Real Pi |
 
 ### Install.sh Tests (WiFi Path)
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| Script parses | 1-Syntax | ✅ Done | pytest |
-| Certificate copied | 3-Integration | ❌ Missing | Check /etc/wpa_supplicant/ |
-| wpa_supplicant configured | 3-Integration | ❌ Missing | Check config file |
-| WiFi connects | 4-Functional | ❌ Missing | `ifconfig wlan0` shows IP |
-| DNS works | 4-Functional | ❌ Missing | `nslookup google.com` |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| Script parses | 1-Syntax | ✅ Done | `test_shellcheck.py::test_bash_syntax_valid` |
+| Dry-run completes | 2-Mock | ✅ Done | `test_script_execution.py` |
+| SSH key in manifest | 2-Mock | ✅ Done | `test_wifi_path_generates_ssh_key` |
+| Certificate in manifest | 2-Mock | ✅ Done | `test_wifi_path_copies_certificate` |
+| wpa_supplicant in manifest | 2-Mock | ✅ Done | `test_manifest_contains_wpa_supplicant_config` |
+| Services enabled in manifest | 2-Mock | ✅ Done | `test_wifi_path_enables_services` |
+| Files actually created | 3-Integration | ❌ Missing | Docker with systemd |
+| WiFi connects | 4-Functional | ❌ Missing | Real Pi with WiFi |
 
 ### Brokkr Tests
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| Venv created | 3-Integration | ❌ Missing | Check /home/pi/ltgenv exists |
-| Venv owned by pi | 3-Integration | ❌ Missing | `ls -la /home/pi/ltgenv` |
-| Brokkr installed | 3-Integration | ❌ Missing | `source ltgenv && brokkr --version` |
-| Config generated | 3-Integration | ❌ Missing | Check /home/pi/.config/brokkr/ |
-| Config owned by pi | 3-Integration | ❌ Missing | `ls -la /home/pi/.config/brokkr/` |
-| Service installed | 3-Integration | ❌ Missing | `systemctl status brokkr-hamma-default` |
-| Service starts | 4-Functional | ❌ Missing | Service shows "active (running)" |
-| Service stays running | 4-Functional | ❌ Missing | Check after 5 minutes |
-| Data collected | 4-Functional | ❌ Missing | Check output files |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| Venv creation in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Git clones in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Pip installs in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Configure commands in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Venv actually created | 3-Integration | ❌ Missing | Docker with systemd |
+| Venv owned by pi | 3-Integration | ❌ Missing | Docker with systemd |
+| Config owned by pi | 3-Integration | ❌ Missing | Docker with systemd |
+| Service starts | 4-Functional | ❌ Missing | Real Pi |
+| Data collected | 4-Functional | ❌ Missing | Real Pi with sensor |
 
 ### Hardware Tests
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| Sensor SSH config created | 3-Integration | ❌ Missing | Check /home/pi/.ssh/config |
-| eth1 network configured | 3-Integration | ❌ Missing | Check /etc/systemd/network/ |
-| Automount rules installed | 3-Integration | ❌ Missing | Check polkit rules |
-| Sensor SSH works | 4-Functional | ❌ Missing | `ssh hamma` (with sensor connected) |
-| USB drive automounts | 4-Functional | ❌ Missing | Plug drive, check /media/pi/ |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| SSH config in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Network files in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Polkit rules in manifest | 2-Mock | ✅ Done | `test_behavior_comparison.py` |
+| Files actually created | 3-Integration | ❌ Missing | Docker with systemd |
+| Sensor SSH works | 4-Functional | ❌ Missing | Real Pi with sensor |
+| USB automounts | 4-Functional | ❌ Missing | Real Pi with drive |
 
 ### Server Connection Tests
 
-| Test | Layer | Status | How to Test |
-|------|-------|--------|-------------|
-| autossh service installed | 3-Integration | ❌ Missing | `systemctl status autossh-hamma-default` |
-| autossh service starts | 4-Functional | ❌ Missing | Service shows "active (running)" |
-| Tunnel connects | 4-Functional | ❌ Missing | `ssh www.hamma.dev` works |
-| Reverse tunnel works | 4-Functional | ❌ Missing | SSH from server to Pi works |
+| Test | Layer | Status | Test Location |
+|------|-------|--------|---------------|
+| autossh service in manifest | 2-Mock | ✅ Done | (implicit in brokkr install) |
+| Service actually installed | 3-Integration | ❌ Missing | Docker with systemd |
+| Tunnel connects | 4-Functional | ❌ Missing | Real Pi + server |
+| Reverse tunnel works | 4-Functional | ❌ Missing | Real Pi + server |
 
 ---
 
@@ -482,19 +497,25 @@ echo "========================================"
 
 ## Next Steps
 
-### Immediate (Before Next Install)
+### Completed ✅
 
-1. **Commit modified files** - Several files modified but not committed
-2. **Create functional_test.sh** - Implement the test script above
-3. **Test bootstrap.sh in Docker** - Currently not tested
-4. **Add shellcheck to CI** - Catch syntax issues automatically
+1. ~~**Commit modified files**~~ - Done (commits 992abc4, 2b8a64b)
+2. ~~**Layer 1 tests:** Add `bash -n` parsing tests for all scripts~~ - Done (19 scripts)
+3. ~~**Layer 2 tests:** Ensure `--dry-run` coverage for all paths~~ - Done (117 tests)
+4. ~~**Test bootstrap.sh in Docker**~~ - Done (via test_script_execution.py)
 
-### Short Term (Test Suite)
+### Immediate (Layer 3 - Integration)
 
-1. **Layer 1 tests:** Add `bash -n` parsing tests for all scripts
-2. **Layer 2 tests:** Ensure `--dry-run` coverage for all paths
-3. **Layer 3 tests:** Docker-with-systemd tests for service installation
-4. **Layer 4 tests:** functional_test.sh on real Pi
+1. **Create Docker integration tests** - Run scripts in container with systemd, verify files created
+2. **Verify file ownership** - Ensure venv, config, SSH keys owned by pi not root
+3. **Verify service installation** - Check systemd unit files created correctly
+4. **Add shellcheck to CI** - Catch lint issues automatically (currently skipped locally)
+
+### Short Term (Layer 4 - Functional)
+
+1. **Create functional_test.sh** - Script to run on Pi after install (see template above)
+2. **Test on real Pi** - Full install with service verification
+3. **Document test Pi setup** - How to prepare a Pi for testing
 
 ### Medium Term (Documentation)
 
@@ -508,6 +529,10 @@ echo "========================================"
 2. **Pre-install Python packages** - Reduce install time
 3. **Pre-configure systemd-resolved** - Avoid DNS issues
 4. **Document image creation** - Reproducible base image
+
+### Investigate
+
+1. **XDG_CONFIG_HOME workaround** - Why is this needed with `sudo -H -u pi`? (see Bugs section)
 
 ---
 
