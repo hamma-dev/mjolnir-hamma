@@ -11,3 +11,12 @@ RouteMetric=20
 
 [Link]
 Unmanaged=yes
+
+# Blackhole route prevents sensor network (10.10.10.0/24) from routing
+# through cellular if eth0 is down. Some carriers have devices responding
+# at 10.10.10.x which causes brokkr to spam logs. When eth0 is up with
+# sensor connected, the direct route (no metric) takes precedence.
+[Route]
+Type=blackhole
+Destination=10.10.10.0/24
+Metric=100
