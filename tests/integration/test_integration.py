@@ -277,7 +277,7 @@ class TestBrokkrSetup:
     def test_venv_has_activate(self):
         """Venv should have activate script."""
         activate = self.VENV_PATH / "bin" / "activate"
-        assert activate.exists(), "venv activate script not found"
+        assert activate.exists(), f"venv activate script not found at {activate}"
 
     def test_convenience_symlink_exists(self):
         """Convenience symlink ~/ltgenv should exist."""
