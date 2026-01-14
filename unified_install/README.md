@@ -71,19 +71,10 @@ The install script generates an SSH key. You MUST copy this key to the server fo
 
 **On the Pi:**
 ```bash
-# Get the public key
-cat /home/pi/.ssh/id_rsa.pub
-# Copy this output
-```
+# Copy the key to the server (will prompt for password)
+ssh-copy-id -i /home/pi/.ssh/id_rsa.pub pi@www.hamma.dev
 
-**On the server (as user pi):**
-```bash
-nano /home/pi/.ssh/authorized_keys
-# Paste the Pi's public key at the end of the file
-```
-
-**Test from Pi:**
-```bash
+# Test connection (should not prompt for password)
 ssh www.hamma.dev
 exit
 ```
