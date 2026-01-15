@@ -206,6 +206,14 @@ check_cellular_services() {
     fi
 }
 
+check_network_services() {
+    print_section "Network Services"
+
+    # systemd-networkd is used on both WiFi and cellular setups
+    check_service_active "systemd-networkd.service" "systemd-networkd running"
+    check_service_enabled "systemd-networkd.service" "systemd-networkd enabled"
+}
+
 check_wifi_services() {
     print_section "WiFi Services"
 
@@ -217,8 +225,6 @@ check_wifi_services() {
 
     check_service_active "wpa_supplicant@wlan0.service" "WPA supplicant running"
     check_service_enabled "wpa_supplicant@wlan0.service" "WPA supplicant enabled"
-    check_service_active "systemd-networkd.service" "systemd-networkd running"
-    check_service_enabled "systemd-networkd.service" "systemd-networkd enabled"
 }
 
 check_file_setup() {
@@ -410,6 +416,7 @@ main() {
     # Run checks
     check_network_connectivity
     check_essential_services
+    check_network_services
     check_cellular_services
     check_wifi_services
     check_file_setup

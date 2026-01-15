@@ -43,3 +43,24 @@ config_version = 1
 
     [test.main.pipelines.rsync_hamma_realtime]
         _enabled = false
+
+# Preset for units without HAMMA sensor hardware connected
+# Disables all science data pipelines and drive checks, keeps telemetry/monitoring
+[nosensor]
+    [nosensor.main.steps.state_monitor]
+        enable_drive_checks = false
+
+    [nosensor.main.pipelines.science_ingest]
+        _enabled = false
+
+    [nosensor.main.pipelines.science_disk_write]
+        _enabled = false
+
+    [nosensor.main.pipelines.science_header_decode]
+        _enabled = false
+
+    [nosensor.main.pipelines.realtime]
+        _enabled = false
+
+    [nosensor.main.pipelines.rsync_hamma_realtime]
+        _enabled = false

@@ -27,6 +27,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         channel=None,
         key_file=None,
         low_pi_space=5,
+        enable_drive_checks=True,
         **output_step_kwargs,
         ):
         """
@@ -54,6 +55,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_pi_space: numeric, optional
             Specifies the critical value, in gigabytes-ish, for hard drive space remaining
             on the backend Pi.
+        enable_drive_checks : bool, optional
+            If True (default), check for archive drives and sensor drive space.
+            Set to False for units without HAMMA sensor hardware connected.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -72,6 +76,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.bad_ping = 0  # Track the number of bad pings
         self.sender = None  # Make sure we "initialize" the attribute
         self.low_pi_space = low_pi_space*1000000000
+        self.enable_drive_checks = enable_drive_checks
 
         sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
         try:
@@ -187,14 +192,17 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Same as argument of `execute`.
 
         """
-        for check_fn in [
-                self.check_drive,
+        checks = [
                 self.check_pi_space,
                 self.check_ping,
                 self.check_power,
                 self.check_battery_voltage,
-                self.check_sensor_drive,
-        ]:
+        ]
+        if self.enable_drive_checks:
+            checks.insert(0, self.check_drive)
+            checks.append(self.check_sensor_drive)
+
+        for check_fn in checks:
             try:
                 # noinspection PyArgumentList
                 msg = check_fn(input_data)
