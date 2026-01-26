@@ -39,14 +39,14 @@ setup_sensor_connection() {
         manifest_add "copy" "src" "$FILES_DIR/config" "dst" "$ssh_config"
         manifest_add "chmod" "path" "$ssh_config" "mode" "0600"
     else
-        # Create .ssh directory if needed
-        mkdir -p "$ssh_dir"
-        chmod 700 "$ssh_dir"
+        # Create .ssh directory if needed (as pi user to ensure correct ownership)
+        sudo -H -u pi mkdir -p "$ssh_dir"
+        sudo -H -u pi chmod 700 "$ssh_dir"
 
         # Copy SSH config (connection settings for sensor and proxy)
         if [[ -f "$FILES_DIR/config" ]]; then
-            cp "$FILES_DIR/config" "$ssh_config"
-            chmod 600 "$ssh_config"
+            sudo -H -u pi cp "$FILES_DIR/config" "$ssh_config"
+            sudo -H -u pi chmod 600 "$ssh_config"
             log_success "SSH config installed"
         else
             log_warn "SSH config file not found at $FILES_DIR/config"

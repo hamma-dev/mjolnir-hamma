@@ -2,7 +2,7 @@
 
 This document summarizes bugs, gotchas, and lessons learned during development of the unified install scripts. This is a developer reference - for user troubleshooting, see README.md.
 
-**Last Updated:** 2026-01-13
+**Last Updated:** 2026-01-25
 
 ---
 
@@ -189,6 +189,28 @@ passwd pi
 ```
 
 **File Changed:** `bootstrap.sh`
+
+---
+
+### 11. SSH Config Owned by Root (hardware.sh)
+
+**Problem:** After install, `/home/pi/.ssh/config` was owned by root:root, causing later operations (like adding github-hamma entry) to fail with permission denied.
+
+**Root Cause:** `setup_sensor_connection()` in `lib/hardware.sh` created the .ssh directory and copied the config file as root, not as the pi user:
+```bash
+# Bug: runs as root
+mkdir -p "$ssh_dir"
+cp "$FILES_DIR/config" "$ssh_config"
+```
+
+**Fix:** Use `sudo -H -u pi` for all operations on pi's files:
+```bash
+# Correct: runs as pi user
+sudo -H -u pi mkdir -p "$ssh_dir"
+sudo -H -u pi cp "$FILES_DIR/config" "$ssh_config"
+```
+
+**File Changed:** `lib/hardware.sh`
 
 ---
 
