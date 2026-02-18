@@ -1,104 +1,12 @@
-# HAMMA Sensor System Knowledge Base
+# mjolnir-hamma Development Reference
 
-Reference document for interacting with HAMMA Pi sensor units.
+Repo-specific knowledge for developing in mjolnir-hamma. For operational sensor knowledge (deployment, troubleshooting, services), see `~/.claude/hamma-system.md`.
 
-## Sensor Network
-
-### Unit Naming
-- Sensors are named `mjolnir01` through `mjolnir09` (and beyond)
-- SSH aliases are configured locally (e.g., `ssh mjolnir02`)
-- Tunnels go through the server on ports 10001-10009 (10000 + unit number)
-
-### Network Types
-- **Cellular units**: Use wwan0 with ModemManager, have `wwan-check.timer`
-- **WiFi units**: Use wlan0 with wpa_supplicant
-- **Sensor interface**: eth0 at 10.10.10.2, sensor at 10.10.10.1
-
-### Identifying Network Type
-```bash
-# Cellular if this file exists:
-ls /etc/systemd/system/wwan-check.timer
-
-# WiFi if this file exists:
-ls /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
-```
-
-## Key Services
-
-| Service | Purpose |
-|---------|---------|
-| `brokkr-hamma-default.service` | Main data collection daemon |
-| `sindri-hamma-client.service` | Data sync to server |
-| `autossh-hamma-default.service` | Reverse SSH tunnel to server |
-| `wwan-check.timer` | Cellular connection monitor (cellular only) |
-| `wpa_supplicant@wlan0.service` | WiFi management (WiFi only) |
-| `systemd-networkd.service` | Network configuration (both) |
-
-### Service Commands
-```bash
-# Check status
-systemctl status brokkr-hamma-default.service
-
-# Restart service
-sudo systemctl restart brokkr-hamma-default.service
-
-# View logs
-journalctl -u brokkr-hamma-default.service -n 50 --no-pager
-```
-
-## Brokkr Modes
-
-### Default Mode
-Full sensor operation with all pipelines enabled.
-
-### Nosensor Mode
-For units without HAMMA sensor hardware connected:
-```bash
-# Manual start
-/home/pi/dev/ltgenv/bin/python3 -m brokkr --system hamma --mode nosensor start
-
-# Service configured in:
-/etc/systemd/system/brokkr-hamma-default.service
-# ExecStart line should include: --mode nosensor
-```
-
-Nosensor mode disables:
-- `science_ingest` pipeline
-- `science_disk_write` pipeline
-- `science_header_decode` pipeline
-- `realtime` pipeline
-- `rsync_hamma_realtime` pipeline
-- Drive checks in state_monitor
-
-## Key File Locations
-
-### On Pi
-| Path | Purpose |
-|------|---------|
-| `/home/pi/dev/mjolnir-hamma/` | System config repo |
-| `/home/pi/dev/ltgenv/` | Brokkr virtual environment |
-| `/home/pi/dev/sindrienv/` | Sindri virtual environment |
-| `/home/pi/.config/brokkr/hamma/` | User config overrides |
-| `/home/pi/brokkr/hamma/telemetry/` | Telemetry CSV output |
-| `/home/pi/brokkr/hamma/log/` | Brokkr logs |
-| `/etc/systemd/network/40-eth0.network` | Sensor interface config |
-| `/etc/systemd/network/20-wwan0.network` | Cellular interface config |
-
-### Config Files
-```bash
-# Mode presets (nosensor, etc.)
-/home/pi/dev/mjolnir-hamma/config/mode.toml
-
-# Main pipeline configuration
-/home/pi/dev/mjolnir-hamma/config/main.toml
-
-# Unit-specific settings
-/home/pi/.config/brokkr/hamma/unit.toml
-```
+---
 
 ## Unified Install Architecture
 
-### Bootstrap vs Install (Two-Phase Design)
+### Two-Phase Design
 
 **CRITICAL:** `bootstrap.sh` runs BEFORE network is available.
 
@@ -107,9 +15,11 @@ Nosensor mode disables:
 | 1 | `bootstrap.sh` | NO network | USB drive |
 | 2 | `install.sh` | Network UP | Local repo |
 
-**bootstrap.sh** - Phase 1 (no network):
+**bootstrap.sh** (Phase 1, no network):
 - Changes pi user password (prompts interactively)
 - Sets timezone to UTC
+- Fixes Buster EOL repos (archive.debian.org)
+- Fixes clock if year < 2024 (uses file timestamp)
 - Configures temp WiFi (not connected yet)
 - Copies repo from USB to `/home/pi/dev/mjolnir-hamma`
 - Removes macOS AppleDouble files (`._*`)
@@ -117,9 +27,9 @@ Nosensor mode disables:
 - Sets hostname to `mjolnirNN`
 - **Requires reboot after**
 
-**install.sh** - Phase 2 (network available):
+**install.sh** (Phase 2, network available):
 - Configures production network (WiFi or cellular)
-- Generates SSH key for server access
+- Generates SSH key for server access (`id_rsa`)
 - Installs system packages
 - Clones/installs brokkr, sindri, pyltg, hamma
 - Configures hardware (relay, automount)
@@ -138,9 +48,7 @@ unified_install/
 │   ├── network_wifi.sh   # WiFi/UAH network setup
 │   ├── network_wwan.sh   # Cellular/WWAN network setup
 │   └── software.sh       # System packages, sindri, pyltg, hamma
-├── README.md             # User installation guide
-├── DEVELOPMENT_NOTES.md  # Developer reference (bugs, gotchas)
-└── MASTER_PLAN.md        # Testing plan and status
+└── README.md             # User installation guide
 ```
 
 ### Clone Sources
@@ -155,16 +63,9 @@ unified_install/
 | pyltg | pbitzer | default | Personal code |
 | hamma | pbitzer | `0.3.x` | Private repo (uses ed25519 deploy key) |
 
-### SSH Keys (Two Different Keys!)
+---
 
-| Key | Purpose | Generated by |
-|-----|---------|--------------|
-| `/home/pi/.ssh/id_rsa` | Server access (autossh tunnel) | `install.sh` network phase |
-| `/home/pi/.ssh/id_ed25519` | GitHub private repo (hamma) | `install.sh --generate-hamma-key` |
-
-**Common mistake:** Confusing these two keys. The server needs `id_rsa.pub`, GitHub needs `id_ed25519.pub`.
-
-## Testing
+## Testing Infrastructure
 
 ### Four Testing Layers
 
@@ -192,324 +93,185 @@ cd scripts
 
 ### Key Test Files
 
-- `tests/shell/test_shellcheck.py` - Syntax validation (19 scripts)
-- `tests/unified/test_*.py` - Mock/dry-run tests (117 tests)
-- `tests/integration/test_integration.py` - Docker integration (35 tests)
-- `scripts/verify_deployment.sh` - Production verification (20 checks)
-
-### Untracked Test Helpers (in tests/integration/)
-
-These scripts are not committed but useful for manual debugging:
-
-**run-install-test.sh** - Automated install test with logging
-```bash
-# Runs install.sh in Docker and saves output to results/
-./run-install-test.sh --cellular           # Test cellular install
-./run-install-test.sh --wifi --dry-run     # Dry-run WiFi test
-./run-install-test.sh --rebuild            # Force rebuild image
-```
-Output saved to `results/install-test-<mode>-<timestamp>.log`
-
-**test-install-interactive.sh** - Interactive debugging environment
-```bash
-# Drops into Docker shell for manual testing
-./test-install-interactive.sh --rebuild    # Rebuild and enter shell
-# Inside container:
-cd /home/pi/dev/mjolnir-hamma/unified_install
-sudo bash install.sh 99 --cellular --dry-run
-```
-Useful for: run test, see failure, exit, fix code, repeat
-
-## Common Issues and Fixes
-
-### Log Spam When Sensor Disconnected
-**Symptom**: Brokkr spams `OSError: [Errno 22] Invalid argument` or `No route to host`
-
-**Cause**: science_ingest pipeline tries to connect to sensor at 10.10.10.1 with no retry delay
-
-**Fix**: Use nosensor mode for units without sensors:
-```bash
-sudo sed -i 's|--system hamma start|--system hamma --mode nosensor start|' \
-    /etc/systemd/system/brokkr-hamma-default.service
-sudo systemctl daemon-reload
-sudo systemctl restart brokkr-hamma-default.service
-```
-
-### DNS Resolution Failing
-**Symptom**: `Could not resolve host: github.com`
-
-**Cause**: resolv.conf only has 10.10.10.1 (sensor) as nameserver, no fallback
-
-**Quick fix**:
-```bash
-echo 'nameserver 8.8.8.8' | sudo tee -a /run/systemd/resolve/resolv.conf
-```
-
-### Sindri Not Installed
-**Symptom**: `sindri-hamma-client.service` not found
-
-**Fix**:
-```bash
-sudo /home/pi/dev/sindrienv/bin/sindri --system hamma install-service --mode client --account pi
-sudo systemctl start sindri-hamma-client.service
-```
-
-### FILES_DIR Not Set When Running Install Scripts
-**Symptom**: `File not found` errors when running install.sh
-
-**Cause**: `unified_install/files/` is intentionally empty. Scripts default to this path when run from unified_install directory.
-
-**Fix**: Set environment variables to point to repo's files:
-```bash
-FILES_DIR=/home/pi/dev/mjolnir-hamma/files \
-SCRIPTS_DIR=/home/pi/dev/mjolnir-hamma/scripts \
-sudo bash install.sh 1 --cellular
-```
-
-### SSH Key Owned by Root
-**Symptom**: `/home/pi/.ssh/id_rsa` has root ownership
-
-**Cause**: Running `ssh-keygen` via sudo creates files as root
-
-**Fix**: Scripts now use `sudo -H -u pi bash -c "ssh-keygen..."` to generate keys as pi user. If already wrong:
-```bash
-sudo chown pi:pi /home/pi/.ssh/id_rsa*
-```
-
-### Git Repo Missing .git Directory
-**Symptom**: `fatal: not a git repository`
-
-**Cause**: Repo was copied from USB during bootstrap, not cloned
-
-**Fix**:
-```bash
-cd /home/pi/dev
-mv mjolnir-hamma mjolnir-hamma.bak
-git clone -b 0.3.x https://github.com/hamma-dev/mjolnir-hamma.git
-cd mjolnir-hamma
-git submodule update --init --recursive
-# Copy updated files if needed, then:
-sudo rm -rf /home/pi/dev/mjolnir-hamma.bak
-```
-
-## Deployment Procedures
-
-### Installation (on real Pi)
-
-```bash
-# Bootstrap from USB
-cd /mnt/usb/mjolnir-hamma/unified_install
-sudo bash bootstrap.sh <sensor_num> --wifi-ssid "Network" --wifi-pass "pass"
-sudo reboot
-
-# Install (after reboot)
-cd /home/pi/dev/mjolnir-hamma/unified_install
-sudo bash install.sh <sensor_num> --cellular  # or --wifi
-
-# Generate HAMMA deploy key
-sudo bash install.sh <sensor_num> --generate-hamma-key
-# Add key to GitHub, then:
-sudo bash install.sh <sensor_num> --hamma-only
-```
-
-### Validation
-```bash
-# Run from Pi:
-bash /home/pi/dev/mjolnir-hamma/scripts/verify_deployment.sh
-
-# Full check including server connection:
-bash /home/pi/dev/mjolnir-hamma/scripts/verify_deployment.sh --full
-```
-
-### Updating Config on Deployed Sensor
-```bash
-# Copy files from local repo to sensor
-scp plugins/state_monitor.py mjolnir02:/home/pi/dev/mjolnir-hamma/plugins/
-scp config/mode.toml mjolnir02:/home/pi/dev/mjolnir-hamma/config/
-
-# Restart brokkr to pick up changes
-ssh mjolnir02 "sudo systemctl restart brokkr-hamma-default.service"
-```
-
-### Checking Sensor Health
-```bash
-# Quick status check
-ssh mjolnir02 "systemctl is-active brokkr-hamma-default.service && \
-               systemctl is-active sindri-hamma-client.service && \
-               systemctl is-active autossh-hamma-default.service"
-
-# Recent telemetry
-ssh mjolnir02 "ls -la /home/pi/brokkr/hamma/telemetry/ | tail -3"
-
-# Recent logs (no spam = healthy)
-ssh mjolnir02 "journalctl -u brokkr-hamma-default.service -n 5 --since '1 min ago'"
-```
-
-### Verification Commands
-```bash
-# Check all services
-systemctl --failed
-systemctl status brokkr-hamma-default.service
-systemctl status autossh-hamma-default.service
-systemctl status wwan-check.timer  # cellular only
-
-# View logs
-journalctl -u brokkr-hamma-default.service -n 50
-journalctl -u autossh-hamma-default.service -n 50
-
-# Force WWAN check (don't wait for 5-minute timer)
-sudo systemctl start wwan-check.service
-
-# Check file ownership (should be pi:pi, not root)
-ls -la /home/pi/.ssh/
-ls -la /home/pi/.config/brokkr/
-ls -la /root/.config/  # Should NOT have brokkr/
-```
-
-## Server Connection Setup
-
-This is the "Enable Access to Server" process. Typically done by admin (Bitzer).
-
-### On Pi (after install.sh completes)
-
-```bash
-# 1. Start reverse tunnel (should already be running)
-sudo systemctl start autossh-hamma-default.service
-
-# 2. Get the public key
-cat /home/pi/.ssh/id_rsa.pub
-
-# 3. Test connection (after admin adds key)
-ssh www.hamma.dev
-exit
-
-# 4. Get Google Chat notifications key
-scp pi@hamma.dev:/home/pi/.googlechat /home/pi/
-```
-
-### On Server (admin does this)
-
-```bash
-# 1. Add Pi's public key to authorized_keys
-nano /home/pi/.ssh/authorized_keys
-# Paste the id_rsa.pub content
-
-# 2. Add to /home/pi/.ssh/config
-Host mjolnirNN
-    Port 100NN
-
-# 3. Copy server key to Pi
-ssh-copy-id mjolnirNN
-
-# 4. For monitor user
-su monitor
-ssh-copy-id pi@mjolnirNN
-exit
-```
-
-## Cellular APN Configuration
-
-| Carrier | APN | Usage |
-|---------|-----|-------|
-| T-Mobile (default) | `h2g2` | Default in scripts |
-| Verizon | `vzwinternet` | `--apn vzwinternet` |
-| Panama | `apn01.cwpanama.com.pa` | `--apn apn01.cwpanama.com.pa` |
-
-```bash
-# Install with custom APN
-sudo bash install.sh 02 --cellular --apn vzwinternet
-```
-
-## Modem Troubleshooting
-
-### Finding the Modem Index
-
-The modem is NOT always at index 0. Always check first:
-
-```bash
-# List all modems
-mmcli -L
-# Output: /org/freedesktop/ModemManager1/Modem/1 [QUALCOMM...]
-#                                              ^ This is the index
-
-# Then use that index
-mmcli -m 1
-```
-
-### Manual Connection
-
-```bash
-# Enable modem
-sudo mmcli -m 1 --enable
-
-# Connect with APN
-sudo mmcli -m 1 --simple-connect='apn=vzwinternet'
-
-# Bring up interface
-sudo ip link set wwan0 up
-sudo udhcpc -i wwan0 -n -q
-
-# Check IP
-ip addr show wwan0
-```
-
-### Debian Buster Repos Return 404 (Docker)
-**Symptom**: `apt-get update` fails with 404 errors in Docker
-
-**Cause**: Debian Buster reached EOL, repos moved to archive
-
-**Fix**: Already applied in `tests/docker/Dockerfile.pi-test`:
+- `tests/shell/test_shellcheck.py` — Syntax validation (19 scripts)
+- `tests/unified/test_script_execution.py` — Dry-run execution, manifest validation (35 tests)
+- `tests/unified/test_behavior_comparison.py` — Comparison with original scripts (25 tests)
+- `tests/unified/test_cellular_path.py` — Cellular path specifics (24 tests)
+- `tests/unified/test_wifi_path.py` — WiFi path specifics (19 tests)
+- `tests/unified/test_failure_scenarios.py` — Failure scenarios (24 tests)
+- `tests/integration/test_integration.py` — Docker integration (35 tests)
+- `scripts/verify_deployment.sh` — Production verification (20 checks)
+
+**Total pytest tests: ~152** (117 Layer 2 + 35 Layer 3)
+
+### Test Coverage by Component
+
+| Component | L1 | L2 | L3 | L4 |
+|-----------|----|----|----|----|
+| bootstrap.sh | pass | 7 tests | N/A | N/A |
+| install.sh | pass | 12 tests | 35 tests | verify script |
+| network_wifi.sh | pass | 19 tests | 8 tests | verify script |
+| network_wwan.sh | pass | 24 tests | 9 tests | verify script |
+| brokkr.sh | pass | 12 tests | 6 tests | verify script |
+| hardware.sh | pass | 4 tests | 4 tests | verify script |
+
+### Docker Testing Notes
+
+The integration tests use `jrei/systemd-debian:10` (Debian Buster with systemd). Buster is EOL, so the Dockerfile applies archive.debian.org fixes:
 ```dockerfile
 RUN sed -i 's|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list && \
     sed -i 's|security.debian.org|archive.debian.org|g' /etc/apt/sources.list && \
     sed -i '/buster-updates/d' /etc/apt/sources.list
 ```
 
+### Untracked Test Helpers (in tests/integration/)
+
+These scripts are not committed but useful for manual debugging:
+
+**run-install-test.sh** — Automated install test with logging
+```bash
+./run-install-test.sh --cellular           # Test cellular install
+./run-install-test.sh --wifi --dry-run     # Dry-run WiFi test
+./run-install-test.sh --rebuild            # Force rebuild image
+```
+
+**test-install-interactive.sh** — Interactive debugging environment
+```bash
+./test-install-interactive.sh --rebuild    # Rebuild and enter shell
+# Inside container:
+cd /home/pi/dev/mjolnir-hamma/unified_install
+sudo bash install.sh 99 --cellular --dry-run
+```
+
+---
+
+## Development Gotchas
+
+### 1. `sudo -H` is mandatory with `sudo -u pi`
+
+`sudo -u pi` does NOT change `$HOME` — it stays `/root`. All user files end up owned by root.
+
+```bash
+# WRONG
+sudo -u pi git clone ...      # HOME stays /root!
+
+# CORRECT
+sudo -H -u pi git clone ...   # HOME=/home/pi
+```
+
+This was the single biggest source of bugs (26+ occurrences fixed across lib/*.sh files).
+
+### 2. No heredocs inside `bash -c` strings
+
+The heredoc is parsed by the OUTER (root) shell, not the inner one.
+
+```bash
+# WRONG — heredoc parsed by root shell, permission denied
+sudo -u pi bash -c "cat >> '$file' <<EOF
+content
+EOF"
+
+# CORRECT — tee runs as root, writes to file
+sudo -H -u pi tee -a "$file" > /dev/null <<EOF
+content
+EOF
+```
+
+### 3. Bash arithmetic + `set -e` = surprise exit
+
+`((COUNT++))` returns exit code 1 when COUNT is 0 (expression evaluates to 0 = falsy).
+
+```bash
+# WRONG — exits script when COUNT was 0
+((COUNT++))
+
+# CORRECT
+((COUNT++)) || true
+```
+
+### 4. No editable pip installs with sudo
+
+Editable installs (`-e`) write to the source directory. When run as root, permissions get mixed up.
+
+```bash
+# WRONG
+sudo -H -u pi pip install -e /home/pi/dev/brokkr
+
+# CORRECT
+sudo -H -u pi pip install /home/pi/dev/brokkr
+```
+
+### 5. `passwd` without username changes current user
+
+When running as root (via sudo), bare `passwd` changes root's password.
+
+```bash
+# WRONG — changes root's password
+passwd
+
+# CORRECT
+passwd pi
+```
+
+### 6. XDG_CONFIG_HOME workaround for brokkr
+
+Even with `sudo -H -u pi`, brokkr's `configure-system` may write to `/root/.config/brokkr/`. Workaround: explicitly set XDG_CONFIG_HOME:
+
+```bash
+sudo -H -u pi XDG_CONFIG_HOME=/home/pi/.config brokkr configure-system ...
+```
+
+Root cause not fully investigated (possible brokkr bug or SUDO_USER interference).
+
+### 7. FILES_DIR must be set correctly
+
+`FILES_DIR` defaults to `unified_install/files/` which is intentionally empty. Scripts need it set to the repo's `files/` directory:
+
+```bash
+FILES_DIR=/home/pi/dev/mjolnir-hamma/files \
+SCRIPTS_DIR=/home/pi/dev/mjolnir-hamma/scripts \
+sudo bash install.sh 1 --cellular
+```
+
+---
+
+## Script Reference (lib/*.sh)
+
+| Script | Role |
+|--------|------|
+| `common.sh` | Shared functions: logging (`log_info`, `log_warn`, `log_error`), manifest output, dry-run support |
+| `brokkr.sh` | Creates ltgenv virtualenv, clones/installs brokkr, runs `configure-system`, installs systemd service |
+| `hardware.sh` | Sets up sensor SSH connection (eth0 at 10.10.10.2), USB automount rules, relay control |
+| `network_wifi.sh` | UAH/NSSTC WiFi: copies certificate, wpa_supplicant config, generates SSH key |
+| `network_wwan.sh` | Cellular: installs modemmanager/udhcpc, copies wwan-check timer/script, configures APN, generates SSH key |
+| `software.sh` | Installs system packages (apt-get), sindri, pyltg, hamma (private repo via deploy key) |
+
+### Key Enhancement Over Original Scripts
+
+The unified scripts generate SSH keys (`id_rsa`) in BOTH wifi and cellular paths. The original `setup_wwan.sh` did NOT generate SSH keys (assumed WiFi ran first).
+
+---
+
 ## Historical Fixed Issues
 
-Issues discovered and fixed during development (for reference):
+Numbered list for reference (all fixed in current code):
 
-1. **Files Owned by Root** - `sudo -u pi` doesn't change HOME; fixed with `sudo -H -u pi`
-2. **SSH Config Permission Denied** - Heredoc in `bash -c` parsed by outer shell; fixed with `tee`
-3. **Bash Arithmetic with `set -e`** - `((COUNT++))` returns 1 when COUNT=0; fixed with `|| true`
-4. **Editable Pip Installs** - `-e` installs write to source directory; use non-editable installs
-5. **XDG_CONFIG_HOME Workaround** - brokkr writes to /root/.config; explicitly set `XDG_CONFIG_HOME`
-6. **DNS Resolution (IPv6)** - `stub-resolv.conf` prefers broken IPv6; use `/run/systemd/resolve/resolv.conf`
-7. **FILES_DIR Default** - Default pointed to empty directory; changed to `../../files`
-8. **macOS AppleDouble Files** - `._*` files cause unicode errors; delete after copying
-9. **Debian Buster EOL** - apt repos return 404; use archive.debian.org
-10. **Password Change Changed Root** - `passwd` without username changes current user; specify `passwd pi`
-11. **SSH Config Owned by Root (hardware.sh)** - `setup_sensor_connection()` created .ssh/config as root; fixed with `sudo -H -u pi`
+1. **Files owned by root** — `sudo -u pi` without `-H`; fixed with `sudo -H -u pi`
+2. **SSH config permission denied** — heredoc in `bash -c`; fixed with `tee`
+3. **Bash arithmetic with `set -e`** — `((COUNT++))` returns 1 when COUNT=0; fixed with `|| true`
+4. **Editable pip installs** — `-e` installs as root cause permission issues; use non-editable
+5. **XDG_CONFIG_HOME workaround** — brokkr writes to /root/.config; explicitly set XDG_CONFIG_HOME
+6. **DNS resolution (IPv6)** — `stub-resolv.conf` prefers broken IPv6; use `resolv.conf`
+7. **FILES_DIR default** — pointed to empty directory; changed to `../../files`
+8. **macOS AppleDouble files** — `._*` files cause unicode errors; delete after copying
+9. **Debian Buster EOL** — apt repos return 404; use archive.debian.org
+10. **Password change changed root** — `passwd` without username; specify `passwd pi`
+11. **SSH config owned by root (hardware.sh)** — `setup_sensor_connection()` ran as root; fixed with `sudo -H -u pi`
 
-## Reference Documentation
-
-### Confluence Pages
-
-| Page | Purpose |
-|------|---------|
-| "Pi Setup [Working]" (ID: 126681092) | Original step-by-step install docs |
-| "MjolnirPi Setup" (ID: 428802050) | Unified install reference |
-| "Troubleshooting" (ID: 132841480) | Common issues and fixes |
-
-### Additional Documentation
-
-- `unified_install/README.md` - User installation guide and troubleshooting
-- `unified_install/DEVELOPMENT_NOTES.md` - Developer reference (bugs, gotchas)
-- `unified_install/MASTER_PLAN.md` - Testing plan and status tracking
+---
 
 ## Future Improvements
 
 - **Auto-mount USB in bootstrap**: Currently user must manually mount USB
 - **Add Dockerfile.systemd to git**: Currently not tracked
-- **Consider removing test helper scripts**: `run-install-test.sh`, `test-install-interactive.sh` may be redundant
-
-## Important Notes
-
-- **Don't guess** about sensor configurations - check the actual state
-- **Ask before making changes** to sensor configurations
-- **Run verify_deployment.sh** after any installation or configuration changes
-- **Cellular units may have WiFi config files** but don't use WiFi as primary
-- **systemd-networkd should be enabled** on all units (manages eth0 and network configs)
-- **Sindri is separate from Brokkr** - installed in sindrienv, runs as sindri-hamma-client.service
-- **Two SSH keys exist** - don't confuse id_rsa (server) with id_ed25519 (GitHub)
-- **Modem index varies** - always use `mmcli -L` to find actual index
+- **Fix DNS bug on cellular sensors**: See `~/.claude/hamma-system.md` under "DNS Resolution Failing on Cellular Sensors"
