@@ -171,6 +171,10 @@ check_essential_services() {
     # Autossh service
     check_service_active "autossh-hamma-default.service" "Autossh service running"
     check_service_enabled "autossh-hamma-default.service" "Autossh service enabled (starts on boot)"
+
+    # Sindri client service
+    check_service_active "sindri-hamma-client.service" "Sindri client service running"
+    check_service_enabled "sindri-hamma-client.service" "Sindri client service enabled (starts on boot)"
 }
 
 check_cellular_services() {
