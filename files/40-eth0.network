@@ -3,7 +3,6 @@ Name=eth0
 
 [Network]
 Address=10.10.10.2/24
-DNS=10.10.10.1
 # Keep route configured even without carrier, so connect() to sensor
 # times out instead of instant failure. This prevents log spam when
 # sensor is disconnected.
