@@ -28,6 +28,7 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                  step=8,
                  quiet_start=2,
                  quiet_end=5,
+                 drive_glob=None,
                  **output_step_kwargs):
         """
         Compress HAMMA trigger data files during quiet hours.
@@ -64,6 +65,11 @@ class CompressData(brokkr.pipeline.base.OutputStep):
             during quiet hours. Default is 2 (2 AM).
         quiet_end : int
             Hour (0-23) when quiet period ends. Default is 5 (5 AM).
+        drive_glob : str, optional
+            Glob pattern for data drive directories under source_path
+            (e.g., "DATA??"). When set, the plugin looks for date dirs
+            inside each matching drive dir. When None, date dirs are
+            expected directly under source_path. Default is None.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -78,6 +84,7 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         self.step = step
         self.quiet_start = quiet_start
         self.quiet_end = quiet_end
+        self.drive_glob = drive_glob
 
     def _is_quiet_time(self, current_time):
         """
@@ -101,20 +108,34 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         else:
             return current_hour >= self.quiet_start or current_hour < self.quiet_end
 
-    def _get_output_path(self):
+    def _get_data_roots(self):
         """
-        Get the output directory for compressed archives.
+        Get the root directories that contain date-named data directories.
 
-        Creates the directory if it doesn't exist.
+        If drive_glob is set, globs source_path for matching drive
+        directories (e.g., DATA37, DATA38) and returns those that exist
+        and are directories. If no drives match, returns an empty list.
+
+        If drive_glob is not set, returns [source_path] for backward
+        compatibility (date dirs directly under source_path).
 
         Returns
         -------
-        Path
-            Path to the output directory.
+        list of Path
+            Directories to search for date-named subdirectories.
         """
-        output_path = self.source_path / self.output_subdir
-        output_path.mkdir(parents=True, exist_ok=True)
-        return output_path
+        if self.drive_glob is None:
+            return [self.source_path]
+
+        drives = sorted(
+            p for p in self.source_path.glob(self.drive_glob)
+            if p.is_dir()
+        )
+        if not drives:
+            self.logger.debug(
+                "No drives matching '%s' found in %s",
+                self.drive_glob, self.source_path)
+        return drives
 
     def execute(self, input_data=None):
         """
@@ -161,6 +182,10 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         """
         Find and compress trigger files older than min_age_days.
 
+        Iterates over data roots (drive directories if drive_glob is set,
+        otherwise source_path itself) and compresses eligible files in
+        each. Each data root gets its own compressed output subdirectory.
+
         Returns
         -------
         tuple
@@ -175,40 +200,48 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                 "Source path does not exist: %s", self.source_path)
             return compressed_count, skipped_count, error_count
 
-        # Get/create output directory
-        output_path = self._get_output_path()
+        data_roots = self._get_data_roots()
 
         cutoff_time = datetime.datetime.now() - datetime.timedelta(
             days=self.min_age_days)
 
-        # Find directories that match the date pattern (YYYY-MM-DD*)
-        # This handles the hourly subdirectories like 2024-01-06T12
-        for data_dir in self.source_path.iterdir():
-            if not data_dir.is_dir():
-                continue
+        for data_root in data_roots:
+            # Each data root gets its own output subdirectory
+            output_path = data_root / self.output_subdir
+            output_path.mkdir(parents=True, exist_ok=True)
 
-            # Skip the output subdirectory itself
-            if data_dir.name == self.output_subdir:
-                continue
-
-            try:
-                # Check if directory is old enough based on modification time
-                dir_mtime = datetime.datetime.fromtimestamp(data_dir.stat().st_mtime)
-                if dir_mtime > cutoff_time:
-                    self.logger.debug(
-                        "Skipping directory (too recent): %s", data_dir.name)
+            # Find directories that match the date pattern (YYYY-MM-DD*)
+            # This handles the hourly subdirectories like 2024-01-06T12
+            for data_dir in data_root.iterdir():
+                if not data_dir.is_dir():
                     continue
 
-                # Process .bin files in this directory
-                result = self._compress_directory_files(data_dir, output_path)
-                compressed_count += result[0]
-                skipped_count += result[1]
-                error_count += result[2]
+                # Skip the output subdirectory itself
+                if data_dir.name == self.output_subdir:
+                    continue
 
-            except Exception as e:
-                self.logger.error(
-                    "Error processing directory %s: %s", data_dir.name, e)
-                error_count += 1
+                try:
+                    # Check if directory is old enough based on modification time
+                    dir_mtime = datetime.datetime.fromtimestamp(
+                        data_dir.stat().st_mtime)
+                    if dir_mtime > cutoff_time:
+                        self.logger.debug(
+                            "Skipping directory (too recent): %s",
+                            data_dir.name)
+                        continue
+
+                    # Process .bin files in this directory
+                    result = self._compress_directory_files(
+                        data_dir, output_path)
+                    compressed_count += result[0]
+                    skipped_count += result[1]
+                    error_count += result[2]
+
+                except Exception as e:
+                    self.logger.error(
+                        "Error processing directory %s: %s",
+                        data_dir.name, e)
+                    error_count += 1
 
         return compressed_count, skipped_count, error_count
 
