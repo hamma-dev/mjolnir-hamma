@@ -212,7 +212,13 @@ class CompressData(brokkr.pipeline.base.OutputStep):
 
             # Find directories that match the date pattern (YYYY-MM-DD*)
             # This handles the hourly subdirectories like 2024-01-06T12
-            for data_dir in data_root.iterdir():
+            for data_dir in sorted(data_root.iterdir()):
+                # Re-check quiet hours so we stop when the window ends
+                if not self._is_quiet_time(datetime.datetime.now()):
+                    self.logger.info(
+                        "Quiet hours ended, stopping compression")
+                    return compressed_count, skipped_count, error_count
+
                 if not data_dir.is_dir():
                     continue
 
@@ -273,6 +279,10 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         bin_files = list(data_dir.glob("*.bin"))
 
         for bin_file in bin_files:
+            # Re-check quiet hours so we stop when the window ends
+            if not self._is_quiet_time(datetime.datetime.now()):
+                break
+
             # Check if already compressed
             hmc_file = out_subdir / (bin_file.stem + ".hmc")
             if hmc_file.exists():
