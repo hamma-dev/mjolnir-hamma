@@ -7,6 +7,8 @@ Only runs during configured quiet hours, deferring CPU and I/O to other processe
 
 # Standard library imports
 import datetime
+import os
+import subprocess
 from pathlib import Path
 
 # Local imports
@@ -26,8 +28,8 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                  delete_originals=True,
                  method="quantize",
                  step=8,
-                 quiet_start=2,
-                 quiet_end=5,
+                 quiet_start=22,
+                 quiet_end=14,
                  drive_glob=None,
                  **output_step_kwargs):
         """
@@ -61,10 +63,12 @@ class CompressData(brokkr.pipeline.base.OutputStep):
             - step=8: ~7% of original, RMSE~4
             Default is 8.
         quiet_start : int
-            Hour (0-23) when quiet period starts. Compression only runs
-            during quiet hours. Default is 2 (2 AM).
+            Hour (0-23 UTC) when quiet period starts. Compression only
+            runs during quiet hours. Supports wraparound (e.g., 22 to 14
+            means 10 PM to 2 PM UTC). Default is 22 (10 PM UTC).
         quiet_end : int
-            Hour (0-23) when quiet period ends. Default is 5 (5 AM).
+            Hour (0-23 UTC) when quiet period ends. Default is 14
+            (2 PM UTC).
         drive_glob : str, optional
             Glob pattern for data drive directories under source_path
             (e.g., "DATA??"). When set, the plugin looks for date dirs
@@ -85,6 +89,7 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         self.quiet_start = quiet_start
         self.quiet_end = quiet_end
         self.drive_glob = drive_glob
+        self._priority_set = False
 
     def _is_quiet_time(self, current_time):
         """
@@ -137,6 +142,30 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                 self.drive_glob, self.source_path)
         return drives
 
+    def _set_low_priority(self):
+        """Set this process to lowest CPU and I/O priority.
+
+        Called once on the first execute() call, which runs in the
+        worker subprocess. Uses nice 19 (lowest CPU priority) and
+        ionice idle class (only gets I/O when nothing else needs it).
+        """
+        if self._priority_set:
+            return
+
+        try:
+            os.nice(19)
+            subprocess.call(
+                ["ionice", "-c", "3", "-p", str(os.getpid())],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.logger.info(
+                "Set compression to low priority (nice=19, ionice=idle)")
+        except Exception as e:
+            self.logger.warning("Could not set low priority: %s", e)
+
+        self._priority_set = True
+
     def execute(self, input_data=None):
         """
         Execute compression if within quiet hours.
@@ -152,6 +181,8 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         input_data : same as input_data
             Input data passed through for further steps to consume.
         """
+        self._set_low_priority()
+
         try:
             current_time = input_data['time'].value
 

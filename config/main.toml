@@ -145,8 +145,8 @@ config_version = 1
         delete_originals = true
         method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
         step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
-        quiet_start = 2  # Only run between 2 AM and 5 AM (quiet hours)
-        quiet_end = 5
+        quiet_start = 22  # 10 PM UTC (5 PM CDT) - low priority, wide window
+        quiet_end = 14  # 2 PM UTC (9 AM CDT) - stop before peak storm hours
 
 
 # List pipelines to run here under the [pipelines] key
