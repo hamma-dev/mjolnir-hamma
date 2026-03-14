@@ -105,3 +105,105 @@ def _discover_drives(sensor):
         raise RuntimeError("No DATA drive found on sensor {}".format(sensor))
     logger.info("Found drives on sensor %d: %s", sensor, ", ".join(drives))
     return drives
+
+
+def _parse_date(value):
+    """Parse a date string or datetime into (date_str, hour_str|None).
+
+    Parameters
+    ----------
+    value : str or datetime
+        Date input. Strings: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH'.
+        datetime objects: date and hour extracted, minutes/seconds ignored.
+
+    Returns
+    -------
+    tuple of (str, str or None)
+        (date_str 'YYYY-MM-DD', hour_str 'HH' or None if date-only)
+    """
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d"), value.strftime("%H")
+    value = str(value)
+    # Try YYYY-MM-DDTHH
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%dT%H")
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%H")
+    except ValueError:
+        pass
+    # Try YYYY-MM-DD
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value, None
+    except ValueError:
+        pass
+    raise ValueError("Cannot parse date: '{}'. Use YYYY-MM-DD or YYYY-MM-DDTHH".format(value))
+
+
+def _filter_dirs(dirs, start, end):
+    """Filter directory names by date/time range.
+
+    Parameters
+    ----------
+    dirs : list of str
+        Directory names in YYYY-MM-DDTHH format.
+    start : str
+        Start date ('YYYY-MM-DD' or 'YYYY-MM-DDTHH').
+    end : str or None
+        End date (same formats). If None, uses start only.
+
+    Returns
+    -------
+    list of str
+        Sorted list of matching directory names.
+    """
+    start_date, start_hour = _parse_date(start)
+    if end is not None:
+        end_date, end_hour = _parse_date(end)
+    else:
+        end_date, end_hour = start_date, start_hour
+
+    # Build min/max datetime strings for comparison
+    if start_hour is not None:
+        range_min = "{}T{}".format(start_date, start_hour)
+    else:
+        range_min = "{}T00".format(start_date)
+
+    if end_hour is not None:
+        range_max = "{}T{}".format(end_date, end_hour)
+    else:
+        range_max = "{}T23".format(end_date)
+
+    matched = []
+    for d in sorted(dirs):
+        if not DATE_DIR_RE.match(d):
+            continue
+        if range_min <= d <= range_max:
+            matched.append(d)
+    return matched
+
+
+def _list_remote_dirs(sensor, drive, compressed=True):
+    """List date directories on a remote sensor drive.
+
+    Parameters
+    ----------
+    sensor : int
+        Sensor number.
+    drive : str
+        Drive name (e.g., 'DATA37').
+    compressed : bool
+        If True, list compressed/ subdir. If False, list drive root.
+
+    Returns
+    -------
+    list of str
+        Directory names matching YYYY-MM-DDTHH pattern.
+    """
+    if compressed:
+        path = "{}/{}/{}".format(MEDIA_PATH, drive, COMPRESSED_SUBDIR)
+    else:
+        path = "{}/{}".format(MEDIA_PATH, drive)
+
+    output = _ssh_run(sensor, "ls {}".format(path))
+    entries = output.split("\n")
+    return [e for e in entries if DATE_DIR_RE.match(e)]

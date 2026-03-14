@@ -91,3 +91,111 @@ class TestDiscoverDrives:
         ):
             with pytest.raises(RuntimeError, match="No DATA drive found"):
                 hamma_download._discover_drives(41)
+
+
+class TestParseDate:
+    """Tests for date string parsing."""
+
+    def test_date_only(self, hamma_download):
+        """YYYY-MM-DD returns (date_str, None)."""
+        date_str, hour = hamma_download._parse_date("2025-11-05")
+        assert date_str == "2025-11-05"
+        assert hour is None
+
+    def test_date_with_hour(self, hamma_download):
+        """YYYY-MM-DDTHH returns (date_str, hour_str)."""
+        date_str, hour = hamma_download._parse_date("2025-11-05T05")
+        assert date_str == "2025-11-05"
+        assert hour == "05"
+
+    def test_datetime_object(self, hamma_download):
+        """datetime object extracts date and hour."""
+        from datetime import datetime
+        dt = datetime(2025, 11, 5, 14, 30, 0)
+        date_str, hour = hamma_download._parse_date(dt)
+        assert date_str == "2025-11-05"
+        assert hour == "14"
+
+    def test_invalid_format_raises(self, hamma_download):
+        """Invalid string raises ValueError."""
+        with pytest.raises(ValueError):
+            hamma_download._parse_date("Nov 5 2025")
+
+
+class TestFilterDirs:
+    """Tests for filtering remote directories by date range."""
+
+    SAMPLE_DIRS = [
+        "2025-11-04T23",
+        "2025-11-05T00",
+        "2025-11-05T05",
+        "2025-11-05T12",
+        "2025-11-06T00",
+        "2025-11-06T23",
+        "2025-11-07T00",
+        "2025-11-07T12",
+    ]
+
+    def test_single_hour(self, hamma_download):
+        """Single hour start returns just that directory."""
+        result = hamma_download._filter_dirs(
+            self.SAMPLE_DIRS, "2025-11-05T05", None
+        )
+        assert result == ["2025-11-05T05"]
+
+    def test_single_date(self, hamma_download):
+        """Date-only start returns all hours for that day."""
+        result = hamma_download._filter_dirs(
+            self.SAMPLE_DIRS, "2025-11-05", None
+        )
+        assert result == ["2025-11-05T00", "2025-11-05T05", "2025-11-05T12"]
+
+    def test_date_range(self, hamma_download):
+        """Range includes all hours of both start and end dates."""
+        result = hamma_download._filter_dirs(
+            self.SAMPLE_DIRS, "2025-11-05", "2025-11-06"
+        )
+        assert result == [
+            "2025-11-05T00", "2025-11-05T05", "2025-11-05T12",
+            "2025-11-06T00", "2025-11-06T23",
+        ]
+
+    def test_range_with_hours(self, hamma_download):
+        """Range with hour precision filters exactly."""
+        result = hamma_download._filter_dirs(
+            self.SAMPLE_DIRS, "2025-11-05T05", "2025-11-06T00"
+        )
+        assert result == ["2025-11-05T05", "2025-11-05T12", "2025-11-06T00"]
+
+    def test_no_matches(self, hamma_download):
+        """No matching dirs returns empty list."""
+        result = hamma_download._filter_dirs(
+            self.SAMPLE_DIRS, "2025-12-01", None
+        )
+        assert result == []
+
+
+class TestListRemoteDirs:
+    """Tests for listing directories on the remote sensor."""
+
+    def test_compressed_path(self, hamma_download):
+        """Compressed mode lists compressed/ subdir."""
+        with patch.object(
+            hamma_download, "_ssh_run",
+            return_value="2025-11-05T00\n2025-11-05T05\n2025-11-05T12"
+        ) as mock_ssh:
+            dirs = hamma_download._list_remote_dirs(41, "DATA37", compressed=True)
+
+        assert dirs == ["2025-11-05T00", "2025-11-05T05", "2025-11-05T12"]
+        cmd = mock_ssh.call_args[0][1]
+        assert "/media/pi/DATA37/compressed" in cmd
+
+    def test_raw_path_filters_non_date_entries(self, hamma_download):
+        """Raw mode lists drive root and filters to date dirs only."""
+        with patch.object(
+            hamma_download, "_ssh_run",
+            return_value="2025-11-05T00\n2025-11-05T05\ncompressed\nlog"
+        ):
+            dirs = hamma_download._list_remote_dirs(41, "DATA37", compressed=False)
+
+        assert dirs == ["2025-11-05T00", "2025-11-05T05"]
