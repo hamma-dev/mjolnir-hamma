@@ -207,3 +207,90 @@ def _list_remote_dirs(sensor, drive, compressed=True):
     output = _ssh_run(sensor, "ls {}".format(path))
     entries = output.split("\n")
     return [e for e in entries if DATE_DIR_RE.match(e)]
+
+
+def download(sensor, dest, start, end=None, compressed=True, dry_run=False):
+    """Download data from a HAMMA sensor via rsync.
+
+    Parameters
+    ----------
+    sensor : int
+        Sensor number (e.g., 41). Derives SSH port as 10000 + sensor.
+    dest : str
+        Local destination path.
+    start : str or datetime
+        Start of time window ('YYYY-MM-DD' or 'YYYY-MM-DDTHH').
+    end : str or datetime or None
+        End of time window. If None, downloads only what start specifies.
+    compressed : bool
+        If True, pull from compressed/ subdirectory. If False, pull raw data.
+    dry_run : bool
+        If True, pass --dry-run to rsync.
+
+    Returns
+    -------
+    int
+        rsync return code (0 = success). Returns 0 if no directories match.
+
+    Raises
+    ------
+    RuntimeError
+        If SSH connection fails or no DATA drive found.
+    """
+    drives = _discover_drives(sensor)
+    port = str(PORT_OFFSET + sensor)
+    last_rc = 0
+
+    for drive in drives:
+        remote_dirs = _list_remote_dirs(sensor, drive, compressed=compressed)
+        matched = _filter_dirs(remote_dirs, start, end)
+
+        if not matched:
+            logger.warning(
+                "No directories matching request on sensor %d drive %s",
+                sensor, drive,
+            )
+            continue
+
+        # Build rsync source paths
+        if compressed:
+            base = "{}/{}/{}".format(MEDIA_PATH, drive, COMPRESSED_SUBDIR)
+        else:
+            base = "{}/{}".format(MEDIA_PATH, drive)
+
+        sources = [
+            "{}@{}:{}/{}".format(SSH_USER, SSH_HOST, base, d)
+            for d in matched
+        ]
+
+        cmd = (
+            ["rsync", "-avz", "--progress"]
+            + (["--dry-run"] if dry_run else [])
+            + ["-e", "ssh {} -p {}".format(" ".join(SSH_OPTIONS), port)]
+            + sources
+            + [dest]
+        )
+
+        logger.debug("Rsync command: %s", " ".join(cmd))
+        logger.info(
+            "Downloading %d directories from sensor %d drive %s",
+            len(matched), sensor, drive,
+        )
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+
+        if result.returncode != 0:
+            logger.error(
+                "Rsync failed (exit %d): %s",
+                result.returncode, result.stderr.strip(),
+            )
+            last_rc = result.returncode
+        else:
+            logger.info("Download complete for drive %s", drive)
+
+    return last_rc
