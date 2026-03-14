@@ -199,3 +199,129 @@ class TestListRemoteDirs:
             dirs = hamma_download._list_remote_dirs(41, "DATA37", compressed=False)
 
         assert dirs == ["2025-11-05T00", "2025-11-05T05"]
+
+
+class TestDownload:
+    """Tests for the main download() function."""
+
+    def test_single_hour_compressed(self, hamma_download):
+        """Download single hour of compressed data."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=["2025-11-05T05"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            rc = hamma_download.download(
+                sensor=41,
+                dest="/rgroup/hammadev/ignis/mj41",
+                start="2025-11-05T05",
+            )
+
+        assert rc == 0
+        cmd = mock_run.call_args[0][0]
+        cmd_str = " ".join(cmd)
+        assert "rsync" in cmd_str
+        assert "-avz" in cmd_str
+        assert "10041" in cmd_str
+        assert "/media/pi/DATA37/compressed/2025-11-05T05" in cmd_str
+        assert "/rgroup/hammadev/ignis/mj41" in cmd_str
+
+    def test_dry_run_flag(self, hamma_download):
+        """dry_run=True passes --dry-run to rsync."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=["2025-11-05T05"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2025-11-05T05", dry_run=True,
+            )
+
+        cmd = mock_run.call_args[0][0]
+        assert "--dry-run" in cmd
+
+    def test_raw_mode(self, hamma_download):
+        """compressed=False uses drive root path."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=["2025-11-05T05"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2025-11-05T05", compressed=False,
+            )
+
+        cmd_str = " ".join(mock_run.call_args[0][0])
+        assert "/media/pi/DATA37/2025-11-05T05" in cmd_str
+        assert "compressed" not in cmd_str
+
+    def test_multiple_drives(self, hamma_download):
+        """Multiple DATA drives each get their own rsync call."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37", "DATA38"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=["2025-11-05T05"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2025-11-05T05",
+            )
+
+        assert mock_run.call_count == 2
+        calls = [" ".join(c[0][0]) for c in mock_run.call_args_list]
+        assert any("DATA37" in c for c in calls)
+        assert any("DATA38" in c for c in calls)
+
+    def test_no_matching_dirs_returns_zero(self, hamma_download):
+        """No matching directories logs warning and returns 0."""
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=[]):
+            rc = hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2099-01-01",
+            )
+
+        assert rc == 0
+
+    def test_rsync_failure_returns_code(self, hamma_download):
+        """Rsync failure returns the non-zero exit code."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 23
+        mock_rsync.stderr = "some rsync error"
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=["2025-11-05T05"]), \
+             patch("subprocess.run", return_value=mock_rsync):
+            rc = hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2025-11-05T05",
+            )
+
+        assert rc == 23
+
+    def test_multiple_dirs_batched(self, hamma_download):
+        """Multiple matching dirs batched into single rsync call."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives", return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs", return_value=[
+                 "2025-11-05T00", "2025-11-05T05", "2025-11-05T12",
+             ]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.download(
+                sensor=41, dest="/tmp/test", start="2025-11-05",
+            )
+
+        # Single rsync call with all three dirs
+        assert mock_run.call_count == 1
+        cmd_str = " ".join(mock_run.call_args[0][0])
+        assert "2025-11-05T00" in cmd_str
+        assert "2025-11-05T05" in cmd_str
+        assert "2025-11-05T12" in cmd_str
