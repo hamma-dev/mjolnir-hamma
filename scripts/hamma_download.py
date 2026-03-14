@@ -294,3 +294,71 @@ def download(sensor, dest, start, end=None, compressed=True, dry_run=False):
             logger.info("Download complete for drive %s", drive)
 
     return last_rc
+
+
+def _build_parser():
+    """Build the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Download data from HAMMA sensors via rsync.",
+    )
+    parser.add_argument(
+        "-s", "--sensor", type=int, required=True,
+        help="Sensor number (e.g., 41)",
+    )
+    parser.add_argument(
+        "-d", "--dest", required=True,
+        help="Destination path (e.g., /rgroup/hammadev/ignis/mj41)",
+    )
+    parser.add_argument(
+        "--start", required=True,
+        help="Start date/time (YYYY-MM-DD or YYYY-MM-DDTHH)",
+    )
+    parser.add_argument(
+        "--end", default=None,
+        help="End date/time (YYYY-MM-DD or YYYY-MM-DDTHH)",
+    )
+    parser.add_argument(
+        "--raw", action="store_true", default=False,
+        help="Download raw data instead of compressed",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true", default=False,
+        dest="dry_run",
+        help="Rsync dry run (show what would transfer)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", default=False,
+        help="Enable debug logging",
+    )
+    return parser
+
+
+def main():
+    """CLI entry point."""
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s: %(message)s",
+    )
+
+    try:
+        rc = download(
+            sensor=args.sensor,
+            dest=args.dest,
+            start=args.start,
+            end=args.end,
+            compressed=not args.raw,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

@@ -325,3 +325,73 @@ class TestDownload:
         assert "2025-11-05T00" in cmd_str
         assert "2025-11-05T05" in cmd_str
         assert "2025-11-05T12" in cmd_str
+
+
+class TestCLI:
+    """Tests for the argparse CLI."""
+
+    def test_required_args(self, hamma_download):
+        """Missing required args causes SystemExit."""
+        with pytest.raises(SystemExit):
+            hamma_download._build_parser().parse_args([])
+
+    def test_all_args_parsed(self, hamma_download):
+        """All arguments parsed correctly."""
+        args = hamma_download._build_parser().parse_args([
+            "-s", "41",
+            "-d", "/rgroup/hammadev/ignis/mj41",
+            "--start", "2025-11-05",
+            "--end", "2025-11-07",
+            "--raw",
+            "-n",
+            "-v",
+        ])
+        assert args.sensor == 41
+        assert args.dest == "/rgroup/hammadev/ignis/mj41"
+        assert args.start == "2025-11-05"
+        assert args.end == "2025-11-07"
+        assert args.raw is True
+        assert args.dry_run is True
+        assert args.verbose is True
+
+    def test_defaults(self, hamma_download):
+        """Default values for optional args."""
+        args = hamma_download._build_parser().parse_args([
+            "-s", "1", "-d", "/tmp/test", "--start", "2025-01-01",
+        ])
+        assert args.end is None
+        assert args.raw is False
+        assert args.dry_run is False
+        assert args.verbose is False
+
+    def test_main_calls_download(self, hamma_download):
+        """main() parses args and calls download()."""
+        with patch.object(hamma_download, "download", return_value=0) as mock_dl, \
+             patch("sys.argv", [
+                 "hamma_download.py", "-s", "41",
+                 "-d", "/tmp/test", "--start", "2025-11-05",
+             ]):
+            with pytest.raises(SystemExit) as exc_info:
+                hamma_download.main()
+            assert exc_info.value.code == 0
+
+        mock_dl.assert_called_once_with(
+            sensor=41,
+            dest="/tmp/test",
+            start="2025-11-05",
+            end=None,
+            compressed=True,
+            dry_run=False,
+        )
+
+    def test_main_raw_flag_inverts_compressed(self, hamma_download):
+        """--raw flag sets compressed=False in download() call."""
+        with patch.object(hamma_download, "download", return_value=0) as mock_dl, \
+             patch("sys.argv", [
+                 "hamma_download.py", "-s", "41",
+                 "-d", "/tmp/test", "--start", "2025-11-05", "--raw",
+             ]):
+            with pytest.raises(SystemExit):
+                hamma_download.main()
+
+        assert mock_dl.call_args[1]["compressed"] is False
