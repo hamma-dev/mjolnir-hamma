@@ -19,11 +19,11 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 PORT_OFFSET = 10000
-SSH_USER = "pi"
+SSH_USER = "datasync"
 SSH_HOST = "localhost"
+JUMP_HOST = "monitor@hamma.dev"
 SSH_OPTIONS = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "BatchMode=yes",
+    "-J", JUMP_HOST,
 ]
 SSH_TIMEOUT = 30
 MEDIA_PATH = "/media/pi"
@@ -204,7 +204,11 @@ def _list_remote_dirs(sensor, drive, compressed=True):
     else:
         path = "{}/{}".format(MEDIA_PATH, drive)
 
-    output = _ssh_run(sensor, "ls {}".format(path))
+    try:
+        output = _ssh_run(sensor, "ls {}".format(path))
+    except RuntimeError:
+        logger.debug("Path %s not found on sensor %d drive %s", path, sensor, drive)
+        return []
     entries = output.split("\n")
     return [e for e in entries if DATE_DIR_RE.match(e)]
 

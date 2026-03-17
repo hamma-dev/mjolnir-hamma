@@ -44,8 +44,8 @@ class TestSSHRun:
         cmd = mock_run.call_args[0][0]
         assert "-p" in cmd
         assert "10041" in cmd
-        assert "StrictHostKeyChecking=no" in " ".join(cmd)
-        assert "BatchMode=yes" in " ".join(cmd)
+        assert "-J" in cmd
+        assert "monitor@hamma.dev" in cmd
 
     def test_ssh_run_raises_on_failure(self, hamma_download):
         """Non-zero SSH exit raises RuntimeError with stderr."""
@@ -199,6 +199,16 @@ class TestListRemoteDirs:
             dirs = hamma_download._list_remote_dirs(41, "DATA37", compressed=False)
 
         assert dirs == ["2025-11-05T00", "2025-11-05T05"]
+
+    def test_missing_directory_returns_empty(self, hamma_download):
+        """Missing remote directory returns empty list instead of raising."""
+        with patch.object(
+            hamma_download, "_ssh_run",
+            side_effect=RuntimeError("SSH to sensor 5 failed (exit 2): No such file")
+        ):
+            dirs = hamma_download._list_remote_dirs(5, "DATA38", compressed=True)
+
+        assert dirs == []
 
 
 class TestDownload:
