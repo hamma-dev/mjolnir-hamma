@@ -232,8 +232,12 @@ class CompressData(brokkr.pipeline.base.OutputStep):
 
             if compressed_count > 0 or error_count > 0:
                 self.logger.info(
-                    "Compression pass: %d compressed, %d already done, %d errors",
+                    "Compression pass: %d compressed, %d skipped, %d errors",
                     compressed_count, skipped_count, error_count)
+            elif skipped_count > 0:
+                self.logger.debug(
+                    "Compression pass: up to date (%d checked)",
+                    skipped_count)
 
         except Exception as e:
             self.logger.error(
