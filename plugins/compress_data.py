@@ -244,12 +244,14 @@ class CompressData(brokkr.pipeline.base.OutputStep):
         return input_data
 
     def compress_old_files(self):
-        """
-        Find and compress trigger files older than min_age_days.
+        """Compress trigger files, resuming from last compressed position.
 
-        Iterates over data roots (drive directories if drive_glob is set,
-        otherwise source_path itself) and compresses eligible files in
-        each. Each data root gets its own compressed output subdirectory.
+        For each data root, finds the newest compressed directory and
+        only processes directories from that point forward. This avoids
+        re-scanning thousands of already-compressed files on each pass.
+
+        On the first run (no compressed output yet), processes everything
+        older than min_age_days.
 
         Returns
         -------
@@ -267,19 +269,18 @@ class CompressData(brokkr.pipeline.base.OutputStep):
 
         data_roots = self._get_data_roots()
 
-        cutoff_time = datetime.datetime.now() - datetime.timedelta(
+        cutoff_time = datetime.datetime.utcnow() - datetime.timedelta(
             days=self.min_age_days)
 
         for data_root in data_roots:
-            # Each data root gets its own output subdirectory
             output_path = data_root / self.output_subdir
             output_path.mkdir(parents=True, exist_ok=True)
 
-            # Find directories that match the date pattern (YYYY-MM-DD*)
-            # This handles the hourly subdirectories like 2024-01-06T12
+            resume_pos = self._find_resume_position(data_root)
+
             for data_dir in sorted(data_root.iterdir()):
                 # Re-check quiet hours so we stop when the window ends
-                if not self._is_quiet_time(datetime.datetime.now()):
+                if not self._is_quiet_time(datetime.datetime.utcnow()):
                     self.logger.info(
                         "Quiet hours ended, stopping compression")
                     return compressed_count, skipped_count, error_count
@@ -287,13 +288,26 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                 if not data_dir.is_dir():
                     continue
 
-                # Skip the output subdirectory itself
                 if data_dir.name == self.output_subdir:
                     continue
 
+                # Skip directories before resume position
+                if resume_pos is not None and data_dir.name < resume_pos:
+                    continue
+
+                # Skip the resume directory itself if already complete
+                if resume_pos is not None and data_dir.name == resume_pos:
+                    out_subdir = output_path / data_dir.name
+                    bin_files = list(data_dir.glob("*.bin"))
+                    all_done = all(
+                        (out_subdir / (f.stem + ".hmc")).exists()
+                        for f in bin_files
+                    )
+                    if all_done and bin_files:
+                        continue
+
                 try:
-                    # Check if directory is old enough based on modification time
-                    dir_mtime = datetime.datetime.fromtimestamp(
+                    dir_mtime = datetime.datetime.utcfromtimestamp(
                         data_dir.stat().st_mtime)
                     if dir_mtime > cutoff_time:
                         self.logger.debug(
@@ -301,7 +315,6 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                             data_dir.name)
                         continue
 
-                    # Process .bin files in this directory
                     result = self._compress_directory_files(
                         data_dir, output_path)
                     compressed_count += result[0]
@@ -345,7 +358,7 @@ class CompressData(brokkr.pipeline.base.OutputStep):
 
         for bin_file in bin_files:
             # Re-check quiet hours so we stop when the window ends
-            if not self._is_quiet_time(datetime.datetime.now()):
+            if not self._is_quiet_time(datetime.datetime.utcnow()):
                 break
 
             # Check if already compressed
