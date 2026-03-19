@@ -142,11 +142,11 @@ config_version = 1
         drive_glob = "DATA??"  # Find data on mounted DATAxx drives
         output_subdir = "compressed"  # Archives stored in each drive's compressed/ subdir
         min_age_days = 1  # Only compress files older than 1 day
-        delete_originals = true
+        delete_originals = false  # Originals are ground truth; .hmc for transfer only
         method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
         step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
-        quiet_start = 22  # 10 PM UTC (5 PM CDT) - low priority, wide window
-        quiet_end = 14  # 2 PM UTC (9 AM CDT) - stop before peak storm hours
+        quiet_start = 8   # 8 AM UTC — after overnight storms
+        quiet_end = 0     # Midnight UTC — wide window for compression
 
 
 # List pipelines to run here under the [pipelines] key
