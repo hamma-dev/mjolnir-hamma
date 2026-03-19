@@ -565,3 +565,42 @@ class TestDriveGlob:
         assert errors == 0
         # Output goes directly to source_path/compressed/
         assert (tmp_path / "compressed" / "2026-01-15T10").is_dir()
+
+
+class TestResumePosition:
+    """Tests for _find_resume_position method."""
+
+    def test_finds_newest_compressed_dir(self, tmp_path):
+        """Returns the newest date directory name in compressed/."""
+        compressed = tmp_path / "compressed"
+        (compressed / "2026-01-15T10").mkdir(parents=True)
+        (compressed / "2026-02-20T08").mkdir()
+        (compressed / "2026-01-20T00").mkdir()
+
+        step = make_step(source_path=str(tmp_path))
+        result = step._find_resume_position(tmp_path)
+        assert result == "2026-02-20T08"  # newest by sort
+
+    def test_returns_none_when_no_compressed_dir(self, tmp_path):
+        """Returns None when compressed/ doesn't exist."""
+        step = make_step(source_path=str(tmp_path))
+        result = step._find_resume_position(tmp_path)
+        assert result is None
+
+    def test_returns_none_when_compressed_empty(self, tmp_path):
+        """Returns None when compressed/ exists but is empty."""
+        (tmp_path / "compressed").mkdir()
+        step = make_step(source_path=str(tmp_path))
+        result = step._find_resume_position(tmp_path)
+        assert result is None
+
+    def test_ignores_non_date_dirs(self, tmp_path):
+        """Skips directories that don't match YYYY-MM-DDTHH pattern."""
+        compressed = tmp_path / "compressed"
+        (compressed / "2026-01-15T10").mkdir(parents=True)
+        (compressed / "$RECYCLE.BIN").mkdir()
+        (compressed / "temp").mkdir()
+
+        step = make_step(source_path=str(tmp_path))
+        result = step._find_resume_position(tmp_path)
+        assert result == "2026-01-15T10"
