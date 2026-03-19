@@ -8,6 +8,7 @@ Only runs during configured quiet hours, deferring CPU and I/O to other processe
 # Standard library imports
 import datetime
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -16,6 +17,8 @@ import brokkr.pipeline.base
 
 # HAMMA compression module
 from hamma.compression import compress_file
+
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
 
 class CompressData(brokkr.pipeline.base.OutputStep):
@@ -141,6 +144,37 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                 "No drives matching '%s' found in %s",
                 self.drive_glob, self.source_path)
         return drives
+
+    def _find_resume_position(self, data_root):
+        """Find the newest date directory in compressed output.
+
+        Scans the compressed output subdirectory for the newest
+        date-named directory (YYYY-MM-DDTHH format). This is where
+        the previous compression pass left off.
+
+        Parameters
+        ----------
+        data_root : Path
+            The data root directory (e.g., /media/pi/DATA41).
+
+        Returns
+        -------
+        str or None
+            The name of the newest date directory, or None if no
+            compressed directories exist.
+        """
+        output_path = data_root / self.output_subdir
+        if not output_path.is_dir():
+            return None
+
+        date_dirs = sorted(
+            d.name for d in output_path.iterdir()
+            if d.is_dir() and DATE_DIR_RE.match(d.name)
+        )
+        if not date_dirs:
+            return None
+
+        return date_dirs[-1]
 
     def _set_low_priority(self):
         """Set this process to lowest CPU and I/O priority.
