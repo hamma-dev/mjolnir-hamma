@@ -405,3 +405,119 @@ class TestCLI:
                 hamma_download.main()
 
         assert mock_dl.call_args[1]["compressed"] is False
+
+
+class TestSync:
+    """Tests for the sync download mode."""
+
+    def test_sync_downloads_all_compressed(self, hamma_download):
+        """Sync mode downloads everything in compressed/ without date filter."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=["2026-03-15T08", "2026-03-15T12"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            rc = hamma_download.sync(sensor=41, dest="/tmp/test")
+
+        assert rc == 0
+        cmd = mock_run.call_args[0][0]
+        cmd_str = " ".join(cmd)
+        assert "rsync" in cmd_str
+        assert "/media/pi/DATA37/compressed/2026-03-15T08" in cmd_str
+        assert "/media/pi/DATA37/compressed/2026-03-15T12" in cmd_str
+
+    def test_sync_uses_remove_source_files(self, hamma_download):
+        """Sync mode passes --remove-source-files to rsync."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=["2026-03-15T08"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.sync(sensor=41, dest="/tmp/test", cleanup=True)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--remove-source-files" in cmd
+
+    def test_sync_no_cleanup_by_default(self, hamma_download):
+        """Without cleanup flag, no --remove-source-files."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=["2026-03-15T08"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.sync(sensor=41, dest="/tmp/test", cleanup=False)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--remove-source-files" not in cmd
+
+    def test_sync_skips_recent_dirs(self, hamma_download):
+        """Sync skips directories from the current hour to avoid partial files."""
+        from datetime import datetime as real_datetime
+        fake_now = real_datetime(2026, 3, 17, 14, 30, 0)
+
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=[
+                              "2026-03-16T08", "2026-03-16T12",
+                              "2026-03-17T14",  # current hour
+                          ]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run, \
+             patch.object(hamma_download, "datetime") as mock_dt:
+            mock_dt.utcnow.return_value = fake_now
+            hamma_download.sync(sensor=41, dest="/tmp/test")
+
+        cmd_str = " ".join(mock_run.call_args[0][0])
+        assert "2026-03-16T08" in cmd_str
+        assert "2026-03-16T12" in cmd_str
+        assert "2026-03-17T14" not in cmd_str
+
+    def test_sync_multiple_drives(self, hamma_download):
+        """Sync handles multiple DATA drives."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37", "DATA38"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=["2026-03-16T08"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.sync(sensor=41, dest="/tmp/test")
+
+        assert mock_run.call_count == 2
+
+    def test_sync_dry_run(self, hamma_download):
+        """Sync dry_run passes --dry-run and omits --remove-source-files."""
+        mock_rsync = MagicMock()
+        mock_rsync.returncode = 0
+        mock_rsync.stderr = ""
+
+        with patch.object(hamma_download, "_discover_drives",
+                          return_value=["DATA37"]), \
+             patch.object(hamma_download, "_list_remote_dirs",
+                          return_value=["2026-03-15T08"]), \
+             patch("subprocess.run", return_value=mock_rsync) as mock_run:
+            hamma_download.sync(
+                sensor=41, dest="/tmp/test", cleanup=True, dry_run=True)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--dry-run" in cmd
+        # cleanup should be suppressed during dry run
+        assert "--remove-source-files" not in cmd

@@ -300,6 +300,91 @@ def download(sensor, dest, start, end=None, compressed=True, dry_run=False):
     return last_rc
 
 
+def sync(sensor, dest, cleanup=False, dry_run=False):
+    """Sync all compressed data from a sensor, optionally cleaning up.
+
+    Downloads everything in compressed/ directories on the sensor,
+    skipping the current hour's directory to avoid partial files.
+    With cleanup=True, successfully transferred files are removed
+    from the sensor via rsync --remove-source-files.
+
+    Parameters
+    ----------
+    sensor : int
+        Sensor number (e.g., 41).
+    dest : str
+        Local destination path.
+    cleanup : bool
+        If True, delete source .hmc files after successful transfer.
+        Suppressed when dry_run is True. Default is False.
+    dry_run : bool
+        If True, pass --dry-run to rsync. Default is False.
+
+    Returns
+    -------
+    int
+        rsync return code (0 = success).
+    """
+    drives = _discover_drives(sensor)
+    port = str(PORT_OFFSET + sensor)
+    last_rc = 0
+
+    # Skip the current hour to avoid grabbing files mid-compression
+    now = datetime.utcnow()
+    current_dir = now.strftime("%Y-%m-%dT%H")
+
+    for drive in drives:
+        remote_dirs = _list_remote_dirs(sensor, drive, compressed=True)
+
+        # Filter out current hour
+        safe_dirs = [d for d in remote_dirs if d < current_dir]
+
+        if not safe_dirs:
+            logger.info(
+                "No completed directories to sync on sensor %d drive %s",
+                sensor, drive)
+            continue
+
+        base = "{}/{}/{}".format(MEDIA_PATH, drive, COMPRESSED_SUBDIR)
+        sources = [
+            "{}@{}:{}/{}".format(SSH_USER, SSH_HOST, base, d)
+            for d in safe_dirs
+        ]
+
+        cmd = (
+            ["rsync", "-avz", "--progress"]
+            + (["--dry-run"] if dry_run else [])
+            + (["--remove-source-files"] if cleanup and not dry_run else [])
+            + ["-e", "ssh {} -p {}".format(" ".join(SSH_OPTIONS), port)]
+            + sources
+            + [dest]
+        )
+
+        logger.info(
+            "Syncing %d directories from sensor %d drive %s%s",
+            len(safe_dirs), sensor, drive,
+            " (cleanup after)" if cleanup and not dry_run else "",
+        )
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+
+        if result.returncode != 0:
+            logger.error(
+                "Rsync failed (exit %d): %s",
+                result.returncode, result.stderr.strip())
+            last_rc = result.returncode
+        else:
+            logger.info(
+                "Sync complete for drive %s (%d dirs)", drive, len(safe_dirs))
+
+    return last_rc
+
+
 def _build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
