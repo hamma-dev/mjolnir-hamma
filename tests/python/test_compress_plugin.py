@@ -567,6 +567,104 @@ class TestDriveGlob:
         assert (tmp_path / "compressed" / "2026-01-15T10").is_dir()
 
 
+class TestForwardOnlyScan:
+    """Tests that compression only scans from resume position forward."""
+
+    def test_skips_directories_before_resume_position(
+            self, tmp_path, mock_compress_file):
+        """Directories older than resume position are not scanned."""
+        mock_compress_file.return_value = [
+            {'ratio': 0.07, 'method': 'quantize'}]
+
+        three_days_ago = time.time() - 3 * 86400
+
+        # Old dir — already compressed
+        old_dir = tmp_path / "2026-01-10T08"
+        old_dir.mkdir()
+        (old_dir / "trigger_old.bin").write_bytes(b"\x00" * 100)
+        os.utime(old_dir, (three_days_ago, three_days_ago))
+
+        # Newer dir — needs compression
+        new_dir = tmp_path / "2026-01-15T10"
+        new_dir.mkdir()
+        (new_dir / "trigger_new.bin").write_bytes(b"\x00" * 100)
+        os.utime(new_dir, (three_days_ago, three_days_ago))
+
+        # Simulate resume position: compressed/ has the old dir done
+        compressed = tmp_path / "compressed"
+        old_out = compressed / "2026-01-10T08"
+        old_out.mkdir(parents=True)
+        (old_out / "trigger_old.hmc").write_bytes(b"\x00" * 50)
+
+        step = make_step(
+            source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True  # Always quiet for test
+        compressed_count, skipped, errors = step.compress_old_files()
+
+        # Should only process the new dir, not re-check old dir's files
+        assert compressed_count == 1
+        assert skipped == 0  # old dir not scanned at all
+        assert errors == 0
+        # Verify compress_file was called only for the new file
+        assert mock_compress_file.call_count == 1
+        assert "trigger_new" in str(mock_compress_file.call_args[0][0])
+
+    def test_rechecks_resume_directory_for_partial(
+            self, tmp_path, mock_compress_file):
+        """The resume directory itself is re-checked for partial completion."""
+        mock_compress_file.return_value = [
+            {'ratio': 0.07, 'method': 'quantize'}]
+
+        three_days_ago = time.time() - 3 * 86400
+
+        # Dir with 2 files, one already compressed
+        data_dir = tmp_path / "2026-01-15T10"
+        data_dir.mkdir()
+        (data_dir / "trigger01.bin").write_bytes(b"\x00" * 100)
+        (data_dir / "trigger02.bin").write_bytes(b"\x00" * 100)
+        os.utime(data_dir, (three_days_ago, three_days_ago))
+
+        compressed = tmp_path / "compressed"
+        out_dir = compressed / "2026-01-15T10"
+        out_dir.mkdir(parents=True)
+        (out_dir / "trigger01.hmc").write_bytes(b"\x00" * 50)
+
+        step = make_step(
+            source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True  # Always quiet for test
+        compressed_count, skipped, errors = step.compress_old_files()
+
+        assert compressed_count == 1  # trigger02
+        assert skipped == 1  # trigger01 already done
+        assert errors == 0
+
+    def test_full_scan_when_no_resume_position(
+            self, tmp_path, mock_compress_file):
+        """Without any compressed output, scans everything (first run)."""
+        mock_compress_file.return_value = [
+            {'ratio': 0.07, 'method': 'quantize'}]
+
+        three_days_ago = time.time() - 3 * 86400
+
+        dir1 = tmp_path / "2026-01-10T08"
+        dir1.mkdir()
+        (dir1 / "trigger01.bin").write_bytes(b"\x00" * 100)
+        os.utime(dir1, (three_days_ago, three_days_ago))
+
+        dir2 = tmp_path / "2026-01-15T10"
+        dir2.mkdir()
+        (dir2 / "trigger02.bin").write_bytes(b"\x00" * 100)
+        os.utime(dir2, (three_days_ago, three_days_ago))
+
+        step = make_step(
+            source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True  # Always quiet for test
+        compressed_count, skipped, errors = step.compress_old_files()
+
+        assert compressed_count == 2
+        assert errors == 0
+
+
 class TestResumePosition:
     """Tests for _find_resume_position method."""
 
