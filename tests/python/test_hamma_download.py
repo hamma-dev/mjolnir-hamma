@@ -521,3 +521,48 @@ class TestSync:
         assert "--dry-run" in cmd
         # cleanup should be suppressed during dry run
         assert "--remove-source-files" not in cmd
+
+
+class TestSyncCLI:
+    """Tests for sync mode CLI integration."""
+
+    def test_sync_flag_no_start_required(self, hamma_download):
+        """--sync mode doesn't require --start."""
+        args = hamma_download._build_parser().parse_args([
+            "-s", "41", "-d", "/tmp/test", "--sync",
+        ])
+        assert args.sync is True
+        assert args.start is None
+
+    def test_sync_with_cleanup(self, hamma_download):
+        """--sync --cleanup parsed correctly."""
+        args = hamma_download._build_parser().parse_args([
+            "-s", "41", "-d", "/tmp/test", "--sync", "--cleanup",
+        ])
+        assert args.sync is True
+        assert args.cleanup is True
+
+    def test_main_sync_calls_sync_function(self, hamma_download):
+        """main() with --sync calls sync() instead of download()."""
+        with patch.object(hamma_download, "sync", return_value=0) as mock_sync, \
+             patch("sys.argv", [
+                 "hamma_download.py", "-s", "41",
+                 "-d", "/tmp/test", "--sync", "--cleanup",
+             ]):
+            with pytest.raises(SystemExit) as exc_info:
+                hamma_download.main()
+            assert exc_info.value.code == 0
+
+        mock_sync.assert_called_once_with(
+            sensor=41, dest="/tmp/test",
+            cleanup=True, dry_run=False,
+        )
+
+    def test_start_required_without_sync(self, hamma_download):
+        """Without --sync, missing --start causes error exit."""
+        with patch("sys.argv", [
+                 "hamma_download.py", "-s", "41", "-d", "/tmp/test",
+             ]):
+            with pytest.raises(SystemExit) as exc_info:
+                hamma_download.main()
+            assert exc_info.value.code != 0
