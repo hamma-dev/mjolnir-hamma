@@ -399,12 +399,20 @@ def _build_parser():
         help="Destination path (e.g., /rgroup/hammadev/ignis/mj41)",
     )
     parser.add_argument(
-        "--start", required=True,
+        "--start", default=None,
         help="Start date/time (YYYY-MM-DD or YYYY-MM-DDTHH)",
     )
     parser.add_argument(
         "--end", default=None,
         help="End date/time (YYYY-MM-DD or YYYY-MM-DDTHH)",
+    )
+    parser.add_argument(
+        "--sync", action="store_true", default=False,
+        help="Sync mode: download all available compressed data",
+    )
+    parser.add_argument(
+        "--cleanup", action="store_true", default=False,
+        help="Remove .hmc files from sensor after successful transfer (sync mode only)",
     )
     parser.add_argument(
         "--raw", action="store_true", default=False,
@@ -427,6 +435,10 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
+    # Validate: either --sync or --start is required
+    if not args.sync and args.start is None:
+        parser.error("--start is required (or use --sync mode)")
+
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -434,14 +446,22 @@ def main():
     )
 
     try:
-        rc = download(
-            sensor=args.sensor,
-            dest=args.dest,
-            start=args.start,
-            end=args.end,
-            compressed=not args.raw,
-            dry_run=args.dry_run,
-        )
+        if args.sync:
+            rc = sync(
+                sensor=args.sensor,
+                dest=args.dest,
+                cleanup=args.cleanup,
+                dry_run=args.dry_run,
+            )
+        else:
+            rc = download(
+                sensor=args.sensor,
+                dest=args.dest,
+                start=args.start,
+                end=args.end,
+                compressed=not args.raw,
+                dry_run=args.dry_run,
+            )
     except RuntimeError as exc:
         logger.error("%s", exc)
         sys.exit(1)
