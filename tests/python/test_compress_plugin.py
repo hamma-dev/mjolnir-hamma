@@ -123,23 +123,23 @@ class TestQuietHours:
     """Tests for the _is_quiet_time method."""
 
     def test_within_quiet_hours(self):
-        step = make_step()
-        t = datetime.datetime(2026, 2, 19, 3, 0, 0)  # 3 AM
+        step = make_step()  # quiet_start=8, quiet_end=0
+        t = datetime.datetime(2026, 2, 19, 12, 0, 0)  # noon
         assert step._is_quiet_time(t) is True
 
     def test_outside_quiet_hours(self):
         step = make_step()
-        t = datetime.datetime(2026, 2, 19, 10, 0, 0)  # 10 AM
+        t = datetime.datetime(2026, 2, 19, 3, 0, 0)  # 3 AM
         assert step._is_quiet_time(t) is False
 
     def test_boundary_start(self):
         step = make_step()
-        t = datetime.datetime(2026, 2, 19, 2, 0, 0)  # exactly 2 AM
+        t = datetime.datetime(2026, 2, 19, 8, 0, 0)  # exactly 8 AM
         assert step._is_quiet_time(t) is True
 
     def test_boundary_end(self):
         step = make_step()
-        t = datetime.datetime(2026, 2, 19, 5, 0, 0)  # exactly 5 AM
+        t = datetime.datetime(2026, 2, 19, 0, 0, 0)  # exactly midnight
         assert step._is_quiet_time(t) is False
 
     def test_wraparound_night(self):
@@ -164,6 +164,7 @@ class TestFileDiscovery:
 
         step = make_step(
             source_path=str(media_tree), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         # trigger01 is already compressed (hmc exists), trigger02 should be new
@@ -177,6 +178,7 @@ class TestFileDiscovery:
 
         step = make_step(
             source_path=str(media_tree), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         step.compress_old_files()
 
         # trigger03.bin is in recent dir, should not be passed to compress
@@ -190,6 +192,7 @@ class TestFileDiscovery:
 
         step = make_step(
             source_path=str(media_tree), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         # trigger01.hmc already exists -> skipped
@@ -201,6 +204,7 @@ class TestFileDiscovery:
     def test_skips_output_subdir(self, media_tree, mock_compress_file):
         step = make_step(
             source_path=str(media_tree), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         step.compress_old_files()
 
         # The compressed/ directory should not be processed as a data dir
@@ -276,6 +280,7 @@ class TestCompression:
 
         step = make_step(
             source_path=str(tmp_path), delete_originals=True)
+        step._is_quiet_time = lambda t: True
         step.compress_old_files()
 
         assert not bin_file.exists()
@@ -293,6 +298,7 @@ class TestCompression:
 
         step = make_step(
             source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         step.compress_old_files()
 
         assert bin_file.exists()
@@ -310,6 +316,7 @@ class TestCompression:
 
         step = make_step(
             source_path=str(tmp_path), delete_originals=True)
+        step._is_quiet_time = lambda t: True
         step.compress_old_files()
 
         # Dir should be removed because delete_originals=True and it's empty
@@ -332,10 +339,10 @@ class TestExecute:
 
         step = make_step(
             source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True
 
-        # 3 AM is within default quiet hours (2-5)
         mock_time_value = MagicMock()
-        mock_time_value.value = datetime.datetime(2026, 2, 19, 3, 0, 0)
+        mock_time_value.value = datetime.datetime(2026, 2, 19, 12, 0, 0)
         input_data = {'time': mock_time_value}
 
         result = step.execute(input_data)
@@ -346,8 +353,9 @@ class TestExecute:
     def test_execute_outside_quiet_hours(self, mock_compress_file):
         step = make_step()
 
+        # 3 AM is outside default quiet hours (8-midnight)
         mock_time_value = MagicMock()
-        mock_time_value.value = datetime.datetime(2026, 2, 19, 10, 0, 0)
+        mock_time_value.value = datetime.datetime(2026, 2, 19, 3, 0, 0)
         input_data = {'time': mock_time_value}
 
         result = step.execute(input_data)
@@ -375,10 +383,10 @@ class TestConfiguration:
         step = make_step()
         assert step.method == "quantize"
         assert step.step == 8
-        assert step.quiet_start == 2
-        assert step.quiet_end == 5
+        assert step.quiet_start == 8
+        assert step.quiet_end == 0
         assert step.min_age_days == 1
-        assert step.delete_originals is True
+        assert step.delete_originals is False
         assert step.output_subdir == "compressed"
         assert step.drive_glob is None
 
@@ -473,6 +481,7 @@ class TestDriveGlob:
             drive_glob="DATA??",
             delete_originals=False,
         )
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         assert compressed == 2
@@ -509,6 +518,7 @@ class TestDriveGlob:
             drive_glob="DATA??",
             delete_originals=False,
         )
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         assert compressed == 2
@@ -540,6 +550,7 @@ class TestDriveGlob:
             drive_glob="DATA??",
             delete_originals=False,
         )
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         assert compressed == 1
@@ -559,6 +570,7 @@ class TestDriveGlob:
         # No drive_glob — original behavior
         step = make_step(
             source_path=str(tmp_path), delete_originals=False)
+        step._is_quiet_time = lambda t: True
         compressed, skipped, errors = step.compress_old_files()
 
         assert compressed == 1

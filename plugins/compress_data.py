@@ -28,11 +28,11 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                  source_path,
                  output_subdir="compressed",
                  min_age_days=1,
-                 delete_originals=True,
+                 delete_originals=False,
                  method="quantize",
                  step=8,
-                 quiet_start=22,
-                 quiet_end=14,
+                 quiet_start=8,
+                 quiet_end=0,
                  drive_glob=None,
                  **output_step_kwargs):
         """
@@ -52,7 +52,7 @@ class CompressData(brokkr.pipeline.base.OutputStep):
             files still being written. Default is 1 day.
         delete_originals : bool
             Whether to delete original files after successful compression.
-            Default is True.
+            Default is False.
         method : str
             Compression method for hamma.compression:
             - 'lossless': Lossless LZMA compression (~25% of original)
@@ -67,11 +67,11 @@ class CompressData(brokkr.pipeline.base.OutputStep):
             Default is 8.
         quiet_start : int
             Hour (0-23 UTC) when quiet period starts. Compression only
-            runs during quiet hours. Supports wraparound (e.g., 22 to 14
-            means 10 PM to 2 PM UTC). Default is 22 (10 PM UTC).
+            runs during quiet hours. Supports wraparound (e.g., 22 to 5
+            means 10 PM to 5 AM UTC). Default is 8 (8 AM UTC).
         quiet_end : int
-            Hour (0-23 UTC) when quiet period ends. Default is 14
-            (2 PM UTC).
+            Hour (0-23 UTC) when quiet period ends. Default is 0
+            (midnight UTC).
         drive_glob : str, optional
             Glob pattern for data drive directories under source_path
             (e.g., "DATA??"). When set, the plugin looks for date dirs
