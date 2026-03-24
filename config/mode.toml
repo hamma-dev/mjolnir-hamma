@@ -64,3 +64,14 @@ config_version = 1
 
     [nosensor.main.pipelines.rsync_hamma_realtime]
         _enabled = false
+
+# Preset for units without a charge controller connected
+# Removes sunsaver input from telemetry; can combine with nosensor
+[nochargecontroller]
+    [nochargecontroller.main.pipelines.telemetry]
+        monitor_input_steps = [
+            "builtins.inputs.current_time",
+            "builtins.inputs.run_time",
+            "hamma2.inputs.ping",
+            "hamma2.inputs.hs",
+        ]
