@@ -115,7 +115,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
 
         cmd = [
             "rsync",
-            "-avz",
+            "-rltDvz",
+            "--omit-dir-times",
         ]
 
         # If we only include certain files, put that in there,
