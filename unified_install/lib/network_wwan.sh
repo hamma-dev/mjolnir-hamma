@@ -128,12 +128,17 @@ setup_cellular_network() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "cp $FILES_DIR/20-wwan0.network $NETWORK_PATH/"
         log_dry_run "cp $FILES_DIR/30-eth1.network $NETWORK_PATH/"
+        log_dry_run "systemctl restart systemd-networkd"
         manifest_add "copy" "src" "$FILES_DIR/20-wwan0.network" "dst" "$NETWORK_PATH/20-wwan0.network" "sudo" "true"
         manifest_add "copy" "src" "$FILES_DIR/30-eth1.network" "dst" "$NETWORK_PATH/30-eth1.network" "sudo" "true"
+        manifest_add "command" "cmd" "systemctl restart systemd-networkd" "sudo" "true"
     else
         sudo cp "$FILES_DIR/20-wwan0.network" "$NETWORK_PATH/"
         sudo cp "$FILES_DIR/30-eth1.network" "$NETWORK_PATH/"
-        log_success "Network configs installed"
+        # Restart networkd so .network file changes take effect (safe for wwan0
+        # since it is Unmanaged=yes — only eth0/eth1 configs are reloaded)
+        sudo systemctl restart systemd-networkd
+        log_success "Network configs installed and networkd restarted"
     fi
 
     # --- Step 5: Copy WWAN scripts to /usr/local/bin ---
