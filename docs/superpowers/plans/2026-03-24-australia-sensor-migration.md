@@ -89,13 +89,23 @@ ssh mjolnir41 "sudo bash /tmp/migration-deadman.sh arm 30"
 
 Verify output shows "DEAD MAN'S SWITCH ARMED" and lists all backed-up files. The clock is now ticking — if we don't defuse within 30 minutes, all changes roll back and the Pi reboots.
 
-- [ ] **Step 4: Stop wwan-check timer**
+- [ ] **Step 4: Fetch new branch (while timer still running)**
+
+Fetch first, before stopping the timer — minimizes the window where the sensor has no automatic wwan0 recovery. The fetch is read-only and safe to run alongside the old scripts.
+
+```bash
+ssh mjolnir41 "cd /home/pi/dev/mjolnir-hamma && git fetch origin"
+```
+
+- [ ] **Step 5: Stop wwan-check timer**
 
 ```bash
 ssh mjolnir41 "sudo systemctl stop wwan-check.timer"
 ```
 
-- [ ] **Step 5: Inspect and clean git working tree**
+From here until install.sh restarts the timer (Step 8), there is no automatic wwan0 recovery. Work quickly but carefully.
+
+- [ ] **Step 6: Inspect and clean git working tree**
 
 ```bash
 ssh mjolnir41 "cd /home/pi/dev/mjolnir-hamma && git status && git diff --stat"
@@ -109,11 +119,10 @@ ssh mjolnir41 "cd /home/pi/dev/mjolnir-hamma && \
   rm -f plugins/compress_data.py presets/compress_data.preset.toml"
 ```
 
-- [ ] **Step 6: Switch to feature/daily-compression**
+- [ ] **Step 7: Switch to feature/daily-compression (local only, already fetched)**
 
 ```bash
 ssh mjolnir41 "cd /home/pi/dev/mjolnir-hamma && \
-  git fetch origin && \
   git checkout feature/daily-compression && \
   git pull"
 ```
@@ -128,7 +137,7 @@ Expected: `feature/daily-compression`, clean working tree.
 
 **GATE: Branch must be clean before running installer.**
 
-- [ ] **Step 7: Run install.sh (network only)**
+- [ ] **Step 8: Run install.sh (network only)**
 
 ```bash
 ssh mjolnir41 "sudo bash /home/pi/dev/mjolnir-hamma/unified_install/install.sh 41 \
@@ -140,24 +149,24 @@ Expected: Warning about branch mismatch ("On branch 'feature/daily-compression',
 
 Watch output for errors. All 9 WWAN steps should complete with success messages.
 
-- [ ] **Step 8: Verify network survived**
+- [ ] **Step 9: Verify network survived**
+
+First check routing, then connectivity:
 
 ```bash
-ssh mjolnir41 "ip -4 addr show wwan0 | grep inet && \
+ssh mjolnir41 "ip route show default && \
+  ip -4 addr show wwan0 | grep inet && \
   ping -c 3 8.8.8.8 && \
   ping -c 3 google.com"
 ```
 
-**GATE: All three pings must succeed. If DNS fails but IP ping works, the DNS fix didn't take effect — investigate.**
+**GATE: Default route must show wwan0. All pings must succeed. If DNS fails but IP ping works, the DNS fix didn't take effect — investigate. If default route is missing, run `sudo /usr/local/bin/wwan-check.sh` immediately.**
 
-- [ ] **Step 9: Apply power_delim override**
+- [ ] **Step 10: Apply power_delim override**
 
 ```bash
-ssh mjolnir41 "sudo -H -u pi mkdir -p /home/pi/.config/brokkr/hamma && \
-  sudo -H -u pi tee /home/pi/.config/brokkr/hamma/main.toml > /dev/null <<'TOML'
-[steps.state_monitor.plugins.hamma_state_monitor.kwargs]
-power_delim = 15
-TOML"
+ssh mjolnir41 "sudo -H -u pi mkdir -p /home/pi/.config/brokkr/hamma"
+ssh mjolnir41 "printf '[steps.state_monitor.plugins.hamma_state_monitor.kwargs]\npower_delim = 15\n' | sudo -H -u pi tee /home/pi/.config/brokkr/hamma/main.toml > /dev/null"
 ```
 
 Verify:
@@ -166,7 +175,7 @@ Verify:
 ssh mjolnir41 "cat /home/pi/.config/brokkr/hamma/main.toml"
 ```
 
-- [ ] **Step 10: Restart brokkr**
+- [ ] **Step 11: Restart brokkr**
 
 ```bash
 ssh mjolnir41 "sudo systemctl restart brokkr-hamma-default.service"
@@ -176,37 +185,42 @@ Do NOT restart autossh.
 
 ### Post-migration verification
 
-- [ ] **Step 11: Full verification checklist**
+- [ ] **Step 12: Full verification checklist**
+
+Uses `;` instead of `&&` so one check failing doesn't abort the rest:
 
 ```bash
-ssh mjolnir41 "echo '=== Services ===' && \
-  systemctl is-active brokkr-hamma-default.service && \
-  systemctl is-active autossh-hamma-default.service && \
-  systemctl is-active wwan-check.timer && \
-  echo '=== Branch ===' && \
-  git -C /home/pi/dev/mjolnir-hamma branch --show-current && \
-  echo '=== carrier.d ===' && \
-  ls /etc/networkd-dispatcher/carrier.d/ && \
-  echo '=== flock ===' && \
-  grep flock /usr/local/bin/wwan-check.sh && \
-  echo '=== APN ===' && \
-  grep '^APN' /usr/local/bin/50_bring_wwan0_up.py && \
-  echo '=== DNS fix ===' && \
-  grep DNS /etc/systemd/network/40-eth0.network; echo '(empty = good)' && \
-  echo '=== Brokkr logs ===' && \
+ssh mjolnir41 "echo '=== Services ===' ; \
+  systemctl is-active brokkr-hamma-default.service ; \
+  systemctl is-active autossh-hamma-default.service ; \
+  systemctl is-active wwan-check.timer ; \
+  echo '=== Branch ===' ; \
+  git -C /home/pi/dev/mjolnir-hamma branch --show-current ; \
+  echo '=== carrier.d ===' ; \
+  ls /etc/networkd-dispatcher/carrier.d/ 2>/dev/null || echo '(directory does not exist)' ; \
+  echo '=== flock ===' ; \
+  grep flock /usr/local/bin/wwan-check.sh ; \
+  echo '=== APN ===' ; \
+  grep '^APN\s*=' /usr/local/bin/50_bring_wwan0_up.py ; \
+  echo '=== DNS fix ===' ; \
+  grep '^DNS=' /etc/systemd/network/40-eth0.network || echo '(no DNS line = good)' ; \
+  echo '=== 30-eth1 ===' ; \
+  head -3 /etc/systemd/network/30-eth1.network ; \
+  echo '=== Brokkr logs ===' ; \
   journalctl -u brokkr-hamma-default.service --since '2 min ago' -n 5 --no-pager"
 ```
 
 Expected:
 - Services: all `active`
 - Branch: `feature/daily-compression`
-- carrier.d: empty listing
+- carrier.d: empty listing or directory does not exist
 - flock: shows `flock -n -E 1`
 - APN: `APN = "telstra.extranet"`
-- DNS: nothing (or just the "(empty = good)" echo)
+- DNS: `(no DNS line = good)`
+- 30-eth1: shows `[Match]` / `Name=eth1` header
 - Brokkr logs: no errors
 
-- [ ] **Step 12: Verify tunnel from hamma.dev**
+- [ ] **Step 13: Verify tunnel from hamma.dev**
 
 ```bash
 ssh monitor@hamma.dev "timeout 5 ssh -o ConnectTimeout=3 -o LogLevel=ERROR -p 10041 pi@127.0.0.1 hostname"
@@ -214,7 +228,7 @@ ssh monitor@hamma.dev "timeout 5 ssh -o ConnectTimeout=3 -o LogLevel=ERROR -p 10
 
 Expected: `mjolnir41`
 
-- [ ] **Step 13: Defuse dead man's switch**
+- [ ] **Step 14: Defuse dead man's switch**
 
 ```bash
 ssh mjolnir41 "sudo bash /tmp/migration-deadman.sh defuse"
@@ -222,7 +236,15 @@ ssh mjolnir41 "sudo bash /tmp/migration-deadman.sh defuse"
 
 Verify output shows "DEAD MAN'S SWITCH DEFUSED". Backup files are preserved at `/var/lib/migration-backup` for manual cleanup later.
 
-- [ ] **Step 14: Wait 15 minutes, recheck**
+If `/tmp/migration-deadman.sh` is missing (e.g., after a reboot), defuse manually:
+```bash
+ssh mjolnir41 "sudo systemctl stop deadman-rollback.timer && \
+  sudo systemctl disable deadman-rollback.timer && \
+  sudo rm -f /etc/systemd/system/deadman-rollback.timer /etc/systemd/system/deadman-rollback.service && \
+  sudo systemctl daemon-reload"
+```
+
+- [ ] **Step 15: Wait 15 minutes, recheck**
 
 ```bash
 ssh mjolnir41 "systemctl is-active brokkr-hamma-default.service && \
@@ -270,13 +292,19 @@ ssh mjolnir42 "sudo bash /tmp/migration-deadman.sh arm 30"
 
 Verify output shows "DEAD MAN'S SWITCH ARMED" and lists all backed-up files.
 
-- [ ] **Step 4: Stop wwan-check timer**
+- [ ] **Step 4: Fetch new branch (while timer still running)**
+
+```bash
+ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && git fetch origin"
+```
+
+- [ ] **Step 5: Stop wwan-check timer**
 
 ```bash
 ssh mjolnir42 "sudo systemctl stop wwan-check.timer"
 ```
 
-- [ ] **Step 5: Inspect and clean git working tree**
+- [ ] **Step 6: Inspect and clean git working tree**
 
 ```bash
 ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && git status && git diff --stat"
@@ -288,16 +316,15 @@ ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && \
   rm -f plugins/compress_data.py presets/compress_data.preset.toml"
 ```
 
-- [ ] **Step 6: Switch to feature/daily-compression**
+- [ ] **Step 7: Switch to feature/daily-compression (local only, already fetched)**
 
 ```bash
 ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && \
-  git fetch origin && \
   git checkout feature/daily-compression && \
   git pull"
 ```
 
-Verify clean:
+Verify:
 
 ```bash
 ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && git branch --show-current && git status"
@@ -305,7 +332,7 @@ ssh mjolnir42 "cd /home/pi/dev/mjolnir-hamma && git branch --show-current && git
 
 **GATE: Clean working tree on correct branch.**
 
-- [ ] **Step 7: Run install.sh (network only)**
+- [ ] **Step 8: Run install.sh (network only)**
 
 ```bash
 ssh mjolnir42 "sudo bash /home/pi/dev/mjolnir-hamma/unified_install/install.sh 42 \
@@ -313,17 +340,18 @@ ssh mjolnir42 "sudo bash /home/pi/dev/mjolnir-hamma/unified_install/install.sh 4
   --skip-packages --skip-brokkr --skip-hardware --skip-extras --skip-hamma"
 ```
 
-- [ ] **Step 8: Verify network survived**
+- [ ] **Step 9: Verify network survived**
 
 ```bash
-ssh mjolnir42 "ip -4 addr show wwan0 | grep inet && \
+ssh mjolnir42 "ip route show default && \
+  ip -4 addr show wwan0 | grep inet && \
   ping -c 3 8.8.8.8 && \
   ping -c 3 google.com"
 ```
 
-**GATE: All pings must succeed.**
+**GATE: Default route must show wwan0. All pings must succeed.**
 
-- [ ] **Step 9: Restart brokkr**
+- [ ] **Step 10: Restart brokkr**
 
 ```bash
 ssh mjolnir42 "sudo systemctl restart brokkr-hamma-default.service"
@@ -331,34 +359,36 @@ ssh mjolnir42 "sudo systemctl restart brokkr-hamma-default.service"
 
 ### Post-migration verification
 
-- [ ] **Step 10: Full verification checklist**
+- [ ] **Step 11: Full verification checklist**
 
 ```bash
-ssh mjolnir42 "echo '=== Services ===' && \
-  systemctl is-active brokkr-hamma-default.service && \
-  systemctl is-active autossh-hamma-default.service && \
-  systemctl is-active wwan-check.timer && \
-  echo '=== Branch ===' && \
-  git -C /home/pi/dev/mjolnir-hamma branch --show-current && \
-  echo '=== carrier.d ===' && \
-  ls /etc/networkd-dispatcher/carrier.d/ && \
-  echo '=== flock ===' && \
-  grep flock /usr/local/bin/wwan-check.sh && \
-  echo '=== APN ===' && \
-  grep '^APN' /usr/local/bin/50_bring_wwan0_up.py && \
-  echo '=== DNS fix ===' && \
-  grep DNS /etc/systemd/network/40-eth0.network; echo '(empty = good)' && \
-  echo '=== Brokkr logs ===' && \
+ssh mjolnir42 "echo '=== Services ===' ; \
+  systemctl is-active brokkr-hamma-default.service ; \
+  systemctl is-active autossh-hamma-default.service ; \
+  systemctl is-active wwan-check.timer ; \
+  echo '=== Branch ===' ; \
+  git -C /home/pi/dev/mjolnir-hamma branch --show-current ; \
+  echo '=== carrier.d ===' ; \
+  ls /etc/networkd-dispatcher/carrier.d/ 2>/dev/null || echo '(directory does not exist)' ; \
+  echo '=== flock ===' ; \
+  grep flock /usr/local/bin/wwan-check.sh ; \
+  echo '=== APN ===' ; \
+  grep '^APN\s*=' /usr/local/bin/50_bring_wwan0_up.py ; \
+  echo '=== DNS fix ===' ; \
+  grep '^DNS=' /etc/systemd/network/40-eth0.network || echo '(no DNS line = good)' ; \
+  echo '=== 30-eth1 ===' ; \
+  head -3 /etc/systemd/network/30-eth1.network ; \
+  echo '=== Brokkr logs ===' ; \
   journalctl -u brokkr-hamma-default.service --since '2 min ago' -n 5 --no-pager"
 ```
 
-- [ ] **Step 11: Verify tunnel from hamma.dev**
+- [ ] **Step 12: Verify tunnel from hamma.dev**
 
 ```bash
 ssh monitor@hamma.dev "timeout 5 ssh -o ConnectTimeout=3 -o LogLevel=ERROR -p 10042 pi@127.0.0.1 hostname"
 ```
 
-- [ ] **Step 12: Defuse dead man's switch**
+- [ ] **Step 13: Defuse dead man's switch**
 
 ```bash
 ssh mjolnir42 "sudo bash /tmp/migration-deadman.sh defuse"
@@ -366,7 +396,7 @@ ssh mjolnir42 "sudo bash /tmp/migration-deadman.sh defuse"
 
 Verify output shows "DEAD MAN'S SWITCH DEFUSED".
 
-- [ ] **Step 13: Wait 15 minutes, recheck**
+- [ ] **Step 14: Wait 15 minutes, recheck**
 
 ```bash
 ssh mjolnir42 "systemctl is-active brokkr-hamma-default.service && \
@@ -414,13 +444,19 @@ ssh mjolnir43 "sudo bash /tmp/migration-deadman.sh arm 30"
 
 Verify output shows "DEAD MAN'S SWITCH ARMED" and lists all backed-up files.
 
-- [ ] **Step 4: Stop wwan-check timer**
+- [ ] **Step 4: Fetch new branch (while timer still running)**
+
+```bash
+ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && git fetch origin"
+```
+
+- [ ] **Step 5: Stop wwan-check timer**
 
 ```bash
 ssh mjolnir43 "sudo systemctl stop wwan-check.timer"
 ```
 
-- [ ] **Step 5: Inspect and clean git working tree**
+- [ ] **Step 6: Inspect and clean git working tree**
 
 ```bash
 ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && git status && git diff --stat"
@@ -432,16 +468,15 @@ ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && \
   rm -f plugins/compress_data.py presets/compress_data.preset.toml"
 ```
 
-- [ ] **Step 6: Switch to feature/daily-compression**
+- [ ] **Step 7: Switch to feature/daily-compression (local only, already fetched)**
 
 ```bash
 ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && \
-  git fetch origin && \
   git checkout feature/daily-compression && \
   git pull"
 ```
 
-Verify clean:
+Verify:
 
 ```bash
 ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && git branch --show-current && git status"
@@ -449,7 +484,7 @@ ssh mjolnir43 "cd /home/pi/dev/mjolnir-hamma && git branch --show-current && git
 
 **GATE: Clean working tree on correct branch.**
 
-- [ ] **Step 7: Run install.sh (network only)**
+- [ ] **Step 8: Run install.sh (network only)**
 
 ```bash
 ssh mjolnir43 "sudo bash /home/pi/dev/mjolnir-hamma/unified_install/install.sh 43 \
@@ -457,17 +492,18 @@ ssh mjolnir43 "sudo bash /home/pi/dev/mjolnir-hamma/unified_install/install.sh 4
   --skip-packages --skip-brokkr --skip-hardware --skip-extras --skip-hamma"
 ```
 
-- [ ] **Step 8: Verify network survived**
+- [ ] **Step 9: Verify network survived**
 
 ```bash
-ssh mjolnir43 "ip -4 addr show wwan0 | grep inet && \
+ssh mjolnir43 "ip route show default && \
+  ip -4 addr show wwan0 | grep inet && \
   ping -c 3 8.8.8.8 && \
   ping -c 3 google.com"
 ```
 
-**GATE: All pings must succeed.**
+**GATE: Default route must show wwan0. All pings must succeed.**
 
-- [ ] **Step 9: Restart brokkr**
+- [ ] **Step 10: Restart brokkr**
 
 ```bash
 ssh mjolnir43 "sudo systemctl restart brokkr-hamma-default.service"
@@ -475,34 +511,36 @@ ssh mjolnir43 "sudo systemctl restart brokkr-hamma-default.service"
 
 ### Post-migration verification
 
-- [ ] **Step 10: Full verification checklist**
+- [ ] **Step 11: Full verification checklist**
 
 ```bash
-ssh mjolnir43 "echo '=== Services ===' && \
-  systemctl is-active brokkr-hamma-default.service && \
-  systemctl is-active autossh-hamma-default.service && \
-  systemctl is-active wwan-check.timer && \
-  echo '=== Branch ===' && \
-  git -C /home/pi/dev/mjolnir-hamma branch --show-current && \
-  echo '=== carrier.d ===' && \
-  ls /etc/networkd-dispatcher/carrier.d/ && \
-  echo '=== flock ===' && \
-  grep flock /usr/local/bin/wwan-check.sh && \
-  echo '=== APN ===' && \
-  grep '^APN' /usr/local/bin/50_bring_wwan0_up.py && \
-  echo '=== DNS fix ===' && \
-  grep DNS /etc/systemd/network/40-eth0.network; echo '(empty = good)' && \
-  echo '=== Brokkr logs ===' && \
+ssh mjolnir43 "echo '=== Services ===' ; \
+  systemctl is-active brokkr-hamma-default.service ; \
+  systemctl is-active autossh-hamma-default.service ; \
+  systemctl is-active wwan-check.timer ; \
+  echo '=== Branch ===' ; \
+  git -C /home/pi/dev/mjolnir-hamma branch --show-current ; \
+  echo '=== carrier.d ===' ; \
+  ls /etc/networkd-dispatcher/carrier.d/ 2>/dev/null || echo '(directory does not exist)' ; \
+  echo '=== flock ===' ; \
+  grep flock /usr/local/bin/wwan-check.sh ; \
+  echo '=== APN ===' ; \
+  grep '^APN\s*=' /usr/local/bin/50_bring_wwan0_up.py ; \
+  echo '=== DNS fix ===' ; \
+  grep '^DNS=' /etc/systemd/network/40-eth0.network || echo '(no DNS line = good)' ; \
+  echo '=== 30-eth1 ===' ; \
+  head -3 /etc/systemd/network/30-eth1.network ; \
+  echo '=== Brokkr logs ===' ; \
   journalctl -u brokkr-hamma-default.service --since '2 min ago' -n 5 --no-pager"
 ```
 
-- [ ] **Step 11: Verify tunnel from hamma.dev**
+- [ ] **Step 12: Verify tunnel from hamma.dev**
 
 ```bash
 ssh monitor@hamma.dev "timeout 5 ssh -o ConnectTimeout=3 -o LogLevel=ERROR -p 10043 pi@127.0.0.1 hostname"
 ```
 
-- [ ] **Step 12: Defuse dead man's switch**
+- [ ] **Step 13: Defuse dead man's switch**
 
 ```bash
 ssh mjolnir43 "sudo bash /tmp/migration-deadman.sh defuse"
@@ -510,7 +548,7 @@ ssh mjolnir43 "sudo bash /tmp/migration-deadman.sh defuse"
 
 Verify output shows "DEAD MAN'S SWITCH DEFUSED".
 
-- [ ] **Step 13: Wait 15 minutes, recheck**
+- [ ] **Step 14: Wait 15 minutes, recheck**
 
 ```bash
 ssh mjolnir43 "systemctl is-active brokkr-hamma-default.service && \
