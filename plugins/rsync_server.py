@@ -116,6 +116,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         cmd = [
             "rsync",
             "-avz",
+            "--no-group",
             "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
         ]
 
