@@ -67,27 +67,47 @@ BACKUP_REMOVABLE=(
     /etc/systemd/system/networkd-dispatcher.service.d
 )
 
+cleanup_partial_arm() {
+    echo "INTERRUPTED -- cleaning up partial arm state..."
+    systemctl stop "$TIMER_UNIT" 2>/dev/null || true
+    systemctl disable "$TIMER_UNIT" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$TIMER_UNIT" "/etc/systemd/system/$SERVICE_UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf "$BACKUP_DIR"
+    echo "Cleaned up. Dead man's switch was NOT armed."
+    exit 130
+}
+
 arm() {
     local minutes="${1:-30}"
 
-    if systemctl is-active "$TIMER_UNIT" &>/dev/null; then
-        echo "ERROR: Dead man's switch is already armed!"
-        echo "Run 'sudo bash $0 defuse' first, or 'sudo bash $0 status' to check."
+    # Validate minutes is a positive integer
+    if ! [[ "$minutes" =~ ^[0-9]+$ ]] || [[ "$minutes" -eq 0 ]]; then
+        echo "ERROR: minutes must be a positive integer, got: '$minutes'"
         exit 1
     fi
 
+    if systemctl is-active "$TIMER_UNIT" &>/dev/null; then
+        echo "ERROR: Dead man's switch is already armed!"
+        echo "Run 'sudo bash migration-deadman.sh defuse' first, or check status."
+        exit 1
+    fi
+
+    # Clean up on interrupt (Ctrl-C, SSH drop, SIGTERM)
+    trap cleanup_partial_arm INT TERM HUP
+
     echo "=== Arming dead man's switch ($minutes minutes) ==="
-    echo ""
+    echo
 
     # Warn if backup directory already exists from a previous run
     if [[ -d "$BACKUP_DIR" ]]; then
         echo "WARNING: Backup directory already exists from a previous run."
         echo "Previous backup will be overwritten."
-        echo ""
+        echo
     fi
 
     # Create backup directory
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" || { echo "ERROR: Cannot create $BACKUP_DIR"; exit 1; }
 
     # --- Save current git branch ---
     local current_branch
@@ -122,8 +142,8 @@ arm() {
         exit 1
     fi
 
-    # Create tar (tar preserves symlinks by default; -h would follow them)
-    if ! tar cf "$BACKUP_TAR" "${files_to_tar[@]}"; then
+    # Create tar (--absolute-names preserves leading /; symlinks stored as-is)
+    if ! tar cf "$BACKUP_TAR" --absolute-names "${files_to_tar[@]}"; then
         echo "ERROR: Failed to create backup tar. Aborting."
         rm -rf "$BACKUP_DIR"
         exit 1
@@ -145,20 +165,26 @@ logger -t "$LOG_TAG" "DEAD MAN'S SWITCH FIRED -- ROLLING BACK"
 # Restore backed-up files
 if [[ -f "$BACKUP_DIR/pre-migration.tar" ]]; then
     logger -t "$LOG_TAG" "Restoring files from backup..."
-    if tar xf "$BACKUP_DIR/pre-migration.tar" -C /; then
+    tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names
+    tar_rc=$?
+    if [[ $tar_rc -eq 0 ]]; then
         logger -t "$LOG_TAG" "Files restored successfully"
     else
-        logger -t "$LOG_TAG" "ERROR: tar restore failed (exit $?), continuing anyway"
+        logger -t "$LOG_TAG" "ERROR: tar restore failed (exit $tar_rc), continuing anyway"
     fi
 else
     logger -t "$LOG_TAG" "ERROR: No backup tar found at $BACKUP_DIR/pre-migration.tar"
 fi
 
-# Restore git branch
+# Once files are restored, ignore SIGTERM so defuse cannot interrupt us
+# mid-rollback -- we must finish and reboot to reach a consistent state
+trap '' TERM
+
+# Restore git branch (force checkout -- working tree may be dirty)
 if [[ -f "$BACKUP_DIR/git-branch" ]]; then
     saved_branch=$(cat "$BACKUP_DIR/git-branch")
     logger -t "$LOG_TAG" "Restoring git branch: $saved_branch"
-    sudo -H -u pi git -C /home/pi/dev/mjolnir-hamma checkout "$saved_branch" 2>/dev/null || true
+    runuser -u pi -- git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" 2>/dev/null || true
 fi
 
 # Reload systemd (timer/service files may have been restored)
@@ -212,29 +238,48 @@ WantedBy=timers.target
 EOF
 
     # Enable (survives reboot) and start
-    systemctl daemon-reload
-    systemctl enable "$TIMER_UNIT"
-    systemctl start "$TIMER_UNIT"
+    systemctl daemon-reload || { echo "ERROR: daemon-reload failed"; exit 1; }
+    systemctl enable "$TIMER_UNIT" || { echo "ERROR: failed to enable timer"; exit 1; }
+    systemctl start "$TIMER_UNIT" || { echo "ERROR: failed to start timer"; exit 1; }
 
-    echo ""
+    # Belt-and-suspenders: verify timer is actually running
+    if ! systemctl is-active "$TIMER_UNIT" &>/dev/null; then
+        echo "ERROR: Timer failed to start despite no errors. Aborting."
+        cleanup_partial_arm
+    fi
+
+    # Disarm the interrupt trap -- we are now in a consistent armed state
+    trap - INT TERM HUP
+
+    echo
     echo "========================================="
     echo " DEAD MAN'S SWITCH ARMED"
     echo " Fires in: $minutes minutes"
-    echo " To defuse: sudo bash $0 defuse"
-    echo " To check:  sudo bash $0 status"
+    echo " To defuse: sudo bash migration-deadman.sh defuse"
+    echo " To check:  sudo bash migration-deadman.sh status"
     echo "========================================="
-    echo ""
+    echo
     echo "If not defused, ALL changes will be rolled back and the Pi will reboot."
 }
 
 defuse() {
     echo "=== Defusing dead man's switch ==="
 
+    # Check if the rollback service is already running (timer just fired)
+    if systemctl is-active "$SERVICE_UNIT" &>/dev/null; then
+        echo "WARNING: Rollback service is ALREADY RUNNING!"
+        echo "The rollback may have already restored files. Attempting to stop it..."
+        # The rollback script traps SIGTERM after file restore, so this may
+        # not stop it if it has passed the point of no return.
+        systemctl kill "$SERVICE_UNIT" 2>/dev/null || true
+        echo "Check system state carefully -- a reboot may be imminent."
+    fi
+
     if ! systemctl is-active "$TIMER_UNIT" &>/dev/null; then
         echo "Timer is not active. Cleaning up any partial state..."
     fi
 
-    # Stop timer and service (service may already be running if timer just fired)
+    # Stop timer and service
     systemctl stop "$SERVICE_UNIT" 2>/dev/null || true
     systemctl stop "$TIMER_UNIT" 2>/dev/null || true
     systemctl disable "$TIMER_UNIT" 2>/dev/null || true
@@ -245,10 +290,10 @@ defuse() {
     systemctl daemon-reload
 
     # Clean up backup (optional — keep for safety)
-    echo ""
+    echo
     echo "Timer stopped and removed."
     echo "Backup files preserved at $BACKUP_DIR (manual cleanup: sudo rm -rf $BACKUP_DIR)"
-    echo ""
+    echo
     echo "========================================="
     echo " DEAD MAN'S SWITCH DEFUSED"
     echo "========================================="
@@ -256,13 +301,13 @@ defuse() {
 
 status() {
     echo "=== Dead Man's Switch Status ==="
-    echo ""
+    echo
 
     if systemctl is-active "$TIMER_UNIT" &>/dev/null; then
         echo "Status: ARMED"
-        echo ""
+        echo
         systemctl status "$TIMER_UNIT" --no-pager 2>/dev/null
-        echo ""
+        echo
         # Show time remaining
         local next_fire
         next_fire=$(systemctl show "$TIMER_UNIT" --property=NextElapseUSecMonotonic --value 2>/dev/null)
@@ -274,7 +319,7 @@ status() {
         echo "Status: NOT ARMED"
     fi
 
-    echo ""
+    echo
     if [[ -d "$BACKUP_DIR" ]]; then
         echo "Backup exists at $BACKUP_DIR"
         if [[ -f "$BACKUP_BRANCH" ]]; then
@@ -300,8 +345,8 @@ case "${1:-}" in
         status
         ;;
     *)
-        echo "Usage: sudo bash $0 {arm [minutes]|defuse|status}"
-        echo ""
+        echo "Usage: sudo bash migration-deadman.sh {arm [minutes]|defuse|status}"
+        echo
         echo "  arm [N]   Backup current state and arm timer (default: 30 min)"
         echo "  defuse    Stop timer and clean up"
         echo "  status    Show current timer status"
