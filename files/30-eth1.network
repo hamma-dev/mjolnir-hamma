@@ -3,7 +3,6 @@ Name=eth1
 
 [Network]
 Address=192.168.1.2/24
-DNS=192.168.1.1
 
 # Route section commented out per Cellular Fixes
 # Having a gateway here can interfere with WWAN routing
