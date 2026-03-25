@@ -1,127 +1,147 @@
-# Deadman Script Review — Rounds 1-3
+# Deadman Script Review — Round 4 (Post-Patch)
 
 ## Context
 
-The deadman script (`scripts/migration-deadman.sh`) is the last line of defense for remote Raspberry Pi sensor migrations in Australia. Three rounds of independent expert review were conducted (bash/shell, systemd/init, networking, reliability/SRE). Each round dispatched fresh reviewers with no knowledge of prior findings.
+The deadman script (`scripts/migration-deadman.sh`) was patched after Round 3 review (commit `1a3a93c`). Round 4 dispatched four independent expert reviewers:
 
-- **Round 1:** 4 experts against the original script. Found 13 issues (2 P0, 4 P1, 5 P2, 2 P3).
-- **Round 2:** 3 experts against the patched script. All 13 R1 issues confirmed fixed. Found 5 new issues (3 P1, 2 P2).
-- **Round 3:** 3 experts against the fully patched script. All R2 issues confirmed fixed. Found 4 minor items (1 P2, 3 P3). Script has converged.
+1. **Bash correctness** — 10 categories of bash semantics (quoting, traps, fd inheritance, etc.)
+2. **Failure mode analysis** — 20 specific failure scenarios traced step-by-step
+3. **Adversarial input** — two reviewers focused on hostile/unexpected inputs
+4. **Operational scenario** — full migration procedure walkthrough against actual repo contents
+
+**What prior rounds fixed:** SIGPIPE trap, arithmetic overflow regex, sync after tar, daemon-reload after unit deletion, `--unlink-first`, persistent log file, chmod +x error check, unit file write verification, defuse stop ordering, defuse `deactivating` state check, RO FS detection + attempt counter, both `/var/lib` and `/etc` writability test, atomic attempt counter write, rollback script deletion ordering, exit after reboot cascade, rollback script write verification, leading-zero octal rejection, non-numeric attempt counter sanitization, arm() rollback service state check, arm() unit file existence guard, per-signal trap declarations, `timeout 5 logger` in rollback log(), RO_FS remount rw + sleep throttle.
 
 ---
 
-## Round 1 — Original Script (all FIXED)
+## Round 4 Findings
+
+### RESOLVED from Round 3 (confirmed fixed)
+
+| Old # | Issue | Fix verified |
+|-------|-------|-------------|
+| R3-1 (P1) | arm() doesn't check rollback service state | ActiveState check + unit file guard |
+| R3-2 (P1) | logger can hang indefinitely in rollback | `timeout 5 logger` in log() |
+| R3-3 (P1) | RO_FS infinite reboot loop (deeper) | remount rw attempt + 5min sleep throttle |
+| R3-4 (P2) | is-active false-negative during early boot | Unit file existence secondary guard |
+| R3-5 (P3) | cleanup_partial_arm wrong exit code | Per-signal trap declarations |
+
+---
+
+### NEW issues found in Round 4
+
+#### R4-1 (P1) — `timeout` in rollback can't kill children due to inherited SIG_IGN
+
+**Source:** Bash correctness reviewer
+
+The rollback script's `trap '' TERM INT HUP PIPE` sets SIGTERM disposition to SIG_IGN. Per POSIX, SIG_IGN survives `fork()`+`exec()`. When `timeout 60 sudo git ...` or `timeout 30 systemctl restart systemd-networkd` hangs, `timeout` sends SIGTERM, but the child inherits SIGTERM-ignored and ignores it. Without `--kill-after`, `timeout` blocks forever. `sudo` likely resets signal handling internally (security-sensitive), so the git path is probably safe. But `systemctl` is a standard D-Bus client that doesn't reset inherited signal dispositions — the high-risk line.
+
+**Impact:** If networkd is in a bad state (exactly when rollback fires), the rollback hangs permanently. Sensor unreachable, requires physical access in Australia.
+
+**Fix:** Add `--kill-after=10` to all `timeout` invocations in the rollback script. SIGKILL cannot be caught or ignored. GNU coreutils 8.30 on Buster supports `--kill-after`. **FIXED.**
+
+---
+
+#### R4-2 (P1) — `logger` in `cleanup_partial_arm` not wrapped in timeout
+
+**Source:** Bash correctness reviewer
+
+Line 84: `logger -t "deadman-arm" "Arm interrupted, cleaning up partial state"` is bare — same class of bug as R3-2. If journald is stuck, cleanup hangs, partial arm state is never cleaned up.
+
+**Fix:** `timeout 5 logger ... 2>/dev/null || true`. **FIXED.**
+
+---
+
+#### R4-3 (P2) — `logger` in arm/defuse paths not wrapped in timeout
+
+**Source:** Bash correctness reviewer
+
+Lines 416, 444, 468, 477: bare `logger` calls in arm() success and defuse() error/success paths. Less critical than R4-2 (these are at the end of operations, not blocking cleanup), but still a hang risk.
+
+**Fix:** `timeout 5 logger ... 2>/dev/null || true` on all four lines. **FIXED.**
+
+---
+
+#### R4-4 (P2) — `systemctl daemon-reload` in rollback has no timeout
+
+**Source:** Failure mode analyst
+
+Line 319: `systemctl daemon-reload || true` has no timeout, but the very next line (`systemctl restart systemd-networkd`) correctly uses `timeout 30`. If systemd's D-Bus interface hangs, the rollback blocks at daemon-reload and never reaches the reboot chain.
+
+**Fix:** `timeout --kill-after=10 30 systemctl daemon-reload || true`. **FIXED.**
+
+---
+
+#### R4-5 (P2) — Orphaned wwan-check files after rollback
+
+**Source:** Operational scenario reviewer
+
+On the current `wwan_install` sensors, `/usr/local/bin/wwan-check.sh`, `/etc/systemd/system/wwan-check.timer`, and `/etc/systemd/system/wwan-check.service` do not exist. The backup tar won't include them. If install.sh creates these files and then rollback fires, the rollback restores old files but doesn't remove the NEW files absent from the tar. The orphaned `wwan-check.timer` fires every 5 minutes, running wwan-check.sh, which calls the OLD `50_bring_wwan0_up.py` that does `os.environ["IFACE"]` → `KeyError`.
+
+**Impact:** After rollback, journal fills with KeyError crashes every 5 minutes. Connectivity NOT affected (carrier.d mechanism is restored), but wastes CPU/SD writes.
+
+**Fix:** Before restarting wwan-check.timer, check whether it was in the original backup tar. If not, remove the orphaned files and disable the timer. **FIXED.**
+
+---
+
+### Confirmed Correct
+
+**Failure mode analyst** traced 20 failure scenarios — 19 of 20 pass clean (scenario 14 was R4-4 above).
+
+**Adversarial reviewers** found no exploitable issues. One suggested adding `--` to `git checkout` — **REJECTED** as this was a previously-fixed bug (adding `--` makes bash treat the branch name as a pathspec/file, not a branch).
+
+**Operational scenario reviewer** verdict: **OPERATIONALLY READY.** Full migration procedure walkthrough confirmed:
+- 30-minute timer gives 6x margin for ~5-minute procedure
+- SSH tunnel survives all install.sh operations (wwan0 is Unmanaged=yes)
+- Kill switch interaction correctly handled
+- Sensors are fully independent
+- Backup coverage matches all non-skipped install.sh actions
+
+**Systemd reviewer** (Round 3, still valid): all design choices verified correct for systemd 241.
+
+---
+
+### Design Limitations (unchanged)
+
+1. **OnActiveSec resets on every reboot** — documented, acceptable given kill-switch cron timing.
+2. **Rollback deletes backup before confirming reboot** — intentional tradeoff for loop prevention.
+3. **Pip packages / brokkr not rolled back** — by design.
+4. **`--unlink-first` tradeoff** — file-type-change protection vs power-loss risk. Documented.
+
+---
+
+## Cumulative Summary Table
 
 | # | Sev | Issue | Status |
 |---|-----|-------|--------|
-| R1-1 | P0 | Defuse says "DEFUSED" but rollback runs and reboots (deactivating state not checked) | **FIXED** (line 439, 465) |
-| R1-2 | P0 | Read-only filesystem → infinite reboot loop (no RO detection) | **FIXED** (lines 236-281) |
-| R1-3 | P1 | SIGPIPE kills rollback mid-execution | **FIXED** (line 214: `trap '' TERM INT HUP PIPE`) |
-| R1-4 | P1 | Arithmetic overflow → zero-second timer | **FIXED** (line 99: regex `^[1-9][0-9]{0,3}$`) |
-| R1-5 | P1 | No sync after tar extraction | **FIXED** (line 296: `sync` after tar xf) |
-| R1-6 | P1 | Partial tar extraction → inconsistent config set | **FIXED** (logged, continues to reboot; attempt counter limits retries) |
-| R1-7 | P2 | No daemon-reload after unit deletion in rollback | **FIXED** (line 335) |
-| R1-8 | P2 | tar xf without --unlink-first | **FIXED** (line 294) |
-| R1-9 | P2 | No persistent log file | **FIXED** (lines 218, 223-226: `log()` writes to `/var/log/deadman-rollback.log`) |
-| R1-10 | P2 | No error check on chmod +x | **FIXED** (line 355: `|| cleanup_partial_arm 1`) |
-| R1-11 | P2 | Systemd unit file writes not verified | **FIXED** (lines 394-398: `-s` checks) |
-| R1-12 | P3 | Timer/service stop ordering in defuse | **FIXED** (lines 453-454: timer stopped first) |
-| R1-13 | P3 | Double tar read on degraded SD | **FIXED** (line 289: simple log message, no tar tf) |
+| R1-1 | ~~P0~~ | Defuse "DEFUSED" lie (deactivating state) | **FIXED** (Round 5-6) |
+| R1-2 | ~~P0~~ | Read-only FS infinite reboot | **FIXED** (Round 7) |
+| R1-3 | ~~P1~~ | SIGPIPE kills rollback | **FIXED** (Round 7) |
+| R1-4 | ~~P1~~ | Arithmetic overflow | **FIXED** (Round 7) |
+| R1-5 | ~~P1~~ | No sync after tar extract | **FIXED** (Round 7) |
+| R1-7–13 | ~~P2/P3~~ | All Round 1 P2/P3 items | **FIXED** (Round 7) |
+| R2-1 | ~~P1~~ | RO test only checks `/var/lib` | **FIXED** (Round 8) |
+| R2-2 | ~~P1~~ | Attempt counter non-atomic write | **FIXED** (Round 8) |
+| R2-3 | ~~P1~~ | `--unlink-first` + power loss tradeoff | **Documented** (Round 8) |
+| R2-4 | ~~P2~~ | No exit after reboot cascade | **FIXED** (Round 8) |
+| R2-5 | ~~P2~~ | Partial `rm -rf` re-arms deadman | **FIXED** (Round 8) |
+| R3-1 | ~~P1~~ | arm() doesn't check rollback service state | **FIXED** (Round 9) |
+| R3-2 | ~~P1~~ | logger can hang indefinitely | **FIXED** (Round 9) |
+| R3-3 | ~~P1~~ | RO_FS infinite reboot loop (deeper fix) | **FIXED** (Round 9) |
+| R3-4 | ~~P2~~ | is-active false-negative during early boot | **FIXED** (Round 9) |
+| R3-5 | ~~P3~~ | cleanup_partial_arm wrong exit code | **FIXED** (Round 9) |
+| R4-1 | ~~P1~~ | timeout can't kill children (SIG_IGN inheritance) | **FIXED** (Round 10) |
+| R4-2 | ~~P1~~ | cleanup_partial_arm logger unwrapped | **FIXED** (Round 10) |
+| R4-3 | ~~P2~~ | arm/defuse logger calls unwrapped | **FIXED** (Round 10) |
+| R4-4 | ~~P2~~ | daemon-reload in rollback has no timeout | **FIXED** (Round 10) |
+| R4-5 | ~~P2~~ | Orphaned wwan-check files after rollback | **FIXED** (Round 10) |
 
----
+## Review History
 
-## Round 2 — Post-Patch (all FIXED)
-
-| # | Sev | Issue | Status |
-|---|-----|-------|--------|
-| R2-1 | P1 | RO test only checks `/var/lib`, not `/etc` | **FIXED** (line 238: tests both `/var/lib` and `/etc`) |
-| R2-2 | P1 | Attempt counter non-atomic write | **FIXED** (lines 268-269: atomic write via tmp+mv) |
-| R2-3 | P1 | `--unlink-first` + power loss = file destruction | **DOCUMENTED** (lines 290-293: code comment explains tradeoff) |
-| R2-4 | P2 | No exit after reboot cascade failure | **FIXED** (lines 352-353: `exit 1` after reboot chain) |
-| R2-5 | P2 | Partial `rm -rf` re-arms deadman | **FIXED** (line 339: `rm -f rollback.sh` before `rm -rf` backup dir) |
-
-**Additional hardening applied between R2 and R3:**
-- `timeout 5 logger` prevents journald blocking from stalling rollback (line 224)
-- `mount -o remount,rw` attempt before giving up on RO filesystem (line 242)
-- 5-minute sleep throttle for RO reboot loops (line 250)
-- Arm-time guard against running rollback service (lines 114-124)
-- Arm-time guard against stale unit files (lines 126-132)
-- Per-signal exit codes in trap handlers (lines 135-137)
-
----
-
-## Round 3 — Final Review (current script)
-
-Three fresh independent experts (bash, systemd, SRE) reviewed the fully patched script.
-
-**False positives discarded (3):**
-1. `ConditionPathExists` leading space (systemd expert) — verified no space via `cat -A` on the heredoc output. This is an artifact of the code viewer's line-number indentation.
-2. Flock FD 9 "never released" (bash expert) — the kernel automatically releases `flock` advisory locks when the process exits. This is standard `flock` usage.
-3. NFS race on attempt counter (bash expert) — these are standalone Pis with local SD cards, not NFS mounts.
-
-### Remaining findings
-
-#### P2 — Narrow defuse race: service state transition between timeout and re-check
-
-**Source:** Systemd expert (Round 3)
-**Lines:** 459, 463-465
-
-Between `timeout 10` killing the `systemctl stop` client and the re-check query, the service can briefly transition from `deactivating` back to `activating` (systemd cancels the stop since the client died). The re-check could theoretically miss this transition.
-
-**Impact:** Extremely narrow race window. If hit, defuse prints "DEFUSED" but rollback continues. Same class as R1-1 but much narrower — requires the timer to fire during defuse AND the state transition to happen in the microsecond between queries.
-
-**Assessment:** Acceptable risk. The window is microseconds, and the consequence (rollback completes, sensor reboots to known-good state) is not destructive.
-
----
-
-#### P3 — OOM killer can SIGKILL rollback mid-execution
-
-**Source:** Bash expert (Round 3)
-**Line:** 214
-
-SIGKILL cannot be trapped. If the Pi is low on memory and the OOM killer selects the rollback process, it dies mid-extraction. Files may be partially restored and the system doesn't reboot. On next boot, the attempt counter increments and eventually breaks the loop.
-
-**Assessment:** Unfixable (SIGKILL can't be trapped by design). Document as known OS-level limitation.
-
----
-
-#### P3 — Tar permissions not explicitly flagged
-
-**Source:** Bash expert (Round 3)
-**Line:** 190
-
-GNU tar preserves ownership and permissions by default when running as root (which this does). No explicit `--preserve-permissions` flag. Non-issue on Raspbian with GNU tar, but could matter if the script were ported to a non-GNU tar system.
-
-**Assessment:** Non-issue for current deployment. Defensive documentation only.
-
----
-
-#### P3 — New systemd units created by install.sh survive rollback
-
-**Source:** Bash expert (Round 3)
-**Line:** 319
-
-If `install.sh` creates systemd units that didn't exist before migration, they're not in the backup tar and won't be removed by rollback. The `daemon-reload` at line 319 reloads them.
-
-**Assessment:** Not applicable to the current migration (which uses `--skip-*` flags and only modifies network configs). Would matter if reused for a different migration that creates new units.
-
----
-
-### Design Limitations (documented, accepted)
-
-1. **OnActiveSec resets on every reboot** — a reboot loop faster than the timer prevents rollback. Mitigated by kill-switch cron (4h) vs timer (30min).
-2. **`--unlink-first` power-loss tradeoff** — power loss during the ~0.1s tar extraction can delete files without replacing them. Acceptable because file-type mismatch is more likely than power loss during extraction. Documented in code comments (lines 290-293).
-3. **Pip packages / brokkr not rolled back** — by design (migration uses `--skip-*` flags).
-4. **RO filesystem reboot loop throttled, not eliminated** — if the SD card is permanently RO, the sensor reboots every 5 minutes. The attempt counter can't increment (can't write). This is the correct behavior: rebooting is the only action that might recover a transiently-RO filesystem.
-
----
-
-## Final Summary
-
-| Round | Findings | Fixed | Remaining |
-|-------|----------|-------|-----------|
-| R1 | 13 (2 P0, 4 P1, 5 P2, 2 P3) | 13/13 | 0 |
-| R2 | 5 (3 P1, 2 P2) | 5/5 | 0 |
-| R3 | 4 (1 P2, 3 P3) | — | 4 (all acceptable risk or unfixable) |
-
-**The script has converged.** No P0 or P1 issues remain. The 4 remaining items are a microsecond race window (P2), two OS-level constraints that can't be fixed in userspace (P3), and a scope limitation that doesn't apply to the current migration (P3).
+| Round | Reviewers | New P0/P1 found | Commit |
+|-------|-----------|-----------------|--------|
+| 5-6 | 4 internal | 2 P0, 4 P1 | `b211b1b` |
+| 7 | 4 internal | 3 risks | `f4f134e` |
+| 8 (independent R1) | 3 independent | 2 P0, 4 P1 | `384a5ac` |
+| 8 (independent R2) | 3 independent | 2 P1 | `70a5557` |
+| 9 | 4 independent (3 returned) | 3 P1 | `1a3a93c` |
+| 10 | 4 independent | 2 P1 | (this commit) |
