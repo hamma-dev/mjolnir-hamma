@@ -1,199 +1,132 @@
-# Deadman Script Hardening — Consolidated Findings
+# Deadman Script Review — Round 2 (Post-Patch)
 
 ## Context
-`scripts/migration-deadman.sh` is the last line of defense for remote Raspberry Pi sensor migrations in Australia. If anything goes wrong, it must restore the sensor to its pre-migration state. Four expert reviews (bash, systemd, networking, reliability) identified the following issues.
+
+The deadman script (`scripts/migration-deadman.sh`) was patched after Round 1 review (commits `384a5ac`, `f4f134e`). Round 2 dispatched three fresh, independent expert reviewers (bash, systemd, reliability/SRE) against the **current** script to identify any remaining issues.
+
+**What Round 1 fixes addressed:** SIGPIPE trap, arithmetic overflow regex, sync after tar, daemon-reload after unit deletion, `--unlink-first` on tar extract, persistent log file, chmod +x error check, unit file write verification, defuse stop ordering (timer before service), defuse `deactivating` state check, read-only FS detection + attempt counter.
 
 ---
 
-## Findings by Severity
+## Round 2 Findings
 
-### P0 — Defuse reports "DEFUSED" but rollback still completes and reboots
+### RESOLVED from Round 1 (confirmed fixed)
 
-**Source:** Systemd expert
-**Lines:** 274, 348, 352
+The following Round 1 issues were verified as fixed in the current script:
 
-The `TimeoutStopSec=infinity` on the service (line 274) combined with the rollback script's `trap '' TERM` (line 190) means `systemctl stop` can never actually kill the rollback. The `timeout 10` wrapper on line 348 only kills the `systemctl` *client process*, not the server-side stop job.
-
-The re-check on line 352 looks for `ActiveState == "activating"`, but after the failed stop attempt, the state is `deactivating` — which doesn't match. So defuse prints "DEFUSED", removes unit files, and exits. Meanwhile the rollback script is still running, restores all files, and reboots.
-
-**Impact:** Operator believes defuse succeeded. System reboots to rolled-back state anyway.
-
-**Fix:** The re-check on line 352 must also match `deactivating` state. Additionally, stop the timer *before* the service (line 361 should come before line 348) to prevent the timer from re-triggering between checks.
-
----
-
-### P0 — Read-only filesystem causes infinite reboot loop
-
-**Source:** Reliability expert
-**Lines:** 204, 233, 247, 252
-
-If the SD card goes read-only (the most common Pi SD card failure mode), the rollback script runs but:
-- `tar xf` fails (can't write files)
-- `rm -rf "$BACKUP_DIR"` fails (can't delete)
-- `systemctl restart systemd-networkd` runs (disrupts network with un-restored configs)
-- `reboot` fires
-
-On next boot, `ConditionPathExists` passes (backup dir still exists because `rm -rf` failed), so the rollback fires again. **Infinite reboot loop with network disruption on every cycle.**
-
-The `ConditionPathExists` loop-breaker only works if the filesystem is writable.
-
-**Impact:** Sensor bricked in infinite reboot loop.
-
-**Fix:** At the top of `rollback.sh`, test writability (e.g., `touch /var/lib/.rw-test && rm -f /var/lib/.rw-test`). If read-only, skip everything except reboot. Add a reboot attempt counter to prevent infinite loops.
+| Old # | Issue | Fix verified at line |
+|-------|-------|---------------------|
+| R1-1 (P0) | Defuse "DEFUSED" lie (deactivating state) | Line 388, 414: checks both `activating` and `deactivating` |
+| R1-2 (P0) | Read-only FS infinite reboot | Lines 210-237: RO detection + attempt counter |
+| R1-3 (P1) | SIGPIPE kills rollback | Line 192: `trap '' TERM INT HUP PIPE` |
+| R1-4 (P1) | Arithmetic overflow | Line 99: regex `^[1-9][0-9]{0,3}$` |
+| R1-5 (P1) | No sync after tar extract | Line 248: `sync` after tar xf |
+| R1-7 (P2) | No daemon-reload after unit deletion | Line 287: `systemctl daemon-reload` |
+| R1-8 (P2) | tar xf without --unlink-first | Line 246: `--unlink-first` present |
+| R1-9 (P2) | No persistent log | Lines 196-201: `log()` writes to `/var/log/deadman-rollback.log` |
+| R1-10 (P2) | No chmod +x error check | Line 304: `|| cleanup_partial_arm 1` |
+| R1-11 (P2) | Unit file writes not verified | Lines 343-348: `-s` checks |
+| R1-12 (P3) | Timer/service stop ordering | Lines 401-403: timer stopped first |
 
 ---
 
-### P1 — Partial tar extraction leaves inconsistent config set
+### NEW or REMAINING issues found in Round 2
 
-**Source:** Reliability expert
-**Lines:** 200-210
+#### P1 — Read-only FS detection only tests `/var/lib`, not `/etc`
 
-A tar with a valid header can pass `tar tf` but fail mid-extraction (bad sectors developed since arm time). Result: first 3 of 7 files restored, rest still have new configs. After reboot, networkd loads a mix of old and new configs. On a cellular sensor this could mean no route to the internet.
+**Source:** Reliability/SRE expert
+**Line:** 212
 
-The script logs the error (line 209) but continues to restart networkd and reboot with the broken config set.
+The RO test does `touch /var/lib/.rw-test`. But the critical restored files live in `/etc/systemd/network/` and `/usr/local/bin/`. On an SD card with selective sector wear, `/var/lib` can be writable while `/etc` is read-only. The script thinks the filesystem is fine, attempts tar extraction to `/etc`, fails silently (tar returns non-zero, logged at line 252 as "continuing anyway"), and reboots with broken configs still in place.
 
-**Impact:** Sensor unreachable with frankenstein config, rollback made things worse.
+**Impact:** Rollback provides zero recovery value. Sensor reboots into broken state.
 
-**Fix:** After `tar xf`, verify at least the critical network files (`40-eth0.network`, `20-wwan0.network`, `wwan-check.sh`) exist and are non-empty before rebooting.
-
----
-
-### P1 — SIGPIPE can kill the rollback script mid-execution
-
-**Source:** My initial review + Bash expert (implied)
-**Lines:** 190
-
-The rollback script traps `TERM INT HUP` but not `PIPE`. If `logger` writes to a dead syslog socket (journal crashed, disk full, early boot), SIGPIPE kills the rollback. Everything after that point — networkd restart, unit cleanup, backup dir deletion, reboot — never runs.
-
-**Impact:** Partial rollback. Sensor left in inconsistent state with no reboot.
-
-**Fix:** Add `PIPE` to the trap: `trap '' TERM INT HUP PIPE`
+**Fix:** Also test `/etc` writability: `touch /etc/.rw-test 2>/dev/null && rm -f /etc/.rw-test`.
 
 ---
 
-### P1 — Arithmetic overflow can produce a zero-second timer
+#### P1 — Attempt counter can reset on power loss, enabling infinite loop
+
+**Source:** Reliability/SRE expert
+**Lines:** 225, 220-222
+
+`echo "$attempts" > "$ATTEMPT_FILE"` (line 225) is not atomic. If power is lost mid-write, the file is corrupted. On next boot, line 222's sanitization (`[[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0`) resets it to 0. The counter never reaches 3 if power keeps cutting during the write.
+
+**Impact:** Infinite reboot loop that the attempt counter was designed to prevent.
+
+**Fix:** Atomic write: `echo "$attempts" > "$ATTEMPT_FILE.tmp" && mv "$ATTEMPT_FILE.tmp" "$ATTEMPT_FILE"`. The `mv` is atomic on ext4 (the Pi's filesystem).
+
+---
+
+#### P1 — `--unlink-first` makes power-loss during tar extraction worse
+
+**Source:** Reliability/SRE expert
+**Line:** 246
+
+`tar xf --unlink-first` deletes the existing file *before* extracting the replacement. If power is lost between the unlink and the write, the file is simply gone — neither old nor new version exists. Each power-loss-during-extraction cycle can incrementally destroy more files. By attempt #3, the counter gives up, and the sensor has missing critical network configs.
+
+**Impact:** Incremental system destruction across power-loss retries.
+
+**Note:** This is a tradeoff. Without `--unlink-first`, tar fails on file-type changes (Round 1 finding #8). With it, power loss is more destructive. The current choice is probably correct (file-type change is more likely than power loss during the ~0.1s extraction), but worth documenting.
+
+---
+
+#### P2 — No `exit` after reboot cascade in rollback script
 
 **Source:** Bash expert
-**Lines:** 98, 281
+**Lines:** 296-302 (in rollback heredoc)
 
-The regex `^[0-9]+$` allows arbitrarily large numbers. On bash 4.x (Raspbian Buster), `[[ 99999999999999999999 -gt 1440 ]]` can wrap to negative, passing the check. Then `$((minutes * 60))` overflows to zero or negative, producing `OnActiveSec=0` — the timer fires immediately.
+If all three reboot methods fail (`reboot`, `reboot -f`, `echo b > /proc/sysrq-trigger`), the script falls through to EOF and exits 0. systemd sees the service as "succeeded." The system continues running with restored files but no reboot, and the deadman won't fire again (ConditionPathExists will fail since backup dir was already deleted at line 291).
 
-**Impact:** Fat-fingered `arm 99999999999999999999` triggers instant rollback + reboot.
+**Impact:** System runs without rebooting after rollback. Services may be in inconsistent state (old configs on disk, new configs in memory).
 
-**Fix:** Constrain the regex to `^[0-9]{1,4}$` (max 4 digits).
-
----
-
-### P1 — No `sync` after tar extraction in rollback
-
-**Source:** My initial review
-**Lines:** 204, 233, 250
-
-After `tar xf` restores files (line 204), the script immediately restarts `systemd-networkd` (line 233). The `sync` doesn't come until line 250, 46 lines and several service restarts later. On a Pi with an SD card, a power glitch in that window could leave restored files half-written.
-
-**Impact:** Corrupted network configs after power loss during rollback.
-
-**Fix:** Add `sync` immediately after the tar extraction block (after line 211).
+**Fix:** Add `sleep infinity` or `exit 1` after line 302, before `ROLLBACK_EOF`.
 
 ---
 
-### P2 — No `daemon-reload` after removing deadman units in rollback
+#### P2 — Backup dir `rm -rf` partial failure can re-arm the deadman
 
-**Source:** My initial review
-**Lines:** 242-243
+**Source:** Reliability/SRE expert
+**Line:** 291
 
-The rollback deletes `/etc/systemd/system/deadman-rollback.{timer,service}` but never does `daemon-reload`. If the 3-tier reboot chain fails (unlikely but this is "bulletproof" territory), systemd still has the units cached in memory.
+If power is lost during `rm -rf "$BACKUP_DIR"`, some files may be deleted (e.g., the attempt counter) while others remain. On reboot, ConditionPathExists passes (rollback script still exists), attempt counter is gone (resets to 0), and the deadman fires again from scratch.
 
-**Fix:** Add `systemctl daemon-reload 2>/dev/null || true` after line 243.
+**Impact:** Extra rollback cycles after supposedly successful rollback.
 
----
-
-### P2 — `tar xf` without `--unlink-first` fails on file-type changes
-
-**Source:** Bash expert
-**Line:** 204
-
-If `install.sh` replaces a file with a directory (or vice versa) between arm and rollback, `tar xf` fails on that entry. The exit code is checked (lines 205-210), but the file is not restored.
-
-**Fix:** Add `--unlink-first` to the tar extract command.
+**Fix:** Delete the rollback script (`$ROLLBACK_SCRIPT`) *first* before `rm -rf`. Since `ConditionPathExists` checks specifically for the rollback script, deleting it first ensures the loop-breaker works even if `rm -rf` is interrupted.
 
 ---
 
-### P2 — No persistent rollback log file
+#### P3 — Double tar read removed from Round 1 list but replaced by verbose logging
 
-**Source:** My initial review
-**Lines:** 195-258
+**Source:** Bash expert (Round 1 finding still partially relevant)
+**Line:** 245
 
-Rollback only logs via `logger` (syslog). If journald isn't running, there's zero forensic trail. The backup dir is deleted at line 247, so a log there would also be lost.
-
-**Fix:** Add a `tee -a /var/log/deadman-rollback.log` alongside logger calls, or redirect the entire rollback script's output to a persistent log.
+The Round 1 double-tar-read issue (logging `tar tf` output before extraction) was fixed — now it just logs "Restoring files from backup tar..." without a second tar read. Confirmed resolved.
 
 ---
 
-### P2 — No error check on `chmod +x` of rollback script
+### Design Limitations (unchanged from Round 1)
 
-**Source:** Bash expert
-**Line:** 260
-
-If `chmod +x` fails (e.g., read-only filesystem remount race), the arm succeeds but the rollback script is not executable. The systemd service will fail to run it. The deadman is "armed" but broken.
-
-**Fix:** Check the return code and abort arm if it fails.
-
----
-
-### P2 — Systemd unit file writes not verified
-
-**Source:** Reliability expert
-**Lines:** 263-275, 282-291
-
-The `cat > /etc/systemd/system/...` heredocs can fail silently if `/etc` is full. The script checks `systemctl daemon-reload` and `enable`, but those can succeed with stale cached state. The backup dir exists, operator thinks the deadman is armed, but the timer unit was never written.
-
-**Fix:** After writing each unit file, verify the file exists and is non-empty before proceeding.
-
----
-
-### P3 — Defuse stops service before timer (ordering)
-
-**Source:** Systemd expert
-**Lines:** 348, 361
-
-The timer could re-trigger the service between stopping the service (line 348) and stopping the timer (line 361). Reversing the order (stop timer first, then service) closes this window.
-
----
-
-### P3 — Double tar read on degraded SD card
-
-**Source:** Bash expert
-**Line:** 203
-
-`logger -t "$LOG_TAG" "Restoring files: $(tar tf ...)"` reads the entire tar file *before* the actual extraction. On a degraded SD card, this doubles I/O and slows rollback.
-
----
-
-### Design Limitations (not bugs, but document explicitly)
-
-1. **OnActiveSec resets on every reboot** — A reboot loop faster than the timer interval prevents rollback from ever firing. The kill-switch cron (4h) vs timer (30min) makes this unlikely, but a kernel panic loop could trigger it.
-
-2. **Rollback deletes backup before confirming reboot** (line 247) — If all 3 reboot methods fail, the system has no backup data. This is an intentional tradeoff to prevent infinite rollback loops.
-
-3. **Pip packages / brokkr not rolled back** — By design (migration uses `--skip-*` flags), but worth verifying the actual flags don't touch anything outside the backup list.
+1. **OnActiveSec resets on every reboot** — documented, acceptable given kill-switch cron timing.
+2. **Rollback deletes backup before confirming reboot** (line 291) — intentional tradeoff for loop prevention.
+3. **Pip packages / brokkr not rolled back** — by design.
+4. **`--unlink-first` tradeoff** — see P1 finding above. File-type-change protection vs power-loss risk.
 
 ---
 
 ## Summary Table
 
-| # | Sev | Lines | Issue |
-|---|-----|-------|-------|
-| 1 | **P0** | 274, 348, 352 | Defuse says "DEFUSED" but rollback runs and reboots anyway |
-| 2 | **P0** | 204, 247, 252 | Read-only filesystem → infinite reboot loop |
-| 3 | **P1** | 190 | SIGPIPE kills rollback mid-execution |
-| 4 | **P1** | 98, 281 | Arithmetic overflow → zero-second timer |
-| 5 | **P1** | 204, 250 | No sync after tar extraction |
-| 6 | **P1** | 200-210 | Partial tar extraction → inconsistent config set |
-| 7 | P2 | 242-243 | No daemon-reload after unit deletion in rollback |
-| 8 | P2 | 204 | tar xf without --unlink-first |
-| 9 | P2 | 195-258 | No persistent log file |
-| 10 | P2 | 260 | No error check on chmod +x |
-| 11 | P2 | 263-291 | Systemd unit file writes not verified |
-| 12 | P3 | 348, 361 | Timer/service stop ordering in defuse |
-| 13 | P3 | 203 | Double tar read on degraded SD |
+| # | Sev | Lines | Issue | Status |
+|---|-----|-------|-------|--------|
+| R1-1 | ~~P0~~ | 388, 414 | Defuse "DEFUSED" lie | **FIXED** |
+| R1-2 | ~~P0~~ | 210-237 | Read-only FS infinite reboot | **FIXED** |
+| R1-3 | ~~P1~~ | 192 | SIGPIPE kills rollback | **FIXED** |
+| R1-4 | ~~P1~~ | 99 | Arithmetic overflow | **FIXED** |
+| R1-5 | ~~P1~~ | 248 | No sync after tar extract | **FIXED** |
+| R1-7–13 | ~~P2/P3~~ | various | All Round 1 P2/P3 items | **FIXED** |
+| **R2-1** | **P1** | 212 | RO test only checks `/var/lib`, not `/etc` | **OPEN** |
+| **R2-2** | **P1** | 225 | Attempt counter non-atomic write | **OPEN** |
+| **R2-3** | **P1** | 246 | `--unlink-first` + power loss = file destruction | **OPEN (tradeoff)** |
+| **R2-4** | P2 | 296-302 | No exit after reboot cascade failure | **OPEN** |
+| **R2-5** | P2 | 291 | Partial `rm -rf` re-arms deadman | **OPEN** |
