@@ -95,8 +95,9 @@ arm() {
     local minutes="${1:-30}"
 
     # Validate minutes is a positive integer, capped at 1440 (24 hours)
-    if ! [[ "$minutes" =~ ^[0-9]+$ ]] || [[ "$minutes" -eq 0 ]]; then
-        echo "ERROR: minutes must be a positive integer, got: '$minutes'"
+    # Regex rejects leading zeros (avoids bash octal interpretation) and zero
+    if ! [[ "$minutes" =~ ^[1-9][0-9]{0,3}$ ]]; then
+        echo "ERROR: minutes must be a positive integer (1-1440), got: '$minutes'"
         exit 1
     fi
     if [[ "$minutes" -gt 1440 ]]; then
@@ -187,40 +188,82 @@ arm() {
 
 # Ignore signals so defuse (systemctl stop) cannot kill us.
 # Once rollback begins, it MUST complete and reboot to reach a consistent state.
-trap '' TERM INT HUP
+# PIPE: prevents dead syslog socket from killing us via logger.
+trap '' TERM INT HUP PIPE
 
 BACKUP_DIR="/var/lib/migration-backup"
 LOG_TAG="deadman-rollback"
+ROLLBACK_LOG="/var/log/deadman-rollback.log"
 
-logger -t "$LOG_TAG" "DEAD MAN'S SWITCH FIRED -- ROLLING BACK"
+# Log to both syslog and a persistent file (survives backup dir deletion)
+log() {
+    logger -t "$LOG_TAG" "$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$ROLLBACK_LOG" 2>/dev/null || true
+}
 
-# Restore backed-up files
-if [[ -f "$BACKUP_DIR/pre-migration.tar" ]]; then
+log "DEAD MAN'S SWITCH FIRED -- ROLLING BACK"
+
+# Check if filesystem is writable. If read-only (most common SD card failure),
+# skip restore (can't write files anyway) and skip backup dir deletion
+# (can't delete). Just reboot — on next boot ConditionPathExists passes again,
+# but we track attempt count to break infinite loops.
+ATTEMPT_FILE="$BACKUP_DIR/.rollback-attempts"
+RO_FS=0
+if ! touch /var/lib/.rw-test 2>/dev/null; then
+    RO_FS=1
+    log "ERROR: Filesystem is read-only! Skipping restore, rebooting."
+else
+    rm -f /var/lib/.rw-test
+    # Track rollback attempts to break infinite reboot loops
+    attempts=0
+    if [[ -f "$ATTEMPT_FILE" ]]; then
+        attempts=$(cat "$ATTEMPT_FILE" 2>/dev/null || echo "0")
+        # Sanitize: if corrupted to non-numeric, reset to 0
+        [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+    fi
+    attempts=$((attempts + 1))
+    echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
+    if [[ $attempts -gt 3 ]]; then
+        log "ERROR: Rollback attempted $attempts times. Giving up to prevent infinite loop."
+        # Delete backup dir to break the ConditionPathExists cycle
+        rm -rf "$BACKUP_DIR"
+        log "Backup dir deleted. Rebooting to whatever state we have."
+        sync
+        sleep 5
+        reboot || reboot -f || echo b > /proc/sysrq-trigger
+        exit 0
+    fi
+    log "Rollback attempt $attempts of 3"
+fi
+
+# Restore backed-up files (skip if filesystem is read-only)
+if [[ $RO_FS -eq 0 ]] && [[ -f "$BACKUP_DIR/pre-migration.tar" ]]; then
     # Verify tar integrity before extracting (corrupt tar -> skip restore, still reboot)
     if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names >/dev/null 2>&1; then
-        logger -t "$LOG_TAG" "ERROR: Backup tar is corrupt! Skipping restore, rebooting anyway"
+        log "ERROR: Backup tar is corrupt! Skipping restore, rebooting anyway"
     else
-        logger -t "$LOG_TAG" "Restoring files: $(tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | tr '\n' ' ')"
-        tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names
+        log "Restoring files from backup tar..."
+        tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names --unlink-first
         tar_rc=$?
+        sync  # Flush restored files to disk immediately
         if [[ $tar_rc -eq 0 ]]; then
-            logger -t "$LOG_TAG" "Files restored successfully"
+            log "Files restored successfully"
         else
-            logger -t "$LOG_TAG" "ERROR: tar restore failed (exit $tar_rc), continuing anyway"
+            log "ERROR: tar restore failed (exit $tar_rc), continuing anyway"
         fi
     fi
-else
-    logger -t "$LOG_TAG" "ERROR: No backup tar found at $BACKUP_DIR/pre-migration.tar"
+elif [[ $RO_FS -eq 0 ]]; then
+    log "ERROR: No backup tar found at $BACKUP_DIR/pre-migration.tar"
 fi
 
 # Restore git branch (force checkout -- working tree may be dirty)
 # Timeout prevents hanging on NFS/hook issues
-if [[ -f "$BACKUP_DIR/git-branch" ]]; then
+if [[ $RO_FS -eq 0 ]] && [[ -f "$BACKUP_DIR/git-branch" ]]; then
     saved_branch=$(cat "$BACKUP_DIR/git-branch")
     if [[ -n "$saved_branch" && "$saved_branch" != "unknown" && "$saved_branch" != "HEAD" ]]; then
-        logger -t "$LOG_TAG" "Restoring git branch: $saved_branch"
+        log "Restoring git branch: $saved_branch"
         timeout 60 sudo -H -u pi git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" || \
-            logger -t "$LOG_TAG" "WARNING: git checkout failed or timed out"
+            log "WARNING: git checkout failed or timed out"
     fi
 fi
 
@@ -241,23 +284,29 @@ systemctl stop deadman-rollback.timer 2>/dev/null || true
 systemctl disable deadman-rollback.timer 2>/dev/null || true
 rm -f /etc/systemd/system/deadman-rollback.timer
 rm -f /etc/systemd/system/deadman-rollback.service
+systemctl daemon-reload 2>/dev/null || true
 
 # Delete backup dir so ConditionPathExists fails if timer removal failed
 # (prevents infinite rollback loop on reboot)
 rm -rf "$BACKUP_DIR"
 
-logger -t "$LOG_TAG" "Rollback complete. Rebooting in 10 seconds..."
+log "Rollback complete. Rebooting in 10 seconds..."
 sync
 sleep 10
 reboot || {
-    logger -t "$LOG_TAG" "ERROR: reboot failed, trying forced reboot"
+    log "ERROR: reboot failed, trying forced reboot"
     reboot -f || {
-        logger -t "$LOG_TAG" "ERROR: forced reboot failed, trying sysrq"
+        log "ERROR: forced reboot failed, trying sysrq"
         echo b > /proc/sysrq-trigger
     }
 }
 ROLLBACK_EOF
-    chmod +x "$ROLLBACK_SCRIPT"
+    chmod +x "$ROLLBACK_SCRIPT" || { echo "ERROR: chmod +x failed on rollback script"; cleanup_partial_arm 1; }
+
+    # Verify the rollback script was fully written (heredoc fails silently on full disk)
+    if [[ ! -s "$ROLLBACK_SCRIPT" ]] || ! grep -q 'sysrq-trigger' "$ROLLBACK_SCRIPT"; then
+        echo "ERROR: Rollback script is empty or truncated"; cleanup_partial_arm 1
+    fi
 
     # --- Create systemd service (runs the rollback) ---
     cat > "/etc/systemd/system/$SERVICE_UNIT" <<EOF
@@ -289,6 +338,14 @@ OnActiveSec=${seconds}
 [Install]
 WantedBy=timers.target
 EOF
+
+    # Verify unit files were written (heredocs fail silently on full disk)
+    if [[ ! -s "/etc/systemd/system/$SERVICE_UNIT" ]]; then
+        echo "ERROR: Service unit file is empty or missing"; cleanup_partial_arm 1
+    fi
+    if [[ ! -s "/etc/systemd/system/$TIMER_UNIT" ]]; then
+        echo "ERROR: Timer unit file is empty or missing"; cleanup_partial_arm 1
+    fi
 
     # Enable (survives reboot) and start
     # Use cleanup_partial_arm on failure to remove orphan unit files
@@ -328,12 +385,12 @@ defuse() {
     svc_state=$(systemctl show "$SERVICE_UNIT" --property=ActiveState 2>/dev/null || echo "unknown")
     # Strip "ActiveState=" prefix (more portable than --value)
     svc_state="${svc_state#ActiveState=}"
-    if [[ "$svc_state" == "activating" ]]; then
-        echo "ERROR: Rollback service is ALREADY RUNNING!"
+    if [[ "$svc_state" == "activating" || "$svc_state" == "deactivating" ]]; then
+        echo "ERROR: Rollback service is ALREADY RUNNING (state: $svc_state)!"
         echo "It is too late to defuse. The system will reboot shortly."
         echo "Wait for reboot, then assess the state."
         echo "After reboot the rollback will have completed. Re-arm if needed."
-        logger -t "deadman-arm" "Defuse attempted but rollback already in progress"
+        logger -t "deadman-arm" "Defuse attempted but rollback already in progress (state: $svc_state)"
         exit 1
     fi
 
@@ -341,25 +398,25 @@ defuse() {
         echo "Timer is not active. Cleaning up any partial state..."
     fi
 
-    # Stop timer and service
-    # Timeout on service stop: if timer fires between our TOCTOU check above and
-    # this stop, the rollback script's trap '' TERM + TimeoutStopSec=infinity
-    # would make this block forever. 10s is enough for systemd housekeeping.
+    # Stop timer FIRST to prevent it from re-triggering the service between stops
+    systemctl stop "$TIMER_UNIT" 2>/dev/null || true
+    systemctl disable "$TIMER_UNIT" 2>/dev/null || true
+
+    # Stop the service. Timeout protects against TOCTOU race: if the timer fired
+    # between our check above and the timer stop, the rollback script's
+    # trap '' TERM + TimeoutStopSec=infinity would block forever.
     timeout 10 systemctl stop "$SERVICE_UNIT" 2>/dev/null || true
 
     # Re-check: if the rollback started during our stop attempt, warn the user
     # instead of printing a misleading "DEFUSED" message.
     svc_state=$(systemctl show "$SERVICE_UNIT" --property=ActiveState 2>/dev/null || echo "unknown")
     svc_state="${svc_state#ActiveState=}"
-    if [[ "$svc_state" == "activating" ]]; then
-        echo "WARNING: Rollback service started during defuse attempt!"
+    if [[ "$svc_state" == "activating" || "$svc_state" == "deactivating" ]]; then
+        echo "WARNING: Rollback service started during defuse (state: $svc_state)!"
         echo "The system will reboot shortly. Wait for reboot, then assess state."
         logger -t "deadman-arm" "Rollback started during defuse, system will reboot"
         exit 1
     fi
-
-    systemctl stop "$TIMER_UNIT" 2>/dev/null || true
-    systemctl disable "$TIMER_UNIT" 2>/dev/null || true
 
     # Remove systemd units
     rm -f "/etc/systemd/system/$TIMER_UNIT"
