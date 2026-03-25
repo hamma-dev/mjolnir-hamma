@@ -42,6 +42,14 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Prevent concurrent execution (two arms, arm+defuse, etc.)
+LOCK_FILE="/var/run/migration-deadman.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "ERROR: Another instance of migration-deadman.sh is already running."
+    exit 1
+fi
+
 BACKUP_DIR="/var/lib/migration-backup"
 BACKUP_TAR="$BACKUP_DIR/pre-migration.tar"
 BACKUP_BRANCH="$BACKUP_DIR/git-branch"
@@ -67,23 +75,32 @@ BACKUP_REMOVABLE=(
     /etc/systemd/system/networkd-dispatcher.service.d
 )
 
+CLEANUP_IN_PROGRESS=0
 cleanup_partial_arm() {
+    # Re-entry guard: if cleanup triggers another signal, don't recurse
+    if [[ "$CLEANUP_IN_PROGRESS" -eq 1 ]]; then return; fi
+    CLEANUP_IN_PROGRESS=1
     echo "INTERRUPTED -- cleaning up partial arm state..."
+    logger -t "deadman-arm" "Arm interrupted, cleaning up partial state"
     systemctl stop "$TIMER_UNIT" 2>/dev/null || true
     systemctl disable "$TIMER_UNIT" 2>/dev/null || true
     rm -f "/etc/systemd/system/$TIMER_UNIT" "/etc/systemd/system/$SERVICE_UNIT"
     systemctl daemon-reload 2>/dev/null || true
     rm -rf "$BACKUP_DIR"
     echo "Cleaned up. Dead man's switch was NOT armed."
-    exit 130
+    exit "${1:-130}"
 }
 
 arm() {
     local minutes="${1:-30}"
 
-    # Validate minutes is a positive integer
+    # Validate minutes is a positive integer, capped at 1440 (24 hours)
     if ! [[ "$minutes" =~ ^[0-9]+$ ]] || [[ "$minutes" -eq 0 ]]; then
         echo "ERROR: minutes must be a positive integer, got: '$minutes'"
+        exit 1
+    fi
+    if [[ "$minutes" -gt 1440 ]]; then
+        echo "ERROR: minutes must be <= 1440 (24 hours), got: '$minutes'"
         exit 1
     fi
 
@@ -108,6 +125,9 @@ arm() {
 
     # Create backup directory
     mkdir -p "$BACKUP_DIR" || { echo "ERROR: Cannot create $BACKUP_DIR"; exit 1; }
+
+    # Copy this script to backup dir so it survives if original location changes
+    cp "${BASH_SOURCE[0]:-$0}" "$BACKUP_DIR/migration-deadman.sh" 2>/dev/null || true
 
     # --- Save current git branch ---
     local current_branch
@@ -139,12 +159,20 @@ arm() {
 
     if [[ ${#files_to_tar[@]} -eq 0 ]]; then
         echo "ERROR: No files found to backup. Something is wrong."
+        rm -rf "$BACKUP_DIR"
         exit 1
     fi
 
     # Create tar (--absolute-names preserves leading /; symlinks stored as-is)
     if ! tar cf "$BACKUP_TAR" --absolute-names "${files_to_tar[@]}"; then
         echo "ERROR: Failed to create backup tar. Aborting."
+        rm -rf "$BACKUP_DIR"
+        exit 1
+    fi
+    sync
+    # Verify tar is valid and non-empty
+    if [[ ! -s "$BACKUP_TAR" ]] || ! tar tf "$BACKUP_TAR" --absolute-names >/dev/null 2>&1; then
+        echo "ERROR: Backup tar is empty or corrupt. Aborting."
         rm -rf "$BACKUP_DIR"
         exit 1
     fi
@@ -157,6 +185,10 @@ arm() {
 # This runs if the dead man's switch fires.
 # No set -e: every command must continue even if prior ones fail.
 
+# Ignore signals so defuse (systemctl stop) cannot kill us.
+# Once rollback begins, it MUST complete and reboot to reach a consistent state.
+trap '' TERM INT HUP
+
 BACKUP_DIR="/var/lib/migration-backup"
 LOG_TAG="deadman-rollback"
 
@@ -164,27 +196,32 @@ logger -t "$LOG_TAG" "DEAD MAN'S SWITCH FIRED -- ROLLING BACK"
 
 # Restore backed-up files
 if [[ -f "$BACKUP_DIR/pre-migration.tar" ]]; then
-    logger -t "$LOG_TAG" "Restoring files from backup..."
-    tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names
-    tar_rc=$?
-    if [[ $tar_rc -eq 0 ]]; then
-        logger -t "$LOG_TAG" "Files restored successfully"
+    # Verify tar integrity before extracting (corrupt tar -> skip restore, still reboot)
+    if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names >/dev/null 2>&1; then
+        logger -t "$LOG_TAG" "ERROR: Backup tar is corrupt! Skipping restore, rebooting anyway"
     else
-        logger -t "$LOG_TAG" "ERROR: tar restore failed (exit $tar_rc), continuing anyway"
+        logger -t "$LOG_TAG" "Restoring files: $(tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | tr '\n' ' ')"
+        tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names
+        tar_rc=$?
+        if [[ $tar_rc -eq 0 ]]; then
+            logger -t "$LOG_TAG" "Files restored successfully"
+        else
+            logger -t "$LOG_TAG" "ERROR: tar restore failed (exit $tar_rc), continuing anyway"
+        fi
     fi
 else
     logger -t "$LOG_TAG" "ERROR: No backup tar found at $BACKUP_DIR/pre-migration.tar"
 fi
 
-# Once files are restored, ignore SIGTERM so defuse cannot interrupt us
-# mid-rollback -- we must finish and reboot to reach a consistent state
-trap '' TERM
-
 # Restore git branch (force checkout -- working tree may be dirty)
+# Timeout prevents hanging on NFS/hook issues
 if [[ -f "$BACKUP_DIR/git-branch" ]]; then
     saved_branch=$(cat "$BACKUP_DIR/git-branch")
-    logger -t "$LOG_TAG" "Restoring git branch: $saved_branch"
-    runuser -u pi -- git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" 2>/dev/null || true
+    if [[ -n "$saved_branch" && "$saved_branch" != "unknown" && "$saved_branch" != "HEAD" ]]; then
+        logger -t "$LOG_TAG" "Restoring git branch: $saved_branch"
+        timeout 60 sudo -H -u pi git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" || \
+            logger -t "$LOG_TAG" "WARNING: git checkout failed or timed out"
+    fi
 fi
 
 # Reload systemd (timer/service files may have been restored)
@@ -192,22 +229,33 @@ systemctl daemon-reload || true
 
 # Restart networkd to apply restored network configs
 # Safe for wwan0: it is Unmanaged=yes, only eth0/eth1 are affected
-systemctl restart systemd-networkd || true
+# Timeout prevents a hung networkd from blocking rollback+reboot
+timeout 30 systemctl restart systemd-networkd || true
 
 # Restart wwan timer (restored version)
 systemctl restart wwan-check.timer 2>/dev/null || true
 
 # Remove the dead man's switch units (they didn't exist before arming,
-# so they are not in the backup tar and must be explicitly cleaned up)
+# so they are not in the backup tar and must be explicitly cleaned up).
 systemctl stop deadman-rollback.timer 2>/dev/null || true
 systemctl disable deadman-rollback.timer 2>/dev/null || true
 rm -f /etc/systemd/system/deadman-rollback.timer
 rm -f /etc/systemd/system/deadman-rollback.service
-systemctl daemon-reload || true
+
+# Delete backup dir so ConditionPathExists fails if timer removal failed
+# (prevents infinite rollback loop on reboot)
+rm -rf "$BACKUP_DIR"
 
 logger -t "$LOG_TAG" "Rollback complete. Rebooting in 10 seconds..."
+sync
 sleep 10
-reboot
+reboot || {
+    logger -t "$LOG_TAG" "ERROR: reboot failed, trying forced reboot"
+    reboot -f || {
+        logger -t "$LOG_TAG" "ERROR: forced reboot failed, trying sysrq"
+        echo b > /proc/sysrq-trigger
+    }
+}
 ROLLBACK_EOF
     chmod +x "$ROLLBACK_SCRIPT"
 
@@ -215,10 +263,15 @@ ROLLBACK_EOF
     cat > "/etc/systemd/system/$SERVICE_UNIT" <<EOF
 [Unit]
 Description=Migration Dead Man's Switch - Rollback Service
+ConditionPathExists=$ROLLBACK_SCRIPT
 
 [Service]
 Type=oneshot
 ExecStart=$ROLLBACK_SCRIPT
+# Oneshot services spend their entire life in "activating" (start phase).
+# Both timeouts must be infinity to prevent systemd from killing the rollback.
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
 EOF
 
     # --- Create systemd timer ---
@@ -238,18 +291,21 @@ WantedBy=timers.target
 EOF
 
     # Enable (survives reboot) and start
-    systemctl daemon-reload || { echo "ERROR: daemon-reload failed"; exit 1; }
-    systemctl enable "$TIMER_UNIT" || { echo "ERROR: failed to enable timer"; exit 1; }
-    systemctl start "$TIMER_UNIT" || { echo "ERROR: failed to start timer"; exit 1; }
+    # Use cleanup_partial_arm on failure to remove orphan unit files
+    systemctl daemon-reload || { echo "ERROR: daemon-reload failed"; cleanup_partial_arm 1; }
+    systemctl enable "$TIMER_UNIT" || { echo "ERROR: failed to enable timer"; cleanup_partial_arm 1; }
+    systemctl start "$TIMER_UNIT" || { echo "ERROR: failed to start timer"; cleanup_partial_arm 1; }
 
     # Belt-and-suspenders: verify timer is actually running
     if ! systemctl is-active "$TIMER_UNIT" &>/dev/null; then
         echo "ERROR: Timer failed to start despite no errors. Aborting."
-        cleanup_partial_arm
+        cleanup_partial_arm 1
     fi
 
     # Disarm the interrupt trap -- we are now in a consistent armed state
     trap - INT TERM HUP
+
+    logger -t "deadman-arm" "Dead man's switch armed for $minutes minutes"
 
     echo
     echo "========================================="
@@ -265,14 +321,20 @@ EOF
 defuse() {
     echo "=== Defusing dead man's switch ==="
 
-    # Check if the rollback service is already running (timer just fired)
-    if systemctl is-active "$SERVICE_UNIT" &>/dev/null; then
-        echo "WARNING: Rollback service is ALREADY RUNNING!"
-        echo "The rollback may have already restored files. Attempting to stop it..."
-        # The rollback script traps SIGTERM after file restore, so this may
-        # not stop it if it has passed the point of no return.
-        systemctl kill "$SERVICE_UNIT" 2>/dev/null || true
-        echo "Check system state carefully -- a reboot may be imminent."
+    # Check if the rollback service is already running (timer just fired).
+    # Type=oneshot services are in "activating" state during execution,
+    # never "active" (is-active returns false). Check ActiveState directly.
+    local svc_state
+    svc_state=$(systemctl show "$SERVICE_UNIT" --property=ActiveState 2>/dev/null || echo "unknown")
+    # Strip "ActiveState=" prefix (more portable than --value)
+    svc_state="${svc_state#ActiveState=}"
+    if [[ "$svc_state" == "activating" ]]; then
+        echo "ERROR: Rollback service is ALREADY RUNNING!"
+        echo "It is too late to defuse. The system will reboot shortly."
+        echo "Wait for reboot, then assess the state."
+        echo "After reboot the rollback will have completed. Re-arm if needed."
+        logger -t "deadman-arm" "Defuse attempted but rollback already in progress"
+        exit 1
     fi
 
     if ! systemctl is-active "$TIMER_UNIT" &>/dev/null; then
@@ -280,7 +342,22 @@ defuse() {
     fi
 
     # Stop timer and service
-    systemctl stop "$SERVICE_UNIT" 2>/dev/null || true
+    # Timeout on service stop: if timer fires between our TOCTOU check above and
+    # this stop, the rollback script's trap '' TERM + TimeoutStopSec=infinity
+    # would make this block forever. 10s is enough for systemd housekeeping.
+    timeout 10 systemctl stop "$SERVICE_UNIT" 2>/dev/null || true
+
+    # Re-check: if the rollback started during our stop attempt, warn the user
+    # instead of printing a misleading "DEFUSED" message.
+    svc_state=$(systemctl show "$SERVICE_UNIT" --property=ActiveState 2>/dev/null || echo "unknown")
+    svc_state="${svc_state#ActiveState=}"
+    if [[ "$svc_state" == "activating" ]]; then
+        echo "WARNING: Rollback service started during defuse attempt!"
+        echo "The system will reboot shortly. Wait for reboot, then assess state."
+        logger -t "deadman-arm" "Rollback started during defuse, system will reboot"
+        exit 1
+    fi
+
     systemctl stop "$TIMER_UNIT" 2>/dev/null || true
     systemctl disable "$TIMER_UNIT" 2>/dev/null || true
 
@@ -288,6 +365,8 @@ defuse() {
     rm -f "/etc/systemd/system/$TIMER_UNIT"
     rm -f "/etc/systemd/system/$SERVICE_UNIT"
     systemctl daemon-reload
+
+    logger -t "deadman-arm" "Dead man's switch defused"
 
     # Clean up backup (optional — keep for safety)
     echo
@@ -306,15 +385,7 @@ status() {
     if systemctl is-active "$TIMER_UNIT" &>/dev/null; then
         echo "Status: ARMED"
         echo
-        systemctl status "$TIMER_UNIT" --no-pager 2>/dev/null
-        echo
-        # Show time remaining
-        local next_fire
-        next_fire=$(systemctl show "$TIMER_UNIT" --property=NextElapseUSecMonotonic --value 2>/dev/null)
-        if [[ -n "$next_fire" && "$next_fire" != "0" ]]; then
-            echo "Timer details:"
-            systemctl list-timers "$TIMER_UNIT" --no-pager 2>/dev/null
-        fi
+        systemctl list-timers "$TIMER_UNIT" --no-pager 2>/dev/null
     else
         echo "Status: NOT ARMED"
     fi
