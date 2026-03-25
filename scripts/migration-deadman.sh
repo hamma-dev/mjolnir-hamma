@@ -209,11 +209,14 @@ log "DEAD MAN'S SWITCH FIRED -- ROLLING BACK"
 # but we track attempt count to break infinite loops.
 ATTEMPT_FILE="$BACKUP_DIR/.rollback-attempts"
 RO_FS=0
-if ! touch /var/lib/.rw-test 2>/dev/null; then
+# Test writability of both /var/lib (backup dir) and /etc (restore targets).
+# Selective sector wear can make one writable while the other is read-only.
+if ! touch /var/lib/.rw-test 2>/dev/null || ! touch /etc/.rw-test 2>/dev/null; then
+    rm -f /var/lib/.rw-test /etc/.rw-test 2>/dev/null
     RO_FS=1
     log "ERROR: Filesystem is read-only! Skipping restore, rebooting."
 else
-    rm -f /var/lib/.rw-test
+    rm -f /var/lib/.rw-test /etc/.rw-test
     # Track rollback attempts to break infinite reboot loops
     attempts=0
     if [[ -f "$ATTEMPT_FILE" ]]; then
@@ -222,7 +225,9 @@ else
         [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
     fi
     attempts=$((attempts + 1))
-    echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
+    # Atomic write: mv is atomic on ext4, prevents corruption on power loss
+    echo "$attempts" > "$ATTEMPT_FILE.tmp" 2>/dev/null && \
+        mv "$ATTEMPT_FILE.tmp" "$ATTEMPT_FILE" 2>/dev/null || true
     if [[ $attempts -gt 3 ]]; then
         log "ERROR: Rollback attempted $attempts times. Giving up to prevent infinite loop."
         # Delete backup dir to break the ConditionPathExists cycle
@@ -243,6 +248,10 @@ if [[ $RO_FS -eq 0 ]] && [[ -f "$BACKUP_DIR/pre-migration.tar" ]]; then
         log "ERROR: Backup tar is corrupt! Skipping restore, rebooting anyway"
     else
         log "Restoring files from backup tar..."
+        # --unlink-first: required so tar can replace symlinks/dirs with files
+        # (or vice versa). Tradeoff: power loss between unlink and write loses
+        # the file entirely. Acceptable because file-type mismatch is more likely
+        # than power loss during the ~0.1s extraction window.
         tar xf "$BACKUP_DIR/pre-migration.tar" --absolute-names --unlink-first
         tar_rc=$?
         sync  # Flush restored files to disk immediately
@@ -286,8 +295,9 @@ rm -f /etc/systemd/system/deadman-rollback.timer
 rm -f /etc/systemd/system/deadman-rollback.service
 systemctl daemon-reload 2>/dev/null || true
 
-# Delete backup dir so ConditionPathExists fails if timer removal failed
-# (prevents infinite rollback loop on reboot)
+# Delete the rollback script FIRST — this is what ConditionPathExists checks.
+# Even if rm -rf is interrupted by power loss, the condition fails on next boot.
+rm -f "$BACKUP_DIR/rollback.sh"
 rm -rf "$BACKUP_DIR"
 
 log "Rollback complete. Rebooting in 10 seconds..."
@@ -300,6 +310,8 @@ reboot || {
         echo b > /proc/sysrq-trigger
     }
 }
+# If all reboot methods failed, exit non-zero so systemd marks service as failed
+exit 1
 ROLLBACK_EOF
     chmod +x "$ROLLBACK_SCRIPT" || { echo "ERROR: chmod +x failed on rollback script"; cleanup_partial_arm 1; }
 
