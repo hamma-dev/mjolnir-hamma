@@ -81,7 +81,7 @@ cleanup_partial_arm() {
     if [[ "$CLEANUP_IN_PROGRESS" -eq 1 ]]; then return; fi
     CLEANUP_IN_PROGRESS=1
     echo "INTERRUPTED -- cleaning up partial arm state..."
-    logger -t "deadman-arm" "Arm interrupted, cleaning up partial state"
+    timeout 5 logger -t "deadman-arm" "Arm interrupted, cleaning up partial state" 2>/dev/null || true
     systemctl stop "$TIMER_UNIT" 2>/dev/null || true
     systemctl disable "$TIMER_UNIT" 2>/dev/null || true
     rm -f "/etc/systemd/system/$TIMER_UNIT" "/etc/systemd/system/$SERVICE_UNIT"
@@ -220,8 +220,11 @@ ROLLBACK_LOG="/var/log/deadman-rollback.log"
 # Log to both syslog and a persistent file (survives backup dir deletion)
 # Timeout on logger: if journald is stuck (disk full), logger blocks forever
 # and the rollback never reaches reboot.
+# --kill-after: trap '' TERM sets SIG_IGN which is inherited across fork+exec
+# per POSIX. timeout's SIGTERM would be ignored by the child; SIGKILL cannot
+# be caught or ignored, so --kill-after guarantees termination.
 log() {
-    timeout 5 logger -t "$LOG_TAG" "$1" 2>/dev/null || true
+    timeout --kill-after=5 5 logger -t "$LOG_TAG" "$1" 2>/dev/null || true
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$ROLLBACK_LOG" 2>/dev/null || true
 }
 
@@ -310,21 +313,37 @@ if [[ $RO_FS -eq 0 ]] && [[ -f "$BACKUP_DIR/git-branch" ]]; then
     saved_branch=$(cat "$BACKUP_DIR/git-branch")
     if [[ -n "$saved_branch" && "$saved_branch" != "unknown" && "$saved_branch" != "HEAD" ]]; then
         log "Restoring git branch: $saved_branch"
-        timeout 60 sudo -H -u pi git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" || \
+        timeout --kill-after=10 60 sudo -H -u pi git -C /home/pi/dev/mjolnir-hamma checkout -f "$saved_branch" || \
             log "WARNING: git checkout failed or timed out"
     fi
 fi
 
 # Reload systemd (timer/service files may have been restored)
-systemctl daemon-reload || true
+# Timeout + kill-after: SIG_IGN inherited from trap '' TERM (see log() comment)
+timeout --kill-after=10 30 systemctl daemon-reload || true
 
 # Restart networkd to apply restored network configs
 # Safe for wwan0: it is Unmanaged=yes, only eth0/eth1 are affected
 # Timeout prevents a hung networkd from blocking rollback+reboot
-timeout 30 systemctl restart systemd-networkd || true
+timeout --kill-after=10 30 systemctl restart systemd-networkd || true
 
-# Restart wwan timer (restored version)
-systemctl restart wwan-check.timer 2>/dev/null || true
+# Clean up files that install.sh may have created but weren't in the backup tar
+# (they didn't exist on the pre-migration system). Without this, the orphaned
+# wwan-check.timer fires every 5min calling a script incompatible with the
+# restored old Python script (KeyError on IFACE).
+if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.sh'; then
+    rm -f /usr/local/bin/wwan-check.sh
+fi
+if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.timer'; then
+    systemctl stop wwan-check.timer 2>/dev/null || true
+    systemctl disable wwan-check.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/wwan-check.timer /etc/systemd/system/wwan-check.service
+fi
+
+# Restart wwan timer only if it was in the original backup (i.e., existed before migration)
+if tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.timer'; then
+    systemctl restart wwan-check.timer 2>/dev/null || true
+fi
 
 # Remove the dead man's switch units (they didn't exist before arming,
 # so they are not in the backup tar and must be explicitly cleaned up).
@@ -413,7 +432,7 @@ EOF
     # Disarm the interrupt trap -- we are now in a consistent armed state
     trap - INT TERM HUP
 
-    logger -t "deadman-arm" "Dead man's switch armed for $minutes minutes"
+    timeout 5 logger -t "deadman-arm" "Dead man's switch armed for $minutes minutes" 2>/dev/null || true
 
     echo
     echo "========================================="
@@ -441,7 +460,7 @@ defuse() {
         echo "It is too late to defuse. The system will reboot shortly."
         echo "Wait for reboot, then assess the state."
         echo "After reboot the rollback will have completed. Re-arm if needed."
-        logger -t "deadman-arm" "Defuse attempted but rollback already in progress (state: $svc_state)"
+        timeout 5 logger -t "deadman-arm" "Defuse attempted but rollback already in progress (state: $svc_state)" 2>/dev/null || true
         exit 1
     fi
 
@@ -465,7 +484,7 @@ defuse() {
     if [[ "$svc_state" == "activating" || "$svc_state" == "deactivating" ]]; then
         echo "WARNING: Rollback service started during defuse (state: $svc_state)!"
         echo "The system will reboot shortly. Wait for reboot, then assess state."
-        logger -t "deadman-arm" "Rollback started during defuse, system will reboot"
+        timeout 5 logger -t "deadman-arm" "Rollback started during defuse, system will reboot" 2>/dev/null || true
         exit 1
     fi
 
@@ -474,7 +493,7 @@ defuse() {
     rm -f "/etc/systemd/system/$SERVICE_UNIT"
     systemctl daemon-reload
 
-    logger -t "deadman-arm" "Dead man's switch defused"
+    timeout 5 logger -t "deadman-arm" "Dead man's switch defused" 2>/dev/null || true
 
     # Clean up backup (optional — keep for safety)
     echo
