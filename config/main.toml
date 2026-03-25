@@ -163,6 +163,7 @@ config_version = 1
         na_on_start = true
         # Most pipeline builders will need one or more lists of steps.
         # These are either names of steps in the [steps] table, or preset names as above
+        # NOTE: If you change this list, also update the nochargecontroller mode in mode.toml
         monitor_input_steps = [
             "builtins.inputs.current_time",
             "builtins.inputs.run_time",
