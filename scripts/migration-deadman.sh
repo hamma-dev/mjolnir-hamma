@@ -111,8 +111,30 @@ arm() {
         exit 1
     fi
 
+    # Check if rollback service is currently running (flock does NOT protect against
+    # this — the rollback is a separate process launched by systemd, not this script).
+    # Without this check, arm() could overwrite BACKUP_DIR while rollback reads from it.
+    local svc_state
+    svc_state=$(systemctl show "$SERVICE_UNIT" --property=ActiveState 2>/dev/null || echo "unknown")
+    svc_state="${svc_state#ActiveState=}"
+    if [[ "$svc_state" == "activating" || "$svc_state" == "deactivating" ]]; then
+        echo "ERROR: Rollback service is currently running (state: $svc_state)!"
+        echo "Wait for the rollback to complete and the system to reboot."
+        exit 1
+    fi
+
+    # Secondary guard: unit files on disk mean we armed previously, even if the
+    # timer isn't active yet (e.g., early boot before timers.target is reached).
+    if [[ -f "/etc/systemd/system/$TIMER_UNIT" ]] && [[ -f "/etc/systemd/system/$SERVICE_UNIT" ]]; then
+        echo "ERROR: Dead man's switch unit files exist but timer is not active."
+        echo "The timer may still be starting. Run 'defuse' to clean up first."
+        exit 1
+    fi
+
     # Clean up on interrupt (Ctrl-C, SSH drop, SIGTERM)
-    trap cleanup_partial_arm INT TERM HUP
+    trap 'cleanup_partial_arm 130' INT
+    trap 'cleanup_partial_arm 143' TERM
+    trap 'cleanup_partial_arm 129' HUP
 
     echo "=== Arming dead man's switch ($minutes minutes) ==="
     echo
@@ -196,8 +218,10 @@ LOG_TAG="deadman-rollback"
 ROLLBACK_LOG="/var/log/deadman-rollback.log"
 
 # Log to both syslog and a persistent file (survives backup dir deletion)
+# Timeout on logger: if journald is stuck (disk full), logger blocks forever
+# and the rollback never reaches reboot.
 log() {
-    logger -t "$LOG_TAG" "$1"
+    timeout 5 logger -t "$LOG_TAG" "$1" 2>/dev/null || true
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$ROLLBACK_LOG" 2>/dev/null || true
 }
 
@@ -213,8 +237,23 @@ RO_FS=0
 # Selective sector wear can make one writable while the other is read-only.
 if ! touch /var/lib/.rw-test 2>/dev/null || ! touch /etc/.rw-test 2>/dev/null; then
     rm -f /var/lib/.rw-test /etc/.rw-test 2>/dev/null
-    RO_FS=1
-    log "ERROR: Filesystem is read-only! Skipping restore, rebooting."
+    # Try to remount rw — RO may be a transient condition (journaling recovery)
+    log "Filesystem is read-only, attempting remount rw..."
+    mount -o remount,rw / 2>/dev/null || true
+    if ! touch /var/lib/.rw-test2 2>/dev/null || ! touch /etc/.rw-test2 2>/dev/null; then
+        rm -f /var/lib/.rw-test2 /etc/.rw-test2 2>/dev/null
+        # Truly RO: can't restore files, can't increment attempt counter, can't
+        # delete rollback.sh to break ConditionPathExists. Jump straight to reboot
+        # with a long delay to throttle the loop (otherwise reboots every ~30s).
+        log "ERROR: Filesystem is read-only even after remount! Sleeping 5min then rebooting."
+        sync
+        sleep 300
+        reboot || reboot -f || echo b > /proc/sysrq-trigger
+        exit 0
+    fi
+    rm -f /var/lib/.rw-test2 /etc/.rw-test2
+    log "Remount succeeded, continuing with rollback"
+    RO_FS=0
 else
     rm -f /var/lib/.rw-test /etc/.rw-test
     # Track rollback attempts to break infinite reboot loops
