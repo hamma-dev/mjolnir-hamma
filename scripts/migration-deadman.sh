@@ -95,8 +95,8 @@ arm() {
     local minutes="${1:-30}"
 
     # Validate minutes is a positive integer, capped at 1440 (24 hours)
-    # Max 4 digits to prevent bash arithmetic overflow on huge numbers
-    if ! [[ "$minutes" =~ ^[0-9]{1,4}$ ]] || [[ "$minutes" -eq 0 ]]; then
+    # Regex rejects leading zeros (avoids bash octal interpretation) and zero
+    if ! [[ "$minutes" =~ ^[1-9][0-9]{0,3}$ ]]; then
         echo "ERROR: minutes must be a positive integer (1-1440), got: '$minutes'"
         exit 1
     fi
@@ -218,6 +218,8 @@ else
     attempts=0
     if [[ -f "$ATTEMPT_FILE" ]]; then
         attempts=$(cat "$ATTEMPT_FILE" 2>/dev/null || echo "0")
+        # Sanitize: if corrupted to non-numeric, reset to 0
+        [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
     fi
     attempts=$((attempts + 1))
     echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
@@ -300,6 +302,11 @@ reboot || {
 }
 ROLLBACK_EOF
     chmod +x "$ROLLBACK_SCRIPT" || { echo "ERROR: chmod +x failed on rollback script"; cleanup_partial_arm 1; }
+
+    # Verify the rollback script was fully written (heredoc fails silently on full disk)
+    if [[ ! -s "$ROLLBACK_SCRIPT" ]] || ! grep -q 'sysrq-trigger' "$ROLLBACK_SCRIPT"; then
+        echo "ERROR: Rollback script is empty or truncated"; cleanup_partial_arm 1
+    fi
 
     # --- Create systemd service (runs the rollback) ---
     cat > "/etc/systemd/system/$SERVICE_UNIT" <<EOF
