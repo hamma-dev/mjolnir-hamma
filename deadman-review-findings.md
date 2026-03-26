@@ -109,6 +109,54 @@ On the current `wwan_install` sensors, `/usr/local/bin/wwan-check.sh`, `/etc/sys
 
 ---
 
+## Round 5 Findings
+
+Round 5 dispatched 4 fresh independent experts (bash, systemd, SRE, networking) against the fully patched script (post-Round 10 commit `616f7fc`).
+
+### RESOLVED from Round 4 (confirmed fixed)
+
+| Old # | Issue | Fix verified |
+|-------|-------|-------------|
+| R4-1 (P1) | timeout can't kill children (SIG_IGN inheritance) | `--kill-after=10` on all timeout calls |
+| R4-2 (P1) | cleanup_partial_arm logger unwrapped | `timeout 5 logger` |
+| R4-3 (P2) | arm/defuse logger calls unwrapped | `timeout 5 logger` on all 4 lines |
+| R4-4 (P2) | daemon-reload in rollback has no timeout | `timeout --kill-after=10 30` |
+| R4-5 (P2) | Orphaned wwan-check files after rollback | tar tf check before remove/restart |
+
+---
+
+### NEW issues found in Round 5
+
+#### R5-1 (P1) — Corrupted tar causes incorrect file deletion in orphan cleanup
+
+**Source:** Networking expert + SRE expert (independently found same bug)
+
+Lines 331, 334: The orphan cleanup logic uses `tar tf ... | grep -q ...` to check whether wwan-check files were in the original backup. When `tar tf` fails on a corrupted archive (SD card sector failure after arm), the pipeline returns exit 1 (grep's exit code, not tar's — bash pipelines return the last command's exit code). The `if !` negation sees exit 1 as "file not in tar" and **deletes wwan-check.sh and wwan-check.timer that should have been preserved**.
+
+**Impact:** On a sensor with SD card degradation (the exact scenario these Pis face), a corrupted backup tar causes the rollback to actively destroy the cellular recovery mechanism. Sensor loses wwan-check and cannot recover cellular connectivity after reboot.
+
+**Fix:** Check tar readability before processing orphan cleanup. If tar is unreadable, skip cleanup entirely (conservative — leave files in place rather than risk deleting needed ones).
+
+---
+
+#### R5-2 (P3) — `daemon-reload` in defuse() missing error handling
+
+**Source:** Systemd expert
+
+Line 475: `systemctl daemon-reload` has no `|| true`, unlike every other daemon-reload call in the script. If daemon-reload fails (systemd in degraded state), defuse exits non-zero even though the operation is logically complete (timer stopped, disabled, unit files deleted).
+
+**Fix:** `systemctl daemon-reload 2>/dev/null || true`
+
+---
+
+### Clean Bills of Health
+
+**Bash expert:** "NO NEW genuine bugs that 10 prior reviews missed. The script is production-quality." Exhaustive 25-item review found all edge cases handled correctly.
+
+**Systemd expert:** All systemd semantics verified correct. Timer/service lifecycle, TOCTOU handling, daemon-reload timing, ConditionPathExists, arm() guards — all pass.
+
+---
+
 ## Cumulative Summary Table
 
 | # | Sev | Issue | Status |
@@ -134,6 +182,8 @@ On the current `wwan_install` sensors, `/usr/local/bin/wwan-check.sh`, `/etc/sys
 | R4-3 | ~~P2~~ | arm/defuse logger calls unwrapped | **FIXED** (Round 10) |
 | R4-4 | ~~P2~~ | daemon-reload in rollback has no timeout | **FIXED** (Round 10) |
 | R4-5 | ~~P2~~ | Orphaned wwan-check files after rollback | **FIXED** (Round 10) |
+| **R5-1** | **P1** | Corrupted tar → incorrect orphan file deletion | **OPEN** |
+| R5-2 | P3 | defuse() daemon-reload missing `|| true` | **OPEN** |
 
 ## Review History
 
@@ -144,4 +194,5 @@ On the current `wwan_install` sensors, `/usr/local/bin/wwan-check.sh`, `/etc/sys
 | 8 (independent R1) | 3 independent | 2 P0, 4 P1 | `384a5ac` |
 | 8 (independent R2) | 3 independent | 2 P1 | `70a5557` |
 | 9 | 4 independent (3 returned) | 3 P1 | `1a3a93c` |
-| 10 | 4 independent | 2 P1 | (this commit) |
+| 10 | 4 independent | 2 P1 | `616f7fc` |
+| 11 | 4 independent (2 clean) | 1 P1 | (pending) |
