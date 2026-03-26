@@ -331,17 +331,25 @@ timeout --kill-after=10 30 systemctl restart systemd-networkd || true
 # (they didn't exist on the pre-migration system). Without this, the orphaned
 # wwan-check.timer fires every 5min calling a script incompatible with the
 # restored old Python script (KeyError on IFACE).
-if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.sh'; then
-    rm -f /usr/local/bin/wwan-check.sh
-fi
-if ! tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.timer'; then
-    systemctl stop wwan-check.timer 2>/dev/null || true
-    systemctl disable wwan-check.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/wwan-check.timer /etc/systemd/system/wwan-check.service
-fi
-
-# Restart wwan timer only if it was in the original backup (i.e., existed before migration)
-if tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null | grep -q 'wwan-check.timer'; then
+# Guard: only do orphan cleanup if tar is readable. If tar is corrupt, skip
+# cleanup entirely — leaving extra files is safer than deleting needed ones.
+if tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names >/dev/null 2>&1; then
+    tar_contents=$(tar tf "$BACKUP_DIR/pre-migration.tar" --absolute-names 2>/dev/null)
+    if ! echo "$tar_contents" | grep -q 'wwan-check.sh'; then
+        rm -f /usr/local/bin/wwan-check.sh
+    fi
+    if ! echo "$tar_contents" | grep -q 'wwan-check.timer'; then
+        systemctl stop wwan-check.timer 2>/dev/null || true
+        systemctl disable wwan-check.timer 2>/dev/null || true
+        rm -f /etc/systemd/system/wwan-check.timer /etc/systemd/system/wwan-check.service
+    fi
+    # Restart wwan timer only if it was in the original backup (i.e., existed before migration)
+    if echo "$tar_contents" | grep -q 'wwan-check.timer'; then
+        systemctl restart wwan-check.timer 2>/dev/null || true
+    fi
+else
+    # Tar corrupt — skip orphan cleanup, just restart timer if it exists on disk
+    log "WARNING: Backup tar unreadable, skipping orphan file cleanup"
     systemctl restart wwan-check.timer 2>/dev/null || true
 fi
 
@@ -491,7 +499,7 @@ defuse() {
     # Remove systemd units
     rm -f "/etc/systemd/system/$TIMER_UNIT"
     rm -f "/etc/systemd/system/$SERVICE_UNIT"
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
 
     timeout 5 logger -t "deadman-arm" "Dead man's switch defused" 2>/dev/null || true
 
