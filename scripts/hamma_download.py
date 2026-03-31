@@ -26,6 +26,7 @@ SSH_OPTIONS = [
     "-J", JUMP_HOST,
 ]
 SSH_TIMEOUT = 30
+RSYNC_TIMEOUT = 300
 MEDIA_PATH = "/media/pi"
 COMPRESSED_SUBDIR = "compressed"
 DRIVE_PATTERN = "DATA??"
@@ -98,7 +99,7 @@ def _discover_drives(sensor):
     RuntimeError
         If no DATA drives are found.
     """
-    output = _ssh_run(sensor, "ls {}".format(MEDIA_PATH))
+    output = _ssh_run(sensor, "ls -1 {}".format(MEDIA_PATH))
     entries = output.split("\n")
     drives = [e for e in entries if fnmatch.fnmatch(e, DRIVE_PATTERN)]
     if not drives:
@@ -205,7 +206,7 @@ def _list_remote_dirs(sensor, drive, compressed=True):
         path = "{}/{}".format(MEDIA_PATH, drive)
 
     try:
-        output = _ssh_run(sensor, "ls {}".format(path))
+        output = _ssh_run(sensor, "ls -1 {}".format(path))
     except RuntimeError:
         logger.debug("Path %s not found on sensor %d drive %s", path, sensor, drive)
         return []
@@ -268,7 +269,7 @@ def download(sensor, dest, start, end=None, compressed=True, dry_run=False):
         ]
 
         cmd = (
-            ["rsync", "-avz", "--progress"]
+            ["rsync", "-avz", "--timeout={}".format(RSYNC_TIMEOUT)]
             + (["--dry-run"] if dry_run else [])
             + ["-e", "ssh {} -p {}".format(" ".join(SSH_OPTIONS), port)]
             + sources
@@ -283,7 +284,6 @@ def download(sensor, dest, start, end=None, compressed=True, dry_run=False):
 
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding="utf-8",
         )
@@ -352,7 +352,7 @@ def sync(sensor, dest, cleanup=False, dry_run=False):
         ]
 
         cmd = (
-            ["rsync", "-avz", "--progress"]
+            ["rsync", "-avz", "--timeout={}".format(RSYNC_TIMEOUT)]
             + (["--dry-run"] if dry_run else [])
             + (["--remove-source-files"] if cleanup and not dry_run else [])
             + ["-e", "ssh {} -p {}".format(" ".join(SSH_OPTIONS), port)]
@@ -368,7 +368,6 @@ def sync(sensor, dest, cleanup=False, dry_run=False):
 
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding="utf-8",
         )
@@ -438,6 +437,8 @@ def main():
     # Validate: either --sync or --start is required
     if not args.sync and args.start is None:
         parser.error("--start is required (or use --sync mode)")
+    if args.sync and (args.start is not None or args.end is not None):
+        parser.error("--sync cannot be combined with --start/--end")
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(

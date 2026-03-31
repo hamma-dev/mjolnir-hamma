@@ -150,10 +150,17 @@ setup_sensor() {
     fi
 
     # Step 4: Write authorized_keys
+    # Pipe the key via stdin to avoid quoting issues if the key comment
+    # contains single quotes.
     log_info "Installing public key"
-    if ! sensor_ssh "$sensor_num" "echo '${pubkey}' | sudo tee /home/datasync/.ssh/authorized_keys > /dev/null && sudo chmod 600 /home/datasync/.ssh/authorized_keys"; then
-        log_error "Failed to install public key on sensor ${sensor_num}"
-        return 1
+    local port=$((PORT_OFFSET + sensor_num))
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "echo <pubkey> | ssh -J ${JUMP_HOST} -p ${port} ${SENSOR_USER}@${SENSOR_HOST} 'sudo tee /home/datasync/.ssh/authorized_keys > /dev/null'"
+    else
+        if ! echo "${pubkey}" | ssh -J "${JUMP_HOST}" -p "${port}" "${SENSOR_USER}@${SENSOR_HOST}" "sudo tee /home/datasync/.ssh/authorized_keys > /dev/null && sudo chmod 600 /home/datasync/.ssh/authorized_keys"; then
+            log_error "Failed to install public key on sensor ${sensor_num}"
+            return 1
+        fi
     fi
 
     # Step 5: Fix ownership
