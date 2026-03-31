@@ -214,6 +214,39 @@ class TestFileDiscovery:
                         for n in compressed_names
                         if str(Path(n).parent.name) == "compressed")
 
+    def test_skips_non_date_directories(self, tmp_path, mock_compress_file):
+        """Non-date dirs like lost+found should not be scanned."""
+        import time
+
+        mock_compress_file.return_value = [
+            {'ratio': 0.07, 'method': 'quantize'}]
+
+        # Create a valid date dir with a .bin file
+        date_dir = tmp_path / "2026-01-15T10"
+        date_dir.mkdir()
+        (date_dir / "trigger01.bin").write_bytes(b"\x00" * 100)
+
+        # Create non-date dirs that should be ignored
+        for name in ["lost+found", ".Trash-1000", "$RECYCLE.BIN",
+                      "System Volume Information", "temp"]:
+            junk = tmp_path / name
+            junk.mkdir()
+            (junk / "trigger01.bin").write_bytes(b"\x00" * 100)
+
+        # Backdate all dirs so min_age_days check passes
+        old_time = time.time() - 86400 * 2
+        for d in tmp_path.iterdir():
+            if d.is_dir():
+                os.utime(d, (old_time, old_time))
+
+        step = make_step(source_path=str(tmp_path))
+        step._is_quiet_time = lambda t: True
+        compressed, skipped, errors = step.compress_old_files()
+
+        # Only the valid date dir's file should be compressed
+        assert mock_compress_file.call_count == 1
+        assert "2026-01-15T10" in str(mock_compress_file.call_args[0][0])
+
     def test_source_path_missing(self):
         step = make_step(source_path="/nonexistent/path")
         result = step.compress_old_files()

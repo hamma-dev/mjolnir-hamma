@@ -295,6 +295,9 @@ class CompressData(brokkr.pipeline.base.OutputStep):
                 if data_dir.name == self.output_subdir:
                     continue
 
+                if not DATE_DIR_RE.match(data_dir.name):
+                    continue
+
                 # Skip directories before resume position
                 if resume_pos is not None and data_dir.name < resume_pos:
                     continue
