@@ -132,6 +132,22 @@ config_version = 1
         _queue_name = "science_data_headers"
         name = "HAMMA2 AGS science data header input queue"
 
+    # Step for daily compression of data files on /media/pi
+    # Works during quiet hours only, compressing whatever is eligible
+    # Uses hamma.compression for optimized HAMMA trigger data compression
+    [steps.compress_media_data]
+        _preset = "compress_data.outputs.plugin"
+        name = "Compress Media Data"
+        source_path = "/media/pi"
+        drive_glob = "DATA??"  # Find data on mounted DATAxx drives
+        output_subdir = "compressed"  # Archives stored in each drive's compressed/ subdir
+        min_age_days = 1  # Only compress files older than 1 day
+        delete_originals = false  # Originals are ground truth; .hmc for transfer only
+        method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
+        step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
+        quiet_start = 8   # 8 AM UTC — after overnight storms
+        quiet_end = 0     # Midnight UTC — wide window for compression
+
 
 # List pipelines to run here under the [pipelines] key
 [pipelines]
@@ -247,4 +263,19 @@ config_version = 1
         ]
         output_steps = [
             "science_csv_output",
+        ]
+
+    # Daily compression of data files on /media/pi
+    [pipelines.daily_compression]
+        _builder = "pipeline"
+        _enabled = true
+        period_s = 3600  # Check every hour; actual compression controlled by step update_time
+        name = "Daily Data Compression"
+        input_steps = [
+            "builtins.inputs.current_time",
+        ]
+        process_steps = [
+        ]
+        output_steps = [
+            "compress_media_data",
         ]
