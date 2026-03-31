@@ -270,6 +270,14 @@ Numbered list for reference (all fixed in current code):
 
 ---
 
+## Post-Install Manual Steps
+
+After `install.sh` completes, these steps must be run manually:
+
+- **datasync user**: Run `scripts/setup_datasync.sh --key /path/to/id_rsa.pub <sensor_numbers>` to create the `datasync` user for remote data download via `hamma_download.py`. This is not part of the automated install.
+
+---
+
 ## Future Improvements
 
 - **Auto-mount USB in bootstrap**: Currently user must manually mount USB
