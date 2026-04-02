@@ -1,19 +1,23 @@
+#!/usr/bin/env python3
 """Download HAMMA sensor data via rsync over SSH tunnels.
 
 Pulls data from remote HAMMA sensors to the local server. Designed to run
-on the matrix server where SSH tunnels to sensors terminate on localhost.
+on the meteor server, connecting to sensors via SSH tunnels on hamma.dev.
 
 Usage:
     python hamma_download.py -s 41 -d /rgroup/hammadev/ignis/mj41 --start 2025-11-05
+    python hamma_download.py -s 41 -d /rgroup/hammadev/ignis/mj41 --sync --slurm
 """
 
 # Standard library imports
 import argparse
 import fnmatch
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,27 @@ MEDIA_PATH = "/media/pi"
 COMPRESSED_SUBDIR = "compressed"
 DRIVE_PATTERN = "DATA??"
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}$")
+
+SLURM_TEMPLATE = """#!/bin/bash
+#SBATCH --mail-user=bitzerp@uah.edu
+#SBATCH -J {jobname}
+#SBATCH -p standard
+#SBATCH --ntasks 1
+#SBATCH -t 0-04:00
+#SBATCH --mem-per-cpu=2G
+#SBATCH --mail-type=END,FAIL
+#SBATCH -o {log_dir}/{jobname}-%j.out
+#SBATCH -e {log_dir}/{jobname}-%j.err
+
+echo "Starting at $(date)"
+echo "Running on host: $(hostname)"
+
+{command}
+rc=$?
+
+echo "Finished at $(date) with exit code $rc"
+exit $rc
+"""
 
 
 def _ssh_run(sensor, command):
@@ -384,6 +409,83 @@ def sync(sensor, dest, cleanup=False, dry_run=False):
     return last_rc
 
 
+def _submit_slurm(args, log_dir):
+    """Generate a slurm batch script and submit via sbatch.
+
+    Rebuilds the command line from parsed args, excluding --slurm,
+    and wraps it in a SLURM batch script.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    log_dir : str
+        Directory for slurm log files.
+
+    Returns
+    -------
+    int
+        0 if sbatch submission succeeded, 1 otherwise.
+    """
+    # Rebuild the command without --slurm
+    script_path = os.path.abspath(__file__)
+    cmd_parts = [sys.executable, script_path]
+    cmd_parts.extend(["-s", str(args.sensor)])
+    cmd_parts.extend(["-d", args.dest])
+    if args.sync:
+        cmd_parts.append("--sync")
+        if args.cleanup:
+            cmd_parts.append("--cleanup")
+    else:
+        cmd_parts.extend(["--start", args.start])
+        if args.end is not None:
+            cmd_parts.extend(["--end", args.end])
+    if args.raw:
+        cmd_parts.append("--raw")
+    if args.dry_run:
+        cmd_parts.append("--dry-run")
+    if args.verbose:
+        cmd_parts.append("-v")
+
+    command = " ".join(cmd_parts)
+
+    # Build job name
+    if args.sync:
+        jobname = "hamma_dl_mj{:02d}_sync".format(args.sensor)
+    else:
+        jobname = "hamma_dl_mj{:02d}_{}".format(args.sensor, args.start)
+
+    os.makedirs(log_dir, exist_ok=True)
+
+    script_content = SLURM_TEMPLATE.format(
+        jobname=jobname,
+        log_dir=log_dir,
+        command=command,
+    )
+
+    # Write to a temp file, submit, clean up
+    fd, script_path = tempfile.mkstemp(suffix=".sh", prefix=jobname + "_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(script_content)
+        logger.info("Submitting slurm job: %s", jobname)
+        logger.debug("Batch script:\n%s", script_content)
+        result = subprocess.run(
+            ["sbatch", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+        if result.returncode == 0:
+            logger.info("%s", result.stdout.strip())
+            return 0
+        else:
+            logger.error("sbatch failed: %s", result.stderr.strip())
+            return 1
+    finally:
+        os.unlink(script_path)
+
+
 def _build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
@@ -426,6 +528,15 @@ def _build_parser():
         "-v", "--verbose", action="store_true", default=False,
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--slurm", action="store_true", default=False,
+        help="Submit as a slurm batch job instead of running directly",
+    )
+    parser.add_argument(
+        "--log-dir", default=os.path.expanduser("~/slurm_log"),
+        dest="log_dir",
+        help="Directory for slurm log files (default: ~/slurm_log)",
+    )
     return parser
 
 
@@ -445,6 +556,10 @@ def main():
         level=level,
         format="%(levelname)s: %(message)s",
     )
+
+    if args.slurm:
+        rc = _submit_slurm(args, args.log_dir)
+        sys.exit(rc)
 
     try:
         if args.sync:
