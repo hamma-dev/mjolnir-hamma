@@ -69,3 +69,17 @@ class TestNullInput:
         instance = null_input_module.NullInput(data_types=[])
         result = instance.read_raw_data(input_data={"some": "data"})
         assert result is None
+
+    def test_accepts_hardware_kwargs(self, null_input_module):
+        """NullInput should accept and discard modbus-specific kwargs."""
+        instance = null_input_module.NullInput(
+            data_types=[],
+            unit=1,
+            start_address=0x0008,
+            serial_port="",
+            serial_pids=[24597],
+            try_usb_reset=True,
+            modbus_kwargs={"baudrate": 9600},
+        )
+        result = instance.read_raw_data()
+        assert result is None
