@@ -206,3 +206,113 @@ def scan_mj_files(base_path):
         "skipped": skipped,
         "elapsed": elapsed,
     }
+
+
+# The strider script runs on the AGS via SSH. It is a self-contained Python
+# script that strides through AGS files and writes headers to stdout using
+# a simple binary protocol.
+#
+# Protocol per trigger:
+#   - filename (null-terminated UTF-8 string)
+#   - offset (uint64 LE, 8 bytes)
+#   - index (uint32 LE, 4 bytes)
+#   - header (128 raw bytes)
+
+STRIDER_SCRIPT = r'''
+import glob, os, struct, sys
+SYNC = b'\xf5\xff\x50\x5d'
+HDR_SIZE = 128
+PAD = 4
+MAX_DS = 20000000
+
+def scan_fwd(f, start, fsize):
+    p = start
+    while p + 4 <= fsize:
+        f.seek(p)
+        c = f.read(min(4096, fsize - p))
+        if not c:
+            break
+        i = c.find(SYNC)
+        if i >= 0:
+            return p + i
+        p += len(c) - 3
+    return -1
+
+data_path = sys.argv[1]
+out = sys.stdout.buffer
+for fpath in sorted(glob.glob(os.path.join(data_path, '*'))):
+    fname = os.path.basename(fpath)
+    try:
+        fsize = os.path.getsize(fpath)
+    except OSError:
+        continue
+    if fsize < HDR_SIZE:
+        continue
+    try:
+        with open(fpath, 'rb') as f:
+            pos = 0
+            idx = 0
+            while pos + HDR_SIZE <= fsize:
+                f.seek(pos)
+                hdr = f.read(HDR_SIZE)
+                if len(hdr) < HDR_SIZE:
+                    break
+                if hdr[:4] != SYNC:
+                    pos = scan_fwd(f, pos + 1, fsize)
+                    if pos < 0:
+                        break
+                    continue
+                ds = struct.unpack_from('<I', hdr, 10)[0]
+                if ds == 0 or ds > MAX_DS:
+                    pos = scan_fwd(f, pos + 1, fsize)
+                    if pos < 0:
+                        break
+                    continue
+                out.write(fname.encode('utf-8') + b'\x00')
+                out.write(struct.pack('<Q', pos))
+                out.write(struct.pack('<I', idx))
+                out.write(hdr)
+                pos += HDR_SIZE + ds * 2 + PAD
+                idx += 1
+    except OSError:
+        continue
+out.flush()
+'''
+
+
+def decode_strider_output(data):
+    """Decode binary output from the remote strider script.
+
+    Parameters
+    ----------
+    data : bytes
+        Raw stdout from strider script.
+
+    Returns
+    -------
+    list of dict
+        Each dict has: filename (str), offset (int), index (int),
+        header (bytes).
+    """
+    entries = []
+    pos = 0
+    while pos < len(data):
+        # Read null-terminated filename
+        null_pos = data.index(b'\x00', pos)
+        filename = data[pos:null_pos].decode('utf-8')
+        pos = null_pos + 1
+        # Read offset (uint64) and index (uint32)
+        offset = struct.unpack_from('<Q', data, pos)[0]
+        pos += 8
+        index = struct.unpack_from('<I', data, pos)[0]
+        pos += 4
+        # Read header
+        header = data[pos:pos + HEADER_SIZE]
+        pos += HEADER_SIZE
+        entries.append({
+            "filename": filename,
+            "offset": offset,
+            "index": index,
+            "header": header,
+        })
+    return entries

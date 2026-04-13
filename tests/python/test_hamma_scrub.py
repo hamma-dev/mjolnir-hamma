@@ -231,3 +231,44 @@ class TestScanMjFiles:
             assert result["file_count"] == 0
         finally:
             os.chmod(str(tmp_path / "DATA37"), 0o755)
+
+
+class TestStriderProtocol:
+    """Test encoding/decoding of the strider binary protocol."""
+
+    def test_decode_single_entry(self, hamma_scrub):
+        """Decode one strider output entry."""
+        filename = b"test.bin\x00"
+        offset = struct.pack('<Q', 0)
+        index = struct.pack('<I', 0)
+        header = b'\xf5\xff\x50\x5d' + b'\x00' * 124
+        raw = filename + offset + index + header
+        entries = hamma_scrub.decode_strider_output(raw)
+        assert len(entries) == 1
+        assert entries[0]["filename"] == "test.bin"
+        assert entries[0]["offset"] == 0
+        assert entries[0]["index"] == 0
+        assert entries[0]["header"] == header
+
+    def test_decode_multiple_entries(self, hamma_scrub):
+        """Decode multiple strider entries."""
+        raw = b''
+        for i in range(3):
+            fname = "file{}.bin".format(i).encode() + b'\x00'
+            raw += fname
+            raw += struct.pack('<Q', i * 22000132)
+            raw += struct.pack('<I', i)
+            hdr = bytearray(128)
+            hdr[0:4] = b'\xf5\xff\x50\x5d'
+            hdr[50] = i
+            raw += bytes(hdr)
+        entries = hamma_scrub.decode_strider_output(raw)
+        assert len(entries) == 3
+        for i, e in enumerate(entries):
+            assert e["filename"] == "file{}.bin".format(i)
+            assert e["index"] == i
+
+    def test_decode_empty(self, hamma_scrub):
+        """Empty input returns empty list."""
+        entries = hamma_scrub.decode_strider_output(b'')
+        assert len(entries) == 0
