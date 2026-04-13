@@ -7,6 +7,7 @@ import pathlib
 import struct
 
 import pytest
+from unittest.mock import patch, MagicMock
 
 # Small datasize for tests to avoid 22MB allocations per trigger
 TEST_DATASIZE = 100
@@ -272,3 +273,77 @@ class TestStriderProtocol:
         """Empty input returns empty list."""
         entries = hamma_scrub.decode_strider_output(b'')
         assert len(entries) == 0
+
+
+class TestScanAgsFiles:
+    """Test SSH-based AGS scanning."""
+
+    def test_calls_ssh_with_strider(self, hamma_scrub):
+        """scan_ags_files runs ssh with python3 via stdin piping."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b''
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            result = hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["ssh", "10.10.10.1", "python3 - /ags/data"]
+        assert mock_run.call_args[1]["input"] == hamma_scrub.STRIDER_SCRIPT.encode('utf-8')
+        assert len(result["entries"]) == 0
+
+    def test_decodes_strider_output(self, hamma_scrub):
+        """Successful SSH returns decoded entries."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        raw = b'test.bin\x00'
+        raw += struct.pack('<Q', 0)
+        raw += struct.pack('<I', 0)
+        raw += bytes(header)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = raw
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+
+        assert len(result["entries"]) == 1
+        assert result["entries"][0]["filename"] == "test.bin"
+        assert len(result["headers"]) == 1
+
+    def test_ssh_failure_raises(self, hamma_scrub):
+        """SSH failure raises RuntimeError."""
+        mock_result = MagicMock()
+        mock_result.returncode = 255
+        mock_result.stdout = b''
+        mock_result.stderr = b'Connection refused'
+
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="Connection refused"):
+                hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+
+    def test_duplicate_headers_detected(self, hamma_scrub):
+        """Duplicate headers counted correctly."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        raw = b''
+        for i in range(3):
+            raw += b'test.bin\x00'
+            raw += struct.pack('<Q', i * 22000132)
+            raw += struct.pack('<I', i)
+            raw += bytes(header)
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = raw
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+
+        assert len(result["entries"]) == 3
+        assert len(result["headers"]) == 1
+        assert result["duplicate_count"] == 2

@@ -316,3 +316,75 @@ def decode_strider_output(data):
             "header": header,
         })
     return entries
+
+
+def scan_ags_files(ags_host, ags_path):
+    """Run remote strider on AGS sensor and collect headers.
+
+    Parameters
+    ----------
+    ags_host : str
+        SSH host for AGS sensor.
+    ags_path : str
+        Path to AGS data directory on sensor.
+
+    Returns
+    -------
+    dict
+        entries: list of dict (filename, offset, index, header)
+        headers: set of bytes (unique 128-byte headers)
+        duplicate_count: int
+        elapsed: float (seconds)
+
+    Raises
+    ------
+    RuntimeError
+        If SSH connection fails.
+    """
+    t0 = time.time()
+
+    cmd = ["ssh", ags_host, "python3 - " + ags_path]
+    logger.debug("Running: %s", " ".join(cmd))
+
+    result = subprocess.run(
+        cmd,
+        input=STRIDER_SCRIPT.encode('utf-8'),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3600,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError(
+            "SSH to {host} failed (rc={rc}): {err}".format(
+                host=ags_host, rc=result.returncode, err=stderr,
+            )
+        )
+
+    entries = decode_strider_output(result.stdout)
+
+    headers = set()
+    duplicate_count = 0
+    for entry in entries:
+        if entry["header"] in headers:
+            duplicate_count += 1
+        else:
+            headers.add(entry["header"])
+
+    elapsed = time.time() - t0
+    file_count = len(set(e["filename"] for e in entries))
+    logger.info("AGS scan: %d unique headers from %d entries in %d files (%.1fs)",
+                len(headers), len(entries), file_count, elapsed)
+
+    if duplicate_count > 0:
+        logger.warning(
+            "AGS: %d duplicate headers detected (likely bad GPS)", duplicate_count
+        )
+
+    return {
+        "entries": entries,
+        "headers": headers,
+        "duplicate_count": duplicate_count,
+        "elapsed": elapsed,
+    }
