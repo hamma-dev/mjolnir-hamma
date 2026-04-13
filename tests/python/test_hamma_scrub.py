@@ -409,3 +409,38 @@ class TestCompareHeaders:
         assert result["matched"] == 0
         assert len(result["missing_on_mj"]) == 0
         assert result["mj_only_count"] == 0
+
+
+class TestDecodeGpsTime:
+    """Test GPS time extraction from raw headers."""
+
+    def test_known_time(self, hamma_scrub):
+        """Decode a header with known GPS fields to expected time."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<f', header, 80, 300000.0)
+        struct.pack_into('<h', header, 84, 2356)
+        struct.pack_into('<f', header, 86, 18.0)
+        struct.pack_into('<I', header, 94, 500000000)
+        struct.pack_into('<I', header, 98, 1000000000)
+        result = hamma_scrub.decode_gps_time(bytes(header))
+        assert result == "2025-03-05T11:19:43.500"
+
+    def test_bad_gps_returns_none(self, hamma_scrub):
+        """Header with year < 2000 returns None."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        result = hamma_scrub.decode_gps_time(bytes(header))
+        assert result is None
+
+    def test_zero_ecc_handled(self, hamma_scrub):
+        """gpsSubSecondECC == 0 should not crash (div by zero guard)."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<f', header, 80, 300000.0)
+        struct.pack_into('<h', header, 84, 2356)
+        struct.pack_into('<f', header, 86, 18.0)
+        struct.pack_into('<I', header, 94, 500000000)
+        struct.pack_into('<I', header, 98, 0)
+        result = hamma_scrub.decode_gps_time(bytes(header))
+        assert result == "2025-03-05T11:19:43.500"

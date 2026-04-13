@@ -45,6 +45,14 @@ EXIT_MISSING = 1
 EXIT_SSH_ERROR = 2
 EXIT_NO_DATA = 3
 
+# GPS field offsets in raw HAMMA 2.0 header (little-endian)
+GPS_TIME_WEEK_OFFSET = 80   # float32
+GPS_WEEK_OFFSET = 84        # int16
+GPS_UTC_OFFSET_OFFSET = 86  # float32
+GPS_SUBSECOND_OFFSET = 94   # uint32
+GPS_ECC_OFFSET = 98         # uint32
+GPS_EPOCH = 315964800        # UTC epoch for GPS week 0
+
 
 def extract_headers(fileobj, file_size, filename):
     """Extract 128-byte headers from a concatenated AGS data file.
@@ -426,3 +434,52 @@ def compare_headers(ags_entries, mj_headers):
         "missing_on_mj": missing_on_mj,
         "mj_only_count": mj_only_count,
     }
+
+
+def decode_gps_time(header):
+    """Decode GPS trigger time from a raw 128-byte header.
+
+    Parameters
+    ----------
+    header : bytes
+        Raw 128-byte HAMMA 2.0 header.
+
+    Returns
+    -------
+    str or None
+        ISO 8601 timestamp at millisecond precision, or None if invalid.
+    """
+    try:
+        time_of_week = struct.unpack_from('<f', header, GPS_TIME_WEEK_OFFSET)[0]
+        week_num = struct.unpack_from('<h', header, GPS_WEEK_OFFSET)[0]
+        utc_offset = struct.unpack_from('<f', header, GPS_UTC_OFFSET_OFFSET)[0]
+        subsecond = struct.unpack_from('<I', header, GPS_SUBSECOND_OFFSET)[0]
+        ecc = struct.unpack_from('<I', header, GPS_ECC_OFFSET)[0]
+    except struct.error:
+        return None
+
+    import math
+
+    # Compute base time (seconds since Unix epoch)
+    # Matches hamma version20 convert(): passes floor(gpsTimeWeek)+1 to base_trigger_time
+    base_time = (GPS_EPOCH
+                 + int(week_num) * 604800
+                 + math.floor(time_of_week) + 1
+                 - float(utc_offset))
+
+    # Guard for zero ECC (use 1GHz default like hamma package)
+    if ecc == 0:
+        ecc_val = 1000000000
+    else:
+        ecc_val = ecc
+    sub_seconds = float(subsecond) / float(ecc_val)
+
+    try:
+        from datetime import datetime, timezone
+        ts = base_time + sub_seconds
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        if dt.year < 2000:
+            return None
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}'.format(dt.microsecond // 1000)
+    except (ValueError, OverflowError, OSError):
+        return None
