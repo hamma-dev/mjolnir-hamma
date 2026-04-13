@@ -347,3 +347,65 @@ class TestScanAgsFiles:
         assert len(result["entries"]) == 3
         assert len(result["headers"]) == 1
         assert result["duplicate_count"] == 2
+
+
+class TestCompareHeaders:
+    """Test header set comparison logic."""
+
+    def test_all_match(self, hamma_scrub):
+        hdrs = [b'\xf5\xff\x50\x5d' + bytes([i]) + b'\x00' * 123
+                for i in range(5)]
+        ags_entries = [
+            {"header": h, "filename": "f.bin", "offset": 0, "index": i}
+            for i, h in enumerate(hdrs)
+        ]
+        mj_headers = set(hdrs)
+        result = hamma_scrub.compare_headers(ags_entries, mj_headers)
+        assert result["matched"] == 5
+        assert len(result["missing_on_mj"]) == 0
+        assert result["mj_only_count"] == 0
+
+    def test_missing_on_mj(self, hamma_scrub):
+        ags_hdrs = [b'\xf5\xff\x50\x5d' + bytes([i]) + b'\x00' * 123
+                    for i in range(5)]
+        ags_entries = [
+            {"header": h, "filename": "f.bin", "offset": i * 22000132,
+             "index": i}
+            for i, h in enumerate(ags_hdrs)
+        ]
+        mj_headers = set(ags_hdrs[:3])
+        result = hamma_scrub.compare_headers(ags_entries, mj_headers)
+        assert result["matched"] == 3
+        assert len(result["missing_on_mj"]) == 2
+        assert result["missing_on_mj"][0]["index"] == 3
+
+    def test_mj_only(self, hamma_scrub):
+        ags_hdrs = [b'\xf5\xff\x50\x5d' + bytes([i]) + b'\x00' * 123
+                    for i in range(3)]
+        mj_hdrs = [b'\xf5\xff\x50\x5d' + bytes([i]) + b'\x00' * 123
+                   for i in range(5)]
+        ags_entries = [
+            {"header": h, "filename": "f.bin", "offset": 0, "index": i}
+            for i, h in enumerate(ags_hdrs)
+        ]
+        mj_headers = set(mj_hdrs)
+        result = hamma_scrub.compare_headers(ags_entries, mj_headers)
+        assert result["matched"] == 3
+        assert result["mj_only_count"] == 2
+
+    def test_no_overlap(self, hamma_scrub):
+        ags_entries = [
+            {"header": b'\xf5\xff\x50\x5d\x01' + b'\x00' * 123,
+             "filename": "f.bin", "offset": 0, "index": 0}
+        ]
+        mj_headers = {b'\xf5\xff\x50\x5d\x02' + b'\x00' * 123}
+        result = hamma_scrub.compare_headers(ags_entries, mj_headers)
+        assert result["matched"] == 0
+        assert len(result["missing_on_mj"]) == 1
+        assert result["mj_only_count"] == 1
+
+    def test_empty_sets(self, hamma_scrub):
+        result = hamma_scrub.compare_headers([], set())
+        assert result["matched"] == 0
+        assert len(result["missing_on_mj"]) == 0
+        assert result["mj_only_count"] == 0

@@ -388,3 +388,41 @@ def scan_ags_files(ags_host, ags_path):
         "duplicate_count": duplicate_count,
         "elapsed": elapsed,
     }
+
+
+def compare_headers(ags_entries, mj_headers):
+    """Compare AGS entries against mjolnir header set.
+
+    Parameters
+    ----------
+    ags_entries : list of dict
+        From scan_ags_files, each with 'header', 'filename', 'offset', 'index'.
+    mj_headers : set of bytes
+        From scan_mj_files.
+
+    Returns
+    -------
+    dict
+        matched: int
+        missing_on_mj: list of dict (entries not found on mj)
+        mj_only_count: int
+    """
+    ags_header_set = set()
+    missing_on_mj = []
+    matched = 0
+
+    for entry in ags_entries:
+        hdr = entry["header"]
+        ags_header_set.add(hdr)
+        if hdr in mj_headers:
+            matched += 1
+        else:
+            missing_on_mj.append(entry)
+
+    mj_only_count = len(mj_headers - ags_header_set)
+
+    return {
+        "matched": matched,
+        "missing_on_mj": missing_on_mj,
+        "mj_only_count": mj_only_count,
+    }
