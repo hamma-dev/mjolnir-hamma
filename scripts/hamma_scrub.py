@@ -483,3 +483,98 @@ def decode_gps_time(header):
         return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}'.format(dt.microsecond // 1000)
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def format_human_report(results):
+    """Format results as human-readable report text.
+
+    Parameters
+    ----------
+    results : dict
+        Combined results from scanning and comparison.
+
+    Returns
+    -------
+    str
+    """
+    lines = []
+    lines.append("AGS Data Scrub Report")
+    lines.append("=" * len("AGS Data Scrub Report"))
+    lines.append("AGS scan: {:,} triggers from {:,} files ({:.1f}s)".format(
+        results["ags_triggers"], results["ags_files"], results["ags_elapsed"],
+    ))
+    lines.append("MJ scan:  {:,} unique triggers from {:,} files ({:.1f}s)".format(
+        results["mj_triggers"], results["mj_files_scanned"],
+        results["mj_elapsed"],
+    ))
+    if results["mj_duplicate_count"] > 0:
+        lines.append("MJ duplicate headers: {:,}".format(
+            results["mj_duplicate_count"],
+        ))
+    lines.append("Matched:  {:,}".format(results["matched"]))
+    lines.append("")
+
+    missing = results["missing_on_mj"]
+    if missing:
+        lines.append("Missing on MJ (potential data loss): {:,}".format(len(missing)))
+        for entry in missing:
+            gps = decode_gps_time(entry["header"])
+            time_str = gps if gps else "bad GPS"
+            lines.append("  AGS file: {}, trigger #{}, GPS time: {}".format(
+                entry["filename"], entry["index"], time_str,
+            ))
+    else:
+        lines.append("No missing triggers detected.")
+
+    lines.append("")
+    lines.append("On MJ only (expected, AGS drops under load): {:,}".format(
+        results["mj_only_count"],
+    ))
+
+    for warning in results.get("warnings", []):
+        lines.append("WARNING: {}".format(warning))
+
+    return "\n".join(lines)
+
+
+def format_json_report(results, ags_host):
+    """Format results as JSON string.
+
+    Parameters
+    ----------
+    results : dict
+        Combined results from scanning and comparison.
+    ags_host : str
+        AGS host for metadata.
+
+    Returns
+    -------
+    str
+        JSON string.
+    """
+    from datetime import datetime, timezone
+
+    missing_entries = []
+    for entry in results["missing_on_mj"]:
+        gps = decode_gps_time(entry["header"])
+        missing_entries.append({
+            "ags_file": entry["filename"],
+            "ags_offset": entry["offset"],
+            "trigger_index": entry["index"],
+            "gps_time": gps,
+        })
+
+    report = {
+        "scan_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "ags_host": ags_host,
+        "ags_triggers": results["ags_triggers"],
+        "ags_files": results["ags_files"],
+        "mj_triggers": results["mj_triggers"],
+        "mj_files_scanned": results["mj_files_scanned"],
+        "mj_duplicate_headers": results["mj_duplicate_count"],
+        "matched": results["matched"],
+        "missing_on_mj": missing_entries,
+        "mj_only_count": results["mj_only_count"],
+        "warnings": results.get("warnings", []),
+    }
+    return json.dumps(report, indent=2)

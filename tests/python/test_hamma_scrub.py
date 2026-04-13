@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import struct
@@ -444,3 +445,54 @@ class TestDecodeGpsTime:
         struct.pack_into('<I', header, 98, 0)
         result = hamma_scrub.decode_gps_time(bytes(header))
         assert result == "2025-03-05T11:19:43.500"
+
+
+class TestFormatReport:
+    """Test human-readable and JSON report generation."""
+
+    def _make_results(self):
+        """Build a sample results dict for testing."""
+        missing_hdr = b'\xf5\xff\x50\x5d' + b'\x00' * 124
+        return {
+            "ags_triggers": 100,
+            "ags_files": 2,
+            "ags_elapsed": 5.2,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 110,
+            "mj_files_scanned": 112,
+            "mj_duplicate_count": 2,
+            "mj_elapsed": 3.1,
+            "matched": 95,
+            "missing_on_mj": [
+                {"filename": "data.bin", "offset": 0, "index": 0,
+                 "header": missing_hdr},
+            ],
+            "mj_only_count": 15,
+            "warnings": [],
+        }
+
+    def test_human_report_contains_counts(self, hamma_scrub):
+        results = self._make_results()
+        report = hamma_scrub.format_human_report(results)
+        assert "100" in report
+        assert "110" in report
+        assert "95" in report
+        assert "Missing on MJ" in report
+        assert "data.bin" in report
+
+    def test_human_report_no_missing(self, hamma_scrub):
+        results = self._make_results()
+        results["missing_on_mj"] = []
+        results["matched"] = 100
+        report = hamma_scrub.format_human_report(results)
+        assert "No missing triggers" in report
+
+    def test_json_report_structure(self, hamma_scrub):
+        results = self._make_results()
+        j = hamma_scrub.format_json_report(results, "10.10.10.1")
+        parsed = json.loads(j)
+        assert parsed["ags_triggers"] == 100
+        assert parsed["matched"] == 95
+        assert len(parsed["missing_on_mj"]) == 1
+        assert "scan_time" in parsed
+        assert "ags_host" in parsed
