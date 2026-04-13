@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import os
 import pathlib
 import struct
 
@@ -149,3 +150,84 @@ class TestExtractHeaders:
         f = io.BytesIO(data)
         results = hamma_scrub.extract_headers(f, len(data), "test.bin")
         assert len(results) == 0
+
+
+class TestScanMjFiles:
+    """Test local mjolnir .bin file scanning."""
+
+    def test_reads_headers_from_bin_files(self, hamma_scrub, tmp_path):
+        """Scan finds .bin files and reads 128-byte headers."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (drive / "mj05_2026-04-10_14-00-00-000.bin").write_bytes(hdr + rest)
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert len(result["headers"]) == 1
+        assert hdr in result["headers"]
+        assert result["file_count"] == 1
+
+    def test_multiple_drives(self, hamma_scrub, tmp_path):
+        """Scan finds files across multiple DATA drives."""
+        for drive_name in ["DATA37", "DATA38"]:
+            d = tmp_path / drive_name / "2026-04-10T14"
+            d.mkdir(parents=True)
+            hdr, rest = _make_trigger()
+            hdr = bytearray(hdr)
+            hdr[50] = ord(drive_name[-1])  # unique per drive
+            (d / "mj05_2026-04-10_14-00-00-000.bin").write_bytes(
+                bytes(hdr) + rest
+            )
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert len(result["headers"]) == 2
+        assert result["file_count"] == 2
+
+    def test_skips_hmc_files(self, hamma_scrub, tmp_path):
+        """Compressed .hmc files are ignored."""
+        drive = tmp_path / "DATA37" / "compressed" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        (drive / "mj05_2026-04-10_14-00-00-000.hmc").write_bytes(b'\x00' * 200)
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert len(result["headers"]) == 0
+        assert result["file_count"] == 0
+
+    def test_skips_truncated_files(self, hamma_scrub, tmp_path):
+        """Files < 128 bytes are skipped with warning."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        (drive / "mj05_2026-04-10_14-00-00-000.bin").write_bytes(b'\x00' * 64)
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert len(result["headers"]) == 0
+        assert result["file_count"] == 1
+        assert result["skipped"] == 1
+
+    def test_no_drives_found(self, hamma_scrub, tmp_path):
+        """Empty base path returns empty result."""
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert len(result["headers"]) == 0
+        assert result["file_count"] == 0
+
+    def test_duplicate_headers_tracked(self, hamma_scrub, tmp_path):
+        """Identical headers produce duplicate count."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        for i in range(3):
+            fname = "mj05_2026-04-10_14-00-0{}-000.bin".format(i)
+            (drive / fname).write_bytes(hdr + rest)
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert result["file_count"] == 3
+        assert len(result["headers"]) == 1  # deduplicated
+        assert result["duplicate_count"] == 2
+
+    def test_permission_error_skips_drive(self, hamma_scrub, tmp_path):
+        """Permission error on a drive skips it, continues."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (drive / "mj05_2026-04-10_14-00-00-000.bin").write_bytes(hdr + rest)
+        os.chmod(str(tmp_path / "DATA37"), 0o000)
+        try:
+            result = hamma_scrub.scan_mj_files(str(tmp_path))
+            assert result["file_count"] == 0
+        finally:
+            os.chmod(str(tmp_path / "DATA37"), 0o755)

@@ -131,3 +131,78 @@ def _scan_forward(fileobj, start_pos, file_size):
         # Overlap by 3 bytes to catch sync spanning chunk boundary
         pos += len(chunk) - 3
     return -1
+
+
+def scan_mj_files(base_path):
+    """Scan local mjolnir .bin files and collect headers.
+
+    Parameters
+    ----------
+    base_path : str
+        Base path containing DATA?? drives (e.g., /media/pi).
+
+    Returns
+    -------
+    dict
+        headers: set of bytes (128-byte raw headers)
+        file_count: int (total .bin files found)
+        duplicate_count: int (files with headers already seen)
+        skipped: int (files < 128 bytes)
+        elapsed: float (seconds)
+    """
+    headers = set()
+    file_count = 0
+    duplicate_count = 0
+    skipped = 0
+    t0 = time.time()
+
+    pattern = os.path.join(base_path, DRIVE_PATTERN)
+    drives = sorted(glob.glob(pattern))
+    if not drives:
+        logger.info("No DATA drives found at %s", base_path)
+
+    for drive in drives:
+        try:
+            bin_pattern = os.path.join(drive, "*", "*.bin")
+            bin_files = sorted(glob.glob(bin_pattern))
+        except PermissionError:
+            logger.warning("Permission denied scanning %s, skipping", drive)
+            continue
+        except OSError as e:
+            logger.warning("Error scanning %s: %s, skipping", drive, e)
+            continue
+
+        for filepath in bin_files:
+            file_count += 1
+            try:
+                fsize = os.path.getsize(filepath)
+                if fsize < HEADER_SIZE:
+                    logger.warning("Truncated file (%d bytes): %s", fsize, filepath)
+                    skipped += 1
+                    continue
+                with open(filepath, 'rb') as f:
+                    header = f.read(HEADER_SIZE)
+                if len(header) < HEADER_SIZE:
+                    skipped += 1
+                    continue
+                if header in headers:
+                    duplicate_count += 1
+                else:
+                    headers.add(header)
+            except PermissionError:
+                logger.warning("Permission denied reading %s", filepath)
+                skipped += 1
+            except OSError as e:
+                logger.warning("Error reading %s: %s", filepath, e)
+                skipped += 1
+
+    elapsed = time.time() - t0
+    logger.info("MJ scan: %d unique headers from %d files (%.1fs)",
+                len(headers), file_count, elapsed)
+    return {
+        "headers": headers,
+        "file_count": file_count,
+        "duplicate_count": duplicate_count,
+        "skipped": skipped,
+        "elapsed": elapsed,
+    }
