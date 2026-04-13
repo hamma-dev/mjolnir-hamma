@@ -35,6 +35,10 @@ config_version = 1
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
+    # Named step wrapping sunsaver preset — allows mode overlay to swap class
+    [steps.sunsaver_input]
+        _preset = "sunsaver_mppt_15l.inputs.ram"
+
     # Step for outputting telemetry data to a standard CSV
     [steps.telemetry_csv_output]
         # Preset for this step, in the format "{device_name}.{input/output/command/etc}.{preset_name}"
@@ -163,11 +167,11 @@ config_version = 1
         na_on_start = true
         # Most pipeline builders will need one or more lists of steps.
         # These are either names of steps in the [steps] table, or preset names as above
-        # NOTE: If you change this list, also update the nochargecontroller mode in mode.toml
+        # NOTE: sunsaver_input is a named step so nochargecontroller mode can override its class
         monitor_input_steps = [
             "builtins.inputs.current_time",
             "builtins.inputs.run_time",
-            "sunsaver_mppt_15l.inputs.ram",
+            "sunsaver_input",
             "hamma2.inputs.ping",
             "hamma2.inputs.hs",
         ]
