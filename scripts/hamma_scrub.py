@@ -578,3 +578,132 @@ def format_json_report(results, ags_host):
         "warnings": results.get("warnings", []),
     }
     return json.dumps(report, indent=2)
+
+
+def _build_parser():
+    """Build argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Compare AGS trigger data against mjolnir .bin files.",
+    )
+    parser.add_argument(
+        "--ags-host", default=DEFAULT_AGS_HOST,
+        help="AGS sensor SSH host (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ags-path", default=DEFAULT_AGS_PATH,
+        help="AGS data directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--mj-path", default=DEFAULT_MJ_PATH,
+        help="Base path for DATA drive discovery (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Write JSON report to file",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Write JSON to stdout instead of human report",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Debug logging",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Report only, no actions (for future phases B/C)",
+    )
+    return parser
+
+
+def run(ags_host, ags_path, mj_path, json_output=False, output_file=None):
+    """Run the scrubber and return exit code.
+
+    Parameters
+    ----------
+    ags_host : str
+    ags_path : str
+    mj_path : str
+    json_output : bool
+        If True, print JSON to stdout.
+    output_file : str or None
+        Path to write JSON report.
+
+    Returns
+    -------
+    int
+        Exit code.
+    """
+    try:
+        ags = scan_ags_files(ags_host, ags_path)
+    except RuntimeError as e:
+        logger.error("AGS scan failed: %s", e)
+        return EXIT_SSH_ERROR
+
+    mj = scan_mj_files(mj_path)
+
+    if not ags["entries"]:
+        logger.info("No AGS data found — nothing to compare")
+        return EXIT_OK
+
+    if mj["file_count"] == 0 and mj["skipped"] == 0:
+        logger.error("No DATA drives or .bin files found at %s", mj_path)
+        return EXIT_NO_DATA
+
+    comparison = compare_headers(ags["entries"], mj["headers"])
+
+    ags_file_count = len(set(e["filename"] for e in ags["entries"]))
+    results = {
+        "ags_triggers": len(ags["entries"]),
+        "ags_files": ags_file_count,
+        "ags_elapsed": ags["elapsed"],
+        "ags_duplicate_count": ags["duplicate_count"],
+        "mj_triggers": len(mj["headers"]),
+        "mj_files_scanned": mj["file_count"],
+        "mj_duplicate_count": mj["duplicate_count"],
+        "mj_elapsed": mj["elapsed"],
+        "matched": comparison["matched"],
+        "missing_on_mj": comparison["missing_on_mj"],
+        "mj_only_count": comparison["mj_only_count"],
+        "warnings": [],
+    }
+
+    if json_output:
+        print(format_json_report(results, ags_host))
+    else:
+        print(format_human_report(results))
+
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(format_json_report(results, ags_host))
+        logger.info("JSON report written to %s", output_file)
+
+    if comparison["missing_on_mj"]:
+        return EXIT_MISSING
+    return EXIT_OK
+
+
+def main():
+    """CLI entry point."""
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    rc = run(
+        ags_host=args.ags_host,
+        ags_path=args.ags_path,
+        mj_path=args.mj_path,
+        json_output=args.json,
+        output_file=args.output,
+    )
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

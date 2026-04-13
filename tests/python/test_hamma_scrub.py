@@ -496,3 +496,126 @@ class TestFormatReport:
         assert len(parsed["missing_on_mj"]) == 1
         assert "scan_time" in parsed
         assert "ags_host" in parsed
+
+
+class TestCLI:
+    """Test argument parsing."""
+
+    def test_default_args(self, hamma_scrub):
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args([])
+        assert args.ags_host == "10.10.10.1"
+        assert args.ags_path == "/ags/data"
+        assert args.mj_path == "/media/pi"
+        assert args.verbose is False
+        assert args.json is False
+        assert args.output is None
+
+    def test_custom_args(self, hamma_scrub):
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args([
+            "--ags-host", "192.168.1.1",
+            "--ags-path", "/data",
+            "--mj-path", "/mnt",
+            "--output", "report.json",
+            "--verbose",
+            "--json",
+        ])
+        assert args.ags_host == "192.168.1.1"
+        assert args.ags_path == "/data"
+        assert args.mj_path == "/mnt"
+        assert args.output == "report.json"
+        assert args.verbose is True
+        assert args.json is True
+
+
+class TestMain:
+    """Test main() integration."""
+
+    def test_exit_code_0_all_match(self, hamma_scrub):
+        """All matched -> exit code 0."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {hdr},
+            "file_count": 1,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "elapsed": 1.0,
+        }
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result):
+            rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
+        assert rc == 0
+
+    def test_exit_code_1_missing(self, hamma_scrub):
+        """Missing triggers -> exit code 1."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        other_hdr = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {other_hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "elapsed": 1.0,
+        }
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result):
+            rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
+        assert rc == 1
+
+    def test_exit_code_0_empty_ags(self, hamma_scrub):
+        """Empty AGS -> exit code 0 (not an error, per spec #9)."""
+        ags_result = {
+            "entries": [],
+            "headers": set(),
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files") as mock_mj:
+            rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
+        assert rc == 0
+        mock_mj.assert_called_once()
+
+    def test_exit_code_2_ssh_error(self, hamma_scrub):
+        """SSH failure -> exit code 2."""
+        with patch.object(hamma_scrub, "scan_ags_files",
+                          side_effect=RuntimeError("SSH failed")):
+            rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
+        assert rc == 2
+
+    def test_exit_code_3_no_data_drives(self, hamma_scrub):
+        """No DATA drives -> exit code 3."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": set(),
+            "file_count": 0,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "elapsed": 1.0,
+        }
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result):
+            rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
+        assert rc == 3
