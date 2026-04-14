@@ -34,10 +34,11 @@ DATASIZE_OFFSET = 10  # byte offset of datasize field in header
 DATASIZE_FORMAT = '<I'  # uint32 little-endian
 
 # Defaults
-DEFAULT_AGS_HOST = "10.10.10.1"
+DEFAULT_AGS_HOST = "hamma"
 DEFAULT_AGS_PATH = "/ags/data"
 DEFAULT_MJ_PATH = "/media/pi"
 DRIVE_PATTERN = "DATA??"
+DEFAULT_LIMIT = 20  # max missing trigger detail lines in human report (0 = no limit)
 
 # Exit codes
 EXIT_OK = 0
@@ -485,13 +486,15 @@ def decode_gps_time(header):
         return None
 
 
-def format_human_report(results):
+def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 
     Parameters
     ----------
     results : dict
         Combined results from scanning and comparison.
+    limit : int
+        Max missing trigger detail lines to show (0 = no limit).
 
     Returns
     -------
@@ -517,11 +520,16 @@ def format_human_report(results):
     missing = results["missing_on_mj"]
     if missing:
         lines.append("Missing on MJ (potential data loss): {:,}".format(len(missing)))
-        for entry in missing:
+        show = missing if limit == 0 else missing[:limit]
+        for entry in show:
             gps = decode_gps_time(entry["header"])
             time_str = gps if gps else "bad GPS"
             lines.append("  AGS file: {}, trigger #{}, GPS time: {}".format(
                 entry["filename"], entry["index"], time_str,
+            ))
+        if limit > 0 and len(missing) > limit:
+            lines.append("  ... and {:,} more (use --limit 0 to show all)".format(
+                len(missing) - limit,
             ))
     else:
         lines.append("No missing triggers detected.")
@@ -610,13 +618,18 @@ def _build_parser():
         help="Debug logging",
     )
     parser.add_argument(
+        "--limit", type=int, default=DEFAULT_LIMIT,
+        help="Max missing trigger detail lines in report; 0 = no limit (default: %(default)s)",
+    )
+    parser.add_argument(
         "-n", "--dry-run", action="store_true",
         help="Report only, no actions (for future phases B/C)",
     )
     return parser
 
 
-def run(ags_host, ags_path, mj_path, json_output=False, output_file=None):
+def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
+        limit=DEFAULT_LIMIT):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -628,6 +641,8 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None):
         If True, print JSON to stdout.
     output_file : str or None
         Path to write JSON report.
+    limit : int
+        Max missing trigger detail lines in human report (0 = no limit).
 
     Returns
     -------
@@ -671,7 +686,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None):
     if json_output:
         print(format_json_report(results, ags_host))
     else:
-        print(format_human_report(results))
+        print(format_human_report(results, limit=limit))
 
     if output_file:
         with open(output_file, 'w') as f:
@@ -701,6 +716,7 @@ def main():
         mj_path=args.mj_path,
         json_output=args.json,
         output_file=args.output,
+        limit=args.limit,
     )
     sys.exit(rc)
 

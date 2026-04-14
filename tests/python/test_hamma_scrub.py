@@ -487,6 +487,37 @@ class TestFormatReport:
         report = hamma_scrub.format_human_report(results)
         assert "No missing triggers" in report
 
+    def test_human_report_limit_truncates(self, hamma_scrub):
+        """Default limit truncates missing trigger details."""
+        results = self._make_results()
+        # Add 30 missing entries (more than DEFAULT_LIMIT=20)
+        missing_hdr = b'\xf5\xff\x50\x5d' + b'\x00' * 124
+        results["missing_on_mj"] = [
+            {"filename": "data.bin", "offset": i * 22000132, "index": i,
+             "header": missing_hdr}
+            for i in range(30)
+        ]
+        report = hamma_scrub.format_human_report(results, limit=20)
+        # Should show 20 detail lines + truncation message
+        assert "... and 10 more" in report
+        assert "--limit 0" in report
+        # Only 20 detail lines (trigger #0 through #19)
+        assert "trigger #19" in report
+        assert "trigger #20" not in report
+
+    def test_human_report_limit_zero_shows_all(self, hamma_scrub):
+        """limit=0 shows all missing trigger details."""
+        results = self._make_results()
+        missing_hdr = b'\xf5\xff\x50\x5d' + b'\x00' * 124
+        results["missing_on_mj"] = [
+            {"filename": "data.bin", "offset": i * 22000132, "index": i,
+             "header": missing_hdr}
+            for i in range(30)
+        ]
+        report = hamma_scrub.format_human_report(results, limit=0)
+        assert "... and" not in report
+        assert "trigger #29" in report
+
     def test_json_report_structure(self, hamma_scrub):
         results = self._make_results()
         j = hamma_scrub.format_json_report(results, "10.10.10.1")
@@ -504,12 +535,13 @@ class TestCLI:
     def test_default_args(self, hamma_scrub):
         parser = hamma_scrub._build_parser()
         args = parser.parse_args([])
-        assert args.ags_host == "10.10.10.1"
+        assert args.ags_host == "hamma"
         assert args.ags_path == "/ags/data"
         assert args.mj_path == "/media/pi"
         assert args.verbose is False
         assert args.json is False
         assert args.output is None
+        assert args.limit == 20
 
     def test_custom_args(self, hamma_scrub):
         parser = hamma_scrub._build_parser()
