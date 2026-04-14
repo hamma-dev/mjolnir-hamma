@@ -142,13 +142,46 @@ def _scan_forward(fileobj, start_pos, file_size):
     return -1
 
 
-def scan_mj_files(base_path):
+def _parse_since(since_str):
+    """Parse a --since value into a comparable directory prefix.
+
+    Parameters
+    ----------
+    since_str : str
+        Date string: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH'.
+
+    Returns
+    -------
+    str
+        Normalized to 'YYYY-MM-DDTHH' format for directory comparison.
+
+    Raises
+    ------
+    ValueError
+        If format is not recognized.
+    """
+    s = since_str.strip()
+    # YYYY-MM-DDTHH (already has hour)
+    if len(s) == 13 and s[10] == 'T':
+        return s
+    # YYYY-MM-DD (add T00 for start of day)
+    if len(s) == 10 and s[4] == '-' and s[7] == '-':
+        return s + 'T00'
+    raise ValueError(
+        "Invalid --since format '{}': expected YYYY-MM-DD or YYYY-MM-DDTHH".format(s)
+    )
+
+
+def scan_mj_files(base_path, since=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Parameters
     ----------
     base_path : str
         Base path containing DATA?? drives (e.g., /media/pi).
+    since : str or None
+        If set, skip directories with names before this cutoff
+        (format: 'YYYY-MM-DDTHH').
 
     Returns
     -------
@@ -157,12 +190,14 @@ def scan_mj_files(base_path):
         file_count: int (total .bin files found)
         duplicate_count: int (files with headers already seen)
         skipped: int (files < 128 bytes)
+        dirs_skipped: int (directories before --since cutoff)
         elapsed: float (seconds)
     """
     headers = set()
     file_count = 0
     duplicate_count = 0
     skipped = 0
+    dirs_skipped = 0
     t0 = time.time()
 
     pattern = os.path.join(base_path, DRIVE_PATTERN)
@@ -172,8 +207,27 @@ def scan_mj_files(base_path):
 
     for drive in drives:
         try:
-            bin_pattern = os.path.join(drive, "*", "*.bin")
-            bin_files = sorted(glob.glob(bin_pattern))
+            if since:
+                # Per-directory filtering: only glob .bin in qualifying dirs
+                dir_pattern = os.path.join(drive, "*")
+                subdirs = sorted(glob.glob(dir_pattern))
+                bin_files = []
+                for subdir in subdirs:
+                    if not os.path.isdir(subdir):
+                        continue
+                    dirname = os.path.basename(subdir)
+                    if dirname < since:
+                        dirs_skipped += 1
+                        continue
+                    try:
+                        bin_files.extend(
+                            sorted(glob.glob(os.path.join(subdir, "*.bin")))
+                        )
+                    except OSError:
+                        continue
+            else:
+                # Fast path: single glob for all .bin files
+                bin_files = sorted(glob.glob(os.path.join(drive, "*", "*.bin")))
         except PermissionError:
             logger.warning("Permission denied scanning %s, skipping", drive)
             continue
@@ -182,30 +236,33 @@ def scan_mj_files(base_path):
             continue
 
         for filepath in bin_files:
-            file_count += 1
-            try:
-                fsize = os.path.getsize(filepath)
-                if fsize < HEADER_SIZE:
-                    logger.warning("Truncated file (%d bytes): %s", fsize, filepath)
+                file_count += 1
+                try:
+                    fsize = os.path.getsize(filepath)
+                    if fsize < HEADER_SIZE:
+                        logger.warning("Truncated file (%d bytes): %s", fsize, filepath)
+                        skipped += 1
+                        continue
+                    with open(filepath, 'rb') as f:
+                        header = f.read(HEADER_SIZE)
+                    if len(header) < HEADER_SIZE:
+                        skipped += 1
+                        continue
+                    if header in headers:
+                        duplicate_count += 1
+                    else:
+                        headers.add(header)
+                except PermissionError:
+                    logger.warning("Permission denied reading %s", filepath)
                     skipped += 1
-                    continue
-                with open(filepath, 'rb') as f:
-                    header = f.read(HEADER_SIZE)
-                if len(header) < HEADER_SIZE:
+                except OSError as e:
+                    logger.warning("Error reading %s: %s", filepath, e)
                     skipped += 1
-                    continue
-                if header in headers:
-                    duplicate_count += 1
-                else:
-                    headers.add(header)
-            except PermissionError:
-                logger.warning("Permission denied reading %s", filepath)
-                skipped += 1
-            except OSError as e:
-                logger.warning("Error reading %s: %s", filepath, e)
-                skipped += 1
 
     elapsed = time.time() - t0
+    if dirs_skipped:
+        logger.info("MJ scan: skipped %d directories before --since cutoff",
+                     dirs_skipped)
     logger.info("MJ scan: %d unique headers from %d files (%.1fs)",
                 len(headers), file_count, elapsed)
     return {
@@ -213,6 +270,7 @@ def scan_mj_files(base_path):
         "file_count": file_count,
         "duplicate_count": duplicate_count,
         "skipped": skipped,
+        "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
     }
 
@@ -618,6 +676,10 @@ def _build_parser():
         help="Debug logging",
     )
     parser.add_argument(
+        "--since",
+        help="Only scan MJ directories at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH)",
+    )
+    parser.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
         help="Max missing trigger detail lines in report; 0 = no limit (default: %(default)s)",
     )
@@ -629,7 +691,7 @@ def _build_parser():
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
-        limit=DEFAULT_LIMIT):
+        limit=DEFAULT_LIMIT, since=None):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -643,19 +705,31 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         Path to write JSON report.
     limit : int
         Max missing trigger detail lines in human report (0 = no limit).
+    since : str or None
+        Only scan MJ directories at or after this date.
 
     Returns
     -------
     int
         Exit code.
     """
+    # Parse --since into normalized directory prefix
+    since_cutoff = None
+    if since:
+        try:
+            since_cutoff = _parse_since(since)
+            logger.info("Filtering MJ directories to >= %s", since_cutoff)
+        except ValueError as e:
+            logger.error("%s", e)
+            return EXIT_NO_DATA
+
     try:
         ags = scan_ags_files(ags_host, ags_path)
     except RuntimeError as e:
         logger.error("AGS scan failed: %s", e)
         return EXIT_SSH_ERROR
 
-    mj = scan_mj_files(mj_path)
+    mj = scan_mj_files(mj_path, since=since_cutoff)
 
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
@@ -717,6 +791,7 @@ def main():
         json_output=args.json,
         output_file=args.output,
         limit=args.limit,
+        since=args.since,
     )
     sys.exit(rc)
 

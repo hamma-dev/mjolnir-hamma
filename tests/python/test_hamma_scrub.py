@@ -234,6 +234,68 @@ class TestScanMjFiles:
         finally:
             os.chmod(str(tmp_path / "DATA37"), 0o755)
 
+    def test_since_filters_old_directories(self, hamma_scrub, tmp_path):
+        """--since skips directories before cutoff."""
+        hdr_old, rest = _make_trigger()
+        hdr_new, rest2 = _make_trigger()
+        hdr_new = bytearray(hdr_new)
+        hdr_new[50] = 99
+        hdr_new = bytes(hdr_new)
+        # Old directory (before cutoff)
+        old_dir = tmp_path / "DATA37" / "2026-04-01T00"
+        old_dir.mkdir(parents=True)
+        (old_dir / "mj05_2026-04-01_00-00-00-000.bin").write_bytes(hdr_old + rest)
+        # New directory (at/after cutoff)
+        new_dir = tmp_path / "DATA37" / "2026-04-10T14"
+        new_dir.mkdir(parents=True)
+        (new_dir / "mj05_2026-04-10_14-00-00-000.bin").write_bytes(hdr_new + rest2)
+
+        result = hamma_scrub.scan_mj_files(str(tmp_path), since="2026-04-10T00")
+        assert len(result["headers"]) == 1
+        assert hdr_new in result["headers"]
+        assert result["file_count"] == 1
+        assert result["dirs_skipped"] == 1
+
+    def test_since_none_scans_all(self, hamma_scrub, tmp_path):
+        """since=None scans everything (backward compat)."""
+        for date in ["2026-04-01T00", "2026-04-10T14"]:
+            d = tmp_path / "DATA37" / date
+            d.mkdir(parents=True)
+            hdr, rest = _make_trigger()
+            hdr = bytearray(hdr)
+            hdr[50] = ord(date[-1])
+            (d / "test.bin").write_bytes(bytes(hdr) + rest)
+        result = hamma_scrub.scan_mj_files(str(tmp_path), since=None)
+        assert len(result["headers"]) == 2
+        assert result["dirs_skipped"] == 0
+
+    def test_since_includes_exact_match(self, hamma_scrub, tmp_path):
+        """Directory matching --since exactly is included."""
+        d = tmp_path / "DATA37" / "2026-04-10T14"
+        d.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (d / "test.bin").write_bytes(hdr + rest)
+        result = hamma_scrub.scan_mj_files(str(tmp_path), since="2026-04-10T14")
+        assert len(result["headers"]) == 1
+        assert result["dirs_skipped"] == 0
+
+
+class TestParseSince:
+    """Test --since date parsing."""
+
+    def test_date_only(self, hamma_scrub):
+        assert hamma_scrub._parse_since("2026-04-10") == "2026-04-10T00"
+
+    def test_date_with_hour(self, hamma_scrub):
+        assert hamma_scrub._parse_since("2026-04-10T14") == "2026-04-10T14"
+
+    def test_invalid_format(self, hamma_scrub):
+        with pytest.raises(ValueError, match="Invalid --since"):
+            hamma_scrub._parse_since("April 10")
+
+    def test_strips_whitespace(self, hamma_scrub):
+        assert hamma_scrub._parse_since("  2026-04-10  ") == "2026-04-10T00"
+
 
 class TestStriderProtocol:
     """Test encoding/decoding of the strider binary protocol."""
@@ -542,6 +604,7 @@ class TestCLI:
         assert args.json is False
         assert args.output is None
         assert args.limit == 20
+        assert args.since is None
 
     def test_custom_args(self, hamma_scrub):
         parser = hamma_scrub._build_parser()
