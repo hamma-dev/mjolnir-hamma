@@ -16,6 +16,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -245,28 +247,28 @@ def scan_mj_files(base_path, since=None):
             continue
 
         for filepath in bin_files:
-                file_count += 1
-                try:
-                    fsize = os.path.getsize(filepath)
-                    if fsize < HEADER_SIZE:
-                        logger.warning("Truncated file (%d bytes): %s", fsize, filepath)
-                        skipped += 1
-                        continue
-                    with open(filepath, 'rb') as f:
-                        header = f.read(HEADER_SIZE)
-                    if len(header) < HEADER_SIZE:
-                        skipped += 1
-                        continue
-                    if header in headers:
-                        duplicate_count += 1
-                    else:
-                        headers.add(header)
-                except PermissionError:
-                    logger.warning("Permission denied reading %s", filepath)
+            file_count += 1
+            try:
+                fsize = os.path.getsize(filepath)
+                if fsize < HEADER_SIZE:
+                    logger.warning("Truncated file (%d bytes): %s", fsize, filepath)
                     skipped += 1
-                except OSError as e:
-                    logger.warning("Error reading %s: %s", filepath, e)
+                    continue
+                with open(filepath, 'rb') as f:
+                    header = f.read(HEADER_SIZE)
+                if len(header) < HEADER_SIZE:
                     skipped += 1
+                    continue
+                if header in headers:
+                    duplicate_count += 1
+                else:
+                    headers.add(header)
+            except PermissionError:
+                logger.warning("Permission denied reading %s", filepath)
+                skipped += 1
+            except OSError as e:
+                logger.warning("Error reading %s: %s", filepath, e)
+                skipped += 1
 
     elapsed = time.time() - t0
     if dirs_skipped:
@@ -526,8 +528,6 @@ def decode_gps_time(header):
     except struct.error:
         return None
 
-    import math
-
     # Compute base time (seconds since Unix epoch)
     # Matches hamma version20 convert(): passes floor(gpsTimeWeek)+1 to base_trigger_time
     base_time = (GPS_EPOCH
@@ -543,7 +543,6 @@ def decode_gps_time(header):
     sub_seconds = float(subsecond) / float(ecc_val)
 
     try:
-        from datetime import datetime, timezone
         ts = base_time + sub_seconds
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         if dt.year < 2000:
@@ -1122,8 +1121,6 @@ def format_json_report(results, ags_host, recovery=None):
     str
         JSON string.
     """
-    from datetime import datetime, timezone
-
     missing_entries = []
     for entry in results["missing_on_mj"]:
         gps = decode_gps_time(entry["header"])
