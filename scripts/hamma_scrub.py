@@ -662,6 +662,84 @@ def select_target_drive(mj_path, min_free=MIN_FREE_SPACE):
     return None
 
 
+def extract_trigger(ags_host, ags_path, filename, offset, size):
+    """Extract a single trigger from AGS via SSH dd.
+
+    Parameters
+    ----------
+    ags_host : str
+        SSH host for AGS sensor.
+    ags_path : str
+        AGS data directory on sensor.
+    filename : str
+        AGS filename (basename).
+    offset : int
+        Byte offset in file.
+    size : int
+        Total bytes to extract (header + payload + padding).
+
+    Returns
+    -------
+    bytes or None
+        Extracted data, or None on failure.
+    """
+    filepath = "{}/{}".format(ags_path, filename)
+    dd_cmd = (
+        "dd if={} iflag=skip_bytes,count_bytes bs=4096"
+        " skip={} count={} status=none"
+    ).format(filepath, offset, size)
+    cmd = ["ssh", ags_host, dd_cmd]
+    logger.debug("Extracting: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=RECOVER_TIMEOUT,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace').strip()
+            logger.warning(
+                "dd failed for %s offset %d (rc=%d): %s",
+                filename, offset, result.returncode, stderr,
+            )
+            return None
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "dd timed out after %ds for %s offset %d",
+            RECOVER_TIMEOUT, filename, offset,
+        )
+        return None
+    except OSError as e:
+        logger.warning("SSH error extracting %s: %s", filename, e)
+        return None
+
+
+def verify_trigger(data, expected_size):
+    """Verify extracted trigger data integrity.
+
+    Parameters
+    ----------
+    data : bytes
+        Extracted trigger data.
+    expected_size : int
+        Expected byte count.
+
+    Returns
+    -------
+    tuple of (bool, str)
+        (success, error_message). Error message is empty on success.
+    """
+    if len(data) != expected_size:
+        return (False, "size mismatch: got {} expected {}".format(
+            len(data), expected_size,
+        ))
+    if data[:4] != SYNC_MARKER:
+        return (False, "sync marker mismatch: got {}".format(data[:4].hex()))
+    return (True, "")
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 

@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import struct
+import subprocess
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -625,6 +626,98 @@ class TestSelectTargetDrive:
         (d38 / "2026-04-10T14").mkdir(parents=True)
         result = hamma_scrub.select_target_drive(str(tmp_path))
         assert result == str(d38)
+
+
+class TestExtractTrigger:
+    """Test SSH dd-based trigger extraction."""
+
+    def test_successful_extraction(self, hamma_scrub):
+        """Successful dd returns extracted bytes."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b'\xf5\xff\x50\x5d' + b'\x00' * 100
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            data = hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "test.bin", 1000, 104,
+            )
+
+        assert data == mock_result.stdout
+        cmd = mock_run.call_args[0][0]
+        assert "dd" in cmd[-1]
+        assert "skip=1000" in cmd[-1]
+        assert "count=104" in cmd[-1]
+        assert "iflag=skip_bytes,count_bytes" in cmd[-1]
+        assert "bs=4096" in cmd[-1]
+        assert "status=none" in cmd[-1]
+
+    def test_dd_failure_returns_none(self, hamma_scrub):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = b''
+        mock_result.stderr = b'No such file'
+
+        with patch("subprocess.run", return_value=mock_result):
+            data = hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "test.bin", 0, 100,
+            )
+        assert data is None
+
+    def test_timeout_returns_none(self, hamma_scrub):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("dd", 60)):
+            data = hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "test.bin", 0, 100,
+            )
+        assert data is None
+
+    def test_ssh_oserror_returns_none(self, hamma_scrub):
+        with patch("subprocess.run", side_effect=OSError("Connection refused")):
+            data = hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "test.bin", 0, 100,
+            )
+        assert data is None
+
+    def test_constructs_correct_path(self, hamma_scrub):
+        """Full path is ags_path/filename."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b'\x00' * 50
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "agsfile.bin", 500, 50,
+            )
+        cmd_str = mock_run.call_args[0][0][-1]
+        assert "if=/ags/data/agsfile.bin" in cmd_str
+
+
+class TestVerifyTrigger:
+    """Test trigger data verification."""
+
+    def test_valid_trigger(self, hamma_scrub):
+        data = SYNC_MARKER + b'\x00' * 96
+        ok, err = hamma_scrub.verify_trigger(data, 100)
+        assert ok is True
+        assert err == ""
+
+    def test_size_mismatch(self, hamma_scrub):
+        data = SYNC_MARKER + b'\x00' * 50
+        ok, err = hamma_scrub.verify_trigger(data, 100)
+        assert ok is False
+        assert "size mismatch" in err
+
+    def test_bad_sync_marker(self, hamma_scrub):
+        data = b'\x00\x00\x00\x00' + b'\x00' * 96
+        ok, err = hamma_scrub.verify_trigger(data, 100)
+        assert ok is False
+        assert "sync marker" in err
+
+    def test_empty_data(self, hamma_scrub):
+        ok, err = hamma_scrub.verify_trigger(b'', 100)
+        assert ok is False
+        assert "size mismatch" in err
 
 
 class TestFormatReport:
