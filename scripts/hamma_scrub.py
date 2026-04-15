@@ -1014,7 +1014,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
     return results
 
 
-def format_human_report(results, limit=DEFAULT_LIMIT):
+def format_human_report(results, limit=DEFAULT_LIMIT, recovery=None):
     """Format results as human-readable report text.
 
     Parameters
@@ -1023,6 +1023,9 @@ def format_human_report(results, limit=DEFAULT_LIMIT):
         Combined results from scanning and comparison.
     limit : int
         Max missing trigger detail lines to show (0 = no limit).
+    recovery : list or None
+        Recovery result records from recover_triggers(), or None if recovery
+        was not performed.
 
     Returns
     -------
@@ -1070,10 +1073,38 @@ def format_human_report(results, limit=DEFAULT_LIMIT):
     for warning in results.get("warnings", []):
         lines.append("WARNING: {}".format(warning))
 
+    # Recovery section (only when recovery was performed)
+    if recovery is not None:
+        lines.append("")
+        is_dry = any(r["status"] == "dry_run" for r in recovery)
+        if is_dry:
+            count = len([r for r in recovery if r["status"] == "dry_run"])
+            lines.append("Recovery (dry run): {} triggers would be recovered".format(count))
+            for r in recovery:
+                if r["status"] == "dry_run":
+                    lines.append("  Would recover: {}".format(r["target_path"]))
+        else:
+            attempted = len([r for r in recovery
+                             if r["status"] not in ("skipped", "skipped_before_since")])
+            succeeded = len([r for r in recovery if r["status"] == "recovered"])
+            failed = len([r for r in recovery if r["status"] == "failed"])
+            lines.append("Recovery: {} attempted, {} succeeded, {} failed".format(
+                attempted, succeeded, failed,
+            ))
+            for r in recovery:
+                if r["status"] == "recovered":
+                    lines.append("  Recovered: {}".format(r["target_path"]))
+                elif r["status"] == "failed":
+                    lines.append("  FAILED: {} trigger #{} \u2014 {}".format(
+                        r["source_file"], r["trigger_index"], r["error"],
+                    ))
+                elif r["status"] == "skipped" and r.get("error") == "file already exists":
+                    lines.append("  Skipped (exists): {}".format(r["target_path"]))
+
     return "\n".join(lines)
 
 
-def format_json_report(results, ags_host):
+def format_json_report(results, ags_host, recovery=None):
     """Format results as JSON string.
 
     Parameters
@@ -1082,6 +1113,9 @@ def format_json_report(results, ags_host):
         Combined results from scanning and comparison.
     ags_host : str
         AGS host for metadata.
+    recovery : list or None
+        Recovery result records from recover_triggers(), or None if recovery
+        was not performed.
 
     Returns
     -------
@@ -1113,6 +1147,8 @@ def format_json_report(results, ags_host):
         "mj_only_count": results["mj_only_count"],
         "warnings": results.get("warnings", []),
     }
+    if recovery is not None:
+        report["recovery"] = recovery
     return json.dumps(report, indent=2)
 
 
@@ -1155,13 +1191,17 @@ def _build_parser():
     )
     parser.add_argument(
         "-n", "--dry-run", action="store_true",
-        help="Report only, no actions (for future phases B/C)",
+        help="Show what would be recovered without transferring (use with --recover)",
+    )
+    parser.add_argument(
+        "--recover", action="store_true",
+        help="After scan, extract missing triggers from AGS to MJ DATA drives",
     )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
-        limit=DEFAULT_LIMIT, since=None):
+        limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1177,6 +1217,10 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         Max missing trigger detail lines in human report (0 = no limit).
     since : str or None
         Only scan MJ directories at or after this date.
+    recover : bool
+        If True, extract missing triggers from AGS to MJ DATA drives.
+    dry_run : bool
+        If True, show what would be recovered without transferring.
 
     Returns
     -------
@@ -1227,14 +1271,34 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         "warnings": [],
     }
 
+    # Recovery flow
+    recovery_results = None
+    if recover and comparison["missing_on_mj"]:
+        cleanup_orphaned_temps(mj_path)
+        candidates = filter_recovery_candidates(
+            comparison["missing_on_mj"], ags["entries"],
+            since_cutoff=since_cutoff,
+        )
+        recovery_results = recover_triggers(
+            candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
+        )
+        recovered_count = len([r for r in recovery_results
+                               if r["status"] == "recovered"])
+        failed_count = len([r for r in recovery_results
+                            if r["status"] == "failed"])
+        if recovered_count:
+            logger.info("Recovery: %d succeeded", recovered_count)
+        if failed_count:
+            logger.warning("Recovery: %d failed", failed_count)
+
     if json_output:
-        print(format_json_report(results, ags_host))
+        print(format_json_report(results, ags_host, recovery=recovery_results))
     else:
-        print(format_human_report(results, limit=limit))
+        print(format_human_report(results, limit=limit, recovery=recovery_results))
 
     if output_file:
         with open(output_file, 'w') as f:
-            f.write(format_json_report(results, ags_host))
+            f.write(format_json_report(results, ags_host, recovery=recovery_results))
         logger.info("JSON report written to %s", output_file)
 
     if comparison["missing_on_mj"]:
@@ -1262,6 +1326,8 @@ def main():
         output_file=args.output,
         limit=args.limit,
         since=args.since,
+        recover=args.recover,
+        dry_run=args.dry_run,
     )
     sys.exit(rc)
 

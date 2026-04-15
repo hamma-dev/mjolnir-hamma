@@ -1003,6 +1003,109 @@ class TestRecoverTriggers:
         assert "unknown" in results[0]["target_path"]
 
 
+class TestRecoveryReport:
+    """Test recovery sections in human and JSON reports."""
+
+    def _make_results_with_recovery(self):
+        """Build results dict with recovery data."""
+        missing_hdr = b'\xf5\xff\x50\x5d' + b'\x00' * 124
+        return {
+            "ags_triggers": 100,
+            "ags_files": 2,
+            "ags_elapsed": 5.2,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 95,
+            "mj_files_scanned": 95,
+            "mj_duplicate_count": 0,
+            "mj_elapsed": 3.1,
+            "matched": 95,
+            "missing_on_mj": [
+                {"filename": "data.bin", "offset": 0, "index": 0,
+                 "header": missing_hdr},
+            ],
+            "mj_only_count": 0,
+            "warnings": [],
+        }
+
+    def test_human_report_with_recovery(self, hamma_scrub):
+        results = self._make_results_with_recovery()
+        recovery = [{
+            "source_file": "data.bin",
+            "source_offset": 0,
+            "trigger_index": 0,
+            "target_path": "DATA37/2026-04-04T01/mj41_2026-04-04_01-13-50-808_recovered.bin",
+            "size": 22000132,
+            "status": "recovered",
+            "error": None,
+        }]
+        report = hamma_scrub.format_human_report(results, recovery=recovery)
+        assert "Recovery:" in report
+        assert "1 attempted" in report
+        assert "1 succeeded" in report
+        assert "Recovered:" in report
+        assert "mj41_" in report
+
+    def test_human_report_with_failed_recovery(self, hamma_scrub):
+        results = self._make_results_with_recovery()
+        recovery = [{
+            "source_file": "data.bin",
+            "source_offset": 0,
+            "trigger_index": 0,
+            "target_path": "DATA37/2026-04-04T01/mj41_2026-04-04_01-13-50-808_recovered.bin",
+            "size": 22000132,
+            "status": "failed",
+            "error": "dd returned rc=1",
+        }]
+        report = hamma_scrub.format_human_report(results, recovery=recovery)
+        assert "FAILED:" in report
+        assert "dd returned rc=1" in report
+
+    def test_human_report_dry_run(self, hamma_scrub):
+        results = self._make_results_with_recovery()
+        recovery = [{
+            "source_file": "data.bin",
+            "source_offset": 0,
+            "trigger_index": 0,
+            "target_path": "DATA37/2026-04-04T01/mj41_2026-04-04_01-13-50-808_recovered.bin",
+            "size": 22000132,
+            "status": "dry_run",
+            "error": None,
+        }]
+        report = hamma_scrub.format_human_report(results, recovery=recovery)
+        assert "dry run" in report.lower()
+        assert "Would recover:" in report
+
+    def test_human_report_no_recovery(self, hamma_scrub):
+        """No recovery parameter -> no recovery section (backward compat)."""
+        results = self._make_results_with_recovery()
+        report = hamma_scrub.format_human_report(results)
+        assert "Recovery:" not in report
+
+    def test_json_report_with_recovery(self, hamma_scrub):
+        results = self._make_results_with_recovery()
+        recovery = [{
+            "source_file": "data.bin",
+            "source_offset": 0,
+            "trigger_index": 0,
+            "target_path": "DATA37/2026-04-04T01/mj41_recovered.bin",
+            "size": 22000132,
+            "status": "recovered",
+            "error": None,
+        }]
+        j = hamma_scrub.format_json_report(results, "hamma", recovery=recovery)
+        parsed = json.loads(j)
+        assert "recovery" in parsed
+        assert len(parsed["recovery"]) == 1
+        assert parsed["recovery"][0]["status"] == "recovered"
+
+    def test_json_report_no_recovery(self, hamma_scrub):
+        """No recovery parameter -> no recovery key in JSON."""
+        results = self._make_results_with_recovery()
+        j = hamma_scrub.format_json_report(results, "hamma")
+        parsed = json.loads(j)
+        assert "recovery" not in parsed
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 
@@ -1117,6 +1220,22 @@ class TestCLI:
         assert args.verbose is True
         assert args.json is True
 
+    def test_recover_flag(self, hamma_scrub):
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args(["--recover"])
+        assert args.recover is True
+
+    def test_recover_default(self, hamma_scrub):
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args([])
+        assert args.recover is False
+
+    def test_recover_with_dry_run(self, hamma_scrub):
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args(["--recover", "--dry-run"])
+        assert args.recover is True
+        assert args.dry_run is True
+
 
 class TestMain:
     """Test main() integration."""
@@ -1208,3 +1327,74 @@ class TestMain:
              patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result):
             rc = hamma_scrub.run("10.10.10.1", "/ags/data", "/media/pi")
         assert rc == 3
+
+    def test_run_with_recover_calls_recovery(self, hamma_scrub, tmp_path):
+        """run() with recover=True invokes recovery flow."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        other_hdr = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {other_hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+        mock_recovery = [{
+            "source_file": "f.bin",
+            "source_offset": 0,
+            "trigger_index": 0,
+            "target_path": "DATA37/test/recovered.bin",
+            "size": 100,
+            "status": "recovered",
+            "error": None,
+        }]
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "cleanup_orphaned_temps", return_value=0), \
+             patch.object(hamma_scrub, "filter_recovery_candidates") as mock_filter, \
+             patch.object(hamma_scrub, "recover_triggers", return_value=mock_recovery) as mock_recover:
+            mock_filter.return_value = [
+                {"header": hdr, "filename": "f.bin", "offset": 0,
+                 "index": 0, "skip_reason": None}
+            ]
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", str(tmp_path),
+                recover=True,
+            )
+        assert rc == 1  # Still EXIT_MISSING even after recovery
+        mock_recover.assert_called_once()
+        mock_filter.assert_called_once()
+
+    def test_run_without_recover_no_recovery(self, hamma_scrub):
+        """run() without recover=True does NOT invoke recovery."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        other_hdr = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {other_hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "recover_triggers") as mock_recover:
+            rc = hamma_scrub.run("hamma", "/ags/data", "/media/pi")
+        assert rc == 1
+        mock_recover.assert_not_called()
