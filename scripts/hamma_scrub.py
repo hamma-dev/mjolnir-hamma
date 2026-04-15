@@ -574,6 +574,43 @@ def detect_unit_name(hostname=None):
     return ("recovered", "")
 
 
+def compute_target_path(header, offset, prefix, unit):
+    """Compute target directory and filename for a recovered trigger.
+
+    Parameters
+    ----------
+    header : bytes
+        128-byte raw header.
+    offset : int
+        Byte offset in source AGS file (discriminator for bad GPS filenames).
+    prefix : str
+        Unit prefix (e.g., "mj").
+    unit : str
+        Unit number string (e.g., "41").
+
+    Returns
+    -------
+    tuple of (str, str)
+        (subdirectory, filename). Subdirectory is 'YYYY-MM-DDTHH' or 'unknown'.
+    """
+    gps_str = decode_gps_time(header)
+    unit_tag = "{}{}".format(prefix, unit) if unit else prefix
+
+    if gps_str is None:
+        subdir = "unknown"
+        filename = "{}_0000-00-00_00-00-00-000_off{}_recovered.bin".format(
+            unit_tag, offset,
+        )
+    else:
+        # gps_str is "YYYY-MM-DDTHH:MM:SS.mmm"
+        subdir = gps_str[:13]  # "YYYY-MM-DDTHH"
+        # Convert to filename: "YYYY-MM-DD_HH-MM-SS-mmm"
+        ts = gps_str[0:10] + '_' + gps_str[11:].replace(':', '-').replace('.', '-')
+        filename = "{}_{}_recovered.bin".format(unit_tag, ts)
+
+    return (subdir, filename)
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 

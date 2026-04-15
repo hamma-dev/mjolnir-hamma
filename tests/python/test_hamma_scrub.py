@@ -533,6 +533,62 @@ class TestDetectUnitName:
             assert hamma_scrub.detect_unit_name() == ("mj", "42")
 
 
+class TestComputeTargetPath:
+    """Test target directory and filename computation."""
+
+    def _make_gps_header(self):
+        """Build a header with known GPS time 2026-04-04T01:13:50.808."""
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        struct.pack_into('<f', header, 80, 522847.0)      # gpsTimeWeek (seconds into week)
+        struct.pack_into('<h', header, 84, 2412)           # gpsWeek
+        struct.pack_into('<f', header, 86, 18.0)           # utcOffset
+        struct.pack_into('<I', header, 94, 808000000)      # gpsSubSecond
+        struct.pack_into('<I', header, 98, 1000000000)     # gpsSubSecondECC
+        return bytes(header)
+
+    def test_good_gps(self, hamma_scrub):
+        header = self._make_gps_header()
+        subdir, filename = hamma_scrub.compute_target_path(header, 0, "mj", "41")
+        assert subdir.startswith("2026-")
+        assert "T" in subdir  # YYYY-MM-DDTHH format
+        assert filename.startswith("mj41_")
+        assert filename.endswith("_recovered.bin")
+        assert "_recovered.bin" in filename
+
+    def test_bad_gps_uses_unknown(self, hamma_scrub):
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        subdir, filename = hamma_scrub.compute_target_path(
+            bytes(header), 924005544, "mj", "41",
+        )
+        assert subdir == "unknown"
+        assert "off924005544" in filename
+        assert filename.startswith("mj41_")
+        assert filename.endswith("_recovered.bin")
+
+    def test_bad_gps_different_offsets(self, hamma_scrub):
+        """Different offsets produce different filenames (collision prevention)."""
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        _, f1 = hamma_scrub.compute_target_path(bytes(header), 100, "mj", "41")
+        _, f2 = hamma_scrub.compute_target_path(bytes(header), 200, "mj", "41")
+        assert f1 != f2
+
+    def test_fallback_prefix(self, hamma_scrub):
+        """No unit number uses prefix only."""
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        _, filename = hamma_scrub.compute_target_path(
+            bytes(header), 0, "recovered", "",
+        )
+        assert filename.startswith("recovered_")
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 
