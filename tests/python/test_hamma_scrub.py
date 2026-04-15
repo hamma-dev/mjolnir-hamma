@@ -7,6 +7,7 @@ import os
 import pathlib
 import struct
 import subprocess
+import time
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -800,6 +801,46 @@ class TestFilterRecoveryCandidates:
     def test_empty_input(self, hamma_scrub):
         result = hamma_scrub.filter_recovery_candidates([], [])
         assert result == []
+
+
+class TestCleanupOrphanedTemps:
+    """Test orphaned temp file cleanup."""
+
+    def test_deletes_old_temps(self, hamma_scrub, tmp_path):
+        drive = tmp_path / "DATA37"
+        drive.mkdir()
+        tmp_file = drive / ".tmp_recover_abc123.bin"
+        tmp_file.write_bytes(b'\x00' * 100)
+        # Set mtime to 2 hours ago
+        old_time = time.time() - 7200
+        os.utime(str(tmp_file), (old_time, old_time))
+        count = hamma_scrub.cleanup_orphaned_temps(str(tmp_path))
+        assert count == 1
+        assert not tmp_file.exists()
+
+    def test_keeps_recent_temps(self, hamma_scrub, tmp_path):
+        drive = tmp_path / "DATA37"
+        drive.mkdir()
+        tmp_file = drive / ".tmp_recover_abc123.bin"
+        tmp_file.write_bytes(b'\x00' * 100)
+        count = hamma_scrub.cleanup_orphaned_temps(str(tmp_path))
+        assert count == 0
+        assert tmp_file.exists()
+
+    def test_no_drives(self, hamma_scrub, tmp_path):
+        count = hamma_scrub.cleanup_orphaned_temps(str(tmp_path))
+        assert count == 0
+
+    def test_ignores_non_matching_files(self, hamma_scrub, tmp_path):
+        drive = tmp_path / "DATA37"
+        drive.mkdir()
+        normal_file = drive / "mj41_2026-04-04_01-13-50-808.bin"
+        normal_file.write_bytes(b'\x00' * 100)
+        old_time = time.time() - 7200
+        os.utime(str(normal_file), (old_time, old_time))
+        count = hamma_scrub.cleanup_orphaned_temps(str(tmp_path))
+        assert count == 0
+        assert normal_file.exists()
 
 
 class TestFormatReport:

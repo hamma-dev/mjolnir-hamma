@@ -800,6 +800,36 @@ def filter_recovery_candidates(missing_entries, ags_entries, since_cutoff=None):
     return results
 
 
+def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
+    """Delete orphaned .tmp_recover_*.bin files older than max_age.
+
+    Parameters
+    ----------
+    mj_path : str
+        Base path containing DATA drives.
+    max_age : int
+        Maximum age in seconds before deletion (default: 1 hour).
+
+    Returns
+    -------
+    int
+        Number of files deleted.
+    """
+    count = 0
+    now = time.time()
+    for drive in glob.glob(os.path.join(mj_path, DRIVE_PATTERN)):
+        for tmp_file in glob.glob(os.path.join(drive, ".tmp_recover_*.bin")):
+            try:
+                mtime = os.path.getmtime(tmp_file)
+                if now - mtime > max_age:
+                    os.unlink(tmp_file)
+                    logger.info("Cleaned orphaned temp: %s", tmp_file)
+                    count += 1
+            except OSError:
+                continue
+    return count
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 
