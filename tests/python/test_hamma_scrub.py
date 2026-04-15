@@ -509,6 +509,30 @@ class TestDecodeGpsTime:
         assert result == "2025-03-05T11:19:43.500"
 
 
+class TestDetectUnitName:
+    """Test hostname-based unit name detection."""
+
+    def test_mjolnir41(self, hamma_scrub):
+        assert hamma_scrub.detect_unit_name("mjolnir41") == ("mj", "41")
+
+    def test_mjolnir05(self, hamma_scrub):
+        assert hamma_scrub.detect_unit_name("mjolnir05") == ("mj", "05")
+
+    def test_mjolnir2(self, hamma_scrub):
+        assert hamma_scrub.detect_unit_name("mjolnir2") == ("mj", "2")
+
+    def test_unknown_hostname(self, hamma_scrub):
+        assert hamma_scrub.detect_unit_name("raspberrypi") == ("recovered", "")
+
+    def test_empty_hostname(self, hamma_scrub):
+        assert hamma_scrub.detect_unit_name("") == ("recovered", "")
+
+    def test_auto_detect(self, hamma_scrub):
+        """With hostname=None, reads from socket.gethostname()."""
+        with patch("socket.gethostname", return_value="mjolnir42"):
+            assert hamma_scrub.detect_unit_name() == ("mj", "42")
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 

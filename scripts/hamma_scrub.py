@@ -17,9 +17,13 @@ import glob
 import json
 import logging
 import os
+import re
+import shutil
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,11 @@ DEFAULT_AGS_PATH = "/ags/data"
 DEFAULT_MJ_PATH = "/media/pi"
 DRIVE_PATTERN = "DATA??"
 DEFAULT_LIMIT = 20  # max missing trigger detail lines in human report (0 = no limit)
+
+# Recovery constants
+MIN_FREE_SPACE = 104857600  # 100MB minimum free space on target drive
+RECOVER_TIMEOUT = 60  # seconds per dd extraction
+ORPHAN_MAX_AGE = 3600  # seconds (1 hour) before orphaned temps are deleted
 
 # Exit codes
 EXIT_OK = 0
@@ -542,6 +551,27 @@ def decode_gps_time(header):
         return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}'.format(dt.microsecond // 1000)
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def detect_unit_name(hostname=None):
+    """Detect unit prefix and number from hostname.
+
+    Parameters
+    ----------
+    hostname : str or None
+        Override hostname for testing. If None, uses socket.gethostname().
+
+    Returns
+    -------
+    tuple of (str, str)
+        (prefix, unit) e.g. ("mj", "41"). Falls back to ("recovered", "").
+    """
+    if hostname is None:
+        hostname = socket.gethostname()
+    match = re.match(r'^mjolnir(\d+)$', hostname)
+    if match:
+        return ("mj", match.group(1))
+    return ("recovered", "")
 
 
 def format_human_report(results, limit=DEFAULT_LIMIT):
