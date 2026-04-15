@@ -589,6 +589,44 @@ class TestComputeTargetPath:
         assert filename.startswith("recovered_")
 
 
+class TestSelectTargetDrive:
+    """Test DATA drive selection for recovery writes."""
+
+    def test_single_drive_with_space(self, hamma_scrub, tmp_path):
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        result = hamma_scrub.select_target_drive(str(tmp_path))
+        assert result == str(drive)
+
+    def test_picks_drive_with_most_recent_data(self, hamma_scrub, tmp_path):
+        d37 = tmp_path / "DATA37"
+        (d37 / "2026-04-01T00").mkdir(parents=True)
+        d38 = tmp_path / "DATA38"
+        (d38 / "2026-04-10T14").mkdir(parents=True)
+        result = hamma_scrub.select_target_drive(str(tmp_path))
+        assert result == str(d38)
+
+    def test_no_drives(self, hamma_scrub, tmp_path):
+        result = hamma_scrub.select_target_drive(str(tmp_path))
+        assert result is None
+
+    def test_drive_with_no_subdirs(self, hamma_scrub, tmp_path):
+        (tmp_path / "DATA37").mkdir()
+        result = hamma_scrub.select_target_drive(str(tmp_path))
+        # Drive exists but has no hourly dirs; should still be returned
+        assert result == str(tmp_path / "DATA37")
+
+    def test_skips_compressed_subdir(self, hamma_scrub, tmp_path):
+        """The 'compressed' subdirectory should not affect drive ranking."""
+        d37 = tmp_path / "DATA37"
+        (d37 / "compressed" / "2099-12-31T23").mkdir(parents=True)
+        (d37 / "2026-04-01T00").mkdir(parents=True)
+        d38 = tmp_path / "DATA38"
+        (d38 / "2026-04-10T14").mkdir(parents=True)
+        result = hamma_scrub.select_target_drive(str(tmp_path))
+        assert result == str(d38)
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 

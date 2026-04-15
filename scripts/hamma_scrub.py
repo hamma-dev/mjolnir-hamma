@@ -611,6 +611,57 @@ def compute_target_path(header, offset, prefix, unit):
     return (subdir, filename)
 
 
+def select_target_drive(mj_path, min_free=MIN_FREE_SPACE):
+    """Select the best DATA drive for writing recovered triggers.
+
+    Picks the drive containing the most recent hourly directory.
+    Falls back to next drive with sufficient free space.
+
+    Parameters
+    ----------
+    mj_path : str
+        Base path (e.g., /media/pi).
+    min_free : int
+        Minimum free bytes required (default: MIN_FREE_SPACE).
+
+    Returns
+    -------
+    str or None
+        Full path to selected DATA drive, or None if no suitable drive.
+    """
+    pattern = os.path.join(mj_path, DRIVE_PATTERN)
+    drives = sorted(glob.glob(pattern))
+    if not drives:
+        return None
+
+    drive_info = []
+    for drive in drives:
+        most_recent = ""
+        try:
+            for entry in os.listdir(drive):
+                if entry == "compressed":
+                    continue
+                full = os.path.join(drive, entry)
+                if os.path.isdir(full) and entry > most_recent:
+                    most_recent = entry
+        except OSError:
+            continue
+        drive_info.append((drive, most_recent))
+
+    # Sort by most recent directory descending
+    drive_info.sort(key=lambda x: x[1], reverse=True)
+
+    for drive, _ in drive_info:
+        try:
+            usage = shutil.disk_usage(drive)
+            if usage.free >= min_free:
+                return drive
+        except OSError:
+            continue
+
+    return None
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 
