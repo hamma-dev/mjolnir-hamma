@@ -740,6 +740,66 @@ def verify_trigger(data, expected_size):
     return (True, "")
 
 
+def filter_recovery_candidates(missing_entries, ags_entries, since_cutoff=None):
+    """Filter missing entries to determine which should be recovered.
+
+    Skips the last trigger in the lexicographically newest AGS file
+    (may be actively written) and triggers with GPS time before the
+    --since cutoff.
+
+    Parameters
+    ----------
+    missing_entries : list of dict
+        Missing entries from compare_headers().
+    ags_entries : list of dict
+        All AGS entries (to identify active file).
+    since_cutoff : str or None
+        Normalized since cutoff ('YYYY-MM-DDTHH').
+
+    Returns
+    -------
+    list of dict
+        Each dict is a copy of the missing entry with added keys:
+        'skip_reason' (None or string), 'skip_status' (None, 'skipped',
+        or 'skipped_before_since').
+    """
+    # Identify last trigger in newest AGS file
+    active_trigger = None
+    if ags_entries:
+        newest_file = max(e["filename"] for e in ags_entries)
+        newest_entries = [e for e in ags_entries if e["filename"] == newest_file]
+        if newest_entries:
+            last = max(newest_entries, key=lambda e: e["offset"])
+            active_trigger = (last["filename"], last["offset"])
+
+    results = []
+    for entry in missing_entries:
+        entry_copy = dict(entry)
+        key = (entry["filename"], entry["offset"])
+
+        if active_trigger and key == active_trigger:
+            entry_copy["skip_reason"] = "last trigger in active file"
+            entry_copy["skip_status"] = "skipped"
+            results.append(entry_copy)
+            continue
+
+        if since_cutoff:
+            gps_str = decode_gps_time(entry["header"])
+            if gps_str is not None:
+                gps_dir = gps_str[:13]
+                if gps_dir < since_cutoff:
+                    entry_copy["skip_reason"] = "before --since cutoff"
+                    entry_copy["skip_status"] = "skipped_before_since"
+                    results.append(entry_copy)
+                    continue
+
+        entry_copy["skip_reason"] = None
+        entry_copy["skip_status"] = None
+        results.append(entry_copy)
+
+    return results
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 

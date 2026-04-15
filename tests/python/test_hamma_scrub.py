@@ -720,6 +720,88 @@ class TestVerifyTrigger:
         assert "size mismatch" in err
 
 
+class TestFilterRecoveryCandidates:
+    """Test filtering of recovery candidates."""
+
+    def _make_entry(self, filename, offset, index, bad_gps=False):
+        """Build a mock AGS entry."""
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        if not bad_gps:
+            # Set GPS fields for 2026-04-04T01:13:50.808
+            struct.pack_into('<f', header, 80, 522847.0)
+            struct.pack_into('<h', header, 84, 2412)
+            struct.pack_into('<f', header, 86, 18.0)
+            struct.pack_into('<I', header, 94, 808000000)
+            struct.pack_into('<I', header, 98, 1000000000)
+        return {
+            "header": bytes(header),
+            "filename": filename,
+            "offset": offset,
+            "index": index,
+        }
+
+    def test_no_filtering_needed(self, hamma_scrub):
+        """All candidates are recoverable when not in newest file's last trigger."""
+        entry = self._make_entry("ags_aaa.bin", 0, 0)
+        all_ags = [
+            self._make_entry("ags_aaa.bin", 0, 0),
+            self._make_entry("ags_zzz.bin", 0, 0),
+            self._make_entry("ags_zzz.bin", 22000132, 1),
+        ]
+        result = hamma_scrub.filter_recovery_candidates([entry], all_ags)
+        assert len(result) == 1
+        assert result[0]["skip_reason"] is None
+
+    def test_skips_last_trigger_in_newest_file(self, hamma_scrub):
+        """Last trigger in lexicographically newest AGS file is skipped."""
+        last_entry = self._make_entry("ags_zzz.bin", 22000132, 1)
+        all_ags = [
+            self._make_entry("ags_zzz.bin", 0, 0),
+            last_entry,
+        ]
+        result = hamma_scrub.filter_recovery_candidates([last_entry], all_ags)
+        assert len(result) == 1
+        assert result[0]["skip_reason"] is not None
+        assert "active" in result[0]["skip_reason"]
+
+    def test_since_skips_old_triggers(self, hamma_scrub):
+        """Triggers with GPS time before --since cutoff are skipped."""
+        # GPS decodes to 2026-04-04T01:...
+        entry = self._make_entry("ags_aaa.bin", 0, 0)
+        all_ags = [entry, self._make_entry("ags_zzz.bin", 0, 0)]
+        result = hamma_scrub.filter_recovery_candidates(
+            [entry], all_ags, since_cutoff="2026-04-10T00",
+        )
+        assert len(result) == 1
+        assert "since" in result[0]["skip_reason"]
+
+    def test_since_keeps_new_triggers(self, hamma_scrub):
+        """Triggers at/after --since cutoff are kept."""
+        entry = self._make_entry("ags_aaa.bin", 0, 0)
+        all_ags = [entry, self._make_entry("ags_zzz.bin", 0, 0)]
+        result = hamma_scrub.filter_recovery_candidates(
+            [entry], all_ags, since_cutoff="2026-04-01T00",
+        )
+        assert len(result) == 1
+        assert result[0]["skip_reason"] is None
+
+    def test_bad_gps_still_recovered_with_since(self, hamma_scrub):
+        """Bad GPS triggers are recovered even with --since (can't determine time)."""
+        entry = self._make_entry("ags_aaa.bin", 0, 0, bad_gps=True)
+        all_ags = [entry, self._make_entry("ags_zzz.bin", 0, 0)]
+        result = hamma_scrub.filter_recovery_candidates(
+            [entry], all_ags, since_cutoff="2026-04-10T00",
+        )
+        assert len(result) == 1
+        assert result[0]["skip_reason"] is None
+
+    def test_empty_input(self, hamma_scrub):
+        result = hamma_scrub.filter_recovery_candidates([], [])
+        assert result == []
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 
