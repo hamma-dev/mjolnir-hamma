@@ -1227,6 +1227,9 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     int
         Exit code.
     """
+    if dry_run and not recover:
+        logger.warning("--dry-run has no effect without --recover")
+
     # Parse --since into normalized directory prefix
     since_cutoff = None
     if since:
