@@ -843,6 +843,166 @@ class TestCleanupOrphanedTemps:
         assert normal_file.exists()
 
 
+class TestRecoverTriggers:
+    """Test the recovery orchestrator."""
+
+    def _make_candidate(self, hamma_scrub, skip_reason=None, skip_status=None, bad_gps=False):
+        """Build a candidate entry with proper header."""
+        header = bytearray(128)
+        header[0:4] = SYNC_MARKER
+        struct.pack_into('<I', header, 10, TEST_DATASIZE)
+        if not bad_gps:
+            struct.pack_into('<f', header, 80, 522847.0)
+            struct.pack_into('<h', header, 84, 2412)
+            struct.pack_into('<f', header, 86, 18.0)
+            struct.pack_into('<I', header, 94, 808000000)
+            struct.pack_into('<I', header, 98, 1000000000)
+        return {
+            "header": bytes(header),
+            "filename": "agsfile.bin",
+            "offset": 0,
+            "index": 0,
+            "skip_reason": skip_reason,
+            "skip_status": skip_status,
+        }
+
+    def test_dry_run(self, hamma_scrub, tmp_path):
+        """Dry run produces dry_run status without extracting."""
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        candidate = self._make_candidate(hamma_scrub)
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path), dry_run=True,
+            )
+        assert len(results) == 1
+        assert results[0]["status"] == "dry_run"
+        assert results[0]["target_path"] is not None
+
+    def test_skipped_candidate(self, hamma_scrub, tmp_path):
+        """Candidates with skip_reason produce skipped status."""
+        candidate = self._make_candidate(
+            hamma_scrub,
+            skip_reason="before --since cutoff",
+            skip_status="skipped_before_since",
+        )
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "skipped_before_since"
+
+    def test_skipped_active_file(self, hamma_scrub, tmp_path):
+        candidate = self._make_candidate(
+            hamma_scrub,
+            skip_reason="last trigger in active file",
+            skip_status="skipped",
+        )
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "skipped"
+
+    def test_successful_recovery(self, hamma_scrub, tmp_path):
+        """Full recovery: extract, verify, write."""
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        candidate = self._make_candidate(hamma_scrub)
+
+        size = 128 + TEST_DATASIZE * 2 + 4
+        fake_data = SYNC_MARKER + b'\x00' * (size - 4)
+
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")), \
+             patch.object(hamma_scrub, "extract_trigger", return_value=fake_data):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "recovered"
+        # Verify file was actually written
+        target = os.path.join(str(tmp_path), results[0]["target_path"])
+        assert os.path.exists(target)
+        assert os.path.getsize(target) == size
+
+    def test_extraction_failure(self, hamma_scrub, tmp_path):
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        candidate = self._make_candidate(hamma_scrub)
+
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")), \
+             patch.object(hamma_scrub, "extract_trigger", return_value=None):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "failed"
+
+    def test_verification_failure(self, hamma_scrub, tmp_path):
+        """Bad sync marker in extracted data -> failed."""
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        candidate = self._make_candidate(hamma_scrub)
+
+        size = 128 + TEST_DATASIZE * 2 + 4
+        bad_data = b'\x00' * size  # no sync marker
+
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")), \
+             patch.object(hamma_scrub, "extract_trigger", return_value=bad_data):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "failed"
+        assert "sync marker" in results[0]["error"]
+
+    def test_no_drive_space(self, hamma_scrub, tmp_path):
+        """No drive with sufficient space -> failed."""
+        candidate = self._make_candidate(hamma_scrub)
+        # No DATA drives at tmp_path
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "failed"
+        assert "space" in results[0]["error"]
+
+    def test_file_already_exists_skipped(self, hamma_scrub, tmp_path):
+        """If target file already exists, skip (idempotent)."""
+        drive = tmp_path / "DATA37"
+        candidate = self._make_candidate(hamma_scrub)
+        # Pre-compute target path to create the file in advance
+        gps_str = hamma_scrub.decode_gps_time(candidate["header"])
+        subdir = gps_str[:13]
+        target_dir = drive / subdir
+        target_dir.mkdir(parents=True)
+        # Create a file that would match the target
+        ts = gps_str[0:10] + '_' + gps_str[11:].replace(':', '-').replace('.', '-')
+        target_file = target_dir / "mj41_{}_recovered.bin".format(ts)
+        target_file.write_bytes(b'\x00' * 100)
+
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "skipped"
+        assert "exists" in results[0]["error"]
+
+    def test_bad_gps_writes_to_unknown(self, hamma_scrub, tmp_path):
+        """Bad GPS trigger goes to unknown/ subdirectory."""
+        drive = tmp_path / "DATA37"
+        (drive / "2026-04-10T14").mkdir(parents=True)
+        candidate = self._make_candidate(hamma_scrub, bad_gps=True)
+
+        size = 128 + TEST_DATASIZE * 2 + 4
+        fake_data = SYNC_MARKER + b'\x00' * (size - 4)
+
+        with patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")), \
+             patch.object(hamma_scrub, "extract_trigger", return_value=fake_data):
+            results = hamma_scrub.recover_triggers(
+                [candidate], "hamma", "/ags/data", str(tmp_path),
+            )
+        assert results[0]["status"] == "recovered"
+        assert "unknown" in results[0]["target_path"]
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 

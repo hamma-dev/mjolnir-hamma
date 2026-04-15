@@ -830,6 +830,190 @@ def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
     return count
 
 
+def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
+    """Recover missing triggers from AGS to MJ DATA drives.
+
+    Parameters
+    ----------
+    candidates : list of dict
+        From filter_recovery_candidates(), each with 'skip_reason' and
+        'skip_status' keys.
+    ags_host : str
+        SSH host for AGS sensor.
+    ags_path : str
+        AGS data directory on sensor.
+    mj_path : str
+        Base path for DATA drives.
+    dry_run : bool
+        If True, report what would be recovered without transferring.
+
+    Returns
+    -------
+    list of dict
+        Each with keys: source_file, source_offset, trigger_index,
+        target_path, size, status, error.
+    """
+    prefix, unit = detect_unit_name()
+    results = []
+
+    for candidate in candidates:
+        src_file = candidate["filename"]
+        src_offset = candidate["offset"]
+        trig_idx = candidate["index"]
+
+        # Handle skipped candidates
+        if candidate["skip_reason"]:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": None,
+                "size": 0,
+                "status": candidate["skip_status"],
+                "error": candidate["skip_reason"],
+            })
+            continue
+
+        # Compute extraction size from header
+        datasize = struct.unpack_from(
+            DATASIZE_FORMAT, candidate["header"], DATASIZE_OFFSET,
+        )[0]
+        size = HEADER_SIZE + datasize * 2 + PACKET_PAD
+
+        # Compute target path
+        subdir, filename = compute_target_path(
+            candidate["header"], src_offset, prefix, unit,
+        )
+
+        # Select drive (re-check free space per trigger)
+        drive = select_target_drive(mj_path)
+        if drive is None:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": None,
+                "size": size,
+                "status": "failed",
+                "error": "no drive with sufficient free space",
+            })
+            continue
+
+        target_dir = os.path.join(drive, subdir)
+        target_path = os.path.join(target_dir, filename)
+        rel_target = os.path.relpath(target_path, mj_path)
+
+        if dry_run:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "dry_run",
+                "error": None,
+            })
+            continue
+
+        # Check if already exists (idempotent)
+        if os.path.exists(target_path):
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "skipped",
+                "error": "file already exists",
+            })
+            continue
+
+        # Extract trigger via SSH dd
+        data = extract_trigger(ags_host, ags_path, src_file, src_offset, size)
+        if data is None:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "failed",
+                "error": "dd extraction failed",
+            })
+            continue
+
+        # Verify extracted data
+        ok, err = verify_trigger(data, size)
+        if not ok:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "failed",
+                "error": err,
+            })
+            continue
+
+        # Atomic write: temp file on target drive, then rename
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".tmp_recover_", suffix=".bin", dir=drive,
+            )
+            try:
+                os.write(fd, data)
+                os.close(fd)
+                fd = None
+                # Race check: another process may have created the file
+                if os.path.exists(target_path):
+                    os.unlink(tmp_path)
+                    results.append({
+                        "source_file": src_file,
+                        "source_offset": src_offset,
+                        "trigger_index": trig_idx,
+                        "target_path": rel_target,
+                        "size": size,
+                        "status": "skipped",
+                        "error": "file already exists",
+                    })
+                    continue
+                os.rename(tmp_path, target_path)
+            except Exception:
+                if fd is not None:
+                    os.close(fd)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "recovered",
+                "error": None,
+            })
+            logger.info("Recovered: %s", rel_target)
+
+        except OSError as e:
+            results.append({
+                "source_file": src_file,
+                "source_offset": src_offset,
+                "trigger_index": trig_idx,
+                "target_path": rel_target,
+                "size": size,
+                "status": "failed",
+                "error": str(e),
+            })
+
+    return results
+
+
 def format_human_report(results, limit=DEFAULT_LIMIT):
     """Format results as human-readable report text.
 
