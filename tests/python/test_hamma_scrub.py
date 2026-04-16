@@ -1029,6 +1029,33 @@ class TestRecoverTriggers:
         assert results[0]["status"] == "skipped"
         assert "exists" in results[0]["error"]
 
+    def test_result_includes_header(self, hamma_scrub, tmp_path):
+        """Each recovery result dict includes the trigger's header bytes."""
+        header, payload_pad = _make_trigger()
+
+        candidates = [{
+            "filename": "ags001.bin",
+            "offset": 0,
+            "index": 0,
+            "header": header,
+            "skip_status": None,
+            "skip_reason": None,
+        }]
+
+        # Create a DATA_1 drive with enough space
+        drive = tmp_path / "DATA_1"
+        drive.mkdir()
+
+        mock_data = header + payload_pad
+        with patch.object(hamma_scrub, "extract_trigger", return_value=mock_data), \
+             patch.object(hamma_scrub, "detect_unit_name", return_value=("mj", "41")), \
+             patch.object(hamma_scrub, "select_target_drive", return_value=str(drive)):
+            results = hamma_scrub.recover_triggers(
+                candidates, "hamma", "/ags/data", str(tmp_path), dry_run=False,
+            )
+
+        assert results[0]["header"] == header
+
     def test_bad_gps_writes_to_unknown(self, hamma_scrub, tmp_path):
         """Bad GPS trigger goes to unknown/ subdirectory."""
         drive = tmp_path / "DATA37"

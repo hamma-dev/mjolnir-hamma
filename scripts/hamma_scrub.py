@@ -901,6 +901,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": 0,
                 "status": candidate["skip_status"],
                 "error": candidate["skip_reason"],
+                "header": candidate["header"],
             })
             continue
 
@@ -926,6 +927,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "failed",
                 "error": "no drive with sufficient free space",
+                "header": candidate["header"],
             })
             continue
 
@@ -942,6 +944,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "dry_run",
                 "error": None,
+                "header": candidate["header"],
             })
             continue
 
@@ -955,6 +958,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "skipped",
                 "error": "file already exists",
+                "header": candidate["header"],
             })
             continue
 
@@ -969,6 +973,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "failed",
                 "error": "dd extraction failed",
+                "header": candidate["header"],
             })
             continue
 
@@ -983,6 +988,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "failed",
                 "error": err,
+                "header": candidate["header"],
             })
             continue
 
@@ -1007,6 +1013,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                         "size": size,
                         "status": "skipped",
                         "error": "file already exists",
+                        "header": candidate["header"],
                     })
                     continue
                 os.rename(tmp_path, target_path)
@@ -1027,6 +1034,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "recovered",
                 "error": None,
+                "header": candidate["header"],
             })
             logger.info("Recovered: %s", rel_target)
 
@@ -1039,6 +1047,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
                 "size": size,
                 "status": "failed",
                 "error": str(e),
+                "header": candidate["header"],
             })
 
     return results
