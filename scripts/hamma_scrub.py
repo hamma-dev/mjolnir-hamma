@@ -830,6 +830,100 @@ def filter_recovery_candidates(missing_entries, ags_entries, since_cutoff=None):
     return results
 
 
+def identify_purgeable_files(ags_entries, mj_headers, recovery_results=None):
+    """Identify AGS files safe to delete.
+
+    A file is purgeable when every trigger in it is confirmed on MJ
+    (by header match or safe recovery status) and it is not the
+    lexicographically newest file (which may be actively written).
+
+    Parameters
+    ----------
+    ags_entries : list of dict
+        From scan_ags_files(), each with filename, offset, index, header.
+    mj_headers : set of bytes
+        128-byte headers confirmed on MJ (already updated post-recovery).
+    recovery_results : list of dict or None
+        From recover_triggers(), each with status, source_file,
+        source_offset, header, error. None if no recovery was needed.
+
+    Returns
+    -------
+    dict
+        purgeable: sorted list of filenames safe to delete.
+        retained: list of dict with filename and reason.
+    """
+    if not ags_entries:
+        return {"purgeable": [], "retained": []}
+
+    # Group entries by filename
+    files = {}
+    for entry in ags_entries:
+        fname = entry["filename"]
+        if fname not in files:
+            files[fname] = []
+        files[fname].append(entry)
+
+    # Build recovery result lookup: (source_file, source_offset) -> result
+    recovery_lookup = {}
+    if recovery_results:
+        for r in recovery_results:
+            key = (r["source_file"], r["source_offset"])
+            recovery_lookup[key] = r
+
+    # Newest file (lexicographically) is never purgeable
+    newest = sorted(files.keys())[-1]
+
+    purgeable = []
+    retained = []
+
+    for fname in sorted(files.keys()):
+        if fname == newest:
+            retained.append({"filename": fname, "reason": "active file"})
+            continue
+
+        triggers = files[fname]
+        total = len(triggers)
+        unconfirmed = 0
+        failed_count = 0
+
+        for entry in triggers:
+            if entry["header"] in mj_headers:
+                continue
+            # Header not in mj_headers — check recovery result
+            key = (fname, entry["offset"])
+            r = recovery_lookup.get(key)
+            if r is not None:
+                if r["status"] == "recovered":
+                    continue
+                if (r["status"] == "skipped"
+                        and r.get("error") == "file already exists"):
+                    continue
+                # Unsafe status
+                if r["status"] == "failed":
+                    failed_count += 1
+                else:
+                    unconfirmed += 1
+            else:
+                unconfirmed += 1
+
+        if unconfirmed == 0 and failed_count == 0:
+            purgeable.append(fname)
+        else:
+            parts = []
+            if unconfirmed > 0:
+                parts.append("{}/{} triggers not on MJ".format(
+                    unconfirmed, total))
+            if failed_count > 0:
+                parts.append("{} recovery failed".format(failed_count))
+            retained.append({
+                "filename": fname,
+                "reason": ", ".join(parts),
+            })
+
+    return {"purgeable": purgeable, "retained": retained}
+
+
 def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
     """Delete orphaned .tmp_recover_*.bin files older than max_age.
 

@@ -1074,6 +1074,212 @@ class TestRecoverTriggers:
         assert "unknown" in results[0]["target_path"]
 
 
+class TestIdentifyPurgeableFiles:
+    """Test AGS file purge eligibility logic."""
+
+    def test_all_matched_is_purgeable(self, hamma_scrub):
+        """File with all triggers in mj_headers is purgeable."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1, h2}
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results=None,
+        )
+
+        assert result["purgeable"] == ["ags001.bin"]
+        assert len(result["retained"]) == 1
+        assert result["retained"][0]["filename"] == "ags002.bin"
+        assert "active" in result["retained"][0]["reason"].lower()
+
+    def test_some_missing_retained(self, hamma_scrub):
+        """File with unmatched triggers is retained."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        h3 = b'\x03' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h3},
+        ]
+        mj_headers = {h1}
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results=None,
+        )
+
+        assert result["purgeable"] == []
+        reasons = {r["filename"]: r["reason"] for r in result["retained"]}
+        assert "1/2 triggers not on MJ" in reasons["ags001.bin"]
+        assert reasons["ags002.bin"] == "active file"
+
+    def test_recovery_failure_retains(self, hamma_scrub):
+        """File with a failed recovery is retained."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+        recovery_results = [{
+            "source_file": "ags001.bin",
+            "source_offset": 1000,
+            "status": "failed",
+            "header": h2,
+            "error": "dd extraction failed",
+        }]
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results,
+        )
+
+        assert result["purgeable"] == []
+        reasons = {r["filename"]: r["reason"] for r in result["retained"]}
+        assert "1 recovery failed" in reasons["ags001.bin"]
+
+    def test_newest_file_always_retained(self, hamma_scrub):
+        """Lexicographically newest file is always retained."""
+        h1 = b'\x01' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results=None,
+        )
+
+        assert result["purgeable"] == []
+        assert result["retained"][0]["reason"] == "active file"
+
+    def test_recovery_results_none(self, hamma_scrub):
+        """None recovery_results evaluates purely on header matching."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h2},
+        ]
+        mj_headers = {h1, h2}
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results=None,
+        )
+
+        assert result["purgeable"] == ["ags001.bin"]
+
+    def test_empty_entries(self, hamma_scrub):
+        """Empty ags_entries returns empty results."""
+        result = hamma_scrub.identify_purgeable_files(
+            [], set(), recovery_results=None,
+        )
+        assert result["purgeable"] == []
+        assert result["retained"] == []
+
+    def test_skipped_before_since_retains(self, hamma_scrub):
+        """Trigger with skipped_before_since status retains the file."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+        recovery_results = [{
+            "source_file": "ags001.bin",
+            "source_offset": 1000,
+            "status": "skipped_before_since",
+            "header": h2,
+            "error": "before --since cutoff",
+        }]
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results,
+        )
+
+        assert result["purgeable"] == []
+
+    def test_dry_run_status_retains(self, hamma_scrub):
+        """Trigger with dry_run status retains the file."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+        recovery_results = [{
+            "source_file": "ags001.bin",
+            "source_offset": 1000,
+            "status": "dry_run",
+            "header": h2,
+            "error": None,
+        }]
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results,
+        )
+
+        assert result["purgeable"] == []
+
+    def test_skipped_file_exists_is_safe(self, hamma_scrub):
+        """Trigger skipped because file already exists is safe for purge."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+        recovery_results = [{
+            "source_file": "ags001.bin",
+            "source_offset": 1000,
+            "status": "skipped",
+            "header": h2,
+            "error": "file already exists",
+        }]
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results,
+        )
+
+        assert "ags001.bin" in result["purgeable"]
+
+    def test_skipped_active_guard_retains(self, hamma_scrub):
+        """Trigger skipped by active file guard retains the file."""
+        h1 = b'\x01' * 128
+        h2 = b'\x02' * 128
+        ags_entries = [
+            {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            {"filename": "ags001.bin", "offset": 1000, "index": 1, "header": h2},
+            {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+        ]
+        mj_headers = {h1}
+        recovery_results = [{
+            "source_file": "ags001.bin",
+            "source_offset": 1000,
+            "status": "skipped",
+            "header": h2,
+            "error": "last trigger in active file",
+        }]
+
+        result = hamma_scrub.identify_purgeable_files(
+            ags_entries, mj_headers, recovery_results,
+        )
+
+        assert result["purgeable"] == []
+
+
 class TestRecoveryReport:
     """Test recovery sections in human and JSON reports."""
 
