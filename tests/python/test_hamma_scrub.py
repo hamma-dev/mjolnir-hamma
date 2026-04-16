@@ -1448,12 +1448,14 @@ class TestRecoveryReport:
             "size": 22000132,
             "status": "recovered",
             "error": None,
+            "header": b'\x00' * 128,
         }]
         j = hamma_scrub.format_json_report(results, "hamma", recovery=recovery)
         parsed = json.loads(j)
         assert "recovery" in parsed
         assert len(parsed["recovery"]) == 1
         assert parsed["recovery"][0]["status"] == "recovered"
+        assert "header" not in parsed["recovery"][0]
 
     def test_json_report_no_recovery(self, hamma_scrub):
         """No recovery parameter -> no recovery key in JSON."""

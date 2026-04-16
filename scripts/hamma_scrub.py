@@ -1372,7 +1372,11 @@ def format_json_report(results, ags_host, recovery=None, purge=None):
         "warnings": results.get("warnings", []),
     }
     if recovery is not None:
-        report["recovery"] = recovery
+        # Strip binary header bytes — not JSON-serializable
+        report["recovery"] = [
+            {k: v for k, v in r.items() if k != "header"}
+            for r in recovery
+        ]
     if purge is not None:
         report["purge"] = purge
     return json.dumps(report, indent=2)
@@ -1553,8 +1557,6 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
 
         deleted_names = [d["filename"] for d in purge_deletions
                          if d["status"] == "deleted"]
-        dry_names = [d["filename"] for d in purge_deletions
-                     if d["status"] == "dry_run"]
         failed_purge = [d for d in purge_deletions
                         if d["status"] == "failed"]
 
