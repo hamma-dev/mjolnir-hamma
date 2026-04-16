@@ -343,19 +343,46 @@ class TestStriderProtocol:
 class TestScanAgsFiles:
     """Test SSH-based AGS scanning."""
 
-    def test_calls_ssh_with_strider(self, hamma_scrub):
-        """scan_ags_files runs ssh with python3 via stdin piping."""
+    def test_deploys_strider_via_scp_then_runs(self, hamma_scrub):
+        """scan_ags_files deploys strider via SCP, then runs via SSH."""
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = b''
         mock_result.stderr = b''
 
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
+        with patch("subprocess.run", return_value=mock_result) as mock_run, \
+             patch("tempfile.mkstemp",
+                   return_value=(99, "/tmp/local_strider.py")), \
+             patch("os.write") as mock_write, \
+             patch("os.close") as mock_close, \
+             patch("os.path.exists", return_value=True), \
+             patch("os.unlink") as mock_unlink:
             result = hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
 
-        cmd = mock_run.call_args[0][0]
-        assert cmd == ["ssh", "10.10.10.1", "python3 - /ags/data"]
-        assert mock_run.call_args[1]["input"] == hamma_scrub.STRIDER_SCRIPT.encode('utf-8')
+        # Two subprocess.run calls: SCP deploy + SSH run
+        assert mock_run.call_count == 2
+        scp_call = mock_run.call_args_list[0]
+        run_call = mock_run.call_args_list[1]
+
+        # SCP deploys the strider script
+        assert scp_call[0][0] == [
+            "scp", "-q", "/tmp/local_strider.py",
+            "10.10.10.1:/tmp/hamma_strider.py",
+        ]
+
+        # SSH runs the deployed script (no stdin piping)
+        assert run_call[0][0] == [
+            "ssh", "10.10.10.1",
+            "python3 /tmp/hamma_strider.py /ags/data; "
+            "rm -f /tmp/hamma_strider.py",
+        ]
+
+        # Local temp file written and cleaned up
+        mock_write.assert_called_once_with(
+            99, hamma_scrub.STRIDER_SCRIPT.encode('utf-8'))
+        mock_close.assert_called_once_with(99)
+        mock_unlink.assert_called_once_with("/tmp/local_strider.py")
+
         assert len(result["entries"]) == 0
 
     def test_decodes_strider_output(self, hamma_scrub):
@@ -379,14 +406,31 @@ class TestScanAgsFiles:
         assert result["entries"][0]["filename"] == "test.bin"
         assert len(result["headers"]) == 1
 
-    def test_ssh_failure_raises(self, hamma_scrub):
-        """SSH failure raises RuntimeError."""
-        mock_result = MagicMock()
-        mock_result.returncode = 255
-        mock_result.stdout = b''
-        mock_result.stderr = b'Connection refused'
+    def test_scp_failure_raises(self, hamma_scrub):
+        """SCP deploy failure raises RuntimeError."""
+        fail_result = MagicMock()
+        fail_result.returncode = 1
+        fail_result.stdout = b''
+        fail_result.stderr = b'No route to host'
 
-        with patch("subprocess.run", return_value=mock_result):
+        with patch("subprocess.run", return_value=fail_result):
+            with pytest.raises(RuntimeError, match="Failed to deploy strider"):
+                hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+
+    def test_ssh_run_failure_raises(self, hamma_scrub):
+        """SSH run failure (after successful deploy) raises RuntimeError."""
+        ok_result = MagicMock()
+        ok_result.returncode = 0
+        ok_result.stdout = b''
+        ok_result.stderr = b''
+
+        fail_result = MagicMock()
+        fail_result.returncode = 255
+        fail_result.stdout = b''
+        fail_result.stderr = b'Connection refused'
+
+        with patch("subprocess.run",
+                   side_effect=[ok_result, fail_result]):
             with pytest.raises(RuntimeError, match="Connection refused"):
                 hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
 

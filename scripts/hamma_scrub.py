@@ -421,12 +421,43 @@ def scan_ags_files(ags_host, ags_path):
     """
     t0 = time.time()
 
-    cmd = ["ssh", ags_host, "python3 - " + ags_path]
-    logger.debug("Running: %s", " ".join(cmd))
+    # Deploy strider to AGS as a temp file, then run it. We avoid piping
+    # the script via stdin (ssh host "python3 -") because that crashes
+    # the AGS SSH daemon.
+    remote_script = "/tmp/hamma_strider.py"
+    local_tmp = None
+    try:
+        fd, local_tmp = tempfile.mkstemp(suffix='.py', prefix='hamma_strider_')
+        os.write(fd, STRIDER_SCRIPT.encode('utf-8'))
+        os.close(fd)
+
+        scp_cmd = ["scp", "-q", local_tmp,
+                   "{host}:{path}".format(host=ags_host, path=remote_script)]
+        logger.debug("Deploying strider: %s", " ".join(scp_cmd))
+        deploy = subprocess.run(
+            scp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if deploy.returncode != 0:
+            stderr = deploy.stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError(
+                "Failed to deploy strider to {host}: {err}".format(
+                    host=ags_host, err=stderr,
+                )
+            )
+    finally:
+        if local_tmp is not None and os.path.exists(local_tmp):
+            os.unlink(local_tmp)
+
+    run_cmd = ["ssh", ags_host,
+               "python3 {script} {path}; rm -f {script}".format(
+                   script=remote_script, path=ags_path)]
+    logger.debug("Running: %s", " ".join(run_cmd))
 
     result = subprocess.run(
-        cmd,
-        input=STRIDER_SCRIPT.encode('utf-8'),
+        run_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=3600,
