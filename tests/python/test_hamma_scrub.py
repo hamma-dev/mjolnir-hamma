@@ -1593,6 +1593,18 @@ class TestCLI:
         assert args.recover is True
         assert args.dry_run is True
 
+    def test_purge_flag(self, hamma_scrub):
+        """--purge flag is parsed."""
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args(["--recover", "--purge"])
+        assert args.purge is True
+
+    def test_purge_default(self, hamma_scrub):
+        """--purge defaults to False."""
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args([])
+        assert args.purge is False
+
 
 class TestMain:
     """Test main() integration."""
@@ -1755,3 +1767,11 @@ class TestMain:
             rc = hamma_scrub.run("hamma", "/ags/data", "/media/pi")
         assert rc == 1
         mock_recover.assert_not_called()
+
+    def test_purge_without_recover_errors(self, hamma_scrub):
+        """--purge without --recover returns error exit code (early exit, no scanning)."""
+        rc = hamma_scrub.run(
+            "hamma", "/ags/data", "/home/pi/data",
+            purge=True, recover=False,
+        )
+        assert rc == hamma_scrub.EXIT_NO_DATA

@@ -1398,11 +1398,16 @@ def _build_parser():
         "--recover", action="store_true",
         help="After scan, extract missing triggers from AGS to MJ DATA drives",
     )
+    parser.add_argument(
+        "--purge", action="store_true",
+        help="After recovery, delete AGS files fully confirmed on MJ (requires --recover)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
-        limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False):
+        limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
+        purge=False):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1422,6 +1427,8 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         If True, extract missing triggers from AGS to MJ DATA drives.
     dry_run : bool
         If True, show what would be recovered without transferring.
+    purge : bool
+        If True, delete AGS files fully confirmed on MJ after recovery.
 
     Returns
     -------
@@ -1430,6 +1437,10 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     """
     if dry_run and not recover:
         logger.warning("--dry-run has no effect without --recover")
+
+    if purge and not recover:
+        logger.error("--purge requires --recover")
+        return EXIT_NO_DATA
 
     # Parse --since into normalized directory prefix
     since_cutoff = None
@@ -1532,6 +1543,7 @@ def main():
         since=args.since,
         recover=args.recover,
         dry_run=args.dry_run,
+        purge=args.purge,
     )
     sys.exit(rc)
 
