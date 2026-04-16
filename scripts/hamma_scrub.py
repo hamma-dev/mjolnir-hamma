@@ -1531,14 +1531,62 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         if failed_count:
             logger.warning("Recovery: %d failed", failed_count)
 
+    # Update mj_headers with recovered triggers
+    if recovery_results:
+        for r in recovery_results:
+            if r["status"] == "recovered":
+                mj["headers"].add(r["header"])
+
+    # Purge flow
+    purge_results = None
+    if purge:
+        eligibility = identify_purgeable_files(
+            ags["entries"], mj["headers"], recovery_results,
+        )
+        if eligibility["purgeable"]:
+            purge_deletions = purge_ags_files(
+                ags_host, ags_path, eligibility["purgeable"],
+                dry_run=dry_run,
+            )
+        else:
+            purge_deletions = []
+
+        deleted_names = [d["filename"] for d in purge_deletions
+                         if d["status"] == "deleted"]
+        dry_names = [d["filename"] for d in purge_deletions
+                     if d["status"] == "dry_run"]
+        failed_purge = [d for d in purge_deletions
+                        if d["status"] == "failed"]
+
+        if deleted_names:
+            logger.info("Purge: deleted %d AGS files", len(deleted_names))
+        if failed_purge:
+            logger.warning("Purge: %d deletions failed", len(failed_purge))
+
+        # Normalize to flat filename lists for reports (matching spec JSON shape)
+        purge_results = {
+            "deleted": [d["filename"] for d in purge_deletions
+                        if d["status"] in ("deleted", "dry_run")],
+            "failed": [{"filename": d["filename"], "error": d["error"]}
+                       for d in purge_deletions if d["status"] == "failed"],
+            "retained": eligibility["retained"],
+            "dry_run": dry_run,
+        }
+
     if json_output:
-        print(format_json_report(results, ags_host, recovery=recovery_results))
+        print(format_json_report(results, ags_host,
+                                 recovery=recovery_results,
+                                 purge=purge_results))
     else:
-        print(format_human_report(results, limit=limit, recovery=recovery_results))
+        print(format_human_report(results, limit=limit,
+                                  recovery=recovery_results,
+                                  purge=purge_results))
 
     if output_file:
         with open(output_file, 'w') as f:
-            f.write(format_json_report(results, ags_host, recovery=recovery_results))
+            f.write(format_json_report(results, ags_host,
+                                       recovery=recovery_results,
+                                       purge=purge_results))
         logger.info("JSON report written to %s", output_file)
 
     if comparison["missing_on_mj"]:

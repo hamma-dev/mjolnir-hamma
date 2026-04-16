@@ -1822,6 +1822,7 @@ class TestMain:
             "target_path": "DATA37/test/recovered.bin",
             "size": 100,
             "status": "recovered",
+            "header": hdr,
             "error": None,
         }]
         with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
@@ -1874,3 +1875,113 @@ class TestMain:
             purge=True, recover=False,
         )
         assert rc == hamma_scrub.EXIT_NO_DATA
+
+    def test_run_with_purge_calls_purge(self, hamma_scrub):
+        """run() with purge=True calls identify_purgeable_files and purge_ags_files."""
+        h1 = b'\x01' * 128
+        ags_result = {
+            "entries": [
+                {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            ],
+            "headers": {h1},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {h1},
+            "file_count": 1,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 0.5,
+        }
+
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": ["ags001.bin"],
+                                        "retained": []}) as mock_identify, \
+             patch.object(hamma_scrub, "purge_ags_files",
+                          return_value=[{"filename": "ags001.bin",
+                                         "status": "deleted",
+                                         "error": None}]) as mock_purge:
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", "/home/pi/data",
+                recover=True, purge=True,
+            )
+
+        mock_identify.assert_called_once()
+        mock_purge.assert_called_once()
+        assert rc == hamma_scrub.EXIT_OK
+
+    def test_run_without_purge_no_purge(self, hamma_scrub):
+        """run() without purge=True does not call purge functions."""
+        h1 = b'\x01' * 128
+        ags_result = {
+            "entries": [
+                {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+            ],
+            "headers": {h1},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {h1},
+            "file_count": 1,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 0.5,
+        }
+
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "identify_purgeable_files") as mock_identify, \
+             patch.object(hamma_scrub, "purge_ags_files") as mock_purge:
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", "/home/pi/data",
+                recover=True, purge=False,
+            )
+
+        mock_identify.assert_not_called()
+        mock_purge.assert_not_called()
+
+    def test_run_purge_no_missing_still_purges(self, hamma_scrub):
+        """Purge runs even when there are no missing triggers."""
+        h1 = b'\x01' * 128
+        ags_result = {
+            "entries": [
+                {"filename": "ags001.bin", "offset": 0, "index": 0, "header": h1},
+                {"filename": "ags002.bin", "offset": 0, "index": 0, "header": h1},
+            ],
+            "headers": {h1},
+            "duplicate_count": 1,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {h1},
+            "file_count": 1,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 0.5,
+        }
+
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": ["ags001.bin"],
+                                        "retained": [{"filename": "ags002.bin",
+                                                       "reason": "active file"}]}) as mock_identify, \
+             patch.object(hamma_scrub, "purge_ags_files",
+                          return_value=[{"filename": "ags001.bin",
+                                         "status": "deleted",
+                                         "error": None}]) as mock_purge:
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", "/home/pi/data",
+                recover=True, purge=True,
+            )
+
+        # Purge was called even though no triggers were missing
+        mock_identify.assert_called_once()
+        mock_purge.assert_called_once()
