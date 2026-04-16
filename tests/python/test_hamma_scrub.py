@@ -1463,6 +1463,105 @@ class TestRecoveryReport:
         assert "recovery" not in parsed
 
 
+class TestPurgeReport:
+    """Test purge section in reports."""
+
+    def test_human_report_with_purge(self, hamma_scrub):
+        """Human report includes purge section with deleted and retained."""
+        results = {
+            "ags_triggers": 10, "ags_files": 2, "ags_elapsed": 1.0,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 10, "mj_files_scanned": 5, "mj_duplicate_count": 0,
+            "mj_elapsed": 0.5, "matched": 10, "missing_on_mj": [],
+            "mj_only_count": 0,
+        }
+        purge = {
+            "deleted": ["ags001.bin"],
+            "failed": [],
+            "retained": [
+                {"filename": "ags002.bin", "reason": "active file"},
+            ],
+            "dry_run": False,
+        }
+        report = hamma_scrub.format_human_report(
+            results, purge=purge,
+        )
+        assert "=== Purge ===" in report
+        assert "Deleted: 1" in report
+        assert "Retained: 1" in report
+        assert "ags002.bin" in report
+        assert "active file" in report
+
+    def test_human_report_purge_dry_run(self, hamma_scrub):
+        """Human report shows 'Would delete' in dry-run mode."""
+        results = {
+            "ags_triggers": 10, "ags_files": 2, "ags_elapsed": 1.0,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 10, "mj_files_scanned": 5, "mj_duplicate_count": 0,
+            "mj_elapsed": 0.5, "matched": 10, "missing_on_mj": [],
+            "mj_only_count": 0,
+        }
+        purge = {
+            "deleted": ["ags001.bin"],
+            "failed": [],
+            "retained": [],
+            "dry_run": True,
+        }
+        report = hamma_scrub.format_human_report(
+            results, purge=purge,
+        )
+        assert "Would delete: 1" in report
+
+    def test_human_report_no_purge(self, hamma_scrub):
+        """Human report without purge has no purge section."""
+        results = {
+            "ags_triggers": 10, "ags_files": 2, "ags_elapsed": 1.0,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 10, "mj_files_scanned": 5, "mj_duplicate_count": 0,
+            "mj_elapsed": 0.5, "matched": 10, "missing_on_mj": [],
+            "mj_only_count": 0,
+        }
+        report = hamma_scrub.format_human_report(results, purge=None)
+        assert "Purge" not in report
+
+    def test_json_report_with_purge(self, hamma_scrub):
+        """JSON report includes purge key."""
+        results = {
+            "ags_triggers": 10, "ags_files": 2, "ags_elapsed": 1.0,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 10, "mj_files_scanned": 5, "mj_duplicate_count": 0,
+            "mj_elapsed": 0.5, "matched": 10, "missing_on_mj": [],
+            "mj_only_count": 0,
+        }
+        purge = {
+            "deleted": ["ags001.bin"],
+            "retained": [{"filename": "ags002.bin", "reason": "active file"}],
+            "dry_run": False,
+        }
+        report_str = hamma_scrub.format_json_report(
+            results, "hamma", purge=purge,
+        )
+        data = json.loads(report_str)
+        assert "purge" in data
+        assert data["purge"]["deleted"] == ["ags001.bin"]
+        assert data["purge"]["dry_run"] is False
+
+    def test_json_report_no_purge(self, hamma_scrub):
+        """JSON report without purge has no purge key."""
+        results = {
+            "ags_triggers": 10, "ags_files": 2, "ags_elapsed": 1.0,
+            "ags_duplicate_count": 0,
+            "mj_triggers": 10, "mj_files_scanned": 5, "mj_duplicate_count": 0,
+            "mj_elapsed": 0.5, "matched": 10, "missing_on_mj": [],
+            "mj_only_count": 0,
+        }
+        report_str = hamma_scrub.format_json_report(
+            results, "hamma", purge=None,
+        )
+        data = json.loads(report_str)
+        assert "purge" not in data
+
+
 class TestFormatReport:
     """Test human-readable and JSON report generation."""
 

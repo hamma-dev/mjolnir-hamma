@@ -1217,7 +1217,7 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
     return results
 
 
-def format_human_report(results, limit=DEFAULT_LIMIT, recovery=None):
+def format_human_report(results, limit=DEFAULT_LIMIT, recovery=None, purge=None):
     """Format results as human-readable report text.
 
     Parameters
@@ -1229,6 +1229,9 @@ def format_human_report(results, limit=DEFAULT_LIMIT, recovery=None):
     recovery : list or None
         Recovery result records from recover_triggers(), or None if recovery
         was not performed.
+    purge : dict or None
+        Purge result dict from purge_ags_files(), or None if purge was not
+        performed.
 
     Returns
     -------
@@ -1304,10 +1307,27 @@ def format_human_report(results, limit=DEFAULT_LIMIT, recovery=None):
                 elif r["status"] == "skipped" and r.get("error") == "file already exists":
                     lines.append("  Skipped (exists): {}".format(r["target_path"]))
 
+    # Purge section (only when purge was performed)
+    if purge is not None:
+        lines.append("")
+        lines.append("=== Purge ===")
+        if purge.get("dry_run"):
+            lines.append("Would delete: {} AGS files".format(
+                len(purge["deleted"])))
+        else:
+            lines.append("Deleted: {} AGS files".format(
+                len(purge["deleted"])))
+        if purge["retained"]:
+            lines.append("Retained: {} AGS files".format(
+                len(purge["retained"])))
+            for r in purge["retained"]:
+                lines.append("  {} \u2014 {}".format(
+                    r["filename"], r["reason"]))
+
     return "\n".join(lines)
 
 
-def format_json_report(results, ags_host, recovery=None):
+def format_json_report(results, ags_host, recovery=None, purge=None):
     """Format results as JSON string.
 
     Parameters
@@ -1319,6 +1339,9 @@ def format_json_report(results, ags_host, recovery=None):
     recovery : list or None
         Recovery result records from recover_triggers(), or None if recovery
         was not performed.
+    purge : dict or None
+        Purge result dict from purge_ags_files(), or None if purge was not
+        performed.
 
     Returns
     -------
@@ -1350,6 +1373,8 @@ def format_json_report(results, ags_host, recovery=None):
     }
     if recovery is not None:
         report["recovery"] = recovery
+    if purge is not None:
+        report["purge"] = purge
     return json.dumps(report, indent=2)
 
 
