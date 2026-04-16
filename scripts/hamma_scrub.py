@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -922,6 +923,75 @@ def identify_purgeable_files(ags_entries, mj_headers, recovery_results=None):
             })
 
     return {"purgeable": purgeable, "retained": retained}
+
+
+def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
+    """Delete AGS files via SSH.
+
+    Parameters
+    ----------
+    ags_host : str
+        SSH host for AGS sensor.
+    ags_path : str
+        Path to AGS data directory on sensor.
+    filenames : list of str
+        Filenames to delete.
+    dry_run : bool
+        If True, log what would be deleted but take no action.
+
+    Returns
+    -------
+    list of dict
+        Each with filename, status ('deleted', 'failed', 'dry_run'),
+        and optional error.
+    """
+    results = []
+    for fname in filenames:
+        remote_path = "{}/{}".format(ags_path, fname)
+
+        if dry_run:
+            logger.info("Would delete: %s:%s", ags_host, remote_path)
+            results.append({
+                "filename": fname,
+                "status": "dry_run",
+                "error": None,
+            })
+            continue
+
+        cmd = ["ssh", ags_host, "rm " + shlex.quote(remote_path)]
+        logger.info("Deleting: %s:%s", ags_host, remote_path)
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout deleting %s on %s", fname, ags_host)
+            results.append({
+                "filename": fname,
+                "status": "failed",
+                "error": "SSH timeout (15s)",
+            })
+            continue
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace').strip()
+            logger.warning("Failed to delete %s: %s", fname, stderr)
+            results.append({
+                "filename": fname,
+                "status": "failed",
+                "error": stderr,
+            })
+        else:
+            results.append({
+                "filename": fname,
+                "status": "deleted",
+                "error": None,
+            })
+
+    return results
 
 
 def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):

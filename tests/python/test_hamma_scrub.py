@@ -1280,6 +1280,86 @@ class TestIdentifyPurgeableFiles:
         assert result["purgeable"] == []
 
 
+class TestPurgeAgsFiles:
+    """Test SSH-based AGS file deletion."""
+
+    def test_successful_deletion(self, hamma_scrub):
+        """Successful SSH rm returns status 'deleted'."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["ags001.bin"], dry_run=False,
+            )
+
+        assert len(results) == 1
+        assert results[0]["filename"] == "ags001.bin"
+        assert results[0]["status"] == "deleted"
+
+    def test_ssh_failure(self, hamma_scrub):
+        """SSH rm failure returns status 'failed' with error."""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = b'No such file or directory'
+
+        with patch("subprocess.run", return_value=mock_result):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["ags001.bin"], dry_run=False,
+            )
+
+        assert results[0]["status"] == "failed"
+        assert "No such file" in results[0]["error"]
+
+    def test_ssh_timeout(self, hamma_scrub):
+        """SSH timeout returns status 'failed'."""
+        with patch("subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=15)):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["ags001.bin"], dry_run=False,
+            )
+
+        assert results[0]["status"] == "failed"
+        assert "timeout" in results[0]["error"].lower()
+
+    def test_dry_run(self, hamma_scrub):
+        """Dry run logs but does not call subprocess."""
+        with patch("subprocess.run") as mock_run:
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["ags001.bin", "ags002.bin"],
+                dry_run=True,
+            )
+
+        mock_run.assert_not_called()
+        assert len(results) == 2
+        assert all(r["status"] == "dry_run" for r in results)
+
+    def test_empty_filenames(self, hamma_scrub):
+        """Empty filenames list returns empty results."""
+        results = hamma_scrub.purge_ags_files(
+            "hamma", "/ags/data", [], dry_run=False,
+        )
+        assert results == []
+
+    def test_path_uses_shlex_quote(self, hamma_scrub):
+        """Remote path is shell-quoted for safety."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = b''
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["ags file.bin"], dry_run=False,
+            )
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "hamma"
+        # shlex.quote wraps paths with spaces in single quotes
+        assert "'/ags/data/ags file.bin'" in cmd[2]
+
+
 class TestRecoveryReport:
     """Test recovery sections in human and JSON reports."""
 
