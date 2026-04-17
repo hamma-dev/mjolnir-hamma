@@ -41,7 +41,7 @@ SLURM_TEMPLATE = """#!/bin/bash
 #SBATCH -J {jobname}
 #SBATCH -p standard
 #SBATCH --ntasks 1
-#SBATCH -t 0-04:00
+#SBATCH -t 0-08:00
 #SBATCH --mem-per-cpu=2G
 #SBATCH --mail-type=END,FAIL
 #SBATCH -o {log_dir}/{jobname}-%j.out
