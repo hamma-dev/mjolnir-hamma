@@ -1548,6 +1548,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                 if e["header"] not in recovered_headers
             ]
             results["missing_on_mj"] = comparison["missing_on_mj"]
+            results["matched"] += len(recovered_headers)
 
     # Purge flow
     purge_results = None
