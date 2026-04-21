@@ -1840,9 +1840,55 @@ class TestMain:
                 "hamma", "/ags/data", str(tmp_path),
                 recover=True,
             )
-        assert rc == 1  # Still EXIT_MISSING even after recovery
+        assert rc == 0  # All missing recovered -> EXIT_OK
         mock_recover.assert_called_once()
         mock_filter.assert_called_once()
+
+    def test_run_partial_recovery_still_exit_missing(self, hamma_scrub, tmp_path):
+        """run() returns EXIT_MISSING when some recoveries fail."""
+        hdr_ok = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        hdr_fail = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [
+                {"header": hdr_ok, "filename": "f.bin", "offset": 0, "index": 0},
+                {"header": hdr_fail, "filename": "f.bin", "offset": 1000, "index": 1},
+            ],
+            "headers": {hdr_ok, hdr_fail},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": set(),
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+        mock_recovery = [
+            {"source_file": "f.bin", "source_offset": 0, "trigger_index": 0,
+             "target_path": "DATA37/test/ok.bin", "size": 100,
+             "status": "recovered", "header": hdr_ok, "error": None},
+            {"source_file": "f.bin", "source_offset": 1000, "trigger_index": 1,
+             "target_path": None, "size": 0,
+             "status": "failed", "header": hdr_fail, "error": "disk full"},
+        ]
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "cleanup_orphaned_temps", return_value=0), \
+             patch.object(hamma_scrub, "filter_recovery_candidates") as mock_filter, \
+             patch.object(hamma_scrub, "recover_triggers", return_value=mock_recovery):
+            mock_filter.return_value = [
+                {"header": hdr_ok, "filename": "f.bin", "offset": 0,
+                 "index": 0, "skip_reason": None},
+                {"header": hdr_fail, "filename": "f.bin", "offset": 1000,
+                 "index": 1, "skip_reason": None},
+            ]
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", str(tmp_path),
+                recover=True,
+            )
+        assert rc == 1  # One failed -> EXIT_MISSING
 
     def test_run_without_recover_no_recovery(self, hamma_scrub):
         """run() without recover=True does NOT invoke recovery."""

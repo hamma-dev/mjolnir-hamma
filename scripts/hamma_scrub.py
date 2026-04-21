@@ -1535,11 +1535,19 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         if failed_count:
             logger.warning("Recovery: %d failed", failed_count)
 
-    # Update mj_headers with recovered triggers
+    # Update mj_headers and missing list with recovered triggers
     if recovery_results:
+        recovered_headers = set()
         for r in recovery_results:
             if r["status"] == "recovered":
                 mj["headers"].add(r["header"])
+                recovered_headers.add(r["header"])
+        if recovered_headers:
+            comparison["missing_on_mj"] = [
+                e for e in comparison["missing_on_mj"]
+                if e["header"] not in recovered_headers
+            ]
+            results["missing_on_mj"] = comparison["missing_on_mj"]
 
     # Purge flow
     purge_results = None
