@@ -298,6 +298,15 @@ class TestParseSince:
     def test_strips_whitespace(self, hamma_scrub):
         assert hamma_scrub._parse_since("  2026-04-10  ") == "2026-04-10T00"
 
+    def test_auto_value_returns_sentinel(self, hamma_scrub):
+        """'auto' returns the sentinel string 'auto'."""
+        assert hamma_scrub._parse_since("auto") == "auto"
+
+    def test_auto_case_insensitive(self, hamma_scrub):
+        """'AUTO' and 'Auto' also return 'auto'."""
+        assert hamma_scrub._parse_since("AUTO") == "auto"
+        assert hamma_scrub._parse_since("Auto") == "auto"
+
 
 class TestStriderProtocol:
     """Test encoding/decoding of the strider binary protocol."""
@@ -2166,3 +2175,82 @@ class TestMain:
         # Purge was called even though no triggers were missing
         mock_identify.assert_called_once()
         mock_purge.assert_called_once()
+
+
+class TestRunSinceAuto:
+    """Test --since auto integration in run()."""
+
+    def test_since_auto_calls_detect(self, hamma_scrub):
+        """run() with since='auto' calls detect_since_auto()."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+
+        with patch.object(hamma_scrub, "detect_since_auto",
+                          return_value="2026-03-15T14") as mock_detect, \
+             patch.object(hamma_scrub, "scan_ags_files",
+                          return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files",
+                          return_value=mj_result):
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            mock_detect.assert_called_once_with("hamma", "/ags/data")
+            assert rc == 0
+
+    def test_since_auto_none_skips_filter(self, hamma_scrub):
+        """If detect_since_auto() returns None, no since filter is applied."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+
+        with patch.object(hamma_scrub, "detect_since_auto",
+                          return_value=None) as mock_detect, \
+             patch.object(hamma_scrub, "scan_ags_files",
+                          return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files",
+                          return_value=mj_result) as mock_mj:
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            # scan_mj_files called without since filter
+            mock_mj.assert_called_once_with("/media/pi", since=None)
+            assert rc == 0
+
+    def test_since_auto_ssh_error(self, hamma_scrub):
+        """If detect_since_auto() raises RuntimeError, return EXIT_SSH_ERROR."""
+        with patch.object(hamma_scrub, "detect_since_auto",
+                          side_effect=RuntimeError("SSH failed")):
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            assert rc == hamma_scrub.EXIT_SSH_ERROR

@@ -160,12 +160,12 @@ def _parse_since(since_str):
     Parameters
     ----------
     since_str : str
-        Date string: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH'.
+        Date string: 'YYYY-MM-DD', 'YYYY-MM-DDTHH', or 'auto'.
 
     Returns
     -------
     str
-        Normalized to 'YYYY-MM-DDTHH' format for directory comparison.
+        Normalized to 'YYYY-MM-DDTHH' format, or 'auto' sentinel.
 
     Raises
     ------
@@ -173,6 +173,8 @@ def _parse_since(since_str):
         If format is not recognized.
     """
     s = since_str.strip()
+    if s.lower() == 'auto':
+        return 'auto'
     # YYYY-MM-DDTHH (already has hour)
     if len(s) == 13 and s[10] == 'T':
         return s
@@ -180,7 +182,7 @@ def _parse_since(since_str):
     if len(s) == 10 and s[4] == '-' and s[7] == '-':
         return s + 'T00'
     raise ValueError(
-        "Invalid --since format '{}': expected YYYY-MM-DD or YYYY-MM-DDTHH".format(s)
+        "Invalid --since format '{}': expected YYYY-MM-DD, YYYY-MM-DDTHH, or auto".format(s)
     )
 
 
@@ -1495,7 +1497,8 @@ def _build_parser():
     )
     parser.add_argument(
         "--since",
-        help="Only scan MJ directories at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH)",
+        help="Only scan MJ directories at or after this date "
+             "(YYYY-MM-DD, YYYY-MM-DDTHH, or 'auto' to detect from AGS)",
     )
     parser.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
@@ -1557,11 +1560,24 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     since_cutoff = None
     if since:
         try:
-            since_cutoff = _parse_since(since)
-            logger.info("Filtering MJ directories to >= %s", since_cutoff)
+            parsed = _parse_since(since)
         except ValueError as e:
             logger.error("%s", e)
             return EXIT_NO_DATA
+
+        if parsed == 'auto':
+            try:
+                since_cutoff = detect_since_auto(ags_host, ags_path)
+            except RuntimeError as e:
+                logger.error("Auto-detect failed: %s", e)
+                return EXIT_SSH_ERROR
+            if since_cutoff:
+                logger.info("Auto-detected --since cutoff: %s", since_cutoff)
+            else:
+                logger.info("Auto-detect found no science data; scanning all MJ dirs")
+        else:
+            since_cutoff = parsed
+            logger.info("Filtering MJ directories to >= %s", since_cutoff)
 
     try:
         ags = scan_ags_files(ags_host, ags_path)
