@@ -1848,6 +1848,12 @@ class TestCLI:
         args = parser.parse_args([])
         assert args.purge is False
 
+    def test_since_auto(self, hamma_scrub):
+        """--since auto is accepted."""
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args(["--since", "auto"])
+        assert args.since == "auto"
+
 
 class TestMain:
     """Test main() integration."""
