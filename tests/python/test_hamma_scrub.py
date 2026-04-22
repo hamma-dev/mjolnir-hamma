@@ -555,6 +555,139 @@ class TestDecodeGpsTime:
         assert result == "2025-03-05T11:19:43.500"
 
 
+class TestDetectSinceAuto:
+    """Test --since auto date detection from AGS."""
+
+    def test_returns_date_from_earliest_science_file(self, hamma_scrub):
+        """Earliest non-1980 file header decoded to YYYY-MM-DDTHH."""
+        # Build a header with known GPS time
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<I', header, 10, 100)  # datasize
+        # GPS week 2000, timeOfWeek 259200.0 (3 days), utcOffset 18.0
+        struct.pack_into('<f', header, 80, 259200.0)
+        struct.pack_into('<h', header, 84, 2000)
+        struct.pack_into('<f', header, 86, 18.0)
+        struct.pack_into('<I', header, 94, 100)
+        struct.pack_into('<I', header, 98, 1000000000)
+        header = bytes(header)
+
+        # Expected: decode this header's GPS time, truncate to YYYY-MM-DDTHH
+        expected_ts = hamma_scrub.decode_gps_time(header)
+        expected_cutoff = expected_ts[:13]  # "YYYY-MM-DDTHH"
+
+        ls_output = "1980-01-06_00.00.00\n2026-03-15_14.30.00\n2026-03-16_10.00.00\n"
+        dd_output = header
+
+        with patch("subprocess.run") as mock_run:
+            # First call: ssh ls
+            ls_result = MagicMock()
+            ls_result.returncode = 0
+            ls_result.stdout = ls_output.encode()
+            # Second call: ssh dd (read first 128 bytes)
+            dd_result = MagicMock()
+            dd_result.returncode = 0
+            dd_result.stdout = dd_output
+            mock_run.side_effect = [ls_result, dd_result]
+
+            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
+            assert result == expected_cutoff
+
+    def test_skips_1980_files(self, hamma_scrub):
+        """All 1980-* files are skipped; uses first non-1980 file."""
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<I', header, 10, 100)
+        struct.pack_into('<f', header, 80, 259200.0)
+        struct.pack_into('<h', header, 84, 2000)
+        struct.pack_into('<f', header, 86, 18.0)
+        struct.pack_into('<I', header, 94, 100)
+        struct.pack_into('<I', header, 98, 1000000000)
+        header = bytes(header)
+
+        ls_output = "1980-01-05_00.00.00\n1980-01-06_12.00.00\n2026-04-01_08.00.00\n"
+
+        with patch("subprocess.run") as mock_run:
+            ls_result = MagicMock()
+            ls_result.returncode = 0
+            ls_result.stdout = ls_output.encode()
+            dd_result = MagicMock()
+            dd_result.returncode = 0
+            dd_result.stdout = header
+            mock_run.side_effect = [ls_result, dd_result]
+
+            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
+
+        # dd called on the first non-1980 file
+        dd_call = mock_run.call_args_list[1]
+        assert "2026-04-01_08.00.00" in dd_call[0][0][-1]
+
+    def test_all_1980_files_returns_none(self, hamma_scrub):
+        """If only 1980-* files exist, return None (no science data)."""
+        ls_output = "1980-01-05_00.00.00\n1980-01-06_12.00.00\n"
+
+        with patch("subprocess.run") as mock_run:
+            ls_result = MagicMock()
+            ls_result.returncode = 0
+            ls_result.stdout = ls_output.encode()
+            mock_run.return_value = ls_result
+
+            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
+            assert result is None
+
+    def test_empty_directory_returns_none(self, hamma_scrub):
+        """Empty AGS data directory returns None."""
+        with patch("subprocess.run") as mock_run:
+            ls_result = MagicMock()
+            ls_result.returncode = 0
+            ls_result.stdout = b""
+            mock_run.return_value = ls_result
+
+            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
+            assert result is None
+
+    def test_ssh_failure_raises(self, hamma_scrub):
+        """SSH failure raises RuntimeError."""
+        with patch("subprocess.run") as mock_run:
+            ls_result = MagicMock()
+            ls_result.returncode = 1
+            ls_result.stderr = b"Connection refused"
+            mock_run.return_value = ls_result
+
+            with pytest.raises(RuntimeError, match="Failed to list AGS"):
+                hamma_scrub.detect_since_auto("hamma", "/ags/data")
+
+    def test_bad_header_in_first_file_tries_next(self, hamma_scrub):
+        """If first science file header can't be decoded, try next file."""
+        bad_header = b'\x00' * 128  # No sync marker, decode_gps_time returns None
+        good_header = bytearray(128)
+        good_header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<I', good_header, 10, 100)
+        struct.pack_into('<f', good_header, 80, 259200.0)
+        struct.pack_into('<h', good_header, 84, 2000)
+        struct.pack_into('<f', good_header, 86, 18.0)
+        struct.pack_into('<I', good_header, 94, 100)
+        struct.pack_into('<I', good_header, 98, 1000000000)
+        good_header = bytes(good_header)
+
+        ls_output = "2026-03-10_08.00.00\n2026-03-11_09.00.00\n"
+
+        with patch("subprocess.run") as mock_run:
+            ls_result = MagicMock()
+            ls_result.returncode = 0
+            ls_result.stdout = ls_output.encode()
+            dd_bad = MagicMock()
+            dd_bad.returncode = 0
+            dd_bad.stdout = bad_header
+            dd_good = MagicMock()
+            dd_good.returncode = 0
+            dd_good.stdout = good_header
+            mock_run.side_effect = [ls_result, dd_bad, dd_good]
+
+            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
+            assert result is not None
+
+
 class TestDetectUnitName:
     """Test hostname-based unit name detection."""
 

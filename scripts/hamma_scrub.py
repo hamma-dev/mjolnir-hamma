@@ -584,6 +584,88 @@ def decode_gps_time(header):
         return None
 
 
+def detect_since_auto(ags_host, ags_path):
+    """Auto-detect earliest science trigger time on AGS.
+
+    Lists AGS data files, skips bad-GPS files (1980-*), reads the first
+    128-byte header from the earliest science file, decodes its GPS time,
+    and returns a YYYY-MM-DDTHH cutoff string.
+
+    Parameters
+    ----------
+    ags_host : str
+        SSH host for AGS sensor.
+    ags_path : str
+        Path to AGS data directory.
+
+    Returns
+    -------
+    str or None
+        'YYYY-MM-DDTHH' cutoff, or None if no science data found.
+
+    Raises
+    ------
+    RuntimeError
+        If SSH connection fails.
+    """
+    # List files on AGS
+    ls_cmd = ["ssh", ags_host,
+              "ls -1 {path}".format(path=shlex.quote(ags_path))]
+    logger.debug("Auto-detect: listing AGS files: %s", " ".join(ls_cmd))
+    result = subprocess.run(
+        ls_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError(
+            "Failed to list AGS files on {host}: {err}".format(
+                host=ags_host, err=stderr)
+        )
+
+    filenames = [f for f in result.stdout.decode('utf-8').strip().split('\n')
+                 if f]
+    if not filenames:
+        logger.info("Auto-detect: no files on AGS")
+        return None
+
+    # Separate 1980-* (bad GPS) from science files, sort each
+    science_files = sorted(f for f in filenames if not f.startswith("1980-"))
+    if not science_files:
+        logger.info("Auto-detect: only bad-GPS (1980-*) files on AGS")
+        return None
+
+    # Try reading first header from each science file until we get a valid one
+    for fname in science_files:
+        remote_path = "{path}/{fname}".format(
+            path=ags_path, fname=fname)
+        dd_cmd = ["ssh", ags_host,
+                  "dd if={rp} bs=128 count=1 2>/dev/null".format(
+                      rp=shlex.quote(remote_path))]
+        logger.debug("Auto-detect: reading header from %s", fname)
+        dd_result = subprocess.run(
+            dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if dd_result.returncode != 0 or len(dd_result.stdout) < HEADER_SIZE:
+            logger.debug("Auto-detect: could not read header from %s", fname)
+            continue
+
+        header = dd_result.stdout[:HEADER_SIZE]
+        timestamp = decode_gps_time(header)
+        if timestamp is None:
+            logger.debug("Auto-detect: bad GPS in header of %s", fname)
+            continue
+
+        # Truncate to YYYY-MM-DDTHH
+        cutoff = timestamp[:13]
+        logger.info("Auto-detect: earliest science trigger at %s (from %s)",
+                     cutoff, fname)
+        return cutoff
+
+    logger.warning("Auto-detect: no decodable headers found in science files")
+    return None
+
+
 def detect_unit_name(hostname=None):
     """Detect unit prefix and number from hostname.
 
