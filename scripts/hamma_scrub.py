@@ -586,87 +586,49 @@ def decode_gps_time(header):
         return None
 
 
-def detect_since_auto(ags_host, ags_path):
-    """Auto-detect earliest science trigger time on AGS.
+def earliest_ags_timestamp(ags_entries):
+    """Find the earliest valid GPS timestamp across all AGS entries.
 
-    Lists AGS data files, skips bad-GPS files (1980-*), reads the first
-    128-byte header from the earliest science file, decodes its GPS time,
-    and returns a YYYY-MM-DDTHH cutoff string.
+    Groups entries by filename, finds the first valid GPS timestamp
+    in each file (triggers within a file are sequential, so the first
+    valid one is the earliest), and returns the minimum across all files.
 
     Parameters
     ----------
-    ags_host : str
-        SSH host for AGS sensor.
-    ags_path : str
-        Path to AGS data directory.
+    ags_entries : list of dict
+        From scan_ags_files(), each with 'header', 'filename', 'offset',
+        'index'.
 
     Returns
     -------
     str or None
-        'YYYY-MM-DDTHH' cutoff, or None if no science data found.
-
-    Raises
-    ------
-    RuntimeError
-        If SSH connection fails.
+        'YYYY-MM-DDTHH' cutoff, or None if no valid GPS found.
     """
-    # List files on AGS
-    ls_cmd = ["ssh", ags_host,
-              "ls -1 {path}".format(path=shlex.quote(ags_path))]
-    logger.debug("Auto-detect: listing AGS files: %s", " ".join(ls_cmd))
-    result = subprocess.run(
-        ls_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.decode('utf-8', errors='replace').strip()
-        raise RuntimeError(
-            "Failed to list AGS files on {host}: {err}".format(
-                host=ags_host, err=stderr)
-        )
-
-    filenames = [f for f in result.stdout.decode('utf-8').strip().split('\n')
-                 if f]
-    if not filenames:
-        logger.info("Auto-detect: no files on AGS")
+    if not ags_entries:
         return None
 
-    # Separate 1980 (bad GPS) from science files, sort each
-    # Filenames have "ags" prefix, e.g. "ags1980-01-06_..." so check with "in"
-    science_files = sorted(f for f in filenames if "1980-" not in f)
-    if not science_files:
-        logger.info("Auto-detect: only bad-GPS (1980) files on AGS")
-        return None
+    # Group entries by filename
+    files = {}
+    for entry in ags_entries:
+        files.setdefault(entry["filename"], []).append(entry)
 
-    # Try reading first header from each science file until we get a valid one
-    for fname in science_files:
-        remote_path = "{path}/{fname}".format(
-            path=ags_path, fname=fname)
-        dd_cmd = ["ssh", ags_host,
-                  "dd if={rp} bs=128 count=1 2>/dev/null".format(
-                      rp=shlex.quote(remote_path))]
-        logger.debug("Auto-detect: reading header from %s", fname)
-        dd_result = subprocess.run(
-            dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=30,
-        )
-        if dd_result.returncode != 0 or len(dd_result.stdout) < HEADER_SIZE:
-            logger.debug("Auto-detect: could not read header from %s", fname)
-            continue
+    earliest = None
+    for filename in sorted(files):
+        # Sort by index within file (triggers are sequential)
+        triggers = sorted(files[filename], key=lambda e: e["index"])
+        for trigger in triggers:
+            timestamp = decode_gps_time(trigger["header"])
+            if timestamp is not None:
+                cutoff = timestamp[:13]  # YYYY-MM-DDTHH
+                if earliest is None or cutoff < earliest:
+                    earliest = cutoff
+                logger.debug("Auto-detect: %s first valid GPS at %s",
+                             filename, cutoff)
+                break  # First valid in file = earliest in file
 
-        header = dd_result.stdout[:HEADER_SIZE]
-        timestamp = decode_gps_time(header)
-        if timestamp is None:
-            logger.debug("Auto-detect: bad GPS in header of %s", fname)
-            continue
-
-        # Truncate to YYYY-MM-DDTHH
-        cutoff = timestamp[:13]
-        logger.info("Auto-detect: earliest science trigger at %s (from %s)",
-                     cutoff, fname)
-        return cutoff
-
-    logger.warning("Auto-detect: no decodable headers found in science files")
-    return None
+    if earliest:
+        logger.info("Auto-detect: earliest AGS trigger at %s", earliest)
+    return earliest
 
 
 def detect_unit_name(hostname=None):
@@ -1559,6 +1521,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
 
     # Parse --since into normalized directory prefix
     since_cutoff = None
+    auto_detect = False
     if since:
         try:
             parsed = _parse_since(since)
@@ -1567,24 +1530,26 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             return EXIT_NO_DATA
 
         if parsed == 'auto':
-            try:
-                since_cutoff = detect_since_auto(ags_host, ags_path)
-            except RuntimeError as e:
-                logger.error("Auto-detect failed: %s", e)
-                return EXIT_SSH_ERROR
-            if since_cutoff:
-                logger.info("Auto-detected --since cutoff: %s", since_cutoff)
-            else:
-                logger.info("Auto-detect found no science data; scanning all MJ dirs")
+            auto_detect = True
         else:
             since_cutoff = parsed
             logger.info("Filtering MJ directories to >= %s", since_cutoff)
 
+    # AGS scan runs first (needed for auto-detect and comparison)
     try:
         ags = scan_ags_files(ags_host, ags_path)
     except RuntimeError as e:
         logger.error("AGS scan failed: %s", e)
         return EXIT_SSH_ERROR
+
+    # Auto-detect: derive cutoff from the scanned AGS entries
+    if auto_detect:
+        since_cutoff = earliest_ags_timestamp(ags["entries"])
+        if since_cutoff:
+            logger.info("Auto-detected --since cutoff: %s", since_cutoff)
+        else:
+            logger.info(
+                "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
     mj = scan_mj_files(mj_path, since=since_cutoff)
 

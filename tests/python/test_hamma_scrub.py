@@ -27,6 +27,24 @@ def _make_trigger(datasize=TEST_DATASIZE, sync=SYNC_MARKER, pad=4):
     return bytes(header), payload + padding
 
 
+def _make_gps_header(week=2412, tow=522847.0, utc_offset=18.0,
+                     subsecond=808000000, ecc=1000000000):
+    """Build a 128-byte header with configurable GPS fields.
+
+    Defaults produce timestamp 2026-04-04T01:13:50.808.
+    Use week=0, tow=0.0 for bad GPS (year < 2000 -> decode returns None).
+    """
+    header = bytearray(128)
+    header[0:4] = SYNC_MARKER
+    struct.pack_into('<I', header, 10, TEST_DATASIZE)
+    struct.pack_into('<f', header, 80, tow)
+    struct.pack_into('<h', header, 84, week)
+    struct.pack_into('<f', header, 86, utc_offset)
+    struct.pack_into('<I', header, 94, subsecond)
+    struct.pack_into('<I', header, 98, ecc)
+    return bytes(header)
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "hamma_scrub.py"
 
@@ -564,137 +582,90 @@ class TestDecodeGpsTime:
         assert result == "2025-03-05T11:19:43.500"
 
 
-class TestDetectSinceAuto:
-    """Test --since auto date detection from AGS."""
+class TestEarliestAgsTimestamp:
+    """Test earliest_ags_timestamp() — derives --since cutoff from AGS data."""
 
-    def test_returns_date_from_earliest_science_file(self, hamma_scrub):
-        """Earliest non-1980 file header decoded to YYYY-MM-DDTHH."""
-        # Build a header with known GPS time
-        header = bytearray(128)
-        header[0:4] = b'\xf5\xff\x50\x5d'
-        struct.pack_into('<I', header, 10, 100)  # datasize
-        # GPS week 2000, timeOfWeek 259200.0 (3 days), utcOffset 18.0
-        struct.pack_into('<f', header, 80, 259200.0)
-        struct.pack_into('<h', header, 84, 2000)
-        struct.pack_into('<f', header, 86, 18.0)
-        struct.pack_into('<I', header, 94, 100)
-        struct.pack_into('<I', header, 98, 1000000000)
-        header = bytes(header)
+    def test_returns_earliest_valid_gps(self, hamma_scrub):
+        """Returns YYYY-MM-DDTHH from earliest valid GPS across files."""
+        # week 2412, tow ~522847 -> 2026-04-04T01
+        hdr_early = _make_gps_header(week=2412, tow=522847.0)
+        # week 2413, tow ~522847 -> ~1 week later
+        hdr_late = _make_gps_header(week=2413, tow=522847.0)
+        entries = [
+            {"header": hdr_late, "filename": "ags2026-04-11.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_early, "filename": "ags2026-04-04.bin",
+             "offset": 0, "index": 0},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_early)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
 
-        # Expected: decode this header's GPS time, truncate to YYYY-MM-DDTHH
-        expected_ts = hamma_scrub.decode_gps_time(header)
-        expected_cutoff = expected_ts[:13]  # "YYYY-MM-DDTHH"
+    def test_includes_1980_files(self, hamma_scrub):
+        """1980-named files are examined, not skipped."""
+        # 1980 file: first trigger bad GPS, second trigger has valid GPS
+        hdr_bad = _make_gps_header(week=0, tow=0.0)  # bad GPS
+        hdr_1980_good = _make_gps_header(week=2410, tow=100000.0)
+        # ags2026 file: valid GPS but later
+        hdr_2026 = _make_gps_header(week=2412, tow=522847.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_1980_good, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+            {"header": hdr_2026, "filename": "ags2026-04-04.bin",
+             "offset": 0, "index": 0},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_1980_good)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
 
-        ls_output = "ags1980-01-06_00.00.00\nags2026-03-15_14.30.00\nags2026-03-16_10.00.00\n"
-        dd_output = header
+    def test_skips_bad_gps_within_file(self, hamma_scrub):
+        """Bad GPS triggers (year < 2000) are skipped; first valid wins."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_good = _make_gps_header(week=2412, tow=522847.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_good, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_good)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
 
-        with patch("subprocess.run") as mock_run:
-            # First call: ssh ls
-            ls_result = MagicMock()
-            ls_result.returncode = 0
-            ls_result.stdout = ls_output.encode()
-            # Second call: ssh dd (read first 128 bytes)
-            dd_result = MagicMock()
-            dd_result.returncode = 0
-            dd_result.stdout = dd_output
-            mock_run.side_effect = [ls_result, dd_result]
+    def test_all_bad_gps_returns_none(self, hamma_scrub):
+        """If no trigger has valid GPS, return None."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+        ]
+        assert hamma_scrub.earliest_ags_timestamp(entries) is None
 
-            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
-            assert result == expected_cutoff
+    def test_empty_entries_returns_none(self, hamma_scrub):
+        """Empty entry list returns None."""
+        assert hamma_scrub.earliest_ags_timestamp([]) is None
 
-    def test_skips_1980_files(self, hamma_scrub):
-        """All 1980-* files are skipped; uses first non-1980 file."""
-        header = bytearray(128)
-        header[0:4] = b'\xf5\xff\x50\x5d'
-        struct.pack_into('<I', header, 10, 100)
-        struct.pack_into('<f', header, 80, 259200.0)
-        struct.pack_into('<h', header, 84, 2000)
-        struct.pack_into('<f', header, 86, 18.0)
-        struct.pack_into('<I', header, 94, 100)
-        struct.pack_into('<I', header, 98, 1000000000)
-        header = bytes(header)
-
-        ls_output = "ags1980-01-05_00.00.00\nags1980-01-06_12.00.00\nags2026-04-01_08.00.00\n"
-
-        with patch("subprocess.run") as mock_run:
-            ls_result = MagicMock()
-            ls_result.returncode = 0
-            ls_result.stdout = ls_output.encode()
-            dd_result = MagicMock()
-            dd_result.returncode = 0
-            dd_result.stdout = header
-            mock_run.side_effect = [ls_result, dd_result]
-
-            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
-
-        # dd called on the first non-1980 file
-        dd_call = mock_run.call_args_list[1]
-        assert "ags2026-04-01_08.00.00" in dd_call[0][0][-1]
-
-    def test_all_1980_files_returns_none(self, hamma_scrub):
-        """If only 1980-* files exist, return None (no science data)."""
-        ls_output = "ags1980-01-05_00.00.00\nags1980-01-06_12.00.00\n"
-
-        with patch("subprocess.run") as mock_run:
-            ls_result = MagicMock()
-            ls_result.returncode = 0
-            ls_result.stdout = ls_output.encode()
-            mock_run.return_value = ls_result
-
-            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
-            assert result is None
-
-    def test_empty_directory_returns_none(self, hamma_scrub):
-        """Empty AGS data directory returns None."""
-        with patch("subprocess.run") as mock_run:
-            ls_result = MagicMock()
-            ls_result.returncode = 0
-            ls_result.stdout = b""
-            mock_run.return_value = ls_result
-
-            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
-            assert result is None
-
-    def test_ssh_failure_raises(self, hamma_scrub):
-        """SSH failure raises RuntimeError."""
-        with patch("subprocess.run") as mock_run:
-            ls_result = MagicMock()
-            ls_result.returncode = 1
-            ls_result.stderr = b"Connection refused"
-            mock_run.return_value = ls_result
-
-            with pytest.raises(RuntimeError, match="Failed to list AGS"):
-                hamma_scrub.detect_since_auto("hamma", "/ags/data")
-
-    def test_bad_header_in_first_file_tries_next(self, hamma_scrub):
-        """If first science file header can't be decoded, try next file."""
-        bad_header = b'\x00' * 128  # No sync marker, decode_gps_time returns None
-        good_header = bytearray(128)
-        good_header[0:4] = b'\xf5\xff\x50\x5d'
-        struct.pack_into('<I', good_header, 10, 100)
-        struct.pack_into('<f', good_header, 80, 259200.0)
-        struct.pack_into('<h', good_header, 84, 2000)
-        struct.pack_into('<f', good_header, 86, 18.0)
-        struct.pack_into('<I', good_header, 94, 100)
-        struct.pack_into('<I', good_header, 98, 1000000000)
-        good_header = bytes(good_header)
-
-        ls_output = "ags2026-03-10_08.00.00\nags2026-03-11_09.00.00\n"
-
-        with patch("subprocess.run") as mock_run:
-            ls_result = MagicMock()
-            ls_result.returncode = 0
-            ls_result.stdout = ls_output.encode()
-            dd_bad = MagicMock()
-            dd_bad.returncode = 0
-            dd_bad.stdout = bad_header
-            dd_good = MagicMock()
-            dd_good.returncode = 0
-            dd_good.stdout = good_header
-            mock_run.side_effect = [ls_result, dd_bad, dd_good]
-
-            result = hamma_scrub.detect_since_auto("hamma", "/ags/data")
-            assert result is not None
+    def test_stops_at_first_valid_per_file(self, hamma_scrub):
+        """Only examines triggers until first valid GPS in each file."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_first = _make_gps_header(week=2412, tow=100000.0)
+        hdr_second = _make_gps_header(week=2412, tow=200000.0)
+        entries = [
+            {"header": hdr_bad, "filename": "file.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_first, "filename": "file.bin",
+             "offset": 22000000, "index": 1},
+            {"header": hdr_second, "filename": "file.bin",
+             "offset": 44000000, "index": 2},
+        ]
+        # Should return cutoff from hdr_first, not hdr_second
+        expected = hamma_scrub.decode_gps_time(hdr_first)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
 
 
 class TestDetectUnitName:
@@ -2186,9 +2157,10 @@ class TestMain:
 class TestRunSinceAuto:
     """Test --since auto integration in run()."""
 
-    def test_since_auto_calls_detect(self, hamma_scrub):
-        """run() with since='auto' calls detect_since_auto()."""
-        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+    def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
+        """run() with since='auto' derives cutoff from AGS entries."""
+        hdr = _make_gps_header()
+        expected_cutoff = hamma_scrub.decode_gps_time(hdr)[:13]
         ags_result = {
             "entries": [{"header": hdr, "filename": "f.bin",
                          "offset": 0, "index": 0}],
@@ -2205,31 +2177,31 @@ class TestRunSinceAuto:
             "elapsed": 1.0,
         }
 
-        with patch.object(hamma_scrub, "detect_since_auto",
-                          return_value="2026-03-15T14") as mock_detect, \
-             patch.object(hamma_scrub, "scan_ags_files",
+        with patch.object(hamma_scrub, "scan_ags_files",
                           return_value=ags_result), \
              patch.object(hamma_scrub, "scan_mj_files",
-                          return_value=mj_result):
+                          return_value=mj_result) as mock_mj:
             rc = hamma_scrub.run(
                 ags_host="hamma", ags_path="/ags/data",
                 mj_path="/media/pi", since="auto",
             )
-            mock_detect.assert_called_once_with("hamma", "/ags/data")
+            # scan_mj_files called with cutoff derived from AGS data
+            mock_mj.assert_called_once_with("/media/pi", since=expected_cutoff)
             assert rc == 0
 
-    def test_since_auto_none_skips_filter(self, hamma_scrub):
-        """If detect_since_auto() returns None, no since filter is applied."""
-        hdr = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+    def test_since_auto_no_valid_gps_scans_all(self, hamma_scrub):
+        """If no AGS entry has valid GPS, no since filter is applied."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_mj = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
         ags_result = {
-            "entries": [{"header": hdr, "filename": "f.bin",
+            "entries": [{"header": hdr_bad, "filename": "f.bin",
                          "offset": 0, "index": 0}],
-            "headers": {hdr},
+            "headers": {hdr_bad},
             "duplicate_count": 0,
             "elapsed": 1.0,
         }
         mj_result = {
-            "headers": {hdr},
+            "headers": {hdr_mj},
             "file_count": 5,
             "duplicate_count": 0,
             "skipped": 0,
@@ -2237,9 +2209,7 @@ class TestRunSinceAuto:
             "elapsed": 1.0,
         }
 
-        with patch.object(hamma_scrub, "detect_since_auto",
-                          return_value=None) as mock_detect, \
-             patch.object(hamma_scrub, "scan_ags_files",
+        with patch.object(hamma_scrub, "scan_ags_files",
                           return_value=ags_result), \
              patch.object(hamma_scrub, "scan_mj_files",
                           return_value=mj_result) as mock_mj:
@@ -2249,11 +2219,10 @@ class TestRunSinceAuto:
             )
             # scan_mj_files called without since filter
             mock_mj.assert_called_once_with("/media/pi", since=None)
-            assert rc == 0
 
-    def test_since_auto_ssh_error(self, hamma_scrub):
-        """If detect_since_auto() raises RuntimeError, return EXIT_SSH_ERROR."""
-        with patch.object(hamma_scrub, "detect_since_auto",
+    def test_since_auto_ags_scan_fails(self, hamma_scrub):
+        """If AGS scan fails, return EXIT_SSH_ERROR."""
+        with patch.object(hamma_scrub, "scan_ags_files",
                           side_effect=RuntimeError("SSH failed")):
             rc = hamma_scrub.run(
                 ags_host="hamma", ags_path="/ags/data",
