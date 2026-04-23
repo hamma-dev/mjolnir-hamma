@@ -585,7 +585,7 @@ class TestDetectSinceAuto:
         expected_ts = hamma_scrub.decode_gps_time(header)
         expected_cutoff = expected_ts[:13]  # "YYYY-MM-DDTHH"
 
-        ls_output = "1980-01-06_00.00.00\n2026-03-15_14.30.00\n2026-03-16_10.00.00\n"
+        ls_output = "ags1980-01-06_00.00.00\nags2026-03-15_14.30.00\nags2026-03-16_10.00.00\n"
         dd_output = header
 
         with patch("subprocess.run") as mock_run:
@@ -614,7 +614,7 @@ class TestDetectSinceAuto:
         struct.pack_into('<I', header, 98, 1000000000)
         header = bytes(header)
 
-        ls_output = "1980-01-05_00.00.00\n1980-01-06_12.00.00\n2026-04-01_08.00.00\n"
+        ls_output = "ags1980-01-05_00.00.00\nags1980-01-06_12.00.00\nags2026-04-01_08.00.00\n"
 
         with patch("subprocess.run") as mock_run:
             ls_result = MagicMock()
@@ -629,11 +629,11 @@ class TestDetectSinceAuto:
 
         # dd called on the first non-1980 file
         dd_call = mock_run.call_args_list[1]
-        assert "2026-04-01_08.00.00" in dd_call[0][0][-1]
+        assert "ags2026-04-01_08.00.00" in dd_call[0][0][-1]
 
     def test_all_1980_files_returns_none(self, hamma_scrub):
         """If only 1980-* files exist, return None (no science data)."""
-        ls_output = "1980-01-05_00.00.00\n1980-01-06_12.00.00\n"
+        ls_output = "ags1980-01-05_00.00.00\nags1980-01-06_12.00.00\n"
 
         with patch("subprocess.run") as mock_run:
             ls_result = MagicMock()
@@ -679,7 +679,7 @@ class TestDetectSinceAuto:
         struct.pack_into('<I', good_header, 98, 1000000000)
         good_header = bytes(good_header)
 
-        ls_output = "2026-03-10_08.00.00\n2026-03-11_09.00.00\n"
+        ls_output = "ags2026-03-10_08.00.00\nags2026-03-11_09.00.00\n"
 
         with patch("subprocess.run") as mock_run:
             ls_result = MagicMock()

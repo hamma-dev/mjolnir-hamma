@@ -630,10 +630,11 @@ def detect_since_auto(ags_host, ags_path):
         logger.info("Auto-detect: no files on AGS")
         return None
 
-    # Separate 1980-* (bad GPS) from science files, sort each
-    science_files = sorted(f for f in filenames if not f.startswith("1980-"))
+    # Separate 1980 (bad GPS) from science files, sort each
+    # Filenames have "ags" prefix, e.g. "ags1980-01-06_..." so check with "in"
+    science_files = sorted(f for f in filenames if "1980-" not in f)
     if not science_files:
-        logger.info("Auto-detect: only bad-GPS (1980-*) files on AGS")
+        logger.info("Auto-detect: only bad-GPS (1980) files on AGS")
         return None
 
     # Try reading first header from each science file until we get a valid one
