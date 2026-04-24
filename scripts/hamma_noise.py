@@ -139,6 +139,7 @@ def aggregate_results(results):
     """
     thresholds = np.array([r["threshold"] for r in results])
     threshold = float(np.median(thresholds))
+    threshold_varied = len(np.unique(thresholds)) > 1
 
     def _channel_stats(key_noise, key_offset):
         noise_vals = np.array([r[key_noise] for r in results])
@@ -173,6 +174,7 @@ def aggregate_results(results):
 
     return {
         "threshold_V": threshold,
+        "threshold_varied": threshold_varied,
         "slow": _channel_stats("slow_noise", "slow_offset"),
         "fast": _channel_stats("fast_noise", "fast_offset"),
     }
@@ -217,6 +219,8 @@ def format_report(sensor_id, files_analyzed, agg, warnings):
     lines.append("=== Noise Check: {} | {} ===".format(sensor_id, now))
     lines.append("Files analyzed: {}".format(files_analyzed))
     lines.append("Threshold: {:.4f}V".format(agg["threshold_V"]))
+    if agg.get("threshold_varied"):
+        lines.append("  NOTE: threshold varied across triggers (using median)")
     lines.append("")
 
     # Noise table
@@ -284,6 +288,10 @@ def _build_parser():
         "--no-save", action="store_true",
         help="Skip saving JSON, print only",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Debug logging",
+    )
     return parser
 
 
@@ -292,7 +300,7 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
-    level = logging.DEBUG if os.environ.get("DEBUG") else logging.INFO
+    level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(levelname)s: %(message)s",
