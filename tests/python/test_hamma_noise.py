@@ -4,7 +4,10 @@ import importlib.util
 import json
 import os
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -117,3 +120,76 @@ class TestDiscoverFiles:
         f_new.write_bytes(b"\x00" * 100)
         result = hamma_noise.discover_files(str(tmp_path), count=10)
         assert os.path.basename(result[0]) == "mj05_new.bin"
+
+
+def _make_mock_header(volt, volt_fast=None, threshold=0.05):
+    """Create a mock hamma.Header that returns given waveform data."""
+    mock_hdr = MagicMock()
+    mock_hdr.count = 1
+    mock_data = MagicMock()
+    mock_data.threshold = [threshold]
+    mock_hdr.data = mock_data
+    data_ns = SimpleNamespace(volt=volt, voltFast=volt_fast)
+    mock_hdr.get_data = MagicMock(return_value=data_ns)
+    return mock_hdr
+
+
+class TestMeasureNoise:
+    """Test noise measurement from a single trigger."""
+
+    def test_quiet_signal(self, hamma_noise):
+        """Noise of a flat signal should be near zero."""
+        volt = np.zeros(30000)
+        volt_fast = np.zeros(300000)
+        mock_hdr = _make_mock_header(volt, volt_fast, threshold=0.05)
+        with patch.object(hamma_noise, '_load_header', return_value=mock_hdr):
+            result = hamma_noise.measure_noise("dummy.bin")
+        assert result is not None
+        assert result["threshold"] == 0.05
+        assert result["slow_noise"] == pytest.approx(0.0, abs=1e-10)
+        assert result["fast_noise"] == pytest.approx(0.0, abs=1e-10)
+        assert result["slow_offset"] == pytest.approx(0.0, abs=1e-10)
+
+    def test_noisy_signal(self, hamma_noise):
+        """Noise of a random signal should be nonzero."""
+        rng = np.random.RandomState(42)
+        volt = rng.normal(0.5, 0.01, 30000)
+        volt_fast = rng.normal(-0.1, 0.02, 300000)
+        mock_hdr = _make_mock_header(volt, volt_fast, threshold=0.1)
+        with patch.object(hamma_noise, '_load_header', return_value=mock_hdr):
+            result = hamma_noise.measure_noise("dummy.bin")
+        assert result["slow_noise"] > 0
+        assert result["fast_noise"] > 0
+        assert result["slow_offset"] == pytest.approx(0.5, abs=0.01)
+        assert result["fast_offset"] == pytest.approx(-0.1, abs=0.01)
+
+    def test_no_fast_channel(self, hamma_noise):
+        """Handles triggers with no fast channel data."""
+        volt = np.zeros(30000)
+        mock_hdr = _make_mock_header(volt, volt_fast=None, threshold=0.05)
+        with patch.object(hamma_noise, '_load_header', return_value=mock_hdr):
+            result = hamma_noise.measure_noise("dummy.bin")
+        assert result["slow_noise"] == pytest.approx(0.0, abs=1e-10)
+        assert np.isnan(result["fast_noise"])
+        assert np.isnan(result["fast_offset"])
+
+    def test_bad_file_returns_none(self, hamma_noise):
+        """Returns None when Header fails to read the file."""
+        with patch.object(hamma_noise, '_load_header', side_effect=Exception("bad file")):
+            result = hamma_noise.measure_noise("bad.bin")
+        assert result is None
+
+
+class TestExtractSensorId:
+    """Test sensor ID extraction from filenames."""
+
+    def test_standard_filename(self, hamma_noise):
+        assert hamma_noise.extract_sensor_id("mj05_2026-04-23_14-00.bin") == "mj05"
+
+    def test_path_with_directory(self, hamma_noise):
+        assert hamma_noise.extract_sensor_id(
+            "/media/pi/DATA37/2026-04-23T14/mj05_file.bin"
+        ) == "mj05"
+
+    def test_unknown_format(self, hamma_noise):
+        assert hamma_noise.extract_sensor_id("weird.bin") == "unknown"

@@ -67,6 +67,63 @@ def discover_files(mj_path, count):
     return bin_files[:count]
 
 
+def _load_header(filepath):
+    """Load a single .bin file via hamma.Header."""
+    import hamma
+    return hamma.Header(filepath)
+
+
+def extract_sensor_id(filepath):
+    """Extract sensor ID from a .bin filename.
+
+    Returns sensor ID (e.g., 'mj05') or 'unknown'.
+    """
+    basename = os.path.basename(filepath)
+    parts = basename.split("_")
+    if len(parts) >= 2:
+        return parts[0]
+    return "unknown"
+
+
+def measure_noise(filepath):
+    """Measure noise and offset from a single trigger file.
+
+    Returns dict with keys: threshold, slow_noise, slow_offset,
+    fast_noise, fast_offset. Returns None on read failure.
+    """
+    try:
+        hdr = _load_header(filepath)
+    except Exception as e:
+        logger.warning("Failed to read %s: %s", filepath, e)
+        return None
+
+    data = hdr.get_data(0, noTimes=True)
+    threshold = float(hdr.data.threshold[0])
+
+    # Slow channel
+    perc = np.percentile(data.volt[0:MEDSIZE], NOISE_PERCENTILES)
+    slow_noise = perc[1] - perc[0]
+    slow_offset = np.median(data.volt[0:MEDSIZE])
+
+    # Fast channel
+    if data.voltFast is not None:
+        fast_med_size = MEDSIZE * 10
+        perc_fast = np.percentile(data.voltFast[0:fast_med_size], NOISE_PERCENTILES)
+        fast_noise = perc_fast[1] - perc_fast[0]
+        fast_offset = np.median(data.voltFast[0:fast_med_size])
+    else:
+        fast_noise = np.nan
+        fast_offset = np.nan
+
+    return {
+        "threshold": threshold,
+        "slow_noise": float(slow_noise),
+        "slow_offset": float(slow_offset),
+        "fast_noise": float(fast_noise),
+        "fast_offset": float(fast_offset),
+    }
+
+
 def _build_parser():
     """Build argument parser."""
     parser = argparse.ArgumentParser(
