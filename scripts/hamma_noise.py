@@ -193,6 +193,72 @@ def check_warnings(agg, warn_pct):
     return warnings
 
 
+def format_report(sensor_id, files_analyzed, agg, warnings):
+    """Format human-readable noise report.
+
+    Parameters
+    ----------
+    sensor_id : str
+        Sensor identifier (e.g., 'mj05').
+    files_analyzed : int
+        Number of files successfully analyzed.
+    agg : dict
+        Aggregated results from aggregate_results().
+    warnings : list of str
+        Warning messages.
+
+    Returns
+    -------
+    str
+        Formatted report string.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = []
+    lines.append("=== Noise Check: {} | {} ===".format(sensor_id, now))
+    lines.append("Files analyzed: {}".format(files_analyzed))
+    lines.append("Threshold: {:.4f}V".format(agg["threshold_V"]))
+    lines.append("")
+
+    # Noise table
+    hdr = "{:<10s} {:>12s} {:>10s} {:>10s} {:>18s}".format(
+        "Channel", "Median(Vpp)", "Max(Vpp)", "IQR(Vpp)", "Noise/Thresh(max)")
+    lines.append(hdr)
+    for ch in ["slow", "fast"]:
+        s = agg[ch]
+        if s["noise_vpp_median"] is None:
+            lines.append("{:<10s} {:>12s} {:>10s} {:>10s} {:>18s}".format(
+                ch, "N/A", "N/A", "N/A", "N/A"))
+        else:
+            pct_str = "{:.1f}%".format(s["noise_thresh_pct"]) if s["noise_thresh_pct"] is not None else "N/A"
+            lines.append("{:<10s} {:>11.4f}V {:>9.4f}V {:>9.4f}V {:>17s}".format(
+                ch, s["noise_vpp_median"], s["noise_vpp_max"],
+                s["noise_vpp_iqr"], pct_str))
+    lines.append("")
+
+    # Offset table
+    hdr2 = "{:<10s} {:>12s} {:>10s} {:>10s}".format(
+        "Channel", "Median(Off)", "Max(Off)", "IQR(Off)")
+    lines.append(hdr2)
+    for ch in ["slow", "fast"]:
+        s = agg[ch]
+        if s["offset_median"] is None:
+            lines.append("{:<10s} {:>12s} {:>10s} {:>10s}".format(
+                ch, "N/A", "N/A", "N/A"))
+        else:
+            lines.append("{:<10s} {:>11.4f}V {:>9.4f}V {:>9.4f}V".format(
+                ch, s["offset_median"], s["offset_max"], s["offset_iqr"]))
+    lines.append("")
+
+    # Status
+    if warnings:
+        for w in warnings:
+            lines.append("Status: WARNING - {}".format(w))
+    else:
+        lines.append("Status: OK")
+
+    return "\n".join(lines)
+
+
 def _build_parser():
     """Build argument parser."""
     parser = argparse.ArgumentParser(

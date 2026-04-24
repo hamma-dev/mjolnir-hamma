@@ -284,3 +284,82 @@ class TestCheckWarnings:
         }
         warnings = hamma_noise.check_warnings(agg, warn_pct=80)
         assert warnings == []
+
+
+class TestFormatReport:
+    """Test human-readable report formatting."""
+
+    def test_basic_report(self, hamma_noise):
+        """Report contains expected sections."""
+        agg = {
+            "threshold_V": 0.042,
+            "slow": {
+                "noise_vpp_median": 0.003, "noise_vpp_max": 0.005,
+                "noise_vpp_iqr": 0.001, "offset_median": 0.015,
+                "offset_max": 0.018, "offset_iqr": 0.002,
+                "noise_thresh_pct": 11.9,
+            },
+            "fast": {
+                "noise_vpp_median": 0.012, "noise_vpp_max": 0.028,
+                "noise_vpp_iqr": 0.006, "offset_median": -0.002,
+                "offset_max": 0.004, "offset_iqr": 0.003,
+                "noise_thresh_pct": 66.7,
+            },
+        }
+        report = hamma_noise.format_report(
+            sensor_id="mj05", files_analyzed=8,
+            agg=agg, warnings=[],
+        )
+        assert "mj05" in report
+        assert "Threshold:" in report
+        assert "0.042" in report
+        assert "Status: OK" in report
+        assert "Files analyzed: 8" in report
+
+    def test_report_with_warning(self, hamma_noise):
+        """Report shows WARNING status."""
+        agg = {
+            "threshold_V": 0.05,
+            "slow": {
+                "noise_vpp_median": 0.003, "noise_vpp_max": 0.005,
+                "noise_vpp_iqr": 0.001, "offset_median": 0.015,
+                "offset_max": 0.018, "offset_iqr": 0.002,
+                "noise_thresh_pct": 10.0,
+            },
+            "fast": {
+                "noise_vpp_median": 0.040, "noise_vpp_max": 0.046,
+                "noise_vpp_iqr": 0.003, "offset_median": 0.0,
+                "offset_max": 0.002, "offset_iqr": 0.001,
+                "noise_thresh_pct": 92.0,
+            },
+        }
+        warnings = ["fast channel noise at 92% of threshold"]
+        report = hamma_noise.format_report(
+            sensor_id="mj05", files_analyzed=10,
+            agg=agg, warnings=warnings,
+        )
+        assert "WARNING" in report
+        assert "92%" in report
+
+    def test_report_none_pct(self, hamma_noise):
+        """Report handles None noise_thresh_pct (zero threshold)."""
+        agg = {
+            "threshold_V": 0.0,
+            "slow": {
+                "noise_vpp_median": 0.003, "noise_vpp_max": 0.005,
+                "noise_vpp_iqr": 0.001, "offset_median": 0.015,
+                "offset_max": 0.018, "offset_iqr": 0.002,
+                "noise_thresh_pct": None,
+            },
+            "fast": {
+                "noise_vpp_median": 0.012, "noise_vpp_max": 0.028,
+                "noise_vpp_iqr": 0.006, "offset_median": -0.002,
+                "offset_max": 0.004, "offset_iqr": 0.003,
+                "noise_thresh_pct": None,
+            },
+        }
+        report = hamma_noise.format_report(
+            sensor_id="mj05", files_analyzed=5,
+            agg=agg, warnings=[],
+        )
+        assert "N/A" in report
