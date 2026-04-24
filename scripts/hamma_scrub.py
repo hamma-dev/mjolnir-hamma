@@ -160,12 +160,12 @@ def _parse_since(since_str):
     Parameters
     ----------
     since_str : str
-        Date string: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH'.
+        Date string: 'YYYY-MM-DD', 'YYYY-MM-DDTHH', or 'auto'.
 
     Returns
     -------
     str
-        Normalized to 'YYYY-MM-DDTHH' format for directory comparison.
+        Normalized to 'YYYY-MM-DDTHH' format, or 'auto' sentinel.
 
     Raises
     ------
@@ -173,6 +173,8 @@ def _parse_since(since_str):
         If format is not recognized.
     """
     s = since_str.strip()
+    if s.lower() == 'auto':
+        return 'auto'
     # YYYY-MM-DDTHH (already has hour)
     if len(s) == 13 and s[10] == 'T':
         return s
@@ -180,7 +182,7 @@ def _parse_since(since_str):
     if len(s) == 10 and s[4] == '-' and s[7] == '-':
         return s + 'T00'
     raise ValueError(
-        "Invalid --since format '{}': expected YYYY-MM-DD or YYYY-MM-DDTHH".format(s)
+        "Invalid --since format '{}': expected YYYY-MM-DD, YYYY-MM-DDTHH, or auto".format(s)
     )
 
 
@@ -582,6 +584,51 @@ def decode_gps_time(header):
         return dt.strftime('%Y-%m-%dT%H:%M:%S.') + '{:03d}'.format(dt.microsecond // 1000)
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def earliest_ags_timestamp(ags_entries):
+    """Find the earliest valid GPS timestamp across all AGS entries.
+
+    Groups entries by filename, finds the first valid GPS timestamp
+    in each file (triggers within a file are sequential, so the first
+    valid one is the earliest), and returns the minimum across all files.
+
+    Parameters
+    ----------
+    ags_entries : list of dict
+        From scan_ags_files(), each with 'header', 'filename', 'offset',
+        'index'.
+
+    Returns
+    -------
+    str or None
+        'YYYY-MM-DDTHH' cutoff, or None if no valid GPS found.
+    """
+    if not ags_entries:
+        return None
+
+    # Group entries by filename
+    files = {}
+    for entry in ags_entries:
+        files.setdefault(entry["filename"], []).append(entry)
+
+    earliest = None
+    for filename in sorted(files):
+        # Sort by index within file (triggers are sequential)
+        triggers = sorted(files[filename], key=lambda e: e["index"])
+        for trigger in triggers:
+            timestamp = decode_gps_time(trigger["header"])
+            if timestamp is not None:
+                cutoff = timestamp[:13]  # YYYY-MM-DDTHH
+                if earliest is None or cutoff < earliest:
+                    earliest = cutoff
+                logger.debug("Auto-detect: %s first valid GPS at %s",
+                             filename, cutoff)
+                break  # First valid in file = earliest in file
+
+    if earliest:
+        logger.info("Auto-detect: earliest AGS trigger at %s", earliest)
+    return earliest
 
 
 def detect_unit_name(hostname=None):
@@ -1413,7 +1460,8 @@ def _build_parser():
     )
     parser.add_argument(
         "--since",
-        help="Only scan MJ directories at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH)",
+        help="Only scan MJ directories at or after this date "
+             "(YYYY-MM-DD, YYYY-MM-DDTHH, or 'auto' to detect from AGS)",
     )
     parser.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
@@ -1473,19 +1521,35 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
 
     # Parse --since into normalized directory prefix
     since_cutoff = None
+    auto_detect = False
     if since:
         try:
-            since_cutoff = _parse_since(since)
-            logger.info("Filtering MJ directories to >= %s", since_cutoff)
+            parsed = _parse_since(since)
         except ValueError as e:
             logger.error("%s", e)
             return EXIT_NO_DATA
 
+        if parsed == 'auto':
+            auto_detect = True
+        else:
+            since_cutoff = parsed
+            logger.info("Filtering MJ directories to >= %s", since_cutoff)
+
+    # AGS scan runs first (needed for auto-detect and comparison)
     try:
         ags = scan_ags_files(ags_host, ags_path)
     except RuntimeError as e:
         logger.error("AGS scan failed: %s", e)
         return EXIT_SSH_ERROR
+
+    # Auto-detect: derive cutoff from the scanned AGS entries
+    if auto_detect:
+        since_cutoff = earliest_ags_timestamp(ags["entries"])
+        if since_cutoff:
+            logger.info("Auto-detected --since cutoff: %s", since_cutoff)
+        else:
+            logger.info(
+                "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
     mj = scan_mj_files(mj_path, since=since_cutoff)
 
@@ -1535,11 +1599,20 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         if failed_count:
             logger.warning("Recovery: %d failed", failed_count)
 
-    # Update mj_headers with recovered triggers
+    # Update mj_headers and missing list with recovered triggers
     if recovery_results:
+        recovered_headers = set()
         for r in recovery_results:
             if r["status"] == "recovered":
                 mj["headers"].add(r["header"])
+                recovered_headers.add(r["header"])
+        if recovered_headers:
+            comparison["missing_on_mj"] = [
+                e for e in comparison["missing_on_mj"]
+                if e["header"] not in recovered_headers
+            ]
+            results["missing_on_mj"] = comparison["missing_on_mj"]
+            results["matched"] += len(recovered_headers)
 
     # Purge flow
     purge_results = None

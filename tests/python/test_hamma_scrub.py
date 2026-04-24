@@ -27,6 +27,24 @@ def _make_trigger(datasize=TEST_DATASIZE, sync=SYNC_MARKER, pad=4):
     return bytes(header), payload + padding
 
 
+def _make_gps_header(week=2412, tow=522847.0, utc_offset=18.0,
+                     subsecond=808000000, ecc=1000000000):
+    """Build a 128-byte header with configurable GPS fields.
+
+    Defaults produce timestamp 2026-04-04T01:13:50.808.
+    Use week=0, tow=0.0 for bad GPS (year < 2000 -> decode returns None).
+    """
+    header = bytearray(128)
+    header[0:4] = SYNC_MARKER
+    struct.pack_into('<I', header, 10, TEST_DATASIZE)
+    struct.pack_into('<f', header, 80, tow)
+    struct.pack_into('<h', header, 84, week)
+    struct.pack_into('<f', header, 86, utc_offset)
+    struct.pack_into('<I', header, 94, subsecond)
+    struct.pack_into('<I', header, 98, ecc)
+    return bytes(header)
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "hamma_scrub.py"
 
@@ -298,6 +316,15 @@ class TestParseSince:
     def test_strips_whitespace(self, hamma_scrub):
         assert hamma_scrub._parse_since("  2026-04-10  ") == "2026-04-10T00"
 
+    def test_auto_value_returns_sentinel(self, hamma_scrub):
+        """'auto' returns the sentinel string 'auto'."""
+        assert hamma_scrub._parse_since("auto") == "auto"
+
+    def test_auto_case_insensitive(self, hamma_scrub):
+        """'AUTO' and 'Auto' also return 'auto'."""
+        assert hamma_scrub._parse_since("AUTO") == "auto"
+        assert hamma_scrub._parse_since("Auto") == "auto"
+
 
 class TestStriderProtocol:
     """Test encoding/decoding of the strider binary protocol."""
@@ -553,6 +580,92 @@ class TestDecodeGpsTime:
         struct.pack_into('<I', header, 98, 0)
         result = hamma_scrub.decode_gps_time(bytes(header))
         assert result == "2025-03-05T11:19:43.500"
+
+
+class TestEarliestAgsTimestamp:
+    """Test earliest_ags_timestamp() — derives --since cutoff from AGS data."""
+
+    def test_returns_earliest_valid_gps(self, hamma_scrub):
+        """Returns YYYY-MM-DDTHH from earliest valid GPS across files."""
+        # week 2412, tow ~522847 -> 2026-04-04T01
+        hdr_early = _make_gps_header(week=2412, tow=522847.0)
+        # week 2413, tow ~522847 -> ~1 week later
+        hdr_late = _make_gps_header(week=2413, tow=522847.0)
+        entries = [
+            {"header": hdr_late, "filename": "ags2026-04-11.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_early, "filename": "ags2026-04-04.bin",
+             "offset": 0, "index": 0},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_early)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
+
+    def test_includes_1980_files(self, hamma_scrub):
+        """1980-named files are examined, not skipped."""
+        # 1980 file: first trigger bad GPS, second trigger has valid GPS
+        hdr_bad = _make_gps_header(week=0, tow=0.0)  # bad GPS
+        hdr_1980_good = _make_gps_header(week=2410, tow=100000.0)
+        # ags2026 file: valid GPS but later
+        hdr_2026 = _make_gps_header(week=2412, tow=522847.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_1980_good, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+            {"header": hdr_2026, "filename": "ags2026-04-04.bin",
+             "offset": 0, "index": 0},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_1980_good)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
+
+    def test_skips_bad_gps_within_file(self, hamma_scrub):
+        """Bad GPS triggers (year < 2000) are skipped; first valid wins."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_good = _make_gps_header(week=2412, tow=522847.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_good, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+        ]
+        expected = hamma_scrub.decode_gps_time(hdr_good)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
+
+    def test_all_bad_gps_returns_none(self, hamma_scrub):
+        """If no trigger has valid GPS, return None."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        entries = [
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_bad, "filename": "ags1980-01-06.bin",
+             "offset": 22000000, "index": 1},
+        ]
+        assert hamma_scrub.earliest_ags_timestamp(entries) is None
+
+    def test_empty_entries_returns_none(self, hamma_scrub):
+        """Empty entry list returns None."""
+        assert hamma_scrub.earliest_ags_timestamp([]) is None
+
+    def test_stops_at_first_valid_per_file(self, hamma_scrub):
+        """Only examines triggers until first valid GPS in each file."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_first = _make_gps_header(week=2412, tow=100000.0)
+        hdr_second = _make_gps_header(week=2412, tow=200000.0)
+        entries = [
+            {"header": hdr_bad, "filename": "file.bin",
+             "offset": 0, "index": 0},
+            {"header": hdr_first, "filename": "file.bin",
+             "offset": 22000000, "index": 1},
+            {"header": hdr_second, "filename": "file.bin",
+             "offset": 44000000, "index": 2},
+        ]
+        # Should return cutoff from hdr_first, not hdr_second
+        expected = hamma_scrub.decode_gps_time(hdr_first)[:13]
+        result = hamma_scrub.earliest_ags_timestamp(entries)
+        assert result == expected
 
 
 class TestDetectUnitName:
@@ -1706,6 +1819,12 @@ class TestCLI:
         args = parser.parse_args([])
         assert args.purge is False
 
+    def test_since_auto(self, hamma_scrub):
+        """--since auto is accepted."""
+        parser = hamma_scrub._build_parser()
+        args = parser.parse_args(["--since", "auto"])
+        assert args.since == "auto"
+
 
 class TestMain:
     """Test main() integration."""
@@ -1840,9 +1959,55 @@ class TestMain:
                 "hamma", "/ags/data", str(tmp_path),
                 recover=True,
             )
-        assert rc == 1  # Still EXIT_MISSING even after recovery
+        assert rc == 0  # All missing recovered -> EXIT_OK
         mock_recover.assert_called_once()
         mock_filter.assert_called_once()
+
+    def test_run_partial_recovery_still_exit_missing(self, hamma_scrub, tmp_path):
+        """run() returns EXIT_MISSING when some recoveries fail."""
+        hdr_ok = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        hdr_fail = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [
+                {"header": hdr_ok, "filename": "f.bin", "offset": 0, "index": 0},
+                {"header": hdr_fail, "filename": "f.bin", "offset": 1000, "index": 1},
+            ],
+            "headers": {hdr_ok, hdr_fail},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": set(),
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+        mock_recovery = [
+            {"source_file": "f.bin", "source_offset": 0, "trigger_index": 0,
+             "target_path": "DATA37/test/ok.bin", "size": 100,
+             "status": "recovered", "header": hdr_ok, "error": None},
+            {"source_file": "f.bin", "source_offset": 1000, "trigger_index": 1,
+             "target_path": None, "size": 0,
+             "status": "failed", "header": hdr_fail, "error": "disk full"},
+        ]
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj_result), \
+             patch.object(hamma_scrub, "cleanup_orphaned_temps", return_value=0), \
+             patch.object(hamma_scrub, "filter_recovery_candidates") as mock_filter, \
+             patch.object(hamma_scrub, "recover_triggers", return_value=mock_recovery):
+            mock_filter.return_value = [
+                {"header": hdr_ok, "filename": "f.bin", "offset": 0,
+                 "index": 0, "skip_reason": None},
+                {"header": hdr_fail, "filename": "f.bin", "offset": 1000,
+                 "index": 1, "skip_reason": None},
+            ]
+            rc = hamma_scrub.run(
+                "hamma", "/ags/data", str(tmp_path),
+                recover=True,
+            )
+        assert rc == 1  # One failed -> EXIT_MISSING
 
     def test_run_without_recover_no_recovery(self, hamma_scrub):
         """run() without recover=True does NOT invoke recovery."""
@@ -1987,3 +2152,80 @@ class TestMain:
         # Purge was called even though no triggers were missing
         mock_identify.assert_called_once()
         mock_purge.assert_called_once()
+
+
+class TestRunSinceAuto:
+    """Test --since auto integration in run()."""
+
+    def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
+        """run() with since='auto' derives cutoff from AGS entries."""
+        hdr = _make_gps_header()
+        expected_cutoff = hamma_scrub.decode_gps_time(hdr)[:13]
+        ags_result = {
+            "entries": [{"header": hdr, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {hdr},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+
+        with patch.object(hamma_scrub, "scan_ags_files",
+                          return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files",
+                          return_value=mj_result) as mock_mj:
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            # scan_mj_files called with cutoff derived from AGS data
+            mock_mj.assert_called_once_with("/media/pi", since=expected_cutoff)
+            assert rc == 0
+
+    def test_since_auto_no_valid_gps_scans_all(self, hamma_scrub):
+        """If no AGS entry has valid GPS, no since filter is applied."""
+        hdr_bad = _make_gps_header(week=0, tow=0.0)
+        hdr_mj = b'\xf5\xff\x50\x5d' + b'\x02' + b'\x00' * 123
+        ags_result = {
+            "entries": [{"header": hdr_bad, "filename": "f.bin",
+                         "offset": 0, "index": 0}],
+            "headers": {hdr_bad},
+            "duplicate_count": 0,
+            "elapsed": 1.0,
+        }
+        mj_result = {
+            "headers": {hdr_mj},
+            "file_count": 5,
+            "duplicate_count": 0,
+            "skipped": 0,
+            "dirs_skipped": 0,
+            "elapsed": 1.0,
+        }
+
+        with patch.object(hamma_scrub, "scan_ags_files",
+                          return_value=ags_result), \
+             patch.object(hamma_scrub, "scan_mj_files",
+                          return_value=mj_result) as mock_mj:
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            # scan_mj_files called without since filter
+            mock_mj.assert_called_once_with("/media/pi", since=None)
+
+    def test_since_auto_ags_scan_fails(self, hamma_scrub):
+        """If AGS scan fails, return EXIT_SSH_ERROR."""
+        with patch.object(hamma_scrub, "scan_ags_files",
+                          side_effect=RuntimeError("SSH failed")):
+            rc = hamma_scrub.run(
+                ags_host="hamma", ags_path="/ags/data",
+                mj_path="/media/pi", since="auto",
+            )
+            assert rc == hamma_scrub.EXIT_SSH_ERROR

@@ -57,6 +57,7 @@ config_version = 1
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"
         key_file = "/home/pi/.googlechat"
+        scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
 
     # Step to create HAMMA plot
     [steps.hamma_plot]

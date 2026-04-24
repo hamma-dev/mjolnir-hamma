@@ -3,7 +3,9 @@ Plugin to monitor state variables from the charge controller.
 """
 
 from math import nan
+import shlex
 import shutil
+import subprocess
 
 # Third party imports
 from notifiers.slack import SlackSender
@@ -28,6 +30,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         key_file=None,
         low_pi_space=5,
         enable_drive_checks=True,
+        scrub_command="",
         **output_step_kwargs,
         ):
         """
@@ -58,6 +61,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         enable_drive_checks : bool, optional
             If True (default), check for archive drives and sensor drive space.
             Set to False for units without HAMMA sensor hardware connected.
+        scrub_command : str, optional
+            Shell command to run hamma_scrub.py when drive space is low.
+            If empty (default), no scrub is spawned. Protected by flock.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -77,6 +83,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.sender = None  # Make sure we "initialize" the attribute
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
+        self.scrub_command = scrub_command
 
         sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
         try:
@@ -321,7 +328,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         This will check to see how much space is remaining on a sensor USB drive.
         If it falls below the value given by the class attribute `low_space`,
-        send a message.
+        send a message and optionally spawn a scrub process.
 
         Parameters
         ----------
@@ -336,8 +343,26 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         """
         space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
         if (space_now < self.low_space) and (space_pre > self.low_space):
+            self._spawn_scrub()
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
+
+    def _spawn_scrub(self):
+        """Spawn detached scrub process if scrub_command is configured."""
+        if not self.scrub_command or not self.scrub_command.strip():
+            return
+        lock_file = "/tmp/hamma_scrub.lock"
+        try:
+            cmd = ["flock", "-n", lock_file] + shlex.split(self.scrub_command)
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.logger.info("Spawned scrub: %s", " ".join(cmd))
+        except (OSError, ValueError) as e:
+            self.logger.error("Failed to spawn scrub: %s", e)
 
     def check_battery_voltage(self, input_data):
         """
