@@ -124,6 +124,75 @@ def measure_noise(filepath):
     }
 
 
+def aggregate_results(results):
+    """Aggregate per-trigger noise measurements.
+
+    Parameters
+    ----------
+    results : list of dict
+        Each dict from measure_noise().
+
+    Returns
+    -------
+    dict
+        Aggregated stats with threshold_V, slow{}, fast{} sub-dicts.
+    """
+    thresholds = np.array([r["threshold"] for r in results])
+    threshold = float(np.median(thresholds))
+
+    def _channel_stats(key_noise, key_offset):
+        noise_vals = np.array([r[key_noise] for r in results])
+        offset_vals = np.array([r[key_offset] for r in results])
+
+        if np.all(np.isnan(noise_vals)):
+            return {
+                "noise_vpp_median": None, "noise_vpp_max": None,
+                "noise_vpp_iqr": None, "offset_median": None,
+                "offset_max": None, "offset_iqr": None,
+                "noise_thresh_pct": None,
+            }
+
+        q25, q75 = np.percentile(noise_vals, [25, 75])
+        oq25, oq75 = np.percentile(offset_vals, [25, 75])
+        noise_max = float(np.max(noise_vals))
+
+        if threshold > 0:
+            noise_thresh_pct = round(100.0 * noise_max / threshold, 1)
+        else:
+            noise_thresh_pct = None
+
+        return {
+            "noise_vpp_median": float(np.median(noise_vals)),
+            "noise_vpp_max": noise_max,
+            "noise_vpp_iqr": float(q75 - q25),
+            "offset_median": float(np.median(offset_vals)),
+            "offset_max": float(np.max(offset_vals)),
+            "offset_iqr": float(oq75 - oq25),
+            "noise_thresh_pct": noise_thresh_pct,
+        }
+
+    return {
+        "threshold_V": threshold,
+        "slow": _channel_stats("slow_noise", "slow_offset"),
+        "fast": _channel_stats("fast_noise", "fast_offset"),
+    }
+
+
+def check_warnings(agg, warn_pct):
+    """Check if noise levels exceed warning threshold.
+
+    Returns list of warning messages (empty if OK).
+    """
+    warnings = []
+    for channel in ["slow", "fast"]:
+        pct = agg[channel].get("noise_thresh_pct")
+        if pct is not None and pct >= warn_pct:
+            warnings.append(
+                "{} channel noise at {:.0f}% of threshold".format(channel, pct)
+            )
+    return warnings
+
+
 def _build_parser():
     """Build argument parser."""
     parser = argparse.ArgumentParser(

@@ -193,3 +193,94 @@ class TestExtractSensorId:
 
     def test_unknown_format(self, hamma_noise):
         assert hamma_noise.extract_sensor_id("weird.bin") == "unknown"
+
+
+class TestAggregateResults:
+    """Test aggregation of per-trigger noise measurements."""
+
+    def test_basic_aggregation(self, hamma_noise):
+        """Computes median, max, IQR for noise and offset."""
+        results = [
+            {"threshold": 0.05, "slow_noise": 0.002, "slow_offset": 0.01,
+             "fast_noise": 0.010, "fast_offset": -0.001},
+            {"threshold": 0.05, "slow_noise": 0.004, "slow_offset": 0.02,
+             "fast_noise": 0.020, "fast_offset": -0.003},
+            {"threshold": 0.05, "slow_noise": 0.003, "slow_offset": 0.015,
+             "fast_noise": 0.015, "fast_offset": -0.002},
+            {"threshold": 0.05, "slow_noise": 0.006, "slow_offset": 0.018,
+             "fast_noise": 0.030, "fast_offset": 0.001},
+        ]
+        agg = hamma_noise.aggregate_results(results)
+
+        assert agg["threshold_V"] == pytest.approx(0.05)
+        assert agg["slow"]["noise_vpp_median"] == pytest.approx(0.0035)
+        assert agg["slow"]["noise_vpp_max"] == pytest.approx(0.006)
+        assert agg["slow"]["noise_vpp_iqr"] == pytest.approx(0.00175)
+
+    def test_threshold_varies_uses_median(self, hamma_noise):
+        """When thresholds differ, uses median."""
+        results = [
+            {"threshold": 0.04, "slow_noise": 0.002, "slow_offset": 0.01,
+             "fast_noise": 0.01, "fast_offset": 0.0},
+            {"threshold": 0.06, "slow_noise": 0.002, "slow_offset": 0.01,
+             "fast_noise": 0.01, "fast_offset": 0.0},
+        ]
+        agg = hamma_noise.aggregate_results(results)
+        assert agg["threshold_V"] == pytest.approx(0.05)
+
+    def test_zero_threshold(self, hamma_noise):
+        """Zero threshold produces None for noise_thresh_pct."""
+        results = [
+            {"threshold": 0.0, "slow_noise": 0.002, "slow_offset": 0.01,
+             "fast_noise": 0.01, "fast_offset": 0.0},
+        ]
+        agg = hamma_noise.aggregate_results(results)
+        assert agg["slow"]["noise_thresh_pct"] is None
+        assert agg["fast"]["noise_thresh_pct"] is None
+
+    def test_nan_fast_channel(self, hamma_noise):
+        """Handles NaN fast channel values (no fast data)."""
+        results = [
+            {"threshold": 0.05, "slow_noise": 0.002, "slow_offset": 0.01,
+             "fast_noise": float("nan"), "fast_offset": float("nan")},
+            {"threshold": 0.05, "slow_noise": 0.003, "slow_offset": 0.02,
+             "fast_noise": float("nan"), "fast_offset": float("nan")},
+        ]
+        agg = hamma_noise.aggregate_results(results)
+        assert agg["fast"]["noise_vpp_median"] is None
+        assert agg["fast"]["noise_thresh_pct"] is None
+
+
+class TestCheckWarnings:
+    """Test warning generation."""
+
+    def test_ok_status(self, hamma_noise):
+        """No warnings when noise is well below threshold."""
+        agg = {
+            "threshold_V": 0.05,
+            "slow": {"noise_vpp_max": 0.005, "noise_thresh_pct": 10.0},
+            "fast": {"noise_vpp_max": 0.020, "noise_thresh_pct": 40.0},
+        }
+        warnings = hamma_noise.check_warnings(agg, warn_pct=80)
+        assert warnings == []
+
+    def test_warning_triggered(self, hamma_noise):
+        """Warning when noise exceeds warn_pct of threshold."""
+        agg = {
+            "threshold_V": 0.05,
+            "slow": {"noise_vpp_max": 0.005, "noise_thresh_pct": 10.0},
+            "fast": {"noise_vpp_max": 0.045, "noise_thresh_pct": 90.0},
+        }
+        warnings = hamma_noise.check_warnings(agg, warn_pct=80)
+        assert len(warnings) == 1
+        assert "fast" in warnings[0].lower()
+
+    def test_no_warning_when_pct_is_none(self, hamma_noise):
+        """No warning when threshold was zero (pct is None)."""
+        agg = {
+            "threshold_V": 0.0,
+            "slow": {"noise_vpp_max": 0.005, "noise_thresh_pct": None},
+            "fast": {"noise_vpp_max": 0.020, "noise_thresh_pct": None},
+        }
+        warnings = hamma_noise.check_warnings(agg, warn_pct=80)
+        assert warnings == []
