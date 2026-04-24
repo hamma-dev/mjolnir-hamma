@@ -310,8 +310,80 @@ def main():
 
 
 def run(mj_path, count, warn_pct, output, no_save):
-    """Main logic. Returns exit code."""
-    # Placeholder — implemented in Task 5
+    """Run noise check and produce report.
+
+    Parameters
+    ----------
+    mj_path : str
+        Base path for DATA drive discovery.
+    count : int
+        Number of most recent files to analyze.
+    warn_pct : int
+        Warning percentage threshold.
+    output : str
+        Path for JSON output file.
+    no_save : bool
+        If True, skip saving JSON.
+
+    Returns
+    -------
+    int
+        Exit code (EXIT_OK or EXIT_ERROR).
+    """
+    # Discover files
+    files = discover_files(mj_path, count)
+    if not files:
+        print("ERROR: No .bin files found under {}".format(mj_path))
+        return EXIT_ERROR
+
+    # Measure each file
+    results = []
+    failures = 0
+    for filepath in files:
+        result = measure_noise(filepath)
+        if result is None:
+            failures += 1
+        else:
+            results.append(result)
+
+    if not results:
+        print("ERROR: All {} files failed to read".format(len(files)))
+        return EXIT_ERROR
+
+    if failures > 0:
+        logger.warning("%d of %d files failed to read", failures, len(files))
+
+    # Extract sensor ID from first successful file
+    sensor_id = extract_sensor_id(files[0])
+
+    # Aggregate and check warnings
+    agg = aggregate_results(results)
+    warnings = check_warnings(agg, warn_pct)
+
+    # Print report
+    report = format_report(sensor_id, len(results), agg, warnings)
+    print(report)
+
+    # Save JSON
+    if not no_save:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        json_data = {
+            "sensor": sensor_id,
+            "timestamp": now,
+            "files_analyzed": len(results),
+            "threshold_V": agg["threshold_V"],
+            "slow": agg["slow"],
+            "fast": agg["fast"],
+            "status": "WARNING" if warnings else "OK",
+            "warnings": warnings,
+        }
+        try:
+            with open(output, "w") as f:
+                json.dump(json_data, f, indent=2)
+            logger.info("Results saved to %s", output)
+        except IOError as e:
+            logger.warning("Could not save JSON: %s", e)
+
     return EXIT_OK
 
 

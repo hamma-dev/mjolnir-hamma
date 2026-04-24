@@ -363,3 +363,92 @@ class TestFormatReport:
             agg=agg, warnings=[],
         )
         assert "N/A" in report
+
+
+class TestRun:
+    """Test the run() function end-to-end with mocked Header."""
+
+    def _make_results(self, n=3, threshold=0.05):
+        """Helper to create n mock measure_noise results."""
+        rng = np.random.RandomState(42)
+        results = []
+        for _ in range(n):
+            results.append({
+                "threshold": threshold,
+                "slow_noise": 0.002 + rng.uniform(0, 0.002),
+                "slow_offset": 0.01 + rng.uniform(0, 0.005),
+                "fast_noise": 0.010 + rng.uniform(0, 0.005),
+                "fast_offset": rng.uniform(-0.003, 0.003),
+            })
+        return results
+
+    def test_run_ok(self, hamma_noise, tmp_path):
+        """Successful run returns EXIT_OK and saves JSON."""
+        results = self._make_results()
+        files = ["mj05_a.bin", "mj05_b.bin", "mj05_c.bin"]
+        output = str(tmp_path / "noise.json")
+
+        with patch.object(hamma_noise, 'discover_files', return_value=files), \
+             patch.object(hamma_noise, 'measure_noise', side_effect=results):
+            rc = hamma_noise.run(
+                mj_path="/tmp", count=10, warn_pct=80,
+                output=output, no_save=False,
+            )
+
+        assert rc == hamma_noise.EXIT_OK
+        assert os.path.exists(output)
+        with open(output) as f:
+            data = json.load(f)
+        assert data["sensor"] == "mj05"
+        assert data["files_analyzed"] == 3
+        assert "slow" in data
+        assert "fast" in data
+
+    def test_run_no_files(self, hamma_noise, tmp_path, capsys):
+        """Returns EXIT_ERROR when no files found."""
+        with patch.object(hamma_noise, 'discover_files', return_value=[]):
+            rc = hamma_noise.run(
+                mj_path="/tmp", count=10, warn_pct=80,
+                output=str(tmp_path / "noise.json"), no_save=False,
+            )
+        assert rc == hamma_noise.EXIT_ERROR
+
+    def test_run_all_files_fail(self, hamma_noise, tmp_path):
+        """Returns EXIT_ERROR when all files fail to read."""
+        files = ["mj05_a.bin", "mj05_b.bin"]
+        with patch.object(hamma_noise, 'discover_files', return_value=files), \
+             patch.object(hamma_noise, 'measure_noise', return_value=None):
+            rc = hamma_noise.run(
+                mj_path="/tmp", count=10, warn_pct=80,
+                output=str(tmp_path / "noise.json"), no_save=False,
+            )
+        assert rc == hamma_noise.EXIT_ERROR
+
+    def test_run_no_save(self, hamma_noise, tmp_path):
+        """With --no-save, JSON file is not created."""
+        results = self._make_results(n=1)
+        output = str(tmp_path / "noise.json")
+        with patch.object(hamma_noise, 'discover_files', return_value=["mj05_a.bin"]), \
+             patch.object(hamma_noise, 'measure_noise', side_effect=results):
+            rc = hamma_noise.run(
+                mj_path="/tmp", count=10, warn_pct=80,
+                output=output, no_save=True,
+            )
+        assert rc == hamma_noise.EXIT_OK
+        assert not os.path.exists(output)
+
+    def test_run_some_files_fail(self, hamma_noise, tmp_path):
+        """Partial failures still produce a report from remaining files."""
+        results = [None, self._make_results(n=1)[0]]
+        files = ["mj05_bad.bin", "mj05_good.bin"]
+        output = str(tmp_path / "noise.json")
+        with patch.object(hamma_noise, 'discover_files', return_value=files), \
+             patch.object(hamma_noise, 'measure_noise', side_effect=results):
+            rc = hamma_noise.run(
+                mj_path="/tmp", count=10, warn_pct=80,
+                output=output, no_save=False,
+            )
+        assert rc == hamma_noise.EXIT_OK
+        with open(output) as f:
+            data = json.load(f)
+        assert data["files_analyzed"] == 1
