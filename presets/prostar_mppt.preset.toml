@@ -12,6 +12,7 @@ type = "device"
     author = "Generated from MStar-WLAN register definitions"
     description = "Device preset for Morningstar ProStar MPPT solar charge controller with Modbus RTU support"
     homepage = "https://www.morningstarcorp.com/products/prostar-mppt/"
+    repo = "https://github.com/hamma-dev/mjolnir-hamma"
     preset_version = "0.1.0"
     brokkr_version_min = "0.4.0"
 
@@ -27,7 +28,8 @@ type = "device"
     temperature = { binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 1, unit = "C", uncertainty = 1 }
     # Amp-hours with 0.1 scaling
     amphours = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
-    # Kilowatt-hours with 0.1 scaling (using 32-bit)
+    # Kilowatt-hours with 0.1 scaling (16-bit based on MStar-WLAN definitions)
+    # NOTE: Verify with hardware if kWh accumulators wrap unexpectedly - may need 32-bit
     kwh_resettable = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "kWh", uncertainty = 0.1 }
     # Double precision values (32-bit)
     amphours_32bit = { binary_type = "I", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
@@ -43,11 +45,12 @@ type = "device"
 
 # Data types for ProStar MPPT registers
 [data_types]
-    # System information
+    # System information (registers 0-15, not currently read by inputs.ram)
+    # These are available for future use or alternative input presets
     sw_ver = { full_name = "Software Version", type_presets = "version_bcd" }
     n_sys_v = { full_name = "Battery Voltage Settings Multiplier", binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 3, unit = "", uncertainty = false }
 
-    # Supply voltages
+    # Supply voltages (registers 4-8, not currently read by inputs.ram)
     vdd_actual = { full_name = "3.3V Supply Voltage", type_presets = "voltage" }
     adc_p12 = { full_name = "12V Supply Voltage", type_presets = "voltage" }
     adc_p5 = { full_name = "5V Supply Voltage", type_presets = "voltage" }
@@ -149,13 +152,12 @@ type = "device"
         unit = 1
         modbus_command = "read_holding_registers"
         # Serial port settings for ProStar MPPT (same as SunSaver)
-        [inputs.ram.modbus_kwargs]
-            method = "rtu"
-            stopbits = 2
-            bytesize = 8
-            parity = "N"
-            baudrate = 9600
-            strict = false
+        modbus_kwargs.method = "rtu"
+        modbus_kwargs.stopbits = 2
+        modbus_kwargs.bytesize = 8
+        modbus_kwargs.parity = "N"
+        modbus_kwargs.baudrate = 9600
+        modbus_kwargs.strict = false
         # Data to read from registers 16-81
         # Reading contiguous block: addresses 0x10-0x51 (16-81 decimal)
         data_names = [

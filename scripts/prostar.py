@@ -113,7 +113,9 @@ def _setup_mppt_client(port=None):
             port_list = serial.tools.list_ports.comports()
             port_object = brokkr.utils.ports.get_serial_port(port_list)
             port = port_object.device
-        except Exception:
+        except (ImportError, AttributeError, ValueError, OSError) as e:
+            # Fall back to default ports if auto-detection fails
+            logging.debug(f"Port auto-detection failed: {e}")
             if Path("/dev/ttyUSB0").exists():
                 port = "/dev/ttyUSB0"
             elif Path("/dev/ttyUSB1").exists():
@@ -155,12 +157,26 @@ def _get_raw_log_data(blocks=LOG_BLOCKS, verbose=False):
                 sys.stdout.write(
                     f"\rGetting data block {block_n + 1} of {blocks}")
                 sys.stdout.flush()
-            log_data_block = mppt_client.read_holding_registers(
-                address=LOG_START_REGISTER + block_n * LOG_BLOCK_LENGTH,
-                count=LOG_BLOCK_LENGTH,
-                unit=UNIT_ID,
-                )
-            log_data_blocks.append(log_data_block.registers)
+            try:
+                log_data_block = mppt_client.read_holding_registers(
+                    address=LOG_START_REGISTER + block_n * LOG_BLOCK_LENGTH,
+                    count=LOG_BLOCK_LENGTH,
+                    unit=UNIT_ID,
+                    )
+                # Check if response is an error
+                if hasattr(log_data_block, 'isError') and log_data_block.isError():
+                    if verbose:
+                        print(f"\nModbus error reading block {block_n}: {log_data_block}")
+                    continue
+                if not hasattr(log_data_block, 'registers'):
+                    if verbose:
+                        print(f"\nInvalid response for block {block_n}: {log_data_block}")
+                    continue
+                log_data_blocks.append(log_data_block.registers)
+            except Exception as e:
+                if verbose:
+                    print(f"\nFailed to read block {block_n}: {type(e).__name__}: {e}")
+                continue
 
         if verbose:
             print("")
@@ -176,26 +192,30 @@ def get_log_data(sort=True, filter_bad=True, verbose=False):
     # Convert data via conversion functions to output format
     for data_block in log_data_blocks:
         log_data_block = {}
-        decoder = pymodbus.payload.BinaryPayloadDecoder.fromRegisters(
-            data_block,
-            byteorder=pymodbus.constants.Endian.Big,
-            wordorder=pymodbus.constants.Endian.Big,
-            )
-        for variable_name, variable_type in LOG_VARIABLES:
-            if variable_name == "alarm_daily":
-                # alarm_daily is 32-bit for ProStar
-                log_data_block[variable_name] = (
-                    CONVERSION_FUNCTIONS[variable_type](
-                        decoder.decode_32bit_uint()))
-            elif variable_name == "hourmeter":
-                # hourmeter is 16-bit in logs but we read as int
-                log_data_block[variable_name] = (
-                    CONVERSION_FUNCTIONS[variable_type](
-                        decoder.decode_16bit_uint()))
-            else:
-                log_data_block[variable_name] = (
-                    CONVERSION_FUNCTIONS[variable_type](
-                        decoder.decode_16bit_uint()))
+        try:
+            decoder = pymodbus.payload.BinaryPayloadDecoder.fromRegisters(
+                data_block,
+                byteorder=pymodbus.constants.Endian.Big,
+                wordorder=pymodbus.constants.Endian.Big,
+                )
+            for variable_name, variable_type in LOG_VARIABLES:
+                if variable_name == "alarm_daily":
+                    # alarm_daily is 32-bit for ProStar - decode and format directly
+                    alarm_value = decoder.decode_32bit_uint()
+                    log_data_block[variable_name] = format(alarm_value, "b").zfill(32)
+                elif variable_name == "hourmeter":
+                    # hourmeter is 16-bit in logs but we read as int
+                    log_data_block[variable_name] = (
+                        CONVERSION_FUNCTIONS[variable_type](
+                            decoder.decode_16bit_uint()))
+                else:
+                    log_data_block[variable_name] = (
+                        CONVERSION_FUNCTIONS[variable_type](
+                            decoder.decode_16bit_uint()))
+        except Exception as e:
+            if verbose:
+                print(f"Error decoding log block: {type(e).__name__}: {e}")
+            continue
         log_data.append(log_data_block)
 
     if filter_bad:
@@ -364,7 +384,7 @@ def main():
     if parsed_args.verbose:
         logging.basicConfig(format="{message}", style="{", level=logging.DEBUG)
 
-    elif getattr(parsed_args, SUBCOMMAND_PARAM, None) in {"register", "coil"}:
+    if getattr(parsed_args, SUBCOMMAND_PARAM, None) in {"register", "coil"}:
         get_set_value(
             address=parsed_args.address,
             address_type=getattr(parsed_args, SUBCOMMAND_PARAM),
