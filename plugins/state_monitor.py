@@ -420,9 +420,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         from brokkr.config.metadata import METADATA
 
         sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
+        site = UNIT_CONFIG['site_description']
 
-        header = f"Message from sensor {sensor_name} at {UNIT_CONFIG['site_description']}"
+        if site:
+            header = f"{sensor_name} ({site}): "
+        else:
+            header = f"{sensor_name}: "
 
-        msg = '\n'.join([header, msg])
-
-        return msg
+        return header + msg
