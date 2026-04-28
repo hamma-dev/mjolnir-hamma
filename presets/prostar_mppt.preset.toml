@@ -17,6 +17,14 @@ type = "device"
     brokkr_version_min = "0.4.0"
 
 # Data type presets to use for the data types that follow
+# NOTE: ProStar MPPT uses Big-Endian byte order for both bytes and words in 32-bit values
+# 32-bit registers are stored as MSW (Most Significant Word) first, then LSW
+# IMPORTANT: Register value 0xFFFF often indicates sensor error or disconnected sensor
+# Applications should validate readings are within physically possible ranges:
+#   - Voltage: 0-100V (ProStar rated to ~96V max)
+#   - Current: 0-80A (ProStar models rated to ~40A, scaling allows up to 79A)
+#   - Temperature: -40°C to +85°C (operating range)
+#   - Power: 0-1000W
 [type_presets]
     # Voltage conversion: n * 96.667 * 2^-15
     voltage = { binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 3, unit = "V", uncertainty = 0.1 }
@@ -24,12 +32,16 @@ type = "device"
     current = { binary_type = "H", conversion = "custom", scale = 79.16, power = -15, base = 2, digits = 3, unit = "A", uncertainty = 0.1 }
     # Power conversion: n * 989.5 * 2^-16
     power = { binary_type = "H", conversion = "custom", scale = 989.5, power = -16, base = 2, digits = 3, unit = "W", uncertainty = 1 }
-    # Temperature conversion (same as voltage scaling)
-    temperature = { binary_type = "H", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 1, unit = "C", uncertainty = 1 }
+    # Temperature conversion (uses signed type to handle negative temperatures in cold weather)
+    # binary_type "h" (lowercase) = signed 16-bit integer for -40°C to +85°C range
+    temperature = { binary_type = "h", conversion = "custom", scale = 96.667, power = -15, base = 2, digits = 1, unit = "C", uncertainty = 1 }
     # Amp-hours with 0.1 scaling
     amphours = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
     # Kilowatt-hours with 0.1 scaling (16-bit based on MStar-WLAN definitions)
-    # NOTE: Verify with hardware if kWh accumulators wrap unexpectedly - may need 32-bit
+    # VERIFICATION NEEDED: These may be 32-bit in actual hardware (addresses 42-43 as pair)
+    # If 16-bit: max 6553.5 kWh, wraps after ~3.6 years at 5kWh/day
+    # If 32-bit: max 429M kWh, no practical wrap concern
+    # Monitor for unexpected wraparound in production; change to binary_type="I" if needed
     kwh_resettable = { binary_type = "H", conversion = "custom", scale = 0.1, digits = 1, unit = "kWh", uncertainty = 0.1 }
     # Double precision values (32-bit)
     amphours_32bit = { binary_type = "I", conversion = "custom", scale = 0.1, digits = 1, unit = "Ah", uncertainty = 0.1 }
@@ -141,8 +153,23 @@ type = "device"
 # Input presets for reading data from the ProStar MPPT
 [inputs]
     # Input preset that reads primary monitoring RAM registers via Modbus RTU
-    # This reads a contiguous block from address 0x0010 (16) to 0x0051 (81)
-    # covering all the main voltage, current, temperature, and status registers
+    # Reads 66 register words from addresses 0x0010-0x0051 (16-81 decimal)
+    #
+    # REGISTER LAYOUT (7 × 32-bit + 52 × 16-bit = 66 register words):
+    # - 16-37:  22 × 16-bit values (voltages, currents, temperatures, status)
+    # - 38-39:  Ahc_r (32-bit Amp-hour charge resettable)
+    # - 40-41:  Ahc_t (32-bit Amp-hour charge total)
+    # - 42-43:  kWhc_r, kWhc_t (16-bit each, OR possibly 32-bit pair - needs verification)
+    # - 44-49:  6 × 16-bit values (temperature limits, load state, voltages)
+    # - 50-51:  Ahl_r (32-bit Amp-hour load resettable)
+    # - 52-53:  Ahl_t (32-bit Amp-hour load total)
+    # - 54-55:  hourmeter (32-bit hours of operation)
+    # - 56-57:  alarm (32-bit alarm bitfield)
+    # - 58-70:  13 × 16-bit values (DIP, LED, power, sweep, daily stats)
+    # - 71-72:  alarm_daily (32-bit daily alarm bitfield)
+    # - 73-81:  9 × 16-bit values (daily time stats, status)
+    #
+    # DATA VALIDATION: Check for 0xFFFF values which indicate sensor errors
     [inputs.ram]
         _module_path = "brokkr.inputs.modbus"
         _class_name = "ModbusSerialInput"
