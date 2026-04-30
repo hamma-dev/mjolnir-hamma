@@ -289,13 +289,13 @@ else
         # Only update if already on the expected branch (don't switch branches mid-install)
         CURRENT_BRANCH=$(git -C "$REPO_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null)
         if [[ "$CURRENT_BRANCH" == "$REPO_BRANCH" ]]; then
-            git -C "$REPO_PATH" fetch origin
             # Reset hard: USB copy leaves dirty working tree (file mode changes)
             # which blocks git pull. Safe here — this is an install, not dev work.
-            if git -C "$REPO_PATH" reset --hard "origin/$REPO_BRANCH"; then
+            if git -C "$REPO_PATH" fetch origin && \
+               git -C "$REPO_PATH" reset --hard "origin/$REPO_BRANCH"; then
                 log_success "Repository updated from GitHub (branch: $REPO_BRANCH)"
             else
-                log_warn "Could not update to latest (continuing with current version)"
+                log_warn "Could not pull latest (continuing with current version)"
             fi
         else
             log_warn "On branch '$CURRENT_BRANCH', not '$REPO_BRANCH' - skipping pull to avoid switching branches"
