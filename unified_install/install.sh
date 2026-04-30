@@ -291,8 +291,10 @@ else
         if [[ "$CURRENT_BRANCH" == "$REPO_BRANCH" ]]; then
             # Reset hard: USB copy leaves dirty working tree (file mode changes)
             # which blocks git pull. Safe here — this is an install, not dev work.
+            # Also reset submodules (same USB file-mode issue affects presets).
             if git -C "$REPO_PATH" fetch origin && \
-               git -C "$REPO_PATH" reset --hard "origin/$REPO_BRANCH"; then
+               git -C "$REPO_PATH" reset --hard "origin/$REPO_BRANCH" && \
+               git -C "$REPO_PATH" submodule foreach --recursive git checkout -- . 2>/dev/null; then
                 log_success "Repository updated from GitHub (branch: $REPO_BRANCH)"
             else
                 log_warn "Could not pull latest (continuing with current version)"
