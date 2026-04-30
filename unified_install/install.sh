@@ -229,7 +229,44 @@ log_success "Prerequisites OK"
 echo ""
 
 # ============================================================================
-# Update mjolnir-hamma repository
+# PHASE 2: Network Setup
+# ============================================================================
+log_info "=== Phase 2: Network Setup ($NETWORK_PATH) ==="
+echo ""
+
+# --- Common: eth0 sensor interface config (applies to all network modes) ---
+log_step "Installing eth0 network configuration..."
+FILES_DIR="${FILES_DIR:-$REPO_ROOT/files}"
+NETWORK_DIR="/etc/systemd/network"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_dry_run "cp $FILES_DIR/40-eth0.network $NETWORK_DIR/"
+    manifest_add "copy" "src" "$FILES_DIR/40-eth0.network" "dst" "$NETWORK_DIR/40-eth0.network" "sudo" "true"
+else
+    sudo cp "$FILES_DIR/40-eth0.network" "$NETWORK_DIR/"
+    log_success "eth0 network config installed"
+fi
+
+echo ""
+
+if [[ "$NETWORK_PATH" == "wifi" ]]; then
+    # --- WiFi Path ---
+    source "$SCRIPT_DIR/lib/network_wifi.sh"
+    setup_wifi_network "$SENSOR_NUM"
+else
+    # --- Cellular Path ---
+    source "$SCRIPT_DIR/lib/network_wwan.sh"
+    if [[ -n "$CELLULAR_APN" ]]; then
+        setup_cellular_network "$SENSOR_NUM" --apn "$CELLULAR_APN"
+    else
+        setup_cellular_network "$SENSOR_NUM"
+    fi
+fi
+
+echo ""
+
+# ============================================================================
+# Update mjolnir-hamma repository (after network is up)
 # ============================================================================
 log_step "Updating mjolnir-hamma repository..."
 
@@ -263,43 +300,6 @@ else
         fi
     else
         log_warn "Repository not found at $REPO_PATH - was bootstrap.sh run?"
-    fi
-fi
-
-echo ""
-
-# ============================================================================
-# PHASE 2: Network Setup
-# ============================================================================
-log_info "=== Phase 2: Network Setup ($NETWORK_PATH) ==="
-echo ""
-
-# --- Common: eth0 sensor interface config (applies to all network modes) ---
-log_step "Installing eth0 network configuration..."
-FILES_DIR="${FILES_DIR:-$REPO_ROOT/files}"
-NETWORK_DIR="/etc/systemd/network"
-
-if [[ "$DRY_RUN" == "true" ]]; then
-    log_dry_run "cp $FILES_DIR/40-eth0.network $NETWORK_DIR/"
-    manifest_add "copy" "src" "$FILES_DIR/40-eth0.network" "dst" "$NETWORK_DIR/40-eth0.network" "sudo" "true"
-else
-    sudo cp "$FILES_DIR/40-eth0.network" "$NETWORK_DIR/"
-    log_success "eth0 network config installed"
-fi
-
-echo ""
-
-if [[ "$NETWORK_PATH" == "wifi" ]]; then
-    # --- WiFi Path ---
-    source "$SCRIPT_DIR/lib/network_wifi.sh"
-    setup_wifi_network "$SENSOR_NUM"
-else
-    # --- Cellular Path ---
-    source "$SCRIPT_DIR/lib/network_wwan.sh"
-    if [[ -n "$CELLULAR_APN" ]]; then
-        setup_cellular_network "$SENSOR_NUM" --apn "$CELLULAR_APN"
-    else
-        setup_cellular_network "$SENSOR_NUM"
     fi
 fi
 
