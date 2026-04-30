@@ -303,6 +303,9 @@ install_hamma() {
                 log_warn "ED25519 key already exists at $ed25519_key"
             fi
 
+            # Fix ownership if a prior run created .ssh files as root
+            chown pi:pi "$ssh_dir" "$ssh_config" 2>/dev/null || true
+
             # Add GitHub host to SSH config (as pi user)
             if ! grep -q "github-hamma" "$ssh_config" 2>/dev/null; then
                 # Use tee to append as pi user (heredoc in outer shell, tee handles permissions)

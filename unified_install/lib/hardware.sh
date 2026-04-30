@@ -40,6 +40,8 @@ setup_sensor_connection() {
         manifest_add "chmod" "path" "$ssh_config" "mode" "0600"
     else
         # Create .ssh directory if needed (as pi user to ensure correct ownership)
+        # Fix ownership first in case a prior run created it as root
+        chown -R pi:pi "$ssh_dir" 2>/dev/null || true
         sudo -H -u pi mkdir -p "$ssh_dir"
         sudo -H -u pi chmod 700 "$ssh_dir"
 
