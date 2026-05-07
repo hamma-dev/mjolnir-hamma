@@ -8,6 +8,7 @@ import textwrap
 
 import pytest
 import toml
+from unittest.mock import patch, MagicMock, call
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sensors.py"
@@ -173,3 +174,108 @@ class TestArchiveTelemetry:
         old_csv.write_text("old\n")
         sensors.archive_telemetry_csv(str(tmp_path))
         assert old_csv.exists()  # untouched
+
+
+class TestRunCommand:
+    """Tests for run_command() helper."""
+
+    def test_success_returns_zero(self, sensors):
+        """Successful command returns 0."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result):
+            rc = sensors.run_command(["echo", "hello"], "Test")
+        assert rc == 0
+
+    def test_failure_returns_nonzero(self, sensors):
+        """Failed command returns nonzero and prints FAIL."""
+        mock_result = MagicMock(returncode=1, stderr="error msg")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            rc = sensors.run_command(["false"], "Test step")
+        assert rc != 0
+
+
+class TestServiceCommands:
+    """Tests for brokkr service management functions."""
+
+    def test_stop_brokkr(self, sensors):
+        """stop_brokkr calls systemctl stop."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.stop_brokkr()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "systemctl", "stop", sensors.BROKKR_SERVICE]
+
+    def test_start_brokkr(self, sensors):
+        """start_brokkr calls systemctl start."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.start_brokkr()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "systemctl", "start", sensors.BROKKR_SERVICE]
+
+    def test_daemon_reload(self, sensors):
+        """daemon_reload calls systemctl daemon-reload."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.daemon_reload()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "systemctl", "daemon-reload"]
+
+
+class TestRelayToggle:
+    """Tests for toggle_relay() subprocess call."""
+
+    def test_relay_on_command(self, sensors):
+        """toggle_relay(True, 17) calls relay.py --pin 17 --on."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.toggle_relay(relay_on=True, pin=17)
+        cmd = mock_run.call_args[0][0]
+        assert cmd == [sensors.RELAY_SCRIPT, "--pin", "17", "--on"]
+
+    def test_relay_off_command(self, sensors):
+        """toggle_relay(False, 4) calls relay.py --pin 4 --off."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.toggle_relay(relay_on=False, pin=4)
+        cmd = mock_run.call_args[0][0]
+        assert cmd == [sensors.RELAY_SCRIPT, "--pin", "4", "--off"]
+
+    def test_pin_forwarded_from_config(self, sensors, tmp_path):
+        """Pin value from config is passed through to relay.py."""
+        config_file = tmp_path / "unit.toml"
+        config_file.write_text("[relay]\npin = 4\nactive_high = true\n")
+        config = sensors.load_relay_config(str(config_file))
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            relay_on = sensors.compute_relay_flag(True, config["active_high"])
+            sensors.toggle_relay(relay_on=relay_on, pin=config["pin"])
+        cmd = mock_run.call_args[0][0]
+        assert "--pin" in cmd
+        assert "4" in cmd
+
+
+class TestDropin:
+    """Tests for drop-in file management."""
+
+    def test_write_dropin_content(self, sensors):
+        """write_dropin writes correct content via sudo tee."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.write_dropin()
+        # Check mkdir call
+        mkdir_cmd = mock_run.call_args_list[0][0][0]
+        assert mkdir_cmd == ["sudo", "mkdir", "-p", sensors.DROPIN_DIR]
+        # Check tee call
+        tee_call = mock_run.call_args_list[1]
+        tee_cmd = tee_call[0][0]
+        assert tee_cmd == ["sudo", "tee", sensors.DROPIN_PATH]
+        assert tee_call[1]["input"] == sensors.DROPIN_CONTENT
+
+    def test_remove_dropin(self, sensors):
+        """remove_dropin calls sudo rm -f."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.remove_dropin()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "rm", "-f", sensors.DROPIN_PATH]

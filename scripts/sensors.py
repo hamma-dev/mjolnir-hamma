@@ -15,6 +15,7 @@ Usage:
 import datetime
 import glob as glob_module
 import os
+import subprocess
 import sys
 
 # Third party imports
@@ -161,3 +162,94 @@ def archive_telemetry_csv(telemetry_dir=None):
         os.rename(csv_path, bak_path)
         print("[OK] Archived {} -> {}".format(
             os.path.basename(csv_path), os.path.basename(bak_path)))
+
+
+def run_command(cmd, description, stdin_data=None):
+    """Run a subprocess command with status output.
+
+    Parameters
+    ----------
+    cmd : list
+        Command and arguments.
+    description : str
+        Human-readable description of the step.
+    stdin_data : str, optional
+        Data to pass to stdin.
+
+    Returns
+    -------
+    int
+        Return code (0 = success).
+    """
+    kwargs = {"capture_output": True, "text": True}
+    if stdin_data is not None:
+        kwargs["input"] = stdin_data
+        kwargs.pop("capture_output")
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.PIPE
+
+    result = subprocess.run(cmd, **kwargs)
+    if result.returncode == 0:
+        print("[OK] {}".format(description))
+    else:
+        stderr = result.stderr.strip() if result.stderr else ""
+        print("[FAIL] {}: {}".format(description, stderr))
+    return result.returncode
+
+
+def stop_brokkr():
+    """Stop the brokkr service."""
+    return run_command(
+        ["sudo", "systemctl", "stop", BROKKR_SERVICE],
+        "Stopped brokkr service")
+
+
+def start_brokkr():
+    """Start the brokkr service."""
+    return run_command(
+        ["sudo", "systemctl", "start", BROKKR_SERVICE],
+        "Started brokkr service")
+
+
+def daemon_reload():
+    """Reload systemd daemon configuration."""
+    return run_command(
+        ["sudo", "systemctl", "daemon-reload"],
+        "Reloaded systemd daemon")
+
+
+def toggle_relay(relay_on, pin):
+    """Toggle the sensor relay via relay.py.
+
+    Parameters
+    ----------
+    relay_on : bool
+        True to energize relay (--on), False to de-energize (--off).
+    pin : int
+        BCM GPIO pin number.
+    """
+    flag = "--on" if relay_on else "--off"
+    description = "Relay {} (pin {})".format(
+        "on (energized)" if relay_on else "off (de-energized)", pin)
+    return run_command(
+        [RELAY_SCRIPT, "--pin", str(pin), flag], description)
+
+
+def write_dropin():
+    """Create the systemd drop-in for nosensor mode."""
+    rc = run_command(
+        ["sudo", "mkdir", "-p", DROPIN_DIR],
+        "Created drop-in directory")
+    if rc != 0:
+        return rc
+    return run_command(
+        ["sudo", "tee", DROPIN_PATH],
+        "Wrote mode drop-in (nosensor)",
+        stdin_data=DROPIN_CONTENT)
+
+
+def remove_dropin():
+    """Remove the systemd drop-in to restore default mode."""
+    return run_command(
+        ["sudo", "rm", "-f", DROPIN_PATH],
+        "Removed mode drop-in (default)")
