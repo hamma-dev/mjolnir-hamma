@@ -12,6 +12,8 @@ Usage:
 """
 
 # Standard library imports
+import datetime
+import glob as glob_module
 import os
 import sys
 
@@ -128,3 +130,34 @@ def compute_relay_flag(sensor_on, active_high):
         True to energize relay (relay.py --on), False to de-energize (--off).
     """
     return sensor_on == active_high
+
+
+def archive_telemetry_csv(telemetry_dir=None):
+    """Archive today's telemetry CSV by renaming to .bak.
+
+    If a .bak already exists, uses a timestamp suffix (.bak.HHMMSS).
+    If no CSV matches today or directory doesn't exist, does nothing.
+
+    Parameters
+    ----------
+    telemetry_dir : str, optional
+        Path to telemetry directory. Defaults to ~/brokkr/hamma/telemetry.
+    """
+    if telemetry_dir is None:
+        telemetry_dir = TELEMETRY_DIR
+
+    if not os.path.isdir(telemetry_dir):
+        return
+
+    today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    pattern = os.path.join(telemetry_dir, "telemetry_*_{}.csv".format(today))
+    matches = glob_module.glob(pattern)
+
+    for csv_path in matches:
+        bak_path = csv_path + ".bak"
+        if os.path.exists(bak_path):
+            timestamp = datetime.datetime.utcnow().strftime("%H%M%S")
+            bak_path = csv_path + ".bak.{}".format(timestamp)
+        os.rename(csv_path, bak_path)
+        print("[OK] Archived {} -> {}".format(
+            os.path.basename(csv_path), os.path.basename(bak_path)))

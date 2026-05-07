@@ -1,5 +1,6 @@
 """Tests for sensors.py — sensor power control script."""
 
+import datetime
 import importlib.util
 import os
 import pathlib
@@ -128,3 +129,47 @@ class TestRelayPolarity:
         """Verify relay_on = (sensor_on == active_high)."""
         result = sensors.compute_relay_flag(sensor_on, active_high)
         assert result == expected_relay_on
+
+
+class TestArchiveTelemetry:
+    """Tests for archive_telemetry_csv()."""
+
+    def test_archives_todays_csv(self, sensors, tmp_path):
+        """Renames today's telemetry CSV to .bak."""
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        csv_file = tmp_path / "telemetry_hamma_0005_{}.csv".format(today)
+        csv_file.write_text("header\ndata\n")
+        sensors.archive_telemetry_csv(str(tmp_path))
+        assert not csv_file.exists()
+        assert (tmp_path / (csv_file.name + ".bak")).exists()
+
+    def test_no_csv_for_today(self, sensors, tmp_path):
+        """No matching CSV — returns without error."""
+        sensors.archive_telemetry_csv(str(tmp_path))
+        # No exception = pass
+
+    def test_bak_collision_uses_timestamp(self, sensors, tmp_path):
+        """When .bak exists, uses timestamp suffix."""
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        csv_file = tmp_path / "telemetry_hamma_0005_{}.csv".format(today)
+        csv_file.write_text("new data\n")
+        bak_file = tmp_path / (csv_file.name + ".bak")
+        bak_file.write_text("old data\n")
+        sensors.archive_telemetry_csv(str(tmp_path))
+        assert not csv_file.exists()
+        assert bak_file.exists()  # original .bak untouched
+        # A timestamped .bak should exist
+        bak_files = list(tmp_path.glob("*.bak.*"))
+        assert len(bak_files) == 1
+
+    def test_telemetry_dir_missing(self, sensors, tmp_path):
+        """Non-existent telemetry directory — returns without error."""
+        sensors.archive_telemetry_csv(str(tmp_path / "nonexistent"))
+        # No exception = pass
+
+    def test_only_archives_todays_file(self, sensors, tmp_path):
+        """Does not archive CSVs from other days."""
+        old_csv = tmp_path / "telemetry_hamma_0005_2020-01-01.csv"
+        old_csv.write_text("old\n")
+        sensors.archive_telemetry_csv(str(tmp_path))
+        assert old_csv.exists()  # untouched
