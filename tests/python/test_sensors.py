@@ -388,3 +388,86 @@ class TestSensorOn:
 
         assert rc != 0
         assert "relay" not in calls
+
+
+class TestStatus:
+    """Tests for sensor_status()."""
+
+    def test_status_checks_dropin(self, sensors, tmp_path):
+        """Status reports drop-in presence."""
+        dropin = tmp_path / "mode.conf"
+        dropin.write_text(sensors.DROPIN_CONTENT)
+        with patch.object(sensors, "DROPIN_PATH", str(dropin)), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Drop-in: yes" in output
+
+    def test_status_no_dropin(self, sensors, tmp_path):
+        """Status reports no drop-in."""
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Drop-in: no" in output
+
+    def test_status_shows_relay_config(self, sensors, tmp_path):
+        """Status shows pin and active_high from config."""
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 4, "active_high": True})
+        assert "pin=4" in output
+        assert "active_high=True" in output
+
+    def test_status_shows_brokkr_service(self, sensors, tmp_path):
+        """Status shows brokkr service state."""
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Brokkr service: active" in output
+
+    def test_status_shows_mode_nosensor(self, sensors, tmp_path):
+        """Status shows nosensor mode when drop-in present."""
+        dropin = tmp_path / "mode.conf"
+        dropin.write_text(sensors.DROPIN_CONTENT)
+        with patch.object(sensors, "DROPIN_PATH", str(dropin)), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Brokkr mode: nosensor" in output
+
+    def test_status_shows_mode_default(self, sensors, tmp_path):
+        """Status shows default mode when no drop-in."""
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Brokkr mode: default" in output
+
+    def test_status_shows_sensor_reachable(self, sensors, tmp_path):
+        """Status shows sensor reachability."""
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Sensor reachable:" in output
+
+    def test_status_shows_last_telemetry(self, sensors, tmp_path):
+        """Status shows last telemetry when CSV exists."""
+        csv_file = tmp_path / "telemetry_hamma_0005_2026-01-01.csv"
+        csv_file.write_text("data\n")
+        with patch.object(sensors, "DROPIN_PATH",
+                          str(tmp_path / "nonexistent")), \
+             patch.object(sensors, "TELEMETRY_DIR", str(tmp_path)), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="active")):
+            output = sensors.sensor_status(config={"pin": 17, "active_high": False})
+        assert "Last telemetry:" in output
+        assert "telemetry_hamma_0005_2026-01-01.csv" in output

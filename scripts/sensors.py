@@ -333,3 +333,67 @@ def sensor_on(pin, active_high):
 
     rc = start_brokkr()
     return rc
+
+
+def sensor_status(config):
+    """Report current sensor state.
+
+    Parameters
+    ----------
+    config : dict
+        Relay config with 'pin' and 'active_high'.
+
+    Returns
+    -------
+    str
+        Multi-line status report.
+    """
+    lines = []
+
+    # Drop-in
+    if os.path.isfile(DROPIN_PATH):
+        lines.append("Drop-in: yes (nosensor mode)")
+        with open(DROPIN_PATH) as f:
+            lines.append("  Contents: {}".format(f.read().strip()))
+    else:
+        lines.append("Drop-in: no (default mode)")
+
+    # Brokkr service
+    result = subprocess.run(
+        ["systemctl", "is-active", BROKKR_SERVICE],
+        capture_output=True, text=True)
+    state = result.stdout.strip() if result.stdout else "unknown"
+    lines.append("Brokkr service: {}".format(state))
+
+    # Brokkr mode
+    mode = "nosensor" if os.path.isfile(DROPIN_PATH) else "default"
+    lines.append("Brokkr mode: {}".format(mode))
+
+    # Sensor reachable
+    result = subprocess.run(
+        ["ping", "-c", "1", "-W", "2", SENSOR_IP],
+        capture_output=True, text=True)
+    reachable = "yes" if result.returncode == 0 else "no"
+    lines.append("Sensor reachable: {} ({})".format(reachable, SENSOR_IP))
+
+    # Last telemetry
+    if os.path.isdir(TELEMETRY_DIR):
+        csvs = sorted(glob_module.glob(
+            os.path.join(TELEMETRY_DIR, "telemetry_*.csv")))
+        if csvs:
+            latest = csvs[-1]
+            mtime = datetime.datetime.fromtimestamp(
+                os.path.getmtime(latest)).strftime("%Y-%m-%d %H:%M:%S")
+            lines.append("Last telemetry: {} ({})".format(
+                os.path.basename(latest), mtime))
+        else:
+            lines.append("Last telemetry: none")
+    else:
+        lines.append("Last telemetry: directory not found")
+
+    # Relay config
+    lines.append("Relay config: pin={}, active_high={}".format(
+        config["pin"], config["active_high"]))
+
+    output = "\n".join(lines)
+    return output
