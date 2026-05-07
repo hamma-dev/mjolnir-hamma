@@ -12,6 +12,7 @@ Usage:
 """
 
 # Standard library imports
+import argparse
 import datetime
 import glob as glob_module
 import os
@@ -397,3 +398,106 @@ def sensor_status(config):
 
     output = "\n".join(lines)
     return output
+
+
+def parse_args(argv=None):
+    """Parse command-line arguments.
+
+    Parameters
+    ----------
+    argv : list, optional
+        Argument list. Defaults to sys.argv[1:].
+
+    Returns
+    -------
+    argparse.Namespace
+    """
+    parser = argparse.ArgumentParser(
+        description="Turn a HAMMA sensor on or off.")
+
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
+        "--on", action="store_true", dest="sensor_on", default=None,
+        help="Turn sensor on (power on, brokkr default mode)")
+    action_group.add_argument(
+        "--off", action="store_false", dest="sensor_on",
+        help="Turn sensor off (power off, brokkr nosensor mode)")
+    action_group.add_argument(
+        "--status", action="store_true", default=False,
+        help="Report current sensor state")
+
+    parser.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Print what would happen without executing")
+
+    args = parser.parse_args(argv)
+
+    # Require at least one action
+    if args.sensor_on is None and not args.status:
+        parser.print_help()
+        sys.exit(1)
+
+    return args
+
+
+def run(argv=None, config_path=None):
+    """Main entry point.
+
+    Parameters
+    ----------
+    argv : list, optional
+        CLI arguments. Defaults to sys.argv[1:].
+    config_path : str, optional
+        Override config path (for testing).
+    """
+    args = parse_args(argv)
+
+    # Load config
+    config = load_relay_config(
+        local_path=config_path) if config_path else load_relay_config()
+
+    # Status
+    if args.status:
+        print(sensor_status(config))
+        return 0
+
+    # Dry run
+    if args.dry_run:
+        relay_on = compute_relay_flag(
+            args.sensor_on, config["active_high"])
+        action = "ON" if args.sensor_on else "OFF"
+        relay_flag = "--on" if relay_on else "--off"
+        print("--- DRY RUN: Turn sensor {} ---".format(action))
+        print("Config: pin={}, active_high={}".format(
+            config["pin"], config["active_high"]))
+        print("Would run:")
+        print("  sudo systemctl stop {}".format(BROKKR_SERVICE))
+        if not args.sensor_on:
+            print("  {} --pin {} {}".format(
+                RELAY_SCRIPT, config["pin"], relay_flag))
+        print("  Archive telemetry CSV")
+        if args.sensor_on:
+            print("  sudo rm -f {}".format(DROPIN_PATH))
+        else:
+            print("  Write {} (nosensor mode)".format(DROPIN_PATH))
+        print("  sudo systemctl daemon-reload")
+        if args.sensor_on:
+            print("  {} --pin {} {}".format(
+                RELAY_SCRIPT, config["pin"], relay_flag))
+        print("  sudo systemctl start {}".format(BROKKR_SERVICE))
+        return 0
+
+    # Execute
+    if args.sensor_on:
+        return sensor_on(pin=config["pin"], active_high=config["active_high"])
+    else:
+        return sensor_off(pin=config["pin"], active_high=config["active_high"])
+
+
+def main():
+    """CLI entry point."""
+    sys.exit(run())
+
+
+if __name__ == "__main__":
+    main()

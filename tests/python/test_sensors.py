@@ -471,3 +471,55 @@ class TestStatus:
             output = sensors.sensor_status(config={"pin": 17, "active_high": False})
         assert "Last telemetry:" in output
         assert "telemetry_hamma_0005_2026-01-01.csv" in output
+
+
+class TestCLI:
+    """Tests for argument parsing."""
+
+    def test_on_flag(self, sensors):
+        """--on sets sensor_on=True."""
+        args = sensors.parse_args(["--on"])
+        assert args.sensor_on is True
+
+    def test_off_flag(self, sensors):
+        """--off sets sensor_on=False."""
+        args = sensors.parse_args(["--off"])
+        assert args.sensor_on is False
+
+    def test_on_off_mutually_exclusive(self, sensors):
+        """--on and --off cannot be used together."""
+        with pytest.raises(SystemExit):
+            sensors.parse_args(["--on", "--off"])
+
+    def test_status_flag(self, sensors):
+        """--status sets status=True."""
+        args = sensors.parse_args(["--status"])
+        assert args.status is True
+
+    def test_dry_run_with_off(self, sensors):
+        """--dry-run can be combined with --off."""
+        args = sensors.parse_args(["--off", "--dry-run"])
+        assert args.sensor_on is False
+        assert args.dry_run is True
+
+    def test_no_args_exits(self, sensors):
+        """No arguments prints help and exits."""
+        with pytest.raises(SystemExit):
+            sensors.parse_args([])
+
+
+class TestDryRun:
+    """Tests for dry-run mode."""
+
+    def test_dry_run_off_no_side_effects(self, sensors, tmp_path):
+        """Dry-run --off prints commands but does not execute."""
+        config_file = tmp_path / "unit.toml"
+        config_file.write_text("[relay]\npin = 17\nactive_high = false\n")
+        with patch.object(sensors, "stop_brokkr") as mock_stop, \
+             patch.object(sensors, "toggle_relay") as mock_relay, \
+             patch.object(sensors, "sensor_off") as mock_off:
+            sensors.run(["--off", "--dry-run"],
+                        config_path=str(config_file))
+        mock_off.assert_not_called()
+        mock_stop.assert_not_called()
+        mock_relay.assert_not_called()
