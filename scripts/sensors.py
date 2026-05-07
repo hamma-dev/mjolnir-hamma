@@ -253,3 +253,83 @@ def remove_dropin():
     return run_command(
         ["sudo", "rm", "-f", DROPIN_PATH],
         "Removed mode drop-in (default)")
+
+
+def sensor_off(pin, active_high):
+    """Execute the sensor off sequence.
+
+    1. Stop brokkr
+    2. Toggle relay to power off sensor
+    3. Archive today's telemetry CSV
+    4. Write nosensor mode drop-in
+    5. Reload systemd
+    6. Start brokkr in nosensor mode
+
+    Returns
+    -------
+    int
+        0 on success, nonzero on failure.
+    """
+    print("--- Turning sensor OFF ---")
+
+    rc = stop_brokkr()
+    if rc != 0:
+        return rc
+
+    relay_on = compute_relay_flag(sensor_on=False, active_high=active_high)
+    rc = toggle_relay(relay_on=relay_on, pin=pin)
+    if rc != 0:
+        return rc
+
+    archive_telemetry_csv()
+
+    rc = write_dropin()
+    if rc != 0:
+        return rc
+
+    rc = daemon_reload()
+    if rc != 0:
+        return rc
+
+    rc = start_brokkr()
+    return rc
+
+
+def sensor_on(pin, active_high):
+    """Execute the sensor on sequence.
+
+    1. Stop brokkr
+    2. Archive today's telemetry CSV
+    3. Remove nosensor mode drop-in
+    4. Reload systemd
+    5. Toggle relay to power on sensor
+    6. Start brokkr in default mode
+
+    Returns
+    -------
+    int
+        0 on success, nonzero on failure.
+    """
+    print("--- Turning sensor ON ---")
+
+    rc = stop_brokkr()
+    if rc != 0:
+        return rc
+
+    archive_telemetry_csv()
+
+    rc = remove_dropin()
+    if rc != 0:
+        return rc
+
+    rc = daemon_reload()
+    if rc != 0:
+        return rc
+
+    relay_on = compute_relay_flag(sensor_on=True, active_high=active_high)
+    rc = toggle_relay(relay_on=relay_on, pin=pin)
+    if rc != 0:
+        return rc
+
+    rc = start_brokkr()
+    return rc
