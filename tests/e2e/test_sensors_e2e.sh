@@ -47,6 +47,12 @@ check_not() {
     fi
 }
 
+get_load_current() {
+    # Extract Load Current from brokkr status (e.g. "Load Current: 1.481 A")
+    brokkr status 2>/dev/null | grep "Load Current" | head -1 | \
+        sed 's/.*: *\([0-9.]*\).*/\1/'
+}
+
 echo "=== E2E Test: sensors.py ==="
 echo ""
 
@@ -58,14 +64,22 @@ echo "--- Initial state ---"
 $SENSORS --status
 echo ""
 
+# Record baseline load current (sensor on)
+BASELINE_LOAD=$(get_load_current)
+echo "Baseline load current: ${BASELINE_LOAD} A"
+echo ""
+
 # Test 1: Turn sensor off
 echo "--- Test 1: sensors.py --off ---"
 $SENSORS --off
 check "Drop-in exists" test -f "$DROPIN"
 check "Brokkr is active" systemctl is-active brokkr-hamma-default.service
-# Wait for sensor to power down
+check "Brokkr mode is nosensor" test "$(systemctl show brokkr-hamma-default.service --property=Environment)" = "Environment=BROKKR_MODE=nosensor"
+# Verify relay toggled via charge controller load current drop
 sleep 3
-check_not "Sensor unreachable" ping -c 1 -W 2 10.10.10.1
+OFF_LOAD=$(get_load_current)
+echo "Load current after off: ${OFF_LOAD} A (was ${BASELINE_LOAD} A)"
+check "Load current dropped (relay toggled)" python3 -c "assert float('${OFF_LOAD}') < float('${BASELINE_LOAD}') - 0.3, 'Load current did not drop enough'"
 echo ""
 
 # Test 2: Idempotency — off again
@@ -80,9 +94,12 @@ echo "--- Test 3: sensors.py --on ---"
 $SENSORS --on
 check_not "Drop-in removed" test -f "$DROPIN"
 check "Brokkr is active" systemctl is-active brokkr-hamma-default.service
-# Wait for sensor to power up
+check "Brokkr mode is default" test "$(systemctl show brokkr-hamma-default.service --property=Environment)" = "Environment="
+# Verify relay toggled via charge controller load current increase
 sleep 5
-check "Sensor reachable" ping -c 1 -W 2 10.10.10.1
+ON_LOAD=$(get_load_current)
+echo "Load current after on: ${ON_LOAD} A (was ${OFF_LOAD} A when off)"
+check "Load current increased (relay toggled)" python3 -c "assert float('${ON_LOAD}') > float('${OFF_LOAD}') + 0.3, 'Load current did not increase enough'"
 echo ""
 
 # Test 4: Idempotency — on again
