@@ -7,7 +7,6 @@ import pathlib
 import textwrap
 
 import pytest
-import toml
 from unittest.mock import patch, MagicMock, call
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent

@@ -20,7 +20,7 @@ import subprocess
 import sys
 
 # Third party imports
-import toml
+import tomli
 
 
 # --- Constants ---
@@ -69,16 +69,18 @@ def load_relay_config(local_path=None, system_path=None):
     # Load system config (optional — may not have [relay])
     if os.path.isfile(system_path):
         try:
-            config = toml.load(system_path)
-        except toml.TomlDecodeError as exc:
+            with open(system_path, "rb") as f:
+                config = tomli.load(f)
+        except tomli.TOMLDecodeError as exc:
             print("[FAIL] Invalid TOML in {}: {}".format(system_path, exc))
             sys.exit(1)
 
     # Load and merge local config (local wins)
     if os.path.isfile(local_path):
         try:
-            local_config = toml.load(local_path)
-        except toml.TomlDecodeError as exc:
+            with open(local_path, "rb") as f:
+                local_config = tomli.load(f)
+        except tomli.TOMLDecodeError as exc:
             print("[FAIL] Invalid TOML in {}: {}".format(local_path, exc))
             sys.exit(1)
         config.update(local_config)
