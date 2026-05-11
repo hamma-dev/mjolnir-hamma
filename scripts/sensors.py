@@ -34,6 +34,7 @@ LOCAL_UNIT_TOML = os.path.expanduser(
 RELAY_SCRIPT = os.path.join(SCRIPT_DIR, "relay.py")
 
 BROKKR_SERVICE = "brokkr-hamma-default.service"
+SINDRI_SERVICE = "sindri-hamma-client.service"
 DROPIN_DIR = "/etc/systemd/system/{}.d".format(BROKKR_SERVICE)
 DROPIN_PATH = os.path.join(DROPIN_DIR, "mode.conf")
 DROPIN_CONTENT = "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"
@@ -214,6 +215,20 @@ def start_brokkr():
         "Started brokkr service")
 
 
+def stop_sindri():
+    """Stop the sindri service."""
+    return run_command(
+        ["sudo", "systemctl", "stop", SINDRI_SERVICE],
+        "Stopped sindri service")
+
+
+def start_sindri():
+    """Start the sindri service."""
+    return run_command(
+        ["sudo", "systemctl", "start", SINDRI_SERVICE],
+        "Started sindri service")
+
+
 def daemon_reload():
     """Reload systemd daemon configuration."""
     return run_command(
@@ -261,12 +276,12 @@ def remove_dropin():
 def sensor_off(pin, active_high):
     """Execute the sensor off sequence.
 
-    1. Stop brokkr
+    1. Stop brokkr and sindri
     2. Toggle relay to power off sensor
     3. Archive today's telemetry CSV
     4. Write nosensor mode drop-in
     5. Reload systemd
-    6. Start brokkr in nosensor mode
+    6. Start brokkr in nosensor mode, then sindri
 
     Returns
     -------
@@ -278,6 +293,8 @@ def sensor_off(pin, active_high):
     rc = stop_brokkr()
     if rc != 0:
         return rc
+
+    stop_sindri()
 
     relay_on = compute_relay_flag(sensor_on=False, active_high=active_high)
     rc = toggle_relay(relay_on=relay_on, pin=pin)
@@ -295,18 +312,22 @@ def sensor_off(pin, active_high):
         return rc
 
     rc = start_brokkr()
-    return rc
+    if rc != 0:
+        return rc
+
+    start_sindri()
+    return 0
 
 
 def sensor_on(pin, active_high):
     """Execute the sensor on sequence.
 
-    1. Stop brokkr
+    1. Stop brokkr and sindri
     2. Archive today's telemetry CSV
     3. Remove nosensor mode drop-in
     4. Reload systemd
     5. Toggle relay to power on sensor
-    6. Start brokkr in default mode
+    6. Start brokkr in default mode, then sindri
 
     Returns
     -------
@@ -318,6 +339,8 @@ def sensor_on(pin, active_high):
     rc = stop_brokkr()
     if rc != 0:
         return rc
+
+    stop_sindri()
 
     archive_telemetry_csv()
 
@@ -335,7 +358,11 @@ def sensor_on(pin, active_high):
         return rc
 
     rc = start_brokkr()
-    return rc
+    if rc != 0:
+        return rc
+
+    start_sindri()
+    return 0
 
 
 def sensor_status(config):

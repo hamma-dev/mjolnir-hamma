@@ -220,6 +220,22 @@ class TestServiceCommands:
         cmd = mock_run.call_args[0][0]
         assert cmd == ["sudo", "systemctl", "daemon-reload"]
 
+    def test_stop_sindri(self, sensors):
+        """stop_sindri calls systemctl stop on sindri service."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.stop_sindri()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "systemctl", "stop", sensors.SINDRI_SERVICE]
+
+    def test_start_sindri(self, sensors):
+        """start_sindri calls systemctl start on sindri service."""
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sensors.start_sindri()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sudo", "systemctl", "start", sensors.SINDRI_SERVICE]
+
 
 class TestRelayToggle:
     """Tests for toggle_relay() subprocess call."""
@@ -284,7 +300,7 @@ class TestSensorOff:
     """Tests for sensor_off() sequence."""
 
     def test_off_sequence_order(self, sensors):
-        """Off sequence: stop -> relay -> archive -> dropin -> reload -> start."""
+        """Off sequence: stop -> stop_sindri -> relay -> archive -> dropin -> reload -> start -> start_sindri."""
         calls = []
         def track(name):
             def fn(*args, **kwargs):
@@ -293,24 +309,29 @@ class TestSensorOff:
             return fn
 
         with patch.object(sensors, "stop_brokkr", side_effect=track("stop")), \
+             patch.object(sensors, "stop_sindri", side_effect=track("stop_sindri")), \
              patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
              patch.object(sensors, "archive_telemetry_csv",
                           side_effect=track("archive")), \
              patch.object(sensors, "write_dropin", side_effect=track("dropin")), \
              patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
-             patch.object(sensors, "start_brokkr", side_effect=track("start")):
+             patch.object(sensors, "start_brokkr", side_effect=track("start")), \
+             patch.object(sensors, "start_sindri", side_effect=track("start_sindri")):
             sensors.sensor_off(pin=17, active_high=False)
 
-        assert calls == ["stop", "relay", "archive", "dropin", "reload", "start"]
+        assert calls == ["stop", "stop_sindri", "relay", "archive",
+                         "dropin", "reload", "start", "start_sindri"]
 
     def test_off_polarity_active_high_false(self, sensors):
         """Off + active_high=false -> relay energized (--on)."""
         with patch.object(sensors, "stop_brokkr", return_value=0), \
+             patch.object(sensors, "stop_sindri", return_value=0), \
              patch.object(sensors, "toggle_relay", return_value=0) as mock_relay, \
              patch.object(sensors, "archive_telemetry_csv"), \
              patch.object(sensors, "write_dropin", return_value=0), \
              patch.object(sensors, "daemon_reload", return_value=0), \
-             patch.object(sensors, "start_brokkr", return_value=0):
+             patch.object(sensors, "start_brokkr", return_value=0), \
+             patch.object(sensors, "start_sindri", return_value=0):
             sensors.sensor_off(pin=17, active_high=False)
         mock_relay.assert_called_once_with(relay_on=True, pin=17)
 
@@ -338,7 +359,7 @@ class TestSensorOn:
     """Tests for sensor_on() sequence."""
 
     def test_on_sequence_order(self, sensors):
-        """On sequence: stop -> archive -> remove dropin -> reload -> relay -> start."""
+        """On sequence: stop -> stop_sindri -> archive -> remove dropin -> reload -> relay -> start -> start_sindri."""
         calls = []
         def track(name):
             def fn(*args, **kwargs):
@@ -347,25 +368,30 @@ class TestSensorOn:
             return fn
 
         with patch.object(sensors, "stop_brokkr", side_effect=track("stop")), \
+             patch.object(sensors, "stop_sindri", side_effect=track("stop_sindri")), \
              patch.object(sensors, "archive_telemetry_csv",
                           side_effect=track("archive")), \
              patch.object(sensors, "remove_dropin",
                           side_effect=track("remove")), \
              patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
              patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
-             patch.object(sensors, "start_brokkr", side_effect=track("start")):
+             patch.object(sensors, "start_brokkr", side_effect=track("start")), \
+             patch.object(sensors, "start_sindri", side_effect=track("start_sindri")):
             sensors.sensor_on(pin=17, active_high=False)
 
-        assert calls == ["stop", "archive", "remove", "reload", "relay", "start"]
+        assert calls == ["stop", "stop_sindri", "archive", "remove",
+                         "reload", "relay", "start", "start_sindri"]
 
     def test_on_polarity_active_high_false(self, sensors):
         """On + active_high=false -> relay de-energized (--off)."""
         with patch.object(sensors, "stop_brokkr", return_value=0), \
+             patch.object(sensors, "stop_sindri", return_value=0), \
              patch.object(sensors, "archive_telemetry_csv"), \
              patch.object(sensors, "remove_dropin", return_value=0), \
              patch.object(sensors, "daemon_reload", return_value=0), \
              patch.object(sensors, "toggle_relay", return_value=0) as mock_relay, \
-             patch.object(sensors, "start_brokkr", return_value=0):
+             patch.object(sensors, "start_brokkr", return_value=0), \
+             patch.object(sensors, "start_sindri", return_value=0):
             sensors.sensor_on(pin=17, active_high=False)
         mock_relay.assert_called_once_with(relay_on=False, pin=17)
 
