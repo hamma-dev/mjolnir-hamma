@@ -103,24 +103,19 @@ class MjolnirArray():
                 print(f"Pi on port {port} is down. Sensor not changed.")
             return
 
-        if bring_up:
-            pin_spec = "off"
-        else:
-            pin_spec = "on"
+        flag = "--on" if bring_up else "--off"
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
-        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/relay.py', f"--{pin_spec}", "--pin", "27"]
+        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/sensors.py', flag]
 
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE)
-            # retval = out.stdout.decode()
-            # retval = retval.split('\n')
-            #
-            # ping_code = next((x for x in retval if 'Ping Retcode' in x))
-            # ping_code = int(ping_code.split(':')[-1])
+            out = subprocess.run(cmd, stdout=subprocess.PIPE, timeout=120)
+        except subprocess.TimeoutExpired:
+            if not quiet:
+                print(f"Timeout: sensors.py on port {port} did not complete in 120s.")
         except Exception as e:
-            # If anything goes wrong, we'll assume we don't see the sensor
-            out = None
+            if not quiet:
+                print(f"Error running sensors.py on port {port}: {e}")
 
     @staticmethod
     def status_fcm(port):
