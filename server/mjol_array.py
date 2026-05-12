@@ -117,7 +117,6 @@ class MjolnirArray():
         # Return a boolean if the FCM sensor is up (True) or down (False)
         # port is fully qualified
 
-        cmd = ['ssh', '-o', 'ConnectTimeout=5', 'pi@localhost', '-p', str(port)]
         cmd = MjolnirArray._pi_ssh_cmd(port)
         cmd = cmd + ['/home/pi/dev/ltgenv/bin/brokkr', 'status']
 

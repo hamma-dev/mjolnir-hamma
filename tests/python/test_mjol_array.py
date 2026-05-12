@@ -158,3 +158,72 @@ class TestStatusLatestTrigger:
         assert 'threshold' in result
         assert 'num_sat' in result
         assert 'time' in result
+
+
+class TestPiSshCmd:
+    """Tests for MjolnirArray._pi_ssh_cmd()."""
+
+    def test_returns_list(self, mjol):
+        cmd = mjol.MjolnirArray._pi_ssh_cmd(10001)
+        assert isinstance(cmd, list)
+
+    def test_contains_ssh(self, mjol):
+        cmd = mjol.MjolnirArray._pi_ssh_cmd(10001)
+        assert cmd[0] == 'ssh'
+
+    def test_contains_port(self, mjol):
+        cmd = mjol.MjolnirArray._pi_ssh_cmd(10005)
+        assert '10005' in cmd
+
+    def test_contains_connect_timeout(self, mjol):
+        cmd = mjol.MjolnirArray._pi_ssh_cmd(10001)
+        assert 'ConnectTimeout=5' in cmd
+
+    def test_contains_pi_user(self, mjol):
+        cmd = mjol.MjolnirArray._pi_ssh_cmd(10001)
+        assert 'pi@localhost' in cmd
+
+
+class TestArgparse:
+    """Tests for array constant definitions."""
+
+    def test_hamma_sensors(self, mjol):
+        assert mjol.HAMMA_SENSORS == list(range(1, 10))
+
+    def test_pamma_sensors(self, mjol):
+        assert mjol.PAMMA_SENSORS == [50, 51, 52, 53, 54, 56]
+
+    def test_aumma_sensors(self, mjol):
+        assert mjol.AUMMA_SENSORS == [41, 42, 43]
+
+
+class TestStatusServices:
+    """Tests for MjolnirArray.status_services()."""
+
+    def test_returns_two_booleans(self, mjol):
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0)
+            result = mjol.MjolnirArray.status_services(10001)
+        assert len(result) == 2
+        assert all(isinstance(v, bool) for v in result)
+
+    def test_both_active(self, mjol):
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0)
+            result = mjol.MjolnirArray.status_services(10001)
+        assert result == [True, True]
+
+    def test_both_inactive(self, mjol):
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=1)
+            result = mjol.MjolnirArray.status_services(10001)
+        assert result == [False, False]
+
+    def test_checks_correct_services(self, mjol):
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0)
+            mjol.MjolnirArray.status_services(10001)
+        calls = mock_sub.run.call_args_list
+        service_names = [c[0][0][-1] for c in calls]
+        assert 'brokkr-hamma-default' in service_names
+        assert 'sindri-hamma-client' in service_names
