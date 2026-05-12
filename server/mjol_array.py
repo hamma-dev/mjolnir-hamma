@@ -69,20 +69,15 @@ class MjolnirArray():
 
         import ast
 
-        # This is the path to python on the Pi
-        remote_python_path = Path('/home/pi/dev/ltgenv/bin/python')
+        cmd = MjolnirArray._pi_ssh_cmd(port)
+        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
 
-        cmd = MjolnirArray._pi_ssh_cmd(port) + [str(remote_python_path)]
-
-        with open('/home/monitor/latest_trigger.py') as proc_stdin:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE, stdin=proc_stdin, universal_newlines=True)
         try:
+            out = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
             if out.returncode:
                 raise Exception
-            # Make sure we have valid output
             ret_val = ast.literal_eval(out.stdout)
             ret_val['time'] = np.datetime64(int(ret_val['time']), 's')
-            # NOTE: NEED TO CHECK IF WE HAVE A DICT AND NOT AN ERROR CODE
         except Exception:
             ret_val = dict()
             ret_val['threshold'] = np.nan

@@ -111,3 +111,50 @@ class TestUpdown:
             with patch.object(mjol.MjolnirArray, 'status', return_value=True):
                 # Should not raise
                 mjol.MjolnirArray.updown(10001, bring_up=True, quiet=True)
+
+
+class TestStatusLatestTrigger:
+    """Tests for MjolnirArray.status_latest_trigger()."""
+
+    def test_calls_script_directly_on_pi(self, mjol):
+        """Should call latest_trigger.py directly, not via stdin piping."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0,
+                stdout="{'threshold': 0.5, 'num_sat': 8, 'time': 1234567890}",
+            )
+            mjol.MjolnirArray.status_latest_trigger(10001)
+
+        cmd = mock_sub.run.call_args[0][0]
+        assert '/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py' in cmd
+        kwargs = mock_sub.run.call_args[1]
+        assert 'stdin' not in kwargs or kwargs['stdin'] is None
+
+    def test_no_local_file_reference(self, mjol):
+        """Should not reference /home/monitor/latest_trigger.py."""
+        import inspect
+        source = inspect.getsource(mjol.MjolnirArray.status_latest_trigger)
+        assert '/home/monitor/' not in source
+
+    def test_returns_dict_on_success(self, mjol):
+        """On success, returns dict with threshold, num_sat, time."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0,
+                stdout="{'threshold': 0.5, 'num_sat': 8, 'time': 1234567890}",
+            )
+            result = mjol.MjolnirArray.status_latest_trigger(10001)
+
+        assert 'threshold' in result
+        assert 'num_sat' in result
+        assert 'time' in result
+
+    def test_returns_nan_dict_on_failure(self, mjol):
+        """On failure, returns dict with nan values (keys present)."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=1, stdout="")
+            result = mjol.MjolnirArray.status_latest_trigger(10001)
+
+        assert 'threshold' in result
+        assert 'num_sat' in result
+        assert 'time' in result
