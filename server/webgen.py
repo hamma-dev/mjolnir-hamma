@@ -11,6 +11,18 @@ import numpy as np
 
 BASE_WEBSITE_PATH = Path('/var/www/hamma.dev/public_html')
 
+LOG_PATHS = {
+    'hamma': Path('/home/monitor/brokkr/hamma/status/'),
+    'pamma': Path('/home/monitor/brokkr/hamma/status/pamma'),
+    'aumma': Path('/home/monitor/brokkr/hamma/status/aumma'),
+}
+
+OUTPUT_FILES = {
+    'hamma': BASE_WEBSITE_PATH / 'latest/hamma_status.html',
+    'pamma': BASE_WEBSITE_PATH / 'latest/pamma_status.html',
+    'aumma': BASE_WEBSITE_PATH / 'latest/aumma_status.html',
+}
+
 def read_latest_log_file(log_path):
     # Find the latest log file and read in the most recent valid data.
     # Format the recent valid data to be passed into HTML generator
@@ -185,8 +197,6 @@ def run_once(
 
 
 def main():
-    # print(read_latest_log_file())
-
     arg_parser = argparse.ArgumentParser(
         description='Generate status page for website')
 
@@ -198,121 +208,12 @@ def main():
 
     parsed_args = arg_parser.parse_args()
 
-    if parsed_args.array == 'pamma':
-        output_file = BASE_WEBSITE_PATH / 'latest/pamma_status.html'
-        log_path = Path('/home/monitor/brokkr/hamma/status/pamma')
-    elif parsed_args.array == 'hamma':
-        output_file =BASE_WEBSITE_PATH / 'latest/hamma_status.html'
-        log_path = Path('/home/monitor/brokkr/hamma/status/')
-    elif parsed_args.array == 'aumma':
-        output_file =BASE_WEBSITE_PATH / 'latest/aumma_status.html'
-        log_path = Path('/home/monitor/brokkr/hamma/status/aumma')
-    else:
-        print('No array specified')
+    array = parsed_args.array
+    if array not in LOG_PATHS:
+        print(f'Unknown or missing array: {array}')
         return
 
-
-    run_once(log_path, output_file=output_file, array=parsed_args.array)
+    run_once(LOG_PATHS[array], output_file=OUTPUT_FILES[array], array=array)
 
 if __name__ == '__main__':
     main()
-
-# <style type="text/css">
-# <!--
-# .row {
-#   display: flex;
-#   flex-direction: row;
-#   flex-wrap: wrap;
-#   width: 100%;
-#   align-items: center;
-#   margin: 5px;
-# }
-#
-# .column {
-#   display: flex;
-#   flex-direction: column;
-#   flex-basis: 100%;
-#   flex: 1;
-# }
-# .text_column {
-#   display: flex;
-#   flex-direction: column;
-#   flex-basis: 50%;
-#   flex: 0.25;
-# }
-#
-# -->
-# </style>
-#
-#
-
-
-#
-
-#
-# <div >
-#   <div class='row'>
-#     <div class='text_column'>
-#       <div>
-#         HAMMA 1
-#       </div>
-#     </div>
-#     <div class='column'>
-#       <div>
-#         <img src="hamma01.png" alt="HAMMA 1 Plot">
-#       </div>
-#     </div>
-#   </div>
-#   <div class='row'>
-#     <div class='text_column'>
-#       <div>
-#         HAMMA 2
-#       </div>
-#     </div>
-#     <div class='column'>
-#       <div>
-#         <img src="hamma02.png" alt="HAMMA 2 Plot">
-#       </div>
-#     </div>
-#   </div>
-#   <div class='row'>
-#     <div class='text_column'>
-#       <div>
-#         HAMMA 3
-#       </div>
-#     </div>
-#     <div class='column'>
-#       <div>
-#         <img src="hamma03.png" alt="HAMMA 3 Plot">
-#       </div>
-#     </div>
-#   </div>
-#   <div class='row'>
-#     <div class='text_column'>
-#       <div>
-#         HAMMA 4
-#       </div>
-#     </div>
-#     <div class='column'>
-#       <div>
-#         <img src="hamma04.png" alt="HAMMA 4 Plot">
-#       </div>
-#     </div>
-#   </div>
-#   <div class='row'>
-#     <div class='text_column'>
-#       <div>
-#         HAMMA 5
-#       </div>
-#     </div>
-#     <div class='column'>
-#       <div>
-#         <img src="hamma05.png" alt="HAMMA 5 Plot">
-#       </div>
-#     </div>
-#   </div>
-#
-# </div>
-#
-#
-#
