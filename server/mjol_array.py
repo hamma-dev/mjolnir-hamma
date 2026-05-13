@@ -4,8 +4,10 @@ import subprocess
 import argparse
 from pathlib import Path
 
-import pandas as pd
-import numpy as np
+# pandas and numpy are imported lazily inside the methods that need them
+# (collect_data, status_latest_trigger). Importing at module scope makes
+# `--help`, `--up`, and `--down` fail on hosts without those packages
+# installed in the active Python.
 
 # Define constants that hold the "mjolnir numbers" for each array.
 # We should only ever need to pass this into the class,
@@ -68,6 +70,7 @@ class MjolnirArray():
         # port is fully qualified
 
         import ast
+        import numpy as np
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
         cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
@@ -89,13 +92,16 @@ class MjolnirArray():
     @staticmethod
     def updown(port, bring_up, quiet=False):
         # Here port is fully qualified
+        sensor_num = port - 10000
+        action = "up" if bring_up else "down"
 
-        # First, make sure Pi is up...
+        # First, make sure the SSH tunnel for this Pi is reachable...
         is_pi_up = MjolnirArray.status(port)
 
         if not is_pi_up:
             if not quiet:
-                print(f"Pi on port {port} is down. Sensor not changed.")
+                print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
+                      f"sensor not brought {action}.")
             return
 
         flag = "--on" if bring_up else "--off"
@@ -103,14 +109,40 @@ class MjolnirArray():
         cmd = MjolnirArray._pi_ssh_cmd(port)
         cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/sensors.py', flag]
 
+        if not quiet:
+            print(f"--- mj{sensor_num:02}: bringing sensor {action} ---")
+
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE, timeout=120)
+            out = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
         except subprocess.TimeoutExpired:
             if not quiet:
-                print(f"Timeout: sensors.py on port {port} did not complete in 120s.")
+                print(f"[FAIL] mj{sensor_num:02}: sensors.py did not complete "
+                      f"in 120s.")
+            return
         except Exception as e:
             if not quiet:
-                print(f"Error running sensors.py on port {port}: {e}")
+                print(f"[FAIL] mj{sensor_num:02}: error running sensors.py: {e}")
+            return
+
+        if quiet:
+            return
+
+        # Surface remote stdout/stderr so the operator sees what happened.
+        # sensors.py prints [OK]/[FAIL] lines describing each step.
+        stdout = out.stdout.decode(errors="replace") if out.stdout else ""
+        stderr = out.stderr.decode(errors="replace") if out.stderr else ""
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, end="" if stderr.endswith("\n") else "\n")
+        if out.returncode != 0:
+            print(f"[FAIL] mj{sensor_num:02}: sensors.py exited "
+                  f"with code {out.returncode}.")
 
     @staticmethod
     def status_fcm(port):
@@ -220,6 +252,8 @@ class MjolnirArray():
     def collect_data(self):
         # TODO: only get some - subset sensor_nums
         # Provide an easy to collect a bunch of data about the array
+        import pandas as pd
+
         hamma_ports = self.sensors
 
         mjol_up, sensor_up, brokkr_up, sindri_up, trig_attr = self.status_array(ports=hamma_ports, quiet=True)
