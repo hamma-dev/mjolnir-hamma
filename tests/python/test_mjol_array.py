@@ -11,13 +11,16 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "server" / "mjol_array.py"
 
 
-def load_mjol_array():
-    """Load mjol_array module from server/."""
-    spec = importlib.util.spec_from_file_location(
-        "mjol_array", str(SCRIPT_PATH),
-    )
-    module = importlib.util.module_from_spec(spec)
+@pytest.fixture
+def mjol():
+    """Provide the mjol_array module.
+
+    pandas and numpy are imported lazily inside collect_data() and
+    status_latest_trigger(); mock them globally for the duration of the
+    test so those lazy imports resolve to mocks too.
+    """
     import sys
+
     mock_pd = MagicMock()
     mock_np = MagicMock()
     orig_pd = sys.modules.get('pandas')
@@ -25,7 +28,12 @@ def load_mjol_array():
     sys.modules['pandas'] = mock_pd
     sys.modules['numpy'] = mock_np
     try:
+        spec = importlib.util.spec_from_file_location(
+            "mjol_array", str(SCRIPT_PATH),
+        )
+        module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        yield module
     finally:
         if orig_pd is not None:
             sys.modules['pandas'] = orig_pd
@@ -35,13 +43,6 @@ def load_mjol_array():
             sys.modules['numpy'] = orig_np
         else:
             sys.modules.pop('numpy', None)
-    return module
-
-
-@pytest.fixture
-def mjol():
-    """Provide the mjol_array module."""
-    return load_mjol_array()
 
 
 class TestUpdown:
