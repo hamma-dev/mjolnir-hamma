@@ -548,3 +548,328 @@ class TestDryRun:
         mock_off.assert_not_called()
         mock_stop.assert_not_called()
         mock_relay.assert_not_called()
+
+
+# --- Notifications ---
+
+class TestLoadNotifierConfig:
+    """Tests for load_notifier_config() reading [steps.state_monitor]."""
+
+    def test_reads_state_monitor_block(self, sensors, tmp_path):
+        """Returns method/channel/key_file from main.toml."""
+        main_toml = tmp_path / "main.toml"
+        main_toml.write_text(textwrap.dedent("""\
+            [steps]
+                [steps.state_monitor]
+                method = "gchat"
+                channel = "status"
+                key_file = "/home/pi/.googlechat"
+        """))
+        cfg = sensors.load_notifier_config(str(main_toml))
+        assert cfg == {
+            "method": "gchat",
+            "channel": "status",
+            "key_file": "/home/pi/.googlechat",
+        }
+
+    def test_missing_file_returns_none(self, sensors, tmp_path):
+        """Non-existent main.toml returns None (notifications disabled)."""
+        assert sensors.load_notifier_config(str(tmp_path / "nope.toml")) is None
+
+    def test_missing_state_monitor_returns_none(self, sensors, tmp_path):
+        """No [steps.state_monitor] block returns None."""
+        main_toml = tmp_path / "main.toml"
+        main_toml.write_text("[steps]\n[steps.other_step]\nfoo = \"bar\"\n")
+        assert sensors.load_notifier_config(str(main_toml)) is None
+
+    def test_invalid_toml_returns_none(self, sensors, tmp_path):
+        """Malformed TOML returns None instead of raising."""
+        main_toml = tmp_path / "main.toml"
+        main_toml.write_text("[steps\nbroken")
+        assert sensors.load_notifier_config(str(main_toml)) is None
+
+    def test_partial_block_keeps_none_values(self, sensors, tmp_path):
+        """Missing keys come back as None rather than KeyError."""
+        main_toml = tmp_path / "main.toml"
+        main_toml.write_text(textwrap.dedent("""\
+            [steps]
+                [steps.state_monitor]
+                method = "gchat"
+        """))
+        cfg = sensors.load_notifier_config(str(main_toml))
+        assert cfg["method"] == "gchat"
+        assert cfg["channel"] is None
+        assert cfg["key_file"] is None
+
+
+class TestBuildSender:
+    """Tests for build_sender() instantiation."""
+
+    def test_none_config_returns_none(self, sensors):
+        """No config -> no sender."""
+        assert sensors.build_sender(None) is None
+
+    def test_missing_method_returns_none(self, sensors):
+        """Missing method -> no sender."""
+        assert sensors.build_sender(
+            {"method": None, "key_file": "/x", "channel": "y"}) is None
+
+    def test_missing_key_file_returns_none(self, sensors):
+        """Missing key_file -> no sender."""
+        assert sensors.build_sender(
+            {"method": "gchat", "key_file": None, "channel": "y"}) is None
+
+    def test_unknown_method_returns_none(self, sensors):
+        """Unknown notifier method -> warn + None (no crash)."""
+        cfg = {"method": "carrier_pigeon", "key_file": "/x", "channel": "y"}
+        assert sensors.build_sender(cfg) is None
+
+    def test_gchat_instantiation(self, sensors):
+        """Resolves gchat -> GoogleChatSender and instantiates with key_file/channel."""
+        cfg = {"method": "gchat", "key_file": "/k", "channel": "status"}
+        fake_sender = MagicMock()
+        fake_cls = MagicMock(return_value=fake_sender)
+        # Patch the notifiers.google_chat module's GoogleChatSender symbol.
+        with patch.dict("sys.modules", {
+                "notifiers": MagicMock(),
+                "notifiers.google_chat": MagicMock(GoogleChatSender=fake_cls)}):
+            result = sensors.build_sender(cfg)
+        assert result is fake_sender
+        fake_cls.assert_called_once_with("/k", channel="status")
+
+    def test_slack_instantiation(self, sensors):
+        """Resolves slack -> SlackSender."""
+        cfg = {"method": "slack", "key_file": "/k", "channel": "status"}
+        fake_sender = MagicMock()
+        fake_cls = MagicMock(return_value=fake_sender)
+        with patch.dict("sys.modules", {
+                "notifiers": MagicMock(),
+                "notifiers.slack": MagicMock(SlackSender=fake_cls)}):
+            result = sensors.build_sender(cfg)
+        assert result is fake_sender
+        fake_cls.assert_called_once_with("/k", channel="status")
+
+    def test_key_file_not_found_returns_none(self, sensors):
+        """Missing key file at instantiation -> warn + None."""
+        cfg = {"method": "gchat", "key_file": "/k", "channel": "status"}
+        fake_cls = MagicMock(side_effect=FileNotFoundError())
+        with patch.dict("sys.modules", {
+                "notifiers": MagicMock(),
+                "notifiers.google_chat": MagicMock(GoogleChatSender=fake_cls)}):
+            assert sensors.build_sender(cfg) is None
+
+    def test_unexpected_exception_returns_none(self, sensors):
+        """Any other exception at instantiation -> warn + None."""
+        cfg = {"method": "gchat", "key_file": "/k", "channel": "status"}
+        fake_cls = MagicMock(side_effect=RuntimeError("boom"))
+        with patch.dict("sys.modules", {
+                "notifiers": MagicMock(),
+                "notifiers.google_chat": MagicMock(GoogleChatSender=fake_cls)}):
+            assert sensors.build_sender(cfg) is None
+
+
+class TestGetUnitIdentifier:
+    """Tests for get_unit_identifier() name + site lookup."""
+
+    def test_reads_number_and_site(self, sensors, tmp_path):
+        """Number formatted as 'MjolnirNN', site_description passed through."""
+        unit = tmp_path / "unit.toml"
+        unit.write_text(textwrap.dedent("""\
+            number = 3
+            site_description = "SWI Berm"
+            [relay]
+            pin = 4
+            active_high = true
+        """))
+        name, site = sensors.get_unit_identifier(str(unit))
+        assert name == "Mjolnir03"
+        assert site == "SWI Berm"
+
+    def test_no_site_returns_none(self, sensors, tmp_path):
+        """site_description absent -> None."""
+        unit = tmp_path / "unit.toml"
+        unit.write_text("number = 7\n[relay]\npin = 4\nactive_high = true\n")
+        name, site = sensors.get_unit_identifier(str(unit))
+        assert name == "Mjolnir07"
+        assert site is None
+
+    def test_empty_site_returns_none(self, sensors, tmp_path):
+        """Empty site_description -> None (not the empty string)."""
+        unit = tmp_path / "unit.toml"
+        unit.write_text(
+            'number = 2\nsite_description = ""\n'
+            '[relay]\npin = 4\nactive_high = true\n')
+        _, site = sensors.get_unit_identifier(str(unit))
+        assert site is None
+
+    def test_missing_file_falls_back_to_hostname(self, sensors, tmp_path):
+        """Missing unit.toml -> hostname, None."""
+        with patch("socket.gethostname", return_value="mjolnir99"):
+            name, site = sensors.get_unit_identifier(str(tmp_path / "nope.toml"))
+        assert name == "mjolnir99"
+        assert site is None
+
+    def test_missing_number_falls_back_to_hostname(self, sensors, tmp_path):
+        """unit.toml present but no 'number' -> hostname."""
+        unit = tmp_path / "unit.toml"
+        unit.write_text("site_description = \"Lab\"\n")
+        with patch("socket.gethostname", return_value="mjolnir99"):
+            name, site = sensors.get_unit_identifier(str(unit))
+        assert name == "mjolnir99"
+        # Site is NOT returned when we fall back — the (name, site) pair
+        # must be consistent (both from unit.toml, or both from hostname).
+        assert site is None
+
+
+class TestBuildMessage:
+    """Tests for build_message() text format."""
+
+    def test_success_with_site(self, sensors):
+        msg = sensors.build_message(
+            "Mjolnir02", "SWI Berm", "on", success=True)
+        assert msg == "Mjolnir02 (SWI Berm): sensor turned ON"
+
+    def test_success_without_site(self, sensors):
+        msg = sensors.build_message(
+            "Mjolnir02", None, "off", success=True)
+        assert msg == "Mjolnir02: sensor turned OFF"
+
+    def test_failure_with_rc(self, sensors):
+        msg = sensors.build_message(
+            "Mjolnir02", None, "off", success=False, rc=1)
+        assert msg == "Mjolnir02: sensor turn-OFF FAILED (rc=1)"
+
+    def test_failure_without_rc(self, sensors):
+        msg = sensors.build_message(
+            "Mjolnir02", None, "on", success=False)
+        assert msg == "Mjolnir02: sensor turn-ON FAILED (rc=?)"
+
+    def test_action_case_normalized(self, sensors):
+        """action is uppercased in message regardless of input case."""
+        msg = sensors.build_message(
+            "Mjolnir02", None, "ON", success=True)
+        assert "ON" in msg
+
+
+class TestSendNotification:
+    """Tests for send_notification() error-swallowing wrapper."""
+
+    def test_none_sender_no_op(self, sensors):
+        """None sender -> no exception, no call."""
+        sensors.send_notification(None, "hello")  # must not raise
+
+    def test_calls_sender_send(self, sensors):
+        """Sender.send is called with the message."""
+        sender = MagicMock()
+        sensors.send_notification(sender, "hello")
+        sender.send.assert_called_once_with("hello")
+
+    def test_swallows_exception(self, sensors):
+        """Exception from sender.send is caught (must not propagate)."""
+        sender = MagicMock()
+        sender.send.side_effect = RuntimeError("network down")
+        sensors.send_notification(sender, "hello")  # must not raise
+
+
+class TestRunNotifications:
+    """Tests that run() wires notifications correctly into the on/off flow."""
+
+    @pytest.fixture
+    def configs(self, tmp_path):
+        unit = tmp_path / "unit.toml"
+        unit.write_text(textwrap.dedent("""\
+            number = 2
+            site_description = "Lab"
+            [relay]
+            pin = 4
+            active_high = true
+        """))
+        main = tmp_path / "main.toml"
+        main.write_text(textwrap.dedent("""\
+            [steps]
+                [steps.state_monitor]
+                method = "gchat"
+                channel = "status"
+                key_file = "/home/pi/.googlechat"
+        """))
+        return str(unit), str(main)
+
+    def test_off_success_sends_success_message(self, sensors, configs):
+        """Successful --off triggers a 'sensor turned OFF' notification."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        with patch.object(sensors, "build_sender", return_value=fake_sender), \
+             patch.object(sensors, "sensor_off", return_value=0):
+            rc = sensors.run(
+                ["--off"], config_path=unit, main_toml_path=main)
+        assert rc == 0
+        fake_sender.send.assert_called_once()
+        msg = fake_sender.send.call_args[0][0]
+        assert "Mjolnir02" in msg
+        assert "Lab" in msg
+        assert "turned OFF" in msg
+
+    def test_on_success_sends_success_message(self, sensors, configs):
+        """Successful --on triggers a 'sensor turned ON' notification."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        with patch.object(sensors, "build_sender", return_value=fake_sender), \
+             patch.object(sensors, "sensor_on", return_value=0):
+            rc = sensors.run(
+                ["--on"], config_path=unit, main_toml_path=main)
+        assert rc == 0
+        msg = fake_sender.send.call_args[0][0]
+        assert "turned ON" in msg
+
+    def test_failure_sends_failure_message(self, sensors, configs):
+        """Failed --off triggers a FAILED notification with the rc."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        with patch.object(sensors, "build_sender", return_value=fake_sender), \
+             patch.object(sensors, "sensor_off", return_value=2):
+            rc = sensors.run(
+                ["--off"], config_path=unit, main_toml_path=main)
+        assert rc == 2
+        msg = fake_sender.send.call_args[0][0]
+        assert "FAILED" in msg
+        assert "rc=2" in msg
+
+    def test_dry_run_no_notification(self, sensors, configs):
+        """--dry-run must not send a notification."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        with patch.object(sensors, "build_sender", return_value=fake_sender):
+            sensors.run(
+                ["--off", "--dry-run"],
+                config_path=unit, main_toml_path=main)
+        fake_sender.send.assert_not_called()
+
+    def test_status_no_notification(self, sensors, configs):
+        """--status must not send a notification."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        with patch.object(sensors, "build_sender", return_value=fake_sender), \
+             patch.object(sensors, "sensor_status", return_value="ok"):
+            sensors.run(
+                ["--status"], config_path=unit, main_toml_path=main)
+        fake_sender.send.assert_not_called()
+
+    def test_no_sender_still_completes(self, sensors, configs):
+        """If build_sender returns None, run() still succeeds (no crash)."""
+        unit, main = configs
+        with patch.object(sensors, "build_sender", return_value=None), \
+             patch.object(sensors, "sensor_off", return_value=0):
+            rc = sensors.run(
+                ["--off"], config_path=unit, main_toml_path=main)
+        assert rc == 0
+
+    def test_send_failure_does_not_change_rc(self, sensors, configs):
+        """A failing sender.send() must not affect the return code."""
+        unit, main = configs
+        fake_sender = MagicMock()
+        fake_sender.send.side_effect = RuntimeError("network down")
+        with patch.object(sensors, "build_sender", return_value=fake_sender), \
+             patch.object(sensors, "sensor_off", return_value=0):
+            rc = sensors.run(
+                ["--off"], config_path=unit, main_toml_path=main)
+        assert rc == 0
