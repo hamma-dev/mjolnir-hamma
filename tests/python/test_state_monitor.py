@@ -1,4 +1,4 @@
-"""Tests for state_monitor construct_message."""
+"""Tests for state_monitor sensor_prefix and send_message."""
 
 import importlib.util
 from pathlib import Path
@@ -42,6 +42,7 @@ def load_state_monitor_module():
         "brokkr.utils": MagicMock(),
         "brokkr.utils.output": MagicMock(),
         "notifiers": MagicMock(),
+        "notifiers.notify": MagicMock(),
         "notifiers.slack": MagicMock(),
         "notifiers.google_chat": MagicMock(),
     }):
@@ -59,12 +60,11 @@ StateMonitor = MODULE.StateMonitor
 
 # --- Tests ---
 
-class TestConstructMessage:
-    """Test compact alert message format."""
+class TestSensorPrefix:
+    """Test the module-level sensor_prefix() function."""
 
     def test_compact_format(self):
-        """With a site_description, format is 'mj05 (UAH): <alert>'."""
-        alert = "Power has dropped from 25.00 to 12.00."
+        """With a site_description, format is 'mj05 (UAH): '."""
         mock_unit_config = {"number": 5, "site_description": "UAH"}
         mock_metadata = {"name": "mj"}
 
@@ -72,13 +72,12 @@ class TestConstructMessage:
             "brokkr.config.unit": MagicMock(UNIT_CONFIG=mock_unit_config),
             "brokkr.config.metadata": MagicMock(METADATA=mock_metadata),
         }):
-            result = StateMonitor.construct_message(alert)
+            result = MODULE.sensor_prefix()
 
-        assert result == "mj05 (UAH): Power has dropped from 25.00 to 12.00."
+        assert result == "mj05 (UAH): "
 
     def test_compact_format_empty_site(self):
-        """With empty site_description, format is 'mj05: <alert>'."""
-        alert = "Power has dropped from 25.00 to 12.00."
+        """With empty site_description, format is 'mj05: '."""
         mock_unit_config = {"number": 5, "site_description": ""}
         mock_metadata = {"name": "mj"}
 
@@ -86,9 +85,9 @@ class TestConstructMessage:
             "brokkr.config.unit": MagicMock(UNIT_CONFIG=mock_unit_config),
             "brokkr.config.metadata": MagicMock(METADATA=mock_metadata),
         }):
-            result = StateMonitor.construct_message(alert)
+            result = MODULE.sensor_prefix()
 
-        assert result == "mj05: Power has dropped from 25.00 to 12.00."
+        assert result == "mj05: "
 
 
 # --- Edge-trigger boundary tests ---
@@ -248,3 +247,18 @@ class TestCheckBatteryVoltageBoundary:
         m._previous_data = self._input(batt=11.0, v_lvd=11.0)  # below 11.5
         msg = m.check_battery_voltage(self._input(batt=10.8, v_lvd=11.0))
         assert msg is None
+
+
+def test_sensor_prefix_includes_site():
+    with patch.object(MODULE, "METADATA", {"name": "mj"}, create=True), \
+         patch.object(MODULE, "UNIT_CONFIG",
+                      {"number": 2, "site_description": "lab"}, create=True):
+        assert MODULE.sensor_prefix() == "mj02 (lab): "
+
+
+def test_send_message_prefixes_and_delegates():
+    sm = StateMonitor.__new__(StateMonitor)
+    sm.notifier = MagicMock()
+    with patch.object(MODULE, "sensor_prefix", return_value="mj02: "):
+        sm.send_message("hi")
+    sm.notifier.send.assert_called_once_with("mj02: hi")
