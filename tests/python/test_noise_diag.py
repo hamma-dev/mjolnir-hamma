@@ -1,5 +1,6 @@
 import importlib.util
 import math
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,7 +16,8 @@ class MockOutputStep:
         self.name = kwargs.get("name", "test_step")
 
 
-def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), threshold=0.083):
+def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), threshold=0.083,
+                times=None, trig_pos=1):
     mock_base = MagicMock()
     mock_base.OutputStep = MockOutputStep
     mock_pipeline = MagicMock(); mock_pipeline.base = mock_base
@@ -23,9 +25,12 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
     mock_brokkr.pipeline.base = mock_base
 
     mock_hamma = MagicMock()
-    data = MagicMock(); data.voltFast = volt_fast
+    if times is None:
+        times = ["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857", "2026-06-23T21:36:59.000"]
+    data = MagicMock(); data.voltFast = volt_fast; data.times = times
     header = MagicMock(); header.read_stream.return_value = data
     header.data.threshold.iloc.__getitem__.return_value = threshold
+    header.data.__getitem__.return_value.iloc.__getitem__.return_value = trig_pos
     mock_hamma.Header.return_value = header
     mock_core = MagicMock(); mock_core._diagnostic_data.return_value = diag_return
 
@@ -52,7 +57,7 @@ def make_input():
 
 
 def test_compute_derives_vpp_snr_ratio():
-    module = load_module(diag_return=(0.1, 4.7, -4.7, 0.035))
+    module = load_module(diag_return=(0.1, 4.7, -4.7, 0.035), trig_pos=1)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
     step.logger = MagicMock()
@@ -63,6 +68,8 @@ def test_compute_derives_vpp_snr_ratio():
     assert m["fast_snr"] == pytest.approx(9.4 / 0.035)
     assert m["threshold"] == pytest.approx(0.083)
     assert m["noise_thresh_ratio"] == pytest.approx(0.035 / 0.083)
+    # trig_pos=1 -> times[1]
+    assert m["trigger_time"] == "2026-06-23T21:36:58.857"
 
 
 def test_compute_returns_none_without_fast_channel():
@@ -92,6 +99,17 @@ def test_compute_ratio_nan_when_threshold_zero():
     assert math.isnan(m["noise_thresh_ratio"])
 
 
+def test_compute_trigger_time_out_of_range_falls_back_to_first():
+    """When triggerPos is beyond the times array, trigger_time falls back to times[0]."""
+    times = ["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857"]
+    module = load_module(trig_pos=999, times=times)  # 999 >= len(times)=2
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert m["trigger_time"] == "2026-06-23T21:36:57.000"
+
+
 def test_write_csv_creates_header_then_appends(tmp_path):
     module = load_module()
     step = module.NoiseDiag.__new__(module.NoiseDiag)
@@ -100,17 +118,16 @@ def test_write_csv_creates_header_then_appends(tmp_path):
     step.output_path = str(tmp_path)
     step.filename_template = "noise_mj02_2026-06-23.csv"
     with patch.object(module, "render_output_filename", return_value=csv_file):
-        metrics = {"fast_offset": 0.1, "fast_noise": 0.035, "fast_vpp": 9.4,
+        metrics = {"trigger_time": "2026-06-23T21:36:58.857",
+                   "fast_offset": 0.1, "fast_noise": 0.035, "fast_vpp": 9.4,
                    "fast_snr": 268.5, "threshold": 0.083, "noise_thresh_ratio": 0.42}
         step._write_csv(metrics, "2026-06-23T17:00:00")
         step._write_csv(metrics, "2026-06-23T17:01:00")
     lines = csv_file.read_text().strip().splitlines()
-    assert lines[0] == "time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio"
+    assert lines[0] == "time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio"
     assert len(lines) == 3  # header + 2 rows
     assert lines[1].startswith("2026-06-23T17:00:00,")
-
-
-from datetime import datetime, timedelta
+    assert lines[2].startswith("2026-06-23T17:01:00,")
 
 
 def _alert_step(module):
@@ -156,7 +173,7 @@ def test_execute_swallows_exceptions_and_passes_through():
     time_dv = MagicMock(); time_dv.value = datetime(2026, 6, 23, 17, 0, 0)
     input_data = {"time": time_dv}
     with patch.object(module.NoiseDiag, "_compute", side_effect=ValueError("boom")):
-        # first call sets baseline time; force elapsed by pre-seeding _last_run_time
+        # pre-seed _last_run_time so elapsed > min_update_time and _compute is reached
         step._last_run_time = MagicMock(); step._last_run_time.value = datetime(2026, 6, 23, 16, 0, 0)
         out = step.execute(input_data)
     assert out is input_data

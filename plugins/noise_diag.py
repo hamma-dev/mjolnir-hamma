@@ -25,7 +25,7 @@ def _sensor_prefix():
 class NoiseDiag(brokkr.pipeline.base.OutputStep):
     """Sample the fast-channel noise floor and report it."""
 
-    CSV_COLUMNS = ["time", "fast_offset", "fast_noise", "fast_vpp",
+    CSV_COLUMNS = ["time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
                    "fast_snr", "threshold", "noise_thresh_ratio"]
 
     def __init__(self,
@@ -78,7 +78,16 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         snr = vpp / noise if noise else float("nan")
         threshold = float(h.data.threshold.iloc[0])
         ratio = noise / threshold if threshold else float("nan")
+        times_slow = getattr(data, "times", None)
+        trigger_time = ""
+        if times_slow is not None and len(times_slow):
+            trig_pos = int(h.data['triggerPos'].iloc[0])
+            if 0 <= trig_pos < len(times_slow):
+                trigger_time = str(times_slow[trig_pos])
+            else:
+                trigger_time = str(times_slow[0])
         return {
+            "trigger_time": trigger_time,
             "fast_offset": float(offset),
             "fast_noise": float(noise),
             "fast_vpp": float(vpp),
