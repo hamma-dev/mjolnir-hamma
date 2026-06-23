@@ -1,6 +1,5 @@
 import importlib.util
 import math
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -30,24 +29,13 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
     mock_hamma.Header.return_value = header
     mock_core = MagicMock(); mock_core._diagnostic_data.return_value = diag_return
 
-    mock_unit_config = MagicMock()
-    mock_unit_config.UNIT_CONFIG = {"number": 0, "site_description": "Lab"}
-    mock_metadata = MagicMock()
-    mock_metadata.METADATA = {"name": "mjolnir"}
-
-    # Install brokkr config mocks persistently so _sensor_prefix()'s lazy
-    # imports succeed when called outside the patch.dict context window.
-    sys.modules.setdefault("brokkr.config", MagicMock())
-    sys.modules["brokkr.config.unit"] = mock_unit_config
-    sys.modules["brokkr.config.metadata"] = mock_metadata
-
     with patch.dict("sys.modules", {
         "brokkr": mock_brokkr, "brokkr.pipeline": mock_pipeline,
         "brokkr.pipeline.base": mock_base,
         "brokkr.utils": MagicMock(), "brokkr.utils.output": MagicMock(),
-        "brokkr.config": sys.modules["brokkr.config"],
-        "brokkr.config.unit": mock_unit_config,
-        "brokkr.config.metadata": mock_metadata,
+        "brokkr.config": MagicMock(),
+        "brokkr.config.unit": MagicMock(),
+        "brokkr.config.metadata": MagicMock(),
         "hamma": mock_hamma, "hamma.header": MagicMock(),
         "hamma.header.core": mock_core,
         "notifiers": MagicMock(),
@@ -140,9 +128,10 @@ def test_alert_fires_on_rising_edge_only():
     module = load_module()
     step = _alert_step(module)
     t0 = datetime(2026, 6, 23, 17, 0, 0)
-    step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0)
-    step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=60))
-    step._maybe_alert({"noise_thresh_ratio": 0.92, "fast_noise": 0.076, "threshold": 0.083}, t0 + timedelta(seconds=120))
+    with patch.object(module, "_sensor_prefix", return_value="mj00 (Lab): "):
+        step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0)
+        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=60))
+        step._maybe_alert({"noise_thresh_ratio": 0.92, "fast_noise": 0.076, "threshold": 0.083}, t0 + timedelta(seconds=120))
     assert step.notifier.send.call_count == 1  # only the crossing
 
 
@@ -150,9 +139,10 @@ def test_alert_respects_cooldown_after_reset():
     module = load_module()
     step = _alert_step(module)
     t0 = datetime(2026, 6, 23, 17, 0, 0)
-    step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0)  # fire
-    step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0 + timedelta(seconds=60))  # drop
-    step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=120))  # within cooldown
+    with patch.object(module, "_sensor_prefix", return_value="mj00 (Lab): "):
+        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0)  # fire
+        step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0 + timedelta(seconds=60))  # drop
+        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=120))  # within cooldown
     assert step.notifier.send.call_count == 1
 
 
@@ -160,6 +150,7 @@ def test_execute_swallows_exceptions_and_passes_through():
     module = load_module()
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.logger = MagicMock()
+    step.name = "noise_diag"
     step._last_run_time = None
     step.min_update_time = 60
     time_dv = MagicMock(); time_dv.value = datetime(2026, 6, 23, 17, 0, 0)

@@ -118,6 +118,6 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         except Exception as e:
             self.logger.error(
                 "%s evaluating in %s on step %s: %s",
-                type(e).__name__, type(self), getattr(self, "name", "?"), e)
+                type(e).__name__, type(self), self.name, e)
             self.logger.info("Error details:", exc_info=True)
         return input_data
