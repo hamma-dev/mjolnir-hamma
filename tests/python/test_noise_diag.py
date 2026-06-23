@@ -1,4 +1,5 @@
 import importlib.util
+import math
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,7 @@ class MockOutputStep:
         self.name = kwargs.get("name", "test_step")
 
 
-def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object()):
+def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), threshold=0.083):
     mock_base = MagicMock()
     mock_base.OutputStep = MockOutputStep
     mock_pipeline = MagicMock(); mock_pipeline.base = mock_base
@@ -24,7 +25,7 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object()):
     mock_hamma = MagicMock()
     data = MagicMock(); data.voltFast = volt_fast
     header = MagicMock(); header.read_stream.return_value = data
-    header.data.threshold.iloc.__getitem__.return_value = 0.083
+    header.data.threshold.iloc.__getitem__.return_value = threshold
     mock_hamma.Header.return_value = header
     mock_core = MagicMock(); mock_core._diagnostic_data.return_value = diag_return
 
@@ -67,3 +68,22 @@ def test_compute_returns_none_without_fast_channel():
     step.medsize = 200000
     step.logger = MagicMock()
     assert step._compute(make_input()) is None
+
+
+def test_compute_snr_nan_when_noise_zero():
+    module = load_module(diag_return=(0.1, 4.7, -4.7, 0.0))  # noise == 0
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert math.isnan(m["fast_snr"])
+    assert m["fast_vpp"] == pytest.approx(9.4)
+
+
+def test_compute_ratio_nan_when_threshold_zero():
+    module = load_module(threshold=0.0)
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert math.isnan(m["noise_thresh_ratio"])

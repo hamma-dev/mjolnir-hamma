@@ -16,7 +16,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
     def __init__(self,
                  min_update_time=60,
                  medsize=200000,
-                 output_path=Path(),
+                 output_path=None,
                  filename_template=None,
                  alert_threshold_frac=0.8,
                  alert_cooldown_s=3600,
@@ -30,7 +30,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         self._last_alert_time = None
         self.min_update_time = min_update_time
         self.medsize = medsize
-        self.output_path = output_path
+        self.output_path = output_path if output_path is not None else Path()
         self.filename_template = filename_template
         self.alert_threshold_frac = alert_threshold_frac
         self.alert_cooldown_s = alert_cooldown_s
