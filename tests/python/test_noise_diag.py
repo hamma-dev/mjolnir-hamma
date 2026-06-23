@@ -87,3 +87,21 @@ def test_compute_ratio_nan_when_threshold_zero():
     step.logger = MagicMock()
     m = step._compute(make_input())
     assert math.isnan(m["noise_thresh_ratio"])
+
+
+def test_write_csv_creates_header_then_appends(tmp_path):
+    module = load_module()
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.logger = MagicMock()
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    step.output_path = str(tmp_path)
+    step.filename_template = "noise_mj02_2026-06-23.csv"
+    with patch.object(module, "render_output_filename", return_value=csv_file):
+        metrics = {"fast_offset": 0.1, "fast_noise": 0.035, "fast_vpp": 9.4,
+                   "fast_snr": 268.5, "threshold": 0.083, "noise_thresh_ratio": 0.42}
+        step._write_csv(metrics, "2026-06-23T17:00:00")
+        step._write_csv(metrics, "2026-06-23T17:01:00")
+    lines = csv_file.read_text().strip().splitlines()
+    assert lines[0] == "time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio"
+    assert len(lines) == 3  # header + 2 rows
+    assert lines[1].startswith("2026-06-23T17:00:00,")

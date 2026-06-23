@@ -2,16 +2,21 @@
 Plugin to compute fast-channel noise diagnostics from live HAMMA triggers.
 """
 
+import csv
 from pathlib import Path
 
 import hamma
 from hamma.header.core import _diagnostic_data
 
 import brokkr.pipeline.base
+from brokkr.utils.output import render_output_filename
 
 
 class NoiseDiag(brokkr.pipeline.base.OutputStep):
     """Sample the fast-channel noise floor and report it."""
+
+    CSV_COLUMNS = ["time", "fast_offset", "fast_noise", "fast_vpp",
+                   "fast_snr", "threshold", "noise_thresh_ratio"]
 
     def __init__(self,
                  min_update_time=60,
@@ -37,6 +42,19 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         from notifiers import Notifier
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
+
+    def _write_csv(self, metrics, sample_time):
+        """Append one metrics row, writing the header if the file is new."""
+        out_file = render_output_filename(
+            output_path=self.output_path,
+            filename_template=self.filename_template)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not out_file.exists()
+        with open(out_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            if new_file:
+                writer.writerow(self.CSV_COLUMNS)
+            writer.writerow([sample_time] + [metrics[c] for c in self.CSV_COLUMNS[1:]])
 
     def _compute(self, input_data):
         """Decode the packet and derive fast-channel noise metrics."""
