@@ -18,14 +18,9 @@ import brokkr.utils.output
 
 def sensor_prefix():
     """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
-    # Check module globals first (allows tests to override via patch.object)
-    _g = globals()
-    UNIT_CONFIG = _g.get('UNIT_CONFIG')
-    METADATA = _g.get('METADATA')
-    if UNIT_CONFIG is None:
-        from brokkr.config.unit import UNIT_CONFIG
-    if METADATA is None:
-        from brokkr.config.metadata import METADATA
+    from brokkr.config.unit import UNIT_CONFIG
+    from brokkr.config.metadata import METADATA
+
     sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
     site = UNIT_CONFIG['site_description']
     return f"{sensor_name} ({site}): " if site else f"{sensor_name}: "

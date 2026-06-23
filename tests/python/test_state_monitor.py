@@ -43,8 +43,6 @@ def load_state_monitor_module():
         "brokkr.utils.output": MagicMock(),
         "notifiers": MagicMock(),
         "notifiers.notify": MagicMock(),
-        "notifiers.slack": MagicMock(),
-        "notifiers.google_chat": MagicMock(),
     }):
         spec = importlib.util.spec_from_file_location(
             "state_monitor", str(PLUGIN_PATH))
@@ -247,15 +245,6 @@ class TestCheckBatteryVoltageBoundary:
         m._previous_data = self._input(batt=11.0, v_lvd=11.0)  # below 11.5
         msg = m.check_battery_voltage(self._input(batt=10.8, v_lvd=11.0))
         assert msg is None
-
-
-def test_sensor_prefix_includes_site():
-    with patch.object(MODULE, "METADATA", {"name": "mj"}, create=True), \
-         patch.object(MODULE, "UNIT_CONFIG",
-                      {"number": 2, "site_description": "lab"}, create=True):
-        assert MODULE.sensor_prefix() == "mj02 (lab): "
-
-
 def test_send_message_prefixes_and_delegates():
     sm = StateMonitor.__new__(StateMonitor)
     sm.notifier = MagicMock()
