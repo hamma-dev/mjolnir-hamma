@@ -228,3 +228,80 @@ class TestStatusServices:
         service_names = [c[0][0][-1] for c in calls]
         assert 'brokkr-hamma-default' in service_names
         assert 'sindri-hamma-client' in service_names
+
+
+class TestTrigger:
+    """Tests for MjolnirArray.trigger()."""
+
+    def test_trigger_calls_ags_manual_trigger(self, mjol):
+        """Default trigger should run ags.py with das_manual_trigger."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            with patch.object(mjol.MjolnirArray, 'status', return_value=True):
+                mjol.MjolnirArray.trigger(10002)
+
+        cmd = mock_sub.run.call_args[0][0]
+        assert '/home/pi/dev/mjolnir-hamma/scripts/ags.py' in cmd
+        assert 'das_manual_trigger' in cmd
+
+    def test_trigger_ssh_target_and_port(self, mjol):
+        """Trigger should SSH to the unit's tunnel (pi@localhost, port)."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            with patch.object(mjol.MjolnirArray, 'status', return_value=True):
+                mjol.MjolnirArray.trigger(10005)
+
+        cmd = mock_sub.run.call_args[0][0]
+        assert 'pi@localhost' in cmd
+        assert '10005' in cmd
+
+    def test_trigger_custom_command(self, mjol):
+        """A custom AGS command should be forwarded verbatim."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            with patch.object(mjol.MjolnirArray, 'status', return_value=True):
+                mjol.MjolnirArray.trigger(10002, command="help")
+
+        cmd = mock_sub.run.call_args[0][0]
+        assert 'help' in cmd
+        assert 'das_manual_trigger' not in cmd
+
+    def test_trigger_has_timeout(self, mjol):
+        """subprocess.run should be called with timeout=30."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            with patch.object(mjol.MjolnirArray, 'status', return_value=True):
+                mjol.MjolnirArray.trigger(10002)
+
+        kwargs = mock_sub.run.call_args[1]
+        assert kwargs.get('timeout') == 30
+
+    def test_trigger_pi_down_skips(self, mjol):
+        """If the tunnel is down, trigger should not call subprocess."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            with patch.object(mjol.MjolnirArray, 'status', return_value=False):
+                mjol.MjolnirArray.trigger(10002, quiet=True)
+
+        mock_sub.run.assert_not_called()
+
+    def test_trigger_timeout_catches_exception(self, mjol):
+        """On timeout, trigger should catch the exception and not raise."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.side_effect = subprocess.TimeoutExpired(cmd="test", timeout=30)
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            with patch.object(mjol.MjolnirArray, 'status', return_value=True):
+                # Should not raise
+                mjol.MjolnirArray.trigger(10002, quiet=True)
+
+    def test_trigger_array_iterates_ports(self, mjol):
+        """trigger_array should call trigger once per port (10000 + unit)."""
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol.MjolnirArray, 'trigger') as mock_trigger:
+            arr.trigger_array(ports=[2, 3])
+
+        called_ports = [c[0][0] for c in mock_trigger.call_args_list]
+        assert called_ports == [10002, 10003]

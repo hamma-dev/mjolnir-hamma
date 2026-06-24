@@ -145,6 +145,60 @@ class MjolnirArray():
                   f"with code {out.returncode}.")
 
     @staticmethod
+    def trigger(port, command="das_manual_trigger", quiet=False):
+        # Send an AGS command (default: a manual trigger) to a sensor.
+        # port is fully qualified (10000 + unit number).
+        # We reach the Pi over its autossh tunnel and run ags.py there; the
+        # AGS command port (10.10.10.1:8082) is only reachable from the Pi.
+        sensor_num = port - 10000
+
+        # First, make sure the SSH tunnel for this Pi is reachable...
+        is_pi_up = MjolnirArray.status(port)
+
+        if not is_pi_up:
+            if not quiet:
+                print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
+                      f"not triggered.")
+            return
+
+        cmd = MjolnirArray._pi_ssh_cmd(port)
+        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py', command]
+
+        if not quiet:
+            print(f"--- mj{sensor_num:02}: sending AGS '{command}' ---")
+
+        try:
+            out = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            if not quiet:
+                print(f"[FAIL] mj{sensor_num:02}: ags.py did not complete "
+                      f"in 30s.")
+            return
+        except Exception as e:
+            if not quiet:
+                print(f"[FAIL] mj{sensor_num:02}: error running ags.py: {e}")
+            return
+
+        if quiet:
+            return
+
+        # Surface the AGS reply so the operator sees the result.
+        stdout = out.stdout.decode(errors="replace") if out.stdout else ""
+        stderr = out.stderr.decode(errors="replace") if out.stderr else ""
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, end="" if stderr.endswith("\n") else "\n")
+        if out.returncode != 0:
+            print(f"[FAIL] mj{sensor_num:02}: ags.py exited "
+                  f"with code {out.returncode}.")
+
+    @staticmethod
     def status_fcm(port):
         # Return a boolean if the FCM sensor is up (True) or down (False)
         # port is fully qualified
@@ -181,6 +235,17 @@ class MjolnirArray():
 
         for p in ports:
             MjolnirArray.updown(p, bring_up)
+
+    def trigger_array(self, ports=None, command="das_manual_trigger"):
+        # Send an AGS command (default: a manual trigger) to one or more sensors.
+        # ports is mod 10000 (list). If None, use all of this array's sensors.
+        if ports is None:
+            ports = [10000 + i for i in self.sensors]
+        else:
+            ports = [10000 + int(p) for p in ports]  # Make this an integer
+
+        for p in ports:
+            MjolnirArray.trigger(p, command=command)
 
     def status_array(self, ports=None, quiet=False):
         # Get status report for a number of sensors in an array
@@ -310,12 +375,13 @@ def main():
                             default=False,
                             )
 
-    # arg_parser.add_argument("--trig",
-    #                  help="Trig statsus",
-    #                  dest="do_trig",
-    #                  action='store_true',
-    #                  default=False,
-    #                  )
+    arg_parser.add_argument("--trigger",
+                            help="Send a manual trigger (ags das_manual_trigger) "
+                                 "to the sensor(s)",
+                            dest="do_trigger",
+                            action='store_true',
+                            default=False,
+                            )
 
     grp = arg_parser.add_mutually_exclusive_group()
     grp.add_argument("--up",
@@ -352,8 +418,8 @@ def main():
 
     if parsed_args.do_status:
         _ = mj_array.status_array(ports=parsed_args.ports)
-    # elif parsed_args.do_trig:
-    #     _ = status_latest_trigger(port=parsed_args.ports)
+    elif parsed_args.do_trigger:
+        mj_array.trigger_array(ports=parsed_args.ports)
     elif parsed_args.bring_up | parsed_args.bring_down:
         # Is it up or down?
         # bring_up = parsed_args.bring_up
