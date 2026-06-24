@@ -42,8 +42,6 @@ def load_state_monitor_module():
         "brokkr.utils": MagicMock(),
         "brokkr.utils.output": MagicMock(),
         "notifiers": MagicMock(),
-        "notifiers.slack": MagicMock(),
-        "notifiers.google_chat": MagicMock(),
     }):
         spec = importlib.util.spec_from_file_location(
             "state_monitor", str(PLUGIN_PATH))

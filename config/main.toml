@@ -69,6 +69,23 @@ config_version = 1
         filename_template = "{system_name}{unit_number:02d}.png"
         min_update_time = 30  # seconds
 
+    # Step for noise diagnostics on HAMMA fast-channel data
+    [steps.noise_diag]
+        _module_path = "noise_diag"
+        _class_name = "NoiseDiag"
+        _is_plugin = true
+        name = "HAMMA Noise Diagnostic"
+        min_update_time = 60          # seconds between samples
+        medsize = 200000             # fast-channel pre-trigger baseline samples
+        min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
+        output_path = "noise_diag"
+        filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
+        alert_threshold_frac = 0.8
+        alert_cooldown_s = 3600
+        method = "gchat"
+        channel = "status"
+        key_file = "/home/pi/.googlechat"
+
     # Step to rsync HAMMA plot to server
     [steps.hamma_plot_rsync]
         _preset = "rsync_server.outputs.plugin"
@@ -223,6 +240,7 @@ config_version = 1
         ]
         output_steps = [
             "hamma_plot",
+            "noise_diag",
         ]
 
     # Run rsync to the HAMMA server

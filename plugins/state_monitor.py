@@ -8,13 +8,22 @@ import shutil
 import subprocess
 
 # Third party imports
-from notifiers.slack import SlackSender
-from notifiers.google_chat import GoogleChatSender
+from notifiers import Notifier
 
 # Local imports
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
 import brokkr.utils.output
+
+
+def sensor_prefix():
+    """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
+    from brokkr.config.unit import UNIT_CONFIG
+    from brokkr.config.metadata import METADATA
+
+    sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
+    site = UNIT_CONFIG['site_description']
+    return f"{sensor_name} ({site}): " if site else f"{sensor_name}: "
 
 
 class StateMonitor(brokkr.pipeline.base.OutputStep):
@@ -80,23 +89,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.low_space = low_space
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
-        self.sender = None  # Make sure we "initialize" the attribute
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
         self.scrub_command = scrub_command
 
-        sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
-        try:
-            self.sender = sender_class(key_file, channel=channel, logger=self.logger)
-        except FileNotFoundError as e:
-            self.logger.error(
-                "%s initializing %s: %s\nIs the key file in the right place?",
-                type(e).__name__, sender_class.__name__, e)
-            self.logger.info("Error details:", exc_info=True)
-        except Exception as e:  # if anything goes wrong, don't set the sender class
-            self.logger.error(
-                "Unexpected %s initializing %s: %s", type(e).__name__, e, sender_class.__name__)
-            self.logger.info("Error details:", exc_info=True)
+        self.notifier = Notifier(
+            method=method, key_file=key_file, channel=channel, logger=self.logger)
 
     def execute(self, input_data=None):
         """
@@ -403,38 +401,5 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         return None
 
     def send_message(self, msg):
-        """
-        Send a message via the method defined the class attribute `method`.
-
-        This is a shepherd method. Given a generic message, we'll send it
-        using the method specified when initializing the class. Before sending, we'll
-        add in which sensor is sending the message.
-
-        Note: Any "sender class" must have a send method.
-
-        Parameters
-        ----------
-        msg : str
-            The message to be sent.
-
-        """
-        msg = self.construct_message(msg)
-
-        if self.sender is not None:
-            self.sender.send(msg)
-
-    @staticmethod
-    def construct_message(msg):
-        """Construct the message detailing the state notification."""
-        from brokkr.config.unit import UNIT_CONFIG
-        from brokkr.config.metadata import METADATA
-
-        sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
-        site = UNIT_CONFIG['site_description']
-
-        if site:
-            header = f"{sensor_name} ({site}): "
-        else:
-            header = f"{sensor_name}: "
-
-        return header + msg
+        """Prefix with the sensor identity and send via the notifier."""
+        self.notifier.send(sensor_prefix() + msg)
