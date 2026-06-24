@@ -284,7 +284,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
 
         power_now, power_pre = load_now * curr_now, load_pre * curr_pre
-        if (power_now < self.power_delim) and (power_pre > self.power_delim):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on power_delim.
+        if (power_now < self.power_delim) and (power_pre >= self.power_delim):
             return f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
         return None
 
@@ -342,7 +345,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         """
         space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
-        if (space_now < self.low_space) and (space_pre > self.low_space):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on low_space (a real case on mj07:
+        # 100.0 -> 99.96 with low_space=100 never fired).
+        if (space_now < self.low_space) and (space_pre >= self.low_space):
             self._spawn_scrub()
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
@@ -388,7 +395,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         CRITICAL_VOLTAGE = low_voltage_val + 0.5
 
         batt_now, batt_pre = self.now_then(input_data, 'adc_vb_f')
-        if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on CRITICAL_VOLTAGE.
+        if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre >= CRITICAL_VOLTAGE):
             return f"Battery voltage critically low ({batt_now:.3f} V)"
         return None
 
