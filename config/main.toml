@@ -77,6 +77,7 @@ config_version = 1
         name = "HAMMA Noise Diagnostic"
         min_update_time = 60          # seconds between samples
         medsize = 200000             # fast-channel pre-trigger baseline samples
+        min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
         output_path = "noise_diag"
         filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
         alert_threshold_frac = 0.8

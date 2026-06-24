@@ -8,6 +8,10 @@ from pathlib import Path
 import hamma
 from hamma.header.core import _diagnostic_data
 
+# HAMMA2 fast-channel sample rate. preTriggerSize is a count of fast samples;
+# the header's sampleRateFast field is not populated, so use the known rate.
+FAST_SAMPLE_RATE_HZ = 10_000_000
+
 import brokkr.pipeline.base
 from brokkr.utils.output import render_output_filename
 
@@ -31,6 +35,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
     def __init__(self,
                  min_update_time=60,
                  medsize=200000,
+                 min_pretrigger_ms=50,
                  output_path=None,
                  filename_template=None,
                  alert_threshold_frac=0.8,
@@ -45,6 +50,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         self._last_alert_time = None
         self.min_update_time = min_update_time
         self.medsize = medsize
+        self.min_pretrigger_ms = min_pretrigger_ms
         self.output_path = output_path if output_path is not None else Path()
         self.filename_template = filename_template
         self.alert_threshold_frac = alert_threshold_frac
@@ -73,19 +79,36 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         if getattr(data, "voltFast", None) is None:
             self.logger.info("No fast channel in trigger; skipping noise diag.")
             return None
+        # The noise floor is measured on the pre-trigger baseline. If the
+        # pre-trigger window is shorter than min_pretrigger_ms, that baseline
+        # would be contaminated by the trigger signal, so skip without
+        # computing any noise. Read straight from the header: preTriggerSize is
+        # a fast-sample count, converted to ms via the fast sample rate.
+        pretrigger_ms = (int(h.data['preTriggerSize'].iloc[0])
+                         / FAST_SAMPLE_RATE_HZ * 1000.0)
+        if pretrigger_ms < self.min_pretrigger_ms:
+            self.logger.info(
+                "Pre-trigger %.1f ms < %.1f ms; skipping noise diag.",
+                pretrigger_ms, self.min_pretrigger_ms)
+            return None
+
         offset, vmax, vmin, noise = _diagnostic_data(data.voltFast, self.medsize)
         vpp = float(vmax) - float(vmin)
         snr = vpp / noise if noise else float("nan")
         threshold = float(h.data.threshold.iloc[0])
         ratio = noise / threshold if threshold else float("nan")
-        times_slow = getattr(data, "times", None)
+
+        # Absolute trigger instant: the fast-channel timestamp at triggerPos
+        # (the pre/post boundary). triggerPos indexes the FAST array.
+        times_fast = getattr(data, "timesFast", None)
         trigger_time = ""
-        if times_slow is not None and len(times_slow):
+        if times_fast is not None and len(times_fast):
             trig_pos = int(h.data['triggerPos'].iloc[0])
-            if 0 <= trig_pos < len(times_slow):
-                trigger_time = str(times_slow[trig_pos])
+            if 0 <= trig_pos < len(times_fast):
+                trigger_time = str(times_fast[trig_pos])
             else:
-                trigger_time = str(times_slow[0])
+                trigger_time = str(times_fast[0])
+
         return {
             "trigger_time": trigger_time,
             "fast_offset": float(offset),

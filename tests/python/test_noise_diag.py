@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import numpy as np
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 PLUGIN_PATH = REPO_ROOT / "plugins" / "noise_diag.py"
@@ -17,7 +18,7 @@ class MockOutputStep:
 
 
 def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), threshold=0.083,
-                times=None, trig_pos=1):
+                times_fast=None, trig_pos=1, pretrigger_size=953250):
     mock_base = MagicMock()
     mock_base.OutputStep = MockOutputStep
     mock_pipeline = MagicMock(); mock_pipeline.base = mock_base
@@ -25,12 +26,22 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
     mock_brokkr.pipeline.base = mock_base
 
     mock_hamma = MagicMock()
-    if times is None:
-        times = ["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857", "2026-06-23T21:36:59.000"]
-    data = MagicMock(); data.voltFast = volt_fast; data.times = times
+    if times_fast is None:
+        times_fast = np.array(["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857",
+                               "2026-06-23T21:36:59.000"], dtype="datetime64[ms]")
+    data = MagicMock(); data.voltFast = volt_fast; data.timesFast = times_fast
     header = MagicMock(); header.read_stream.return_value = data
     header.data.threshold.iloc.__getitem__.return_value = threshold
-    header.data.__getitem__.return_value.iloc.__getitem__.return_value = trig_pos
+
+    def _col(name):
+        # h.data['triggerPos'].iloc[0] / h.data['preTriggerSize'].iloc[0]
+        col = MagicMock()
+        col.iloc.__getitem__.return_value = {
+            "triggerPos": trig_pos,
+            "preTriggerSize": pretrigger_size,
+        }.get(name, 0)
+        return col
+    header.data.__getitem__.side_effect = _col
     mock_hamma.Header.return_value = header
     mock_core = MagicMock(); mock_core._diagnostic_data.return_value = diag_return
 
@@ -60,6 +71,7 @@ def test_compute_derives_vpp_snr_ratio():
     module = load_module(diag_return=(0.1, 4.7, -4.7, 0.035), trig_pos=1)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
     assert m["fast_offset"] == pytest.approx(0.1)
@@ -76,6 +88,7 @@ def test_compute_returns_none_without_fast_channel():
     module = load_module(volt_fast=None)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     assert step._compute(make_input()) is None
 
@@ -84,6 +97,7 @@ def test_compute_snr_nan_when_noise_zero():
     module = load_module(diag_return=(0.1, 4.7, -4.7, 0.0))  # noise == 0
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
     assert math.isnan(m["fast_snr"])
@@ -94,20 +108,50 @@ def test_compute_ratio_nan_when_threshold_zero():
     module = load_module(threshold=0.0)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
     assert math.isnan(m["noise_thresh_ratio"])
 
 
 def test_compute_trigger_time_out_of_range_falls_back_to_first():
-    """When triggerPos is beyond the times array, trigger_time falls back to times[0]."""
-    times = ["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857"]
-    module = load_module(trig_pos=999, times=times)  # 999 >= len(times)=2
+    """When triggerPos is beyond timesFast, trigger_time falls back to timesFast[0]."""
+    times = np.array(["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857"],
+                     dtype="datetime64[ms]")
+    module = load_module(trig_pos=999, times_fast=times)  # 999 >= len=2
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
     assert m["trigger_time"] == "2026-06-23T21:36:57.000"
+
+
+def test_compute_skips_short_pretrigger():
+    """preTriggerSize below min_pretrigger_ms -> skip (None), no noise computed."""
+    # 300000 fast samples / 10 MHz = 30 ms, below the 50 ms threshold.
+    module = load_module(pretrigger_size=300000)
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.min_pretrigger_ms = 50
+    step.logger = MagicMock()
+    with patch.object(module, "_diagnostic_data") as mock_diag:
+        result = step._compute(make_input())
+    assert result is None
+    mock_diag.assert_not_called()
+
+
+def test_compute_keeps_long_pretrigger():
+    """preTriggerSize above min_pretrigger_ms -> computed normally."""
+    # 953250 fast samples / 10 MHz = 95.3 ms, above the 50 ms threshold.
+    module = load_module(pretrigger_size=953250)
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.min_pretrigger_ms = 50
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert m is not None
+    assert m["trigger_time"] == "2026-06-23T21:36:58.857"
 
 
 def test_write_csv_creates_header_then_appends(tmp_path):
