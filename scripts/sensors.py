@@ -16,6 +16,7 @@ import argparse
 import datetime
 import glob as glob_module
 import os
+import socket
 import subprocess
 import sys
 
@@ -28,6 +29,7 @@ import tomli
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 SYSTEM_UNIT_TOML = os.path.join(REPO_ROOT, "config", "unit.toml")
+SYSTEM_MAIN_TOML = os.path.join(REPO_ROOT, "config", "main.toml")
 LOCAL_UNIT_TOML = os.path.expanduser(
     "~/.config/brokkr/hamma/unit.toml")
 
@@ -115,6 +117,181 @@ def load_relay_config(local_path=None, system_path=None):
         sys.exit(1)
 
     return relay
+
+
+# --- Notifications (uses same channel as state_monitor) ---
+
+def load_notifier_config(main_toml_path=None):
+    """Load notifier config from main.toml's [steps.state_monitor] block.
+
+    Reuses the same method/channel/key_file that the state_monitor plugin
+    uses, so on/off notifications land in the same chat channel.
+
+    Parameters
+    ----------
+    main_toml_path : str, optional
+        Path to main.toml. Defaults to repo config/main.toml.
+
+    Returns
+    -------
+    dict or None
+        Dict with 'method', 'channel', 'key_file' (any may be None), or
+        None if main.toml or the state_monitor block is missing/malformed.
+    """
+    if main_toml_path is None:
+        main_toml_path = SYSTEM_MAIN_TOML
+    if not os.path.isfile(main_toml_path):
+        return None
+    try:
+        with open(main_toml_path, "rb") as f:
+            data = tomli.load(f)
+    except (tomli.TOMLDecodeError, OSError):
+        return None
+    try:
+        sm = data["steps"]["state_monitor"]
+    except (KeyError, TypeError):
+        return None
+    return {
+        "method": sm.get("method"),
+        "channel": sm.get("channel"),
+        "key_file": sm.get("key_file"),
+    }
+
+
+def build_sender(notifier_config):
+    """Instantiate a notifier sender from config.
+
+    Returns None on any failure (missing config, unknown method, import
+    error, missing key file). All failures print a [WARN] to stderr and
+    are swallowed so notifications never block the main on/off operation.
+
+    Parameters
+    ----------
+    notifier_config : dict or None
+        Output of load_notifier_config().
+
+    Returns
+    -------
+    object or None
+        Sender with a .send(msg) method, or None.
+    """
+    if not notifier_config:
+        return None
+    method = notifier_config.get("method")
+    key_file = notifier_config.get("key_file")
+    channel = notifier_config.get("channel")
+    if not method or not key_file:
+        return None
+
+    try:
+        if method == "gchat":
+            from notifiers.google_chat import GoogleChatSender
+            cls = GoogleChatSender
+        elif method == "slack":
+            from notifiers.slack import SlackSender
+            cls = SlackSender
+        else:
+            print("[WARN] Unknown notifier method '{}'; "
+                  "skipping notification.".format(method), file=sys.stderr)
+            return None
+    except ImportError as exc:
+        print("[WARN] Could not import notifier ({}); "
+              "skipping notification.".format(exc), file=sys.stderr)
+        return None
+
+    try:
+        return cls(key_file, channel=channel)
+    except FileNotFoundError:
+        print("[WARN] Notifier key file not found: {}; "
+              "skipping notification.".format(key_file), file=sys.stderr)
+        return None
+    except Exception as exc:
+        print("[WARN] Could not initialize notifier ({}: {}); "
+              "skipping notification.".format(type(exc).__name__, exc),
+              file=sys.stderr)
+        return None
+
+
+def get_unit_identifier(local_path=None):
+    """Return (sensor_name, site_description) for notification messages.
+
+    sensor_name is 'MjolnirNN' from unit.toml's 'number'. Falls back to
+    socket.gethostname() if the number is missing or the file can't be
+    read. site_description is None if not set in unit.toml.
+
+    Parameters
+    ----------
+    local_path : str, optional
+        Path to local unit.toml. Defaults to LOCAL_UNIT_TOML.
+
+    Returns
+    -------
+    tuple of (str, str or None)
+    """
+    if local_path is None:
+        local_path = LOCAL_UNIT_TOML
+    try:
+        if os.path.isfile(local_path):
+            with open(local_path, "rb") as f:
+                config = tomli.load(f)
+            number = config.get("number")
+            site = config.get("site_description") or None
+            if isinstance(number, int):
+                return "Mjolnir{:02d}".format(number), site
+    except (tomli.TOMLDecodeError, OSError):
+        pass
+    return socket.gethostname(), None
+
+
+def build_message(sensor_name, site, action, success, rc=None):
+    """Construct the notification message for an on/off event.
+
+    Parameters
+    ----------
+    sensor_name : str
+        e.g. 'Mjolnir02'.
+    site : str or None
+        e.g. 'SWI Berm'. Included in parentheses if non-empty.
+    action : str
+        'on' or 'off' (case-insensitive).
+    success : bool
+        True for success, False for failure.
+    rc : int, optional
+        Return code on failure. Included in the message if provided.
+
+    Returns
+    -------
+    str
+    """
+    header = "{} ({}): ".format(sensor_name, site) if site else "{}: ".format(sensor_name)
+    if success:
+        body = "sensor turned {}".format(action.upper())
+    else:
+        rc_str = "rc={}".format(rc) if rc is not None else "rc=?"
+        body = "sensor turn-{} FAILED ({})".format(action.upper(), rc_str)
+    return header + body
+
+
+def send_notification(sender, msg):
+    """Send a notification, swallowing any errors.
+
+    Notifications are best-effort: a send failure must never fail the
+    on/off operation that has already happened on the hardware.
+
+    Parameters
+    ----------
+    sender : object or None
+        Sender with a .send(msg) method. If None, this is a no-op.
+    msg : str
+    """
+    if sender is None:
+        return
+    try:
+        sender.send(msg)
+        print("[OK] Notification sent")
+    except Exception as exc:
+        print("[WARN] Notification send failed ({}: {})".format(
+            type(exc).__name__, exc), file=sys.stderr)
 
 
 # --- Relay polarity ---
@@ -469,7 +646,7 @@ def parse_args(argv=None):
     return args
 
 
-def run(argv=None, config_path=None):
+def run(argv=None, config_path=None, main_toml_path=None):
     """Main entry point.
 
     Parameters
@@ -477,7 +654,10 @@ def run(argv=None, config_path=None):
     argv : list, optional
         CLI arguments. Defaults to sys.argv[1:].
     config_path : str, optional
-        Override config path (for testing).
+        Override unit.toml path (for testing).
+    main_toml_path : str, optional
+        Override main.toml path (for testing). Used to locate the
+        state_monitor notifier config.
     """
     args = parse_args(argv)
 
@@ -516,11 +696,24 @@ def run(argv=None, config_path=None):
         print("  sudo systemctl start {}".format(BROKKR_SERVICE))
         return 0
 
+    # Prepare the notifier up front; failures here are non-fatal and just
+    # disable notifications for this run.
+    sender = build_sender(load_notifier_config(main_toml_path))
+    sensor_name, site = get_unit_identifier(config_path)
+    action = "on" if args.sensor_on else "off"
+
     # Execute
     if args.sensor_on:
-        return sensor_on(pin=config["pin"], active_high=config["active_high"])
+        rc = sensor_on(pin=config["pin"], active_high=config["active_high"])
     else:
-        return sensor_off(pin=config["pin"], active_high=config["active_high"])
+        rc = sensor_off(pin=config["pin"], active_high=config["active_high"])
+
+    msg = build_message(
+        sensor_name, site, action,
+        success=(rc == 0),
+        rc=rc if rc != 0 else None)
+    send_notification(sender, msg)
+    return rc
 
 
 def main():
