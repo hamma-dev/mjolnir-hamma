@@ -20,6 +20,8 @@ First tagged release since 0.3.0, consolidating a large backlog of sensor-softwa
 * **Google Chat notifier**, later refactored into a shared `notifiers.Notifier` transport. (2022-07-07 #23, 2026-06-24 #64)
 * **Cellular / WWAN connectivity** — install, settings, "patient" ping, and connectivity fixes. (2022-11 to 2025-06: #26, #28, #31, #32)
 
+**Deploy note:** requires the `hamma` package **0.3.0** (`python_requires >=3.6`; resolves HAM-96). Install hamma from the `0.3.0` tag. Verified against brokkr 0.4.0 and sindri 0.3.1.dev0.
+
 
 ## Version 0.1.0a3 (2020-03-20)
 
