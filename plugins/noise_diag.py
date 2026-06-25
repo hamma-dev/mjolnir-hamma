@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 
 import hamma
-from hamma.header.core import _diagnostic_data
+from hamma import diagnostic_data
 
 # HAMMA2 fast-channel sample rate. preTriggerSize is a count of fast samples;
 # the header's sampleRateFast field is not populated, so use the known rate.
@@ -92,7 +92,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
                 pretrigger_ms, self.min_pretrigger_ms)
             return None
 
-        offset, vmax, vmin, noise = _diagnostic_data(data.voltFast, self.medsize)
+        offset, vmax, vmin, noise = diagnostic_data(data.voltFast, self.medsize)
         vpp = float(vmax) - float(vmin)
         snr = vpp / noise if noise else float("nan")
         threshold = float(h.data.threshold.iloc[0])
