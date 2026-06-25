@@ -1,0 +1,10 @@
+[Unit]
+Description=WWAN Connectivity Check Service (via flock wrapper)
+# Dependencies to ensure ModemManager is ready
+Requires=ModemManager.service
+After=ModemManager.service
+
+[Service]
+Type=oneshot
+# Execute the flock wrapper script
+ExecStart=/usr/local/bin/wwan-check.sh

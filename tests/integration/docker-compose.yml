@@ -1,0 +1,30 @@
+# Docker Compose for mjolnir-hamma integration tests
+version: '3.8'
+
+services:
+  test-pi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mjolnir-test-pi
+    hostname: mjolnir-test
+
+    # Mount the repository
+    volumes:
+      - ../../:/home/pi/dev/mjolnir-hamma:ro
+      - ./results:/test-results
+
+    # Required for systemd (though limited in container)
+    privileged: false
+
+    # Keep container running for interactive testing
+    tty: true
+    stdin_open: true
+
+    # Environment
+    environment:
+      - TESTING=1
+      - HOME=/home/pi
+
+    # Override entrypoint for test runs
+    entrypoint: ["/bin/bash"]

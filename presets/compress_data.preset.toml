@@ -1,0 +1,23 @@
+# Preset for daily data compression
+
+config_version = 1
+# Name of this device preset, used for lookup
+name = "compress_data"
+# Type of this preset
+type = "non"
+
+# Preset-level metadata
+[metadata]
+name_full = "Daily Data Compression"
+author = "Phillip Bitzer, C.A.M. Gerlach, and the UAH HAMMA group"
+description = "Compress data files on a daily basis to save disk space"
+homepage = "https://hamma.dev/"
+repo = "https://github.com/hamma-dev/mjolnir-hamma"
+preset_version = "0.1.0"
+brokkr_version_min = "0.4.0"
+
+[outputs.plugin]
+_module_path = "compress_data"
+_class_name = "CompressData"
+_is_plugin = true
+name = "Daily Data Compression"

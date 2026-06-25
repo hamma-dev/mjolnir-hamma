@@ -35,6 +35,10 @@ config_version = 1
 
 # List custom steps or override default preset settings here under the [steps] key
 [steps]
+    # Named step wrapping sunsaver preset — allows mode overlay to swap class
+    [steps.sunsaver_input]
+        _preset = "sunsaver_mppt_15l.inputs.ram"
+
     # Step for outputting telemetry data to a standard CSV
     [steps.telemetry_csv_output]
         # Preset for this step, in the format "{device_name}.{input/output/command/etc}.{preset_name}"
@@ -47,12 +51,13 @@ config_version = 1
 
     [steps.state_monitor]
         _preset = "state_monitor.outputs.plugin"
-        power_delim = 20  # delimiter between normal power and low power
+        power_delim = 15  # delimiter between normal power and low power
         low_space = 100  # if # of GB is less than this, generate a notification
         ping_max = 3  # after this many pings, send chat message
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"
         key_file = "/home/pi/.googlechat"
+        scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
 
     # Step to create HAMMA plot
     [steps.hamma_plot]
@@ -63,6 +68,23 @@ config_version = 1
         output_path = "trigger_plots"
         filename_template = "{system_name}{unit_number:02d}.png"
         min_update_time = 30  # seconds
+
+    # Step for noise diagnostics on HAMMA fast-channel data
+    [steps.noise_diag]
+        _module_path = "noise_diag"
+        _class_name = "NoiseDiag"
+        _is_plugin = true
+        name = "HAMMA Noise Diagnostic"
+        min_update_time = 60          # seconds between samples
+        medsize = 200000             # fast-channel pre-trigger baseline samples
+        min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
+        output_path = "noise_diag"
+        filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
+        alert_threshold_frac = 0.8
+        alert_cooldown_s = 3600
+        method = "gchat"
+        channel = "status"
+        key_file = "/home/pi/.googlechat"
 
     # Step to rsync HAMMA plot to server
     [steps.hamma_plot_rsync]
@@ -132,6 +154,22 @@ config_version = 1
         _queue_name = "science_data_headers"
         name = "HAMMA2 AGS science data header input queue"
 
+    # Step for daily compression of data files on /media/pi
+    # Works during quiet hours only, compressing whatever is eligible
+    # Uses hamma.compression for optimized HAMMA trigger data compression
+    [steps.compress_media_data]
+        _preset = "compress_data.outputs.plugin"
+        name = "Compress Media Data"
+        source_path = "/media/pi"
+        drive_glob = "DATA??"  # Find data on mounted DATAxx drives
+        output_subdir = "compressed"  # Archives stored in each drive's compressed/ subdir
+        min_age_days = 1  # Only compress files older than 1 day
+        delete_originals = false  # Originals are ground truth; .hmc for transfer only
+        method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
+        step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
+        quiet_start = 8   # 8 AM UTC — after overnight storms
+        quiet_end = 0     # Midnight UTC — wide window for compression
+
 
 # List pipelines to run here under the [pipelines] key
 [pipelines]
@@ -147,10 +185,11 @@ config_version = 1
         na_on_start = true
         # Most pipeline builders will need one or more lists of steps.
         # These are either names of steps in the [steps] table, or preset names as above
+        # NOTE: sunsaver_input is a named step so nochargecontroller mode can override its class
         monitor_input_steps = [
             "builtins.inputs.current_time",
             "builtins.inputs.run_time",
-            "sunsaver_mppt_15l.inputs.ram",
+            "sunsaver_input",
             "hamma2.inputs.ping",
             "hamma2.inputs.hs",
         ]
@@ -201,6 +240,7 @@ config_version = 1
         ]
         output_steps = [
             "hamma_plot",
+            "noise_diag",
         ]
 
     # Run rsync to the HAMMA server
@@ -246,4 +286,19 @@ config_version = 1
         ]
         output_steps = [
             "science_csv_output",
+        ]
+
+    # Daily compression of data files on /media/pi
+    [pipelines.daily_compression]
+        _builder = "pipeline"
+        _enabled = true
+        period_s = 3600  # Check every hour; actual compression controlled by step update_time
+        name = "Daily Data Compression"
+        input_steps = [
+            "builtins.inputs.current_time",
+        ]
+        process_steps = [
+        ]
+        output_steps = [
+            "compress_media_data",
         ]

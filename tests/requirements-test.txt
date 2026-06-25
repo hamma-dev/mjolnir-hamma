@@ -1,0 +1,5 @@
+# Test dependencies for mjolnir-hamma
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-xdist>=3.0.0  # For parallel test execution
+tomli>=1.1.0

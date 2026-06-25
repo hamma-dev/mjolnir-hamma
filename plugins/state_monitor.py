@@ -3,14 +3,27 @@ Plugin to monitor state variables from the charge controller.
 """
 
 from math import nan
+import shlex
+import shutil
+import subprocess
 
 # Third party imports
-from notifiers.slack import SlackSender
-from notifiers.google_chat import GoogleChatSender
+from notifiers import Notifier
 
 # Local imports
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
+import brokkr.utils.output
+
+
+def sensor_prefix():
+    """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
+    from brokkr.config.unit import UNIT_CONFIG
+    from brokkr.config.metadata import METADATA
+
+    sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
+    site = UNIT_CONFIG['site_description']
+    return f"{sensor_name} ({site}): " if site else f"{sensor_name}: "
 
 
 class StateMonitor(brokkr.pipeline.base.OutputStep):
@@ -24,6 +37,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         ping_max=3,
         channel=None,
         key_file=None,
+        low_pi_space=5,
+        enable_drive_checks=True,
+        scrub_command="",
         **output_step_kwargs,
         ):
         """
@@ -48,6 +64,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             The chat channel in which to post notifications.
         key_file : str or pathlib.Path, optional
             The path to the file that contains the secret/webhook key for the given `method`.
+        low_pi_space: numeric, optional
+            Specifies the critical value, in gigabytes-ish, for hard drive space remaining
+            on the backend Pi.
+        enable_drive_checks : bool, optional
+            If True (default), check for archive drives and sensor drive space.
+            Set to False for units without HAMMA sensor hardware connected.
+        scrub_command : str, optional
+            Shell command to run hamma_scrub.py when drive space is low.
+            If empty (default), no scrub is spawned. Protected by flock.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -64,20 +89,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.low_space = low_space
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
-        self.sender = None  # Make sure we "initialize" the attribute
+        self.low_pi_space = low_pi_space*1000000000
+        self.enable_drive_checks = enable_drive_checks
+        self.scrub_command = scrub_command
 
-        sender_class = {"slack": SlackSender, "gchat": GoogleChatSender}[method]
-        try:
-            self.sender = sender_class(key_file, channel=channel, logger=self.logger)
-        except FileNotFoundError as e:
-            self.logger.error(
-                "%s initializing %s: %s\nIs the key file in the right place?",
-                type(e).__name__, sender_class.__name__, e)
-            self.logger.info("Error details:", exc_info=True)
-        except Exception as e:  # if anything goes wrong, don't set the sender class
-            self.logger.error(
-                "Unexpected %s initializing %s: %s", type(e).__name__, e, sender_class.__name__)
-            self.logger.info("Error details:", exc_info=True)
+        self.notifier = Notifier(
+            method=method, key_file=key_file, channel=channel, logger=self.logger)
 
     def execute(self, input_data=None):
         """
@@ -170,7 +187,6 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             self.logger.info(
                 "%s data: %r", pretty_name, data)
 
-
     def run_checks(self, input_data):
         """
         Run the monitoring checks and log/send messages for the results.
@@ -181,19 +197,68 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Same as argument of `execute`.
 
         """
-        for check_fn in [
-                self.check_power,
+        checks = [
+                self.check_pi_space,
                 self.check_ping,
-                self.check_sensor_drive,
+                self.check_power,
                 self.check_battery_voltage,
-                ]:
+        ]
+        if self.enable_drive_checks:
+            checks.insert(0, self.check_drive)
+            checks.append(self.check_sensor_drive)
+
+        for check_fn in checks:
             try:
+                # noinspection PyArgumentList
                 msg = check_fn(input_data)
                 if msg:
                     self.logger.info(msg)
                     self.send_message(msg)
             except Exception as e:
                 self.log_error(input_data, e)
+
+    def check_pi_space(self, input_data):
+        """
+        Check the remaining space on backend Pi.
+
+        This will check to see how much space is remaining on a backend Pi.
+        If it falls below the value given by the class attribute `low_pi_space`,
+        send a message.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute`.
+
+        Returns
+        -------
+        str | None
+            Message to send depending on the check, or None if no message.
+
+        """
+
+        total, used, free = shutil.disk_usage("/")
+
+        if free < self.low_pi_space:
+            return f"Free space is low! Current {free/(2**30):.2f} GB; critical value:{self.low_pi_space/(2**30):.2f} GB."
+        else:
+            return None
+
+    def check_drive(self, input_data):
+        """Check to see if the archive drive is available"""
+        from brokkr.config.main import CONFIG
+        import brokkr.utils.output
+        drive_settings = CONFIG['steps']['science_binary_output']['drive_kwargs']
+
+        avail_drives = brokkr.utils.output.find_drives(
+                 drive_settings['drive_glob'],
+                 '/dev/disk/by-label',
+        )
+
+        if not avail_drives:
+            return "No drives available."
+        else:
+            return None
 
     def check_power(self, input_data):
         """
@@ -217,7 +282,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         curr_now, curr_pre = self.now_then(input_data, 'adc_il_f')
 
         power_now, power_pre = load_now * curr_now, load_pre * curr_pre
-        if (power_now < self.power_delim) and (power_pre > self.power_delim):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on power_delim.
+        if (power_now < self.power_delim) and (power_pre >= self.power_delim):
             return f"Power has dropped from {power_pre:.2f} to {power_now:.2f}."
         return None
 
@@ -261,7 +329,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         This will check to see how much space is remaining on a sensor USB drive.
         If it falls below the value given by the class attribute `low_space`,
-        send a message.
+        send a message and optionally spawn a scrub process.
 
         Parameters
         ----------
@@ -275,9 +343,31 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         """
         space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
-        if (space_now < self.low_space) and (space_pre > self.low_space):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on low_space (a real case on mj07:
+        # 100.0 -> 99.96 with low_space=100 never fired).
+        if (space_now < self.low_space) and (space_pre >= self.low_space):
+            self._spawn_scrub()
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
+
+    def _spawn_scrub(self):
+        """Spawn detached scrub process if scrub_command is configured."""
+        if not self.scrub_command or not self.scrub_command.strip():
+            return
+        lock_file = "/tmp/hamma_scrub.lock"
+        try:
+            cmd = ["flock", "-n", lock_file] + shlex.split(self.scrub_command)
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.logger.info("Spawned scrub: %s", " ".join(cmd))
+        except (OSError, ValueError) as e:
+            self.logger.error("Failed to spawn scrub: %s", e)
 
     def check_battery_voltage(self, input_data):
         """
@@ -303,41 +393,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         CRITICAL_VOLTAGE = low_voltage_val + 0.5
 
         batt_now, batt_pre = self.now_then(input_data, 'adc_vb_f')
-        if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre > CRITICAL_VOLTAGE):
+        # Use >= for `pre` so a previous sample sitting exactly on the
+        # threshold still counts as above it. Strict `>` silently misses
+        # the edge when pre lands on CRITICAL_VOLTAGE.
+        if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre >= CRITICAL_VOLTAGE):
             return f"Battery voltage critically low ({batt_now:.3f} V)"
         return None
 
     def send_message(self, msg):
-        """
-        Send a message via the method defined the class attribute `method`.
-
-        This is a shepherd method. Given a generic message, we'll send it
-        using the method specified when initializing the class. Before sending, we'll
-        add in which sensor is sending the message.
-
-        Note: Any "sender class" must have a send method.
-
-        Parameters
-        ----------
-        msg : str
-            The message to be sent.
-
-        """
-        msg = self.construct_message(msg)
-
-        if self.sender is not None:
-            self.sender.send(msg)
-
-    @staticmethod
-    def construct_message(msg):
-        """Construct the message detailing the state notification."""
-        from brokkr.config.unit import UNIT_CONFIG
-        from brokkr.config.metadata import METADATA
-
-        sensor_name = f"{METADATA['name']}{UNIT_CONFIG['number']:02d}"
-
-        header = f"Message from sensor {sensor_name} at {UNIT_CONFIG['site_description']}"
-
-        msg = '\n'.join([header, msg])
-
-        return msg
+        """Prefix with the sensor identity and send via the notifier."""
+        self.notifier.send(sensor_prefix() + msg)

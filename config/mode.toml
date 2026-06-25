@@ -43,3 +43,60 @@ config_version = 1
 
     [test.main.pipelines.rsync_hamma_realtime]
         _enabled = false
+
+# Preset for units without HAMMA sensor hardware connected
+# Disables all science data pipelines and drive checks, keeps telemetry/monitoring
+[nosensor]
+    [nosensor.main.steps.state_monitor]
+        enable_drive_checks = false
+
+    [nosensor.main.pipelines.science_ingest]
+        _enabled = false
+
+    [nosensor.main.pipelines.science_disk_write]
+        _enabled = false
+
+    [nosensor.main.pipelines.science_header_decode]
+        _enabled = false
+
+    [nosensor.main.pipelines.realtime]
+        _enabled = false
+
+    [nosensor.main.pipelines.rsync_hamma_realtime]
+        _enabled = false
+
+# Preset for units without a charge controller connected
+# Swaps sunsaver modbus input with NullInput to preserve CSV schema with NA values
+[nochargecontroller]
+    [nochargecontroller.main.steps.sunsaver_input]
+        _module_path = "null_input"
+        _class_name = "NullInput"
+        _is_plugin = true
+        _preset = "sunsaver_mppt_15l.inputs.ram"
+
+# Preset for units with neither sensor nor charge controller
+# Combines nosensor + nochargecontroller overrides
+[nosensor_nochargecontroller]
+    [nosensor_nochargecontroller.main.steps.sunsaver_input]
+        _module_path = "null_input"
+        _class_name = "NullInput"
+        _is_plugin = true
+        _preset = "sunsaver_mppt_15l.inputs.ram"
+
+    [nosensor_nochargecontroller.main.steps.state_monitor]
+        enable_drive_checks = false
+
+    [nosensor_nochargecontroller.main.pipelines.science_ingest]
+        _enabled = false
+
+    [nosensor_nochargecontroller.main.pipelines.science_disk_write]
+        _enabled = false
+
+    [nosensor_nochargecontroller.main.pipelines.science_header_decode]
+        _enabled = false
+
+    [nosensor_nochargecontroller.main.pipelines.realtime]
+        _enabled = false
+
+    [nosensor_nochargecontroller.main.pipelines.rsync_hamma_realtime]
+        _enabled = false
