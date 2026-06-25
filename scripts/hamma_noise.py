@@ -27,9 +27,9 @@ DEFAULT_COUNT = 10
 DEFAULT_WARN_PCT = 80
 DEFAULT_OUTPUT = "/tmp/noise_check.json"
 
-# Noise measurement constants (from hamma.header.core._diagnostic_data)
-MEDSIZE = 20000  # samples for slow channel offset/noise window
-NOISE_PERCENTILES = [0.01, 99.9]
+# Sample window sizes for hamma.diagnostic_data
+SLOW_N_SAMPLES = 20000
+FAST_N_SAMPLES = 200000
 
 # Exit codes
 EXIT_OK = 0
@@ -97,20 +97,20 @@ def measure_noise(filepath):
         logger.warning("Failed to read %s: %s", filepath, e)
         return None
 
+    import hamma as _hamma
     data = hdr.get_data(0, noTimes=True)
     threshold = float(hdr.data.threshold[0])
 
     # Slow channel
-    perc = np.percentile(data.volt[0:MEDSIZE], NOISE_PERCENTILES)
-    slow_noise = perc[1] - perc[0]
-    slow_offset = np.median(data.volt[0:MEDSIZE])
+    slow_offset, _, _, slow_noise = _hamma.diagnostic_data(
+        data.volt, n_samples=SLOW_N_SAMPLES
+    )
 
     # Fast channel
     if data.voltFast is not None:
-        fast_med_size = MEDSIZE * 10
-        perc_fast = np.percentile(data.voltFast[0:fast_med_size], NOISE_PERCENTILES)
-        fast_noise = perc_fast[1] - perc_fast[0]
-        fast_offset = np.median(data.voltFast[0:fast_med_size])
+        fast_offset, _, _, fast_noise = _hamma.diagnostic_data(
+            data.voltFast, n_samples=FAST_N_SAMPLES
+        )
     else:
         fast_noise = np.nan
         fast_offset = np.nan
