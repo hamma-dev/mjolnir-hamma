@@ -80,6 +80,8 @@ VARIABLE_NAME_MAP = {
     "crc_errors_daily": "CRC Errors/Day",
     "bytes_written": "Data Written",
     "triggers_remaining": "Triggers Left",
+    "fast_noise": "Fast Noise Floor",
+    "fast_offset": "DC Offset",
     }
 
 
@@ -108,6 +110,8 @@ STANDARD_LAYOUTS = {
     "trigger_rate": {"dtick": 20, "range": [0, 60], "suffix": ""},
     "gigabytes": {"dtick": 100, "range": [0, 500], "suffix": " GB"},
     "triggers_remaining": {"dtick": 6000, "range": [0, 24000], "suffix": ""},
+    "noise_floor_mv": {"dtick": 20, "range": [0, 100], "suffix": " mV"},
+    "dc_offset_mv": {"dtick": 200, "range": [0, 1000], "suffix": " mV"},
     }
 
 LAYOUT_MAP = {
@@ -138,6 +142,8 @@ LAYOUT_MAP = {
     "trigger_rate_1hr": STANDARD_LAYOUTS["trigger_rate"],
     "bytes_written": STANDARD_LAYOUTS["gigabytes"],
     "triggers_remaining": STANDARD_LAYOUTS["triggers_remaining"],
+    "fast_noise": STANDARD_LAYOUTS["noise_floor_mv"],
+    "fast_offset": STANDARD_LAYOUTS["dc_offset_mv"],
     }
 
 
@@ -668,6 +674,66 @@ STATUS_DASHBOARD_PLOTS = {
             },
         "fast_update": False,
         },
+    "noisefloor": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("fast_noise"),
+            },
+        "plot_metadata": {
+            "plot_title": "Fast Noise Floor",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "green",
+            "increasing_color": "red",
+            "dtick": 20,
+            "range": [0, 100],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
+    "dcoffset": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("fast_offset"),
+            },
+        "plot_metadata": {
+            "plot_title": "DC Offset",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "green",
+            "increasing_color": "red",
+            "dtick": 200,
+            "range": [0, 1000],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
     }
 
 STATUS_DASHBOARD_METADATA = {
@@ -881,6 +947,129 @@ HISTORY_PLOT_ARGS = {
     "name_map": VARIABLE_NAME_MAP,
     "layout_map": LAYOUT_MAP,
     "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SLOW_SECONDS,
+    }
+
+
+# --- Noise panel (fast-channel noise floor + DC offset) ---
+
+NOISE_DATA_DIR = Path.home() / "brokkr" / "hamma" / "noise_diag"
+NOISE_GLOB_PATTERN = "noise_hamma??_????-??-??.csv"
+NOISE_CSV_COLUMNS = [
+    "time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
+    "fast_snr", "threshold", "noise_thresh_ratio",
+    ]
+NOISE_NUMERIC_COLUMNS = [
+    "fast_offset", "fast_noise", "fast_vpp",
+    "fast_snr", "threshold", "noise_thresh_ratio",
+    ]
+NOISE_PLOT_DAYS = 30
+DEFAULT_NOISE_THRESHOLD_MV = 80.0  # fleet-typical AGS threshold; fallback only
+
+NOISE_PLOT_SUBPLOTS = {
+    "fast_noise": {},
+    "fast_offset": {},
+    }
+
+
+def ingest_noise_data(n_days=None, data_dir=NOISE_DATA_DIR,
+                      glob_pattern=NOISE_GLOB_PATTERN):
+    """Load + index the local noise_diag CSVs (volts). Empty-safe."""
+    files = sorted(Path(data_dir).glob(glob_pattern))
+    if n_days is not None:
+        files = files[-n_days:]
+    if not files:
+        return pd.DataFrame(
+            {col: pd.Series(dtype="float64") for col in NOISE_NUMERIC_COLUMNS},
+            index=pd.DatetimeIndex([], name="time"),
+            )
+    raw = pd.concat(
+        (pd.read_csv(f, on_bad_lines="warn") for f in files),
+        ignore_index=True, sort=False)
+    raw["time"] = pd.to_datetime(raw["time"], utc=True).dt.tz_convert(None)
+    raw = raw[raw["time"].notnull()]
+    raw = raw.set_index("time", drop=False).sort_index()
+    for col in NOISE_NUMERIC_COLUMNS:
+        if col in raw.columns:
+            # A malformed numeric value becomes NaN (plots as a gap) silently.
+            raw[col] = pd.to_numeric(raw[col], errors="coerce").astype("float64")
+    return raw
+
+
+def get_latest_noise_threshold_mv(default=None, n_days=1):
+    try:
+        threshold_v = ingest_noise_data(n_days=n_days)["threshold"].dropna()
+        if threshold_v.empty:
+            return default
+        return float(threshold_v.iloc[-1]) * 1000
+    except Exception:
+        return default
+
+
+def _noise_plot_preprocess(_full_data):
+    """Self-load noise (ignores telemetry full_data); V->mV. NEVER raises."""
+    try:
+        noise = ingest_noise_data(n_days=NOISE_PLOT_DAYS).copy()
+        for column in ("fast_noise", "fast_offset"):
+            noise[column] = noise[column] * 1000
+        return noise
+    except Exception:
+        return pd.DataFrame(
+            {col: pd.Series(dtype="float64") for col in NOISE_PLOT_SUBPLOTS},
+            index=pd.DatetimeIndex([], name="time"),
+            )
+
+
+def _noise_gauge_series(column):
+    """Latest noise Series in mV for a dashboard gauge; empty-safe."""
+    try:
+        return ingest_noise_data(n_days=1)[column] * 1000
+    except Exception:
+        return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+
+
+NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
+    default=DEFAULT_NOISE_THRESHOLD_MV)
+
+# Shaded "near/over threshold" band on the fast_noise subplot, split at the
+# per-Pi threshold (mV). generate_step_strings needs len(thresholds)==len(colors)-1.
+NOISE_COLOR_TABLE_MAP = {
+    "fast_noise": [[NOISE_THRESHOLD_MV],
+                   [THEME_BG_ACCENT_COLOR, "rgba(200, 60, 60, 0.25)"]],
+    }
+
+NOISE_PLOT_METADATA = {
+    "section_title": "Noise Floor",
+    "section_description": (
+        "Fast-channel noise floor and DC offset (mV) per trigger, last "
+        f"{NOISE_PLOT_DAYS} days, updated every "
+        f"{STATUS_UPDATE_INTERVAL_SLOW_SECONDS} s. The shaded band marks the "
+        "AGS trigger threshold."
+        "\n\nHover to view values and click/drag to zoom in/out."),
+    "section_nav_label": "Noise",
+    "button_content": "",
+    "button_type": "",
+    "button_link": "",
+    "button_position": "",
+    "button_newtab": "",
+    }
+
+NOISE_PLOT_DATA_ARGS = {
+    "plot_subplots": NOISE_PLOT_SUBPLOTS,
+    "preprocess_fn": _noise_plot_preprocess,
+    "round_floats": 4,
+    "index_converter": lambda index: index.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+NOISE_PLOT_CONTENT_ARGS = dict(HISTORY_PLOT_CONTENT_ARGS)
+NOISE_PLOT_CONTENT_ARGS["plot_height"] = 512
+
+NOISE_PLOT_ARGS = {
+    "data_args": NOISE_PLOT_DATA_ARGS,
+    "content_args": NOISE_PLOT_CONTENT_ARGS,
+    "name_map": VARIABLE_NAME_MAP,
+    "layout_map": LAYOUT_MAP,
+    "color_map": NOISE_COLOR_TABLE_MAP,
     "update_interval_seconds": STATUS_UPDATE_INTERVAL_SLOW_SECONDS,
     }
 
@@ -1124,6 +1313,11 @@ SENSOR_PAGE_BLOCKS = {
         "type": "plot",
         "metadata": HISTORY_PLOT_METADATA,
         "args": HISTORY_PLOT_ARGS,
+        },
+    "noise": {
+        "type": "plot",
+        "metadata": NOISE_PLOT_METADATA,
+        "args": NOISE_PLOT_ARGS,
         },
     "raw": {
         "type": "table",
