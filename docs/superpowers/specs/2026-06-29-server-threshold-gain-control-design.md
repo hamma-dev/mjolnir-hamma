@@ -55,16 +55,23 @@ Notes grounding the design:
 
 ### Threshold unit conversion (operator works in mV)
 
-`das_set_threshold` takes a DAC-side "volts 0–5" value. The scientifically meaningful
-number is the **input-referred threshold = DAC_volts ÷ 6.024** (the fixed analog gain
-factor, per the `hamma` package: `version20.py` and `header/utilities.py`). The
-operator specifies the **input-referred threshold in mV**, and the script converts:
+`das_set_threshold` takes a unitless "ags" value (the firmware help labels it
+"volts 0–5", but that range is **nominal, not enforced** — the underlying header field
+is a uint16 and the scale is `5/4096`, so the value can exceed the point "5" maps to).
+The scientifically meaningful number is the **input-referred threshold = ags ÷ 6.024**
+(the fixed analog factor, per the `hamma` package: `version20.py:83` =
+`(5/4096)·thresh1/6.024`; `header/utilities.py` `ags_threshold_convert` = `ags/6.024`).
+
+The operator specifies the **input-referred threshold in mV**, and the script converts:
 
 ```
-das_volts = (mV / 1000) * 6.024
+ags_value = (mV / 1000) * 6.024
 ```
 
-- Valid `das_volts` ∈ [0, 5] → valid input-referred **mV ∈ [0, ~829.8]**.
+- **No hard upper cap.** Validate only `mV >= 0`; the firmware enforces its real limit.
+  (For reference, the nominal full-scale point "5" corresponds to ~830 mV; mj02's
+  current `0.5` ags value = 83 mV. A value well above ~830 mV may warrant an operator
+  warning but is not rejected.)
 - Readback: header raw `threashold_1/2` → input-referred volts = raw·(5/4096)/6.024 →
   display in mV.
 
@@ -115,8 +122,9 @@ New, clearly-named functions on top of the existing `send_ags_command()`:
 
 - `set_threshold(channel, millivolts, *, persist=False, host, port)`
   - `channel ∈ {1, 2}` (the firmware's threshold channel number). Reject 3–8.
-  - Convert mV → das_volts; validate das_volts ∈ [0, 5] (i.e. mV ∈ [0, 829.8]).
-  - Send `das_set_threshold <channel> <das_volts>`; return firmware reply.
+  - Validate `mV >= 0` (no hard upper cap); convert `ags = mV/1000·6.024`. Optionally
+    warn if mV exceeds the ~830 mV nominal full-scale, but still send.
+  - Send `das_set_threshold <channel> <ags>`; return firmware reply.
   - If `persist`: rewrite the matching `das_set_threshold <channel> ...` line in
     `/ags/scripts/startup`.
 - `set_gain(channel, level, *, persist=False, host, port)`
@@ -173,9 +181,12 @@ alongside `--status` / `--trigger` / `--up` / `--down`.
 
 ## Validation & safety
 
-- Reject out-of-range up front (channel, mV, gain level) before touching the sensor —
-  bad threshold can blind the sensor (too high → misses lightning) or fill disk (too
-  low → noise triggering).
+- Reject clearly-invalid input up front (channel ∉ {1,2}, negative mV, gain level
+  ∉ {0..3}) before touching the sensor. The mV threshold has **no hard upper cap** (the
+  "0–5" nominal range is not firmware-enforced); a value far above the ~830 mV nominal
+  full-scale may warrant a warning. Bad threshold can blind the sensor (too high →
+  misses lightning) or fill disk (too low → noise triggering), so the warning helps, but
+  the firmware is the final authority on range.
 - `--persist` writes are atomic and line-exact; never rewrite unrelated lines, never
   reorder relative to `das_reset`.
 - Tunnel-down → `[SKIP]`, consistent with `updown`/`trigger`.
@@ -184,9 +195,9 @@ alongside `--status` / `--trigger` / `--up` / `--down`.
 ## Testing
 
 **Unit (pytest, mock socket + ssh subprocess):**
-- mV ↔ das_volts conversion (round-trip, boundaries 0 and 829.8 mV).
-- Validation rejects channel ∉ {1,2}, mV out of [0, 829.8], gain channel name typos,
-  level ∉ {0..3}.
+- mV ↔ ags conversion (round-trip; e.g. 83 mV ↔ 0.5, 830 mV ↔ 5.0).
+- Validation rejects channel ∉ {1,2}, negative mV, gain channel name typos,
+  level ∉ {0..3}. mV above nominal full-scale is allowed (optionally warns), not rejected.
 - Correct firmware command strings built (`das_set_threshold 1 <v>`,
   `das_send_command 8 <l>`, etc.).
 - `persist_startup` line replacement: replaces only the matching line, preserves all
