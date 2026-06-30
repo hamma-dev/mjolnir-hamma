@@ -71,6 +71,11 @@ def _format_ags(ags_value):
     return "{:g}".format(ags_value)
 
 
+def _reply_indicates_error(reply):
+    """True if any line of an AGS reply signals a firmware error."""
+    return any(line.strip().startswith("Error") for line in reply.splitlines())
+
+
 def set_threshold(channel, millivolts, persist=False,
                   host=SENSOR_IP, port=AGS_COMMAND_PORT):
     """Set a DAC trigger threshold (input-referred mV) on a HAMMA2 sensor."""
@@ -80,12 +85,10 @@ def set_threshold(channel, millivolts, persist=False,
     ags_value = mv_to_ags(millivolts)
     command = "das_set_threshold {} {}".format(channel, _format_ags(ags_value))
     reply = send_ags_command(command, host=host, port=port)
-    # NOTE: persist writes the startup file regardless of the firmware's
-    # reply. send_ags_command only raises on transport failure, not on a
-    # firmware "out of range" reply, so --persist may store a value the
-    # sensor rejected. The firmware is the range authority; confirm via
-    # header readback (threashold_1..4) after setting.
-    if persist:
+    # Only persist if the sensor accepted the live value. The firmware
+    # replies with an "Error -" line when it rejects a value (e.g. out of
+    # range); persisting that would store a bad value in the startup script.
+    if persist and not _reply_indicates_error(reply):
         persist_startup(["das_set_threshold", str(channel)],
                         "das_set_threshold {} {}".format(channel, _format_ags(ags_value)))
     return reply
@@ -125,12 +128,8 @@ def set_gain(channel, level, persist=False,
     register = GAIN_REGISTERS[channel]
     command = "das_send_command {} {}".format(register, level)
     reply = send_ags_command(command, host=host, port=port)
-    # NOTE: persist writes the startup file regardless of the firmware's
-    # reply. send_ags_command only raises on transport failure, not on a
-    # firmware "out of range" reply, so --persist may store a value the
-    # sensor rejected. The firmware is the range authority; confirm via
-    # header readback (threashold_1..4) after setting.
-    if persist:
+    # Only persist if the sensor accepted the live value (see set_threshold).
+    if persist and not _reply_indicates_error(reply):
         persist_startup(["das_send_command", register],
                         "das_send_command {} {}".format(register, level))
     return reply

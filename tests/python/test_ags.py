@@ -212,6 +212,34 @@ class TestPersist:
             mock_persist.assert_not_called()
 
 
+class TestPersistGating:
+    def test_reply_indicates_error_detects_error_line(self, ags):
+        reply = ('Use "help" command to display a list of commands.\n'
+                 'Error - Invalid threshold value: 12.048')
+        assert ags._reply_indicates_error(reply) is True
+
+    def test_reply_indicates_error_false_on_success(self, ags):
+        reply = ('Use "help" command to display a list of commands.\n'
+                 'Set DAS Threshold 1 to 1.2048.')
+        assert ags._reply_indicates_error(reply) is False
+
+    def test_set_threshold_skips_persist_on_firmware_error(self, ags):
+        err = ('Use "help" command to display a list of commands.\n'
+               'Error - Invalid threshold value: 12.048')
+        with patch.object(ags, "send_ags_command", return_value=err):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_threshold(1, 2000, persist=True)
+            mock_persist.assert_not_called()
+
+    def test_set_gain_skips_persist_on_firmware_error(self, ags):
+        err = ('Use "help" command to display a list of commands.\n'
+               'Error - bad gain')
+        with patch.object(ags, "send_ags_command", return_value=err):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_gain("fast-e", 2, persist=True)
+            mock_persist.assert_not_called()
+
+
 class TestCli:
     def test_set_threshold_subcommand(self, ags):
         with patch.object(ags, "set_threshold", return_value="OK") as mock_set:
