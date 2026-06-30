@@ -90,3 +90,51 @@ class TestSetGain:
             with pytest.raises(ValueError):
                 ags.set_gain("fast-e", 4)
             mock_send.assert_not_called()
+
+
+STARTUP_SAMPLE = (
+    "ds_enable\n"
+    "das_enable\n"
+    "das_set_threshold 1 0.5\n"
+    "das_set_threshold 2 0\n"
+    "das_send_command 8 1\n"
+    "das_send_command 10 1\n"
+    "das_set_mask 3\n"
+    "das_reset\n"
+)
+
+
+class TestRewriteStartup:
+    def test_replaces_matching_threshold_line(self, ags):
+        out = ags.rewrite_startup(
+            STARTUP_SAMPLE, ["das_set_threshold", "1"], "das_set_threshold 1 5")
+        assert "das_set_threshold 1 5\n" in out
+        assert "das_set_threshold 1 0.5" not in out
+        # other lines untouched
+        assert "das_set_threshold 2 0\n" in out
+        assert "das_send_command 8 1\n" in out
+
+    def test_replaces_only_exact_register(self, ags):
+        out = ags.rewrite_startup(
+            STARTUP_SAMPLE, ["das_send_command", "8"], "das_send_command 8 3")
+        assert "das_send_command 8 3\n" in out
+        assert "das_send_command 10 1\n" in out  # 10 not touched by an "8" match
+
+    def test_inserts_before_das_reset_when_absent(self, ags):
+        text = "ds_enable\ndas_enable\ndas_reset\n"
+        out = ags.rewrite_startup(
+            text, ["das_set_threshold", "1"], "das_set_threshold 1 0.5")
+        lines = out.splitlines()
+        assert lines.index("das_set_threshold 1 0.5") < lines.index("das_reset")
+
+    def test_idempotent(self, ags):
+        once = ags.rewrite_startup(
+            STARTUP_SAMPLE, ["das_set_threshold", "1"], "das_set_threshold 1 5")
+        twice = ags.rewrite_startup(
+            once, ["das_set_threshold", "1"], "das_set_threshold 1 5")
+        assert once == twice
+
+    def test_preserves_trailing_newline_absence(self, ags):
+        text = "ds_enable\ndas_reset"  # no trailing newline
+        out = ags.rewrite_startup(text, ["ds_enable"], "ds_enable")
+        assert not out.endswith("\n")

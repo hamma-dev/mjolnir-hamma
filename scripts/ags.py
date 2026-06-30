@@ -96,6 +96,40 @@ def set_gain(channel, level, persist=False,
     return send_ags_command(command, host=host, port=port)
 
 
+def rewrite_startup(text, match_tokens, new_line):
+    """Return startup-file text with the line matching match_tokens replaced.
+
+    Match is on leading whitespace-split tokens (so "8" never matches "80").
+    If no line matches, new_line is inserted before the first das_reset line,
+    or appended if there is no das_reset.
+    """
+    match_tokens = list(match_tokens)
+    n = len(match_tokens)
+    lines = text.splitlines()
+    out = []
+    replaced = False
+    for line in lines:
+        if line.split()[:n] == match_tokens:
+            out.append(new_line)
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        insert_at = None
+        for i, line in enumerate(out):
+            if line.split()[:1] == ["das_reset"]:
+                insert_at = i
+                break
+        if insert_at is None:
+            out.append(new_line)
+        else:
+            out.insert(insert_at, new_line)
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def main():
     parser_main = argparse.ArgumentParser(
         description=(
