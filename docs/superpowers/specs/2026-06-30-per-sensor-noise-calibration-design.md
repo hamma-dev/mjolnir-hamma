@@ -94,8 +94,8 @@ Gauge coloring is config-only: gauges already pull `steps` from `color_map` via
   Demarcation constant `OFFSET_GREEN_RED_MV = 200`, fleet-wide.
 - **Gauge red marker:** `threshold_value` left at `0` (center reference).
 - **Series axis:** data-derived range from the offset data (symmetric, padded), e.g.
-  `m = max(|min|, |max|) * 1.1; range = [-m, m]`. Fallback `[-1000, 1000]` (or the
-  override `offset_range`) when the frame is empty. `dtick` derived.
+  `m = max(|min|, |max|) * 1.1; range = [-m, m]`. Fallback `[-300, 300]` (matching the
+  gauge arc; or the override `offset_range`) when the frame is empty. `dtick` derived.
 - **Series colors:** no band (the user asked for autoscale only; coloring lives on the
   gauge).
 
