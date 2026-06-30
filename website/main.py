@@ -1146,12 +1146,12 @@ _NOISE_THR = _NOISE_CFG["threshold_mv"]
 
 LAYOUT_MAP["fast_noise"] = {
     "dtick": _NOISE_CFG["noise_dtick"],
-    "range": _NOISE_CFG["noise_range"],
+    "range": list(_NOISE_CFG["noise_range"]),
     "suffix": " mV",
     }
 
 STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
-    "range": _NOISE_CFG["noise_range"],
+    "range": list(_NOISE_CFG["noise_range"]),
     "dtick": _NOISE_CFG["noise_dtick"],
     "threshold_value": _NOISE_THR,
     "steps": [[_NOISE_THR], ["green", "red"]],
@@ -1161,12 +1161,12 @@ STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
 _OFFSET_RANGE = get_noise_offset_range_mv()
 LAYOUT_MAP["fast_offset"] = {
     "dtick": _nice_dtick(_OFFSET_RANGE[1] - _OFFSET_RANGE[0]),
-    "range": _OFFSET_RANGE,
+    "range": list(_OFFSET_RANGE),
     "suffix": " mV",
     }
 
 STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
-    "range": OFFSET_GAUGE_RANGE,
+    "range": list(OFFSET_GAUGE_RANGE),
     "dtick": 100,
     "steps": [[-OFFSET_GREEN_RED_MV, OFFSET_GREEN_RED_MV],
               ["red", "green", "red"]],

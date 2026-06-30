@@ -313,6 +313,26 @@ def test_offset_range_never_raises(ns):
     finally:
         ns["ingest_noise_data"] = orig
 
+def test_offset_range_malformed_override_fallback(ns, empty_noise_dir):
+    """Malformed offset_range override must not raise; falls back to no-data default.
+
+    Fix 3: covers the branch where float() on a non-numeric element raises inside
+    the try/except, causing fallback to data-derivation and then the [-300, 300]
+    default (no data in empty_noise_dir).
+    """
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = (
+        lambda n_days=None, data_dir=empty_noise_dir,
+               glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+        orig(n_days=n_days, data_dir=empty_noise_dir, glob_pattern=glob_pattern)
+    )
+    try:
+        rng = ns["get_noise_offset_range_mv"](
+            unit_n=2, overrides={2: {"offset_range": [-500, "x"]}})
+        assert rng == [-300.0, 300.0]
+    finally:
+        ns["ingest_noise_data"] = orig
+
 
 # ---------------------------------------------------------------------------
 # Noise-floor wiring (no data in test env -> threshold 80 -> [0,100])
@@ -354,6 +374,46 @@ def test_module_exec_no_data_is_safe_and_consistent(ns):
     offset_gauge = ns["STATUS_DASHBOARD_PLOTS"]["dcoffset"]["plot_params"]
     assert offset_gauge["range"] == [-300, 300]
     assert ns["LAYOUT_MAP"]["fast_offset"]["range"] == [-300.0, 300.0]
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: E2E wiring test with a NON-default threshold (data present)
+# ---------------------------------------------------------------------------
+
+def test_wiring_with_real_threshold(tmp_path, monkeypatch):
+    """E2E wiring: execing main.py with noise data present picks up threshold.
+
+    SAMPLE_CSV_CONTENT has threshold=0.05 V -> 50.0 mV and offsets 0.012/0.013 V
+    -> max 13 mV.  All derived ranges must differ from the 80 mV no-data defaults,
+    so a regression that reverts to hardcoded [0,100] would fail this test.
+    """
+    # 1. Build a temp HOME dir containing the noise CSV at the expected path.
+    noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
+    noise_dir.mkdir(parents=True)
+    (noise_dir / "noise_hamma02_2026-06-26.csv").write_text(SAMPLE_CSV_CONTENT)
+
+    # 2. Monkeypatch Path.home BEFORE exec so NOISE_DATA_DIR and the
+    #    ingest_noise_data default both resolve to our temp tree.
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+
+    # 3. Fresh namespace exec (do NOT reuse the module-scoped ns fixture).
+    _install_stubs()
+    ns2 = {}
+    exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
+
+    # 4. Assert derived wiring (threshold 50 mV -> range [0, 62.5]).
+    assert ns2["LAYOUT_MAP"]["fast_noise"]["range"] == [0, 62.5], (
+        "fast_noise range must be [0, 1.25*50] = [0, 62.5]")
+    params = ns2["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_params"]
+    assert params["threshold_value"] == 50.0
+    assert params["range"] == [0, 62.5]
+    # Color-table band split must be at the threshold.
+    assert ns2["NOISE_COLOR_TABLE_MAP"]["fast_noise"][0] == [50.0]
+    # Offset range: max(12, 13)*1.1 = 14.3 mV, symmetric.
+    offset_range = ns2["LAYOUT_MAP"]["fast_offset"]["range"]
+    assert abs(offset_range[1] - 14.3) < 0.1, (
+        f"fast_offset upper range expected ~14.3, got {offset_range[1]}")
+    assert offset_range[0] == -offset_range[1]
 
 
 # ---------------------------------------------------------------------------
