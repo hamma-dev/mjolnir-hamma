@@ -66,3 +66,27 @@ class TestSetThreshold:
             ags.set_threshold(1, 5000)  # far above nominal full-scale
         toks = mock_send.call_args[0][0].split()
         assert float(toks[2]) == pytest.approx(ags.mv_to_ags(5000), abs=1e-3)
+
+
+class TestSetGain:
+    def test_fast_e_register(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            ags.set_gain("fast-e", 2)
+        assert mock_send.call_args[0][0] == "das_send_command 8 2"
+
+    def test_slow_e_register(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            ags.set_gain("slow-e", 0)
+        assert mock_send.call_args[0][0] == "das_send_command 10 0"
+
+    def test_rejects_bad_channel(self, ags):
+        with patch.object(ags, "send_ags_command") as mock_send:
+            with pytest.raises(ValueError):
+                ags.set_gain("middle-e", 1)
+            mock_send.assert_not_called()
+
+    def test_rejects_bad_level(self, ags):
+        with patch.object(ags, "send_ags_command") as mock_send:
+            with pytest.raises(ValueError):
+                ags.set_gain("fast-e", 4)
+            mock_send.assert_not_called()

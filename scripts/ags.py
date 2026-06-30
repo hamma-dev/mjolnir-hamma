@@ -78,6 +78,24 @@ def set_threshold(channel, millivolts, persist=False,
     return send_ags_command(command, host=host, port=port)
 
 
+GAIN_REGISTERS = {"fast-e": "8", "slow-e": "10"}
+GAIN_LEVELS = (0, 1, 2, 3)
+
+
+def set_gain(channel, level, persist=False,
+             host=SENSOR_IP, port=AGS_COMMAND_PORT):
+    """Set an FCM gain level (0-3) on a HAMMA2 sensor."""
+    if channel not in GAIN_REGISTERS:
+        raise ValueError("gain channel must be one of: "
+                         + ", ".join(sorted(GAIN_REGISTERS)))
+    level = int(level)
+    if level not in GAIN_LEVELS:
+        raise ValueError("gain level must be 0, 1, 2, or 3")
+    register = GAIN_REGISTERS[channel]
+    command = "das_send_command {} {}".format(register, level)
+    return send_ags_command(command, host=host, port=port)
+
+
 def main():
     parser_main = argparse.ArgumentParser(
         description=(
