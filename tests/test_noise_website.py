@@ -222,6 +222,48 @@ def test_preprocess_raises_guard(ns):
 
 
 # ---------------------------------------------------------------------------
+# Per-sensor noise config resolver
+# ---------------------------------------------------------------------------
+
+def test_nice_dtick_basic(ns):
+    nd = ns["_nice_dtick"]
+    assert nd(100) == 20      # 100/5 = 20
+    assert nd(0) == 1         # non-positive guard
+    assert nd(-5) == 1
+
+def test_resolve_noise_config_derived(ns):
+    cfg = ns["_resolve_noise_config"](2, 83.0, overrides={})
+    assert cfg["threshold_mv"] == 83.0
+    assert cfg["noise_range"] == [0, 1.25 * 83.0]      # [0, 103.75]
+    assert cfg["noise_dtick"] > 0
+
+def test_resolve_noise_config_fallback(ns):
+    # Missing/NaN/non-positive threshold -> 80 mV default -> [0, 100]
+    for bad in (None, float("nan"), 0, -5):
+        cfg = ns["_resolve_noise_config"](2, bad, overrides={})
+        assert cfg["threshold_mv"] == 80.0
+        assert cfg["noise_range"] == [0, 100]
+
+def test_resolve_noise_config_override_wins(ns):
+    overrides = {2: {"noise_range": [0, 250], "noise_dtick": 50,
+                     "threshold_mv": 120.0}}
+    cfg = ns["_resolve_noise_config"](2, 83.0, overrides=overrides)
+    assert cfg["noise_range"] == [0, 250]
+    assert cfg["noise_dtick"] == 50
+    assert cfg["threshold_mv"] == 120.0
+
+def test_resolve_noise_config_malformed_override_ignored(ns):
+    overrides = {2: {"noise_range": "not-a-range", "noise_dtick": None}}
+    cfg = ns["_resolve_noise_config"](2, 83.0, overrides=overrides)
+    # falls back to threshold-derived, no raise
+    assert cfg["noise_range"] == [0, 1.25 * 83.0]
+    assert cfg["noise_dtick"] > 0
+
+def test_noise_overrides_ships_empty(ns):
+    assert ns["NOISE_OVERRIDES"] == {}
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 

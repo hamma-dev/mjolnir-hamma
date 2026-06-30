@@ -4,6 +4,7 @@
 import copy
 import datetime
 import itertools
+import math
 from pathlib import Path
 
 # Third party imports
@@ -1026,6 +1027,80 @@ def _noise_gauge_series(column):
         return ingest_noise_data(n_days=1)[column] * 1000
     except Exception:
         return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+
+
+# --- Per-sensor noise calibration -------------------------------------------
+# Optional manual overrides, keyed by unit number. Empty = pure data-driven.
+#   {unit_n: {"threshold_mv": float, "noise_range": [lo, hi],
+#             "noise_dtick": float, "offset_range": [lo, hi]}}
+NOISE_OVERRIDES = {}
+
+OFFSET_GREEN_RED_MV = 200      # DC-offset green/red demarcation (fleet constant)
+OFFSET_GAUGE_RANGE = [-300, 300]
+
+
+def _nice_dtick(span, divisions=5):
+    """A 'nice' tick step (1/2/2.5/5 x 10**n) close to span/divisions."""
+    try:
+        raw = float(span) / divisions
+        if not math.isfinite(raw) or raw <= 0:
+            return 1
+        mag = 10 ** math.floor(math.log10(raw))
+        for mult in (1, 2, 2.5, 5, 10):
+            if raw <= mult * mag:
+                return mult * mag
+        return 10 * mag
+    except Exception:
+        return 1
+
+
+def _coerce_positive_float(value):
+    """Return float(value) if finite and > 0, else None."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out <= 0:
+        return None
+    return out
+
+
+def _resolve_noise_config(unit_n, threshold_mv, overrides=None):
+    """Effective noise-floor layout for a unit. Override > derived > default.
+
+    Never raises. Returns {"threshold_mv", "noise_range", "noise_dtick"}.
+    """
+    if overrides is None:
+        overrides = NOISE_OVERRIDES
+    unit_override = {}
+    try:
+        candidate = overrides.get(unit_n, {})
+        if isinstance(candidate, dict):
+            unit_override = candidate
+    except Exception:
+        unit_override = {}
+
+    # Threshold: override -> data-derived -> 80 mV default.
+    threshold = (_coerce_positive_float(unit_override.get("threshold_mv"))
+                 or _coerce_positive_float(threshold_mv)
+                 or 80.0)
+
+    # Axis range: override -> [0, 1.25 * threshold].
+    noise_range = [0, 1.25 * threshold]
+    ov_range = unit_override.get("noise_range")
+    if (isinstance(ov_range, (list, tuple)) and len(ov_range) == 2):
+        try:
+            noise_range = [float(ov_range[0]), float(ov_range[1])]
+        except (TypeError, ValueError):
+            pass
+
+    # dtick: override -> derived from the range span.
+    noise_dtick = (_coerce_positive_float(unit_override.get("noise_dtick"))
+                   or _nice_dtick(noise_range[1] - noise_range[0]))
+
+    return {"threshold_mv": threshold,
+            "noise_range": noise_range,
+            "noise_dtick": noise_dtick}
 
 
 NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
