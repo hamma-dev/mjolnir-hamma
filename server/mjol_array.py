@@ -145,39 +145,31 @@ class MjolnirArray():
                   f"with code {out.returncode}.")
 
     @staticmethod
-    def trigger(port, command="das_manual_trigger", quiet=False):
-        # Send an AGS command (default: a manual trigger) to a sensor.
+    def _run_ags_command(port, ags_args, action_label, quiet=False, timeout=30):
+        # Run ags.py on the Pi over its autossh tunnel with the given args.
         # port is fully qualified (10000 + unit number).
-        # We reach the Pi over its autossh tunnel and run ags.py there; the
-        # AGS command port (10.10.10.1:8082) is only reachable from the Pi.
         sensor_num = port - 10000
 
-        # First, make sure the SSH tunnel for this Pi is reachable...
-        is_pi_up = MjolnirArray.status(port)
-
-        if not is_pi_up:
+        if not MjolnirArray.status(port):
             if not quiet:
                 print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
-                      f"not triggered.")
+                      f"{action_label} not sent.")
             return
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
-        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py', command]
+        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py'] + list(ags_args)
 
         if not quiet:
-            print(f"--- mj{sensor_num:02}: sending AGS '{command}' ---")
+            print(f"--- mj{sensor_num:02}: {action_label} ---")
 
         try:
             out = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-            )
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout)
         except subprocess.TimeoutExpired:
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: ags.py did not complete "
-                      f"in 30s.")
+                      f"in {timeout}s.")
             return
         except Exception as e:
             if not quiet:
@@ -187,7 +179,6 @@ class MjolnirArray():
         if quiet:
             return
 
-        # Surface the AGS reply so the operator sees the result.
         stdout = out.stdout.decode(errors="replace") if out.stdout else ""
         stderr = out.stderr.decode(errors="replace") if out.stderr else ""
         if stdout:
@@ -197,6 +188,12 @@ class MjolnirArray():
         if out.returncode != 0:
             print(f"[FAIL] mj{sensor_num:02}: ags.py exited "
                   f"with code {out.returncode}.")
+
+    @staticmethod
+    def trigger(port, command="das_manual_trigger", quiet=False):
+        # Send an AGS command (default: a manual trigger) to a sensor.
+        MjolnirArray._run_ags_command(
+            port, [command], f"sending AGS '{command}'", quiet=quiet)
 
     @staticmethod
     def status_fcm(port):

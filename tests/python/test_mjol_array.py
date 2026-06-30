@@ -305,3 +305,33 @@ class TestTrigger:
 
         called_ports = [c[0][0] for c in mock_trigger.call_args_list]
         assert called_ports == [10002, 10003]
+
+
+class TestRunAgsCommand:
+    def test_skips_when_tunnel_down(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "status", return_value=False):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+                mock_sub.run.assert_not_called()
+        assert "[SKIP]" in capsys.readouterr().out
+
+    def test_runs_ags_with_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"OK", stderr=b"")
+                mock_sub.TimeoutExpired = Exception
+                mjol.MjolnirArray._run_ags_command(
+                    10002, ["set-threshold", "1", "830"], "set thr")
+        cmd = mock_sub.run.call_args[0][0]
+        assert "/home/pi/dev/mjolnir-hamma/scripts/ags.py" in cmd
+        assert cmd[-3:] == ["set-threshold", "1", "830"]
+
+    def test_trigger_still_invokes_ags_command(self, mjol):
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"OK", stderr=b"")
+                mock_sub.TimeoutExpired = Exception
+                mjol.MjolnirArray.trigger(10002)
+        cmd = mock_sub.run.call_args[0][0]
+        assert "/home/pi/dev/mjolnir-hamma/scripts/ags.py" in cmd
+        assert "das_manual_trigger" in cmd
