@@ -198,6 +198,31 @@ class TestArgparse:
         assert mjol.AUMMA_SENSORS == [41, 42, 43]
 
 
+class TestCliValidation:
+    def test_bad_threshold_channel_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "9", "830"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_injection_attempt_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "8; rm -rf /"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_bad_gain_level_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_gain_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-gain", "fast-e", "9"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_valid_threshold_still_dispatches(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "830"])
+        mock_arr.assert_called_once()
+
+
 class TestStatusServices:
     """Tests for MjolnirArray.status_services()."""
 

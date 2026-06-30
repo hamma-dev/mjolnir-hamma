@@ -18,6 +18,20 @@ PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
 AUMMA_SENSORS = [41, 42, 43, ]
 
 
+def _validate_threshold_cli(channel, millivolts):
+    if str(channel) not in ("1", "2"):
+        raise ValueError("threshold channel must be 1 or 2")
+    if float(millivolts) < 0:
+        raise ValueError("threshold mV must be non-negative")
+
+
+def _validate_gain_cli(channel, level):
+    if channel not in ("fast-e", "slow-e"):
+        raise ValueError("gain channel must be fast-e or slow-e")
+    if int(level) not in (0, 1, 2, 3):
+        raise ValueError("gain level must be 0, 1, 2, or 3")
+
+
 class MjolnirArray():
 
     def __init__(self, sensors, sensor_name='Mjolnir'):
@@ -468,11 +482,21 @@ def main(argv=None):
         mj_array.trigger_array(ports=parsed_args.ports)
     elif parsed_args.set_threshold is not None:
         channel, millivolts = parsed_args.set_threshold
+        try:
+            _validate_threshold_cli(channel, millivolts)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
         mj_array.set_threshold_array(
             ports=parsed_args.ports, channel=channel, millivolts=millivolts,
             persist=parsed_args.persist)
     elif parsed_args.set_gain is not None:
         channel, level = parsed_args.set_gain
+        try:
+            _validate_gain_cli(channel, level)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
         mj_array.set_gain_array(
             ports=parsed_args.ports, channel=channel, level=level,
             persist=parsed_args.persist)

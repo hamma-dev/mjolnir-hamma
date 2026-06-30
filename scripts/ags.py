@@ -80,6 +80,11 @@ def set_threshold(channel, millivolts, persist=False,
     ags_value = mv_to_ags(millivolts)
     command = "das_set_threshold {} {}".format(channel, _format_ags(ags_value))
     reply = send_ags_command(command, host=host, port=port)
+    # NOTE: persist writes the startup file regardless of the firmware's
+    # reply. send_ags_command only raises on transport failure, not on a
+    # firmware "out of range" reply, so --persist may store a value the
+    # sensor rejected. The firmware is the range authority; confirm via
+    # header readback (threashold_1..4) after setting.
     if persist:
         persist_startup(["das_set_threshold", str(channel)],
                         "das_set_threshold {} {}".format(channel, _format_ags(ags_value)))
@@ -120,6 +125,11 @@ def set_gain(channel, level, persist=False,
     register = GAIN_REGISTERS[channel]
     command = "das_send_command {} {}".format(register, level)
     reply = send_ags_command(command, host=host, port=port)
+    # NOTE: persist writes the startup file regardless of the firmware's
+    # reply. send_ags_command only raises on transport failure, not on a
+    # firmware "out of range" reply, so --persist may store a value the
+    # sensor rejected. The firmware is the range authority; confirm via
+    # header readback (threashold_1..4) after setting.
     if persist:
         persist_startup(["das_send_command", register],
                         "das_send_command {} {}".format(register, level))
