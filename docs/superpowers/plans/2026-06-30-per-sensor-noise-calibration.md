@@ -301,7 +301,7 @@ git commit -m "Add data-derived DC-offset range helper"
 - Produces (post-exec module state, with no noise data present → threshold 80):
   - `LAYOUT_MAP["fast_noise"] == {"dtick": 20, "range": [0, 100], "suffix": " mV"}`
   - `STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"]`: `range [0,100]`, `dtick 20`, `threshold_value 80.0`, `steps [[80.0], ["green", "red"]]`.
-  - `NOISE_COLOR_TABLE_MAP["fast_noise"]` = a thin red stripe centered at the threshold.
+  - `NOISE_COLOR_TABLE_MAP["fast_noise"]` = green-below / red-above fill split at the threshold.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -323,20 +323,20 @@ def test_noisefloor_gauge_wired(ns):
     assert params["threshold_value"] == 80.0
     assert params["steps"] == [[80.0], ["green", "red"]]
 
-def test_noise_color_table_is_threshold_stripe(ns):
-    # fast_noise band is a thin stripe straddling the threshold (a red line):
-    # domain [lo, hi] with 3 colors, middle one red, outers transparent.
+def test_noise_color_table_is_threshold_fill(ns):
+    # fast_noise band: single split at the threshold, green below / red above.
     domain, colors = ns["NOISE_COLOR_TABLE_MAP"]["fast_noise"]
-    assert len(domain) == 2 and len(colors) == 3
-    assert colors[1] == "red"
-    lo, hi = domain
-    assert lo < 80.0 < hi      # straddles the threshold
+    assert domain == [80.0]
+    assert len(colors) == 2
+    # below-threshold colour is green-ish, above is red-ish
+    assert "0, 160, 0" in colors[0] or "green" in colors[0]
+    assert "200, 60, 60" in colors[1] or "red" in colors[1]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_noise_website.py -k "fast_noise_derived or noisefloor_gauge_wired or threshold_stripe" -v`
-Expected: FAIL — current `LAYOUT_MAP["fast_noise"]` is the shared `[0,100]` dict but `dtick 20` already matches by coincidence; the gauge `threshold_value` is `0` and `steps` is `None`, and `NOISE_COLOR_TABLE_MAP` has a single-breakpoint 2-color band → assertions fail.
+Run: `python -m pytest tests/test_noise_website.py -k "fast_noise_derived or noisefloor_gauge_wired or threshold_fill" -v`
+Expected: FAIL — the gauge `threshold_value` is `0` and `steps` is `None`, and `NOISE_COLOR_TABLE_MAP["fast_noise"]` currently uses `THEME_BG_ACCENT_COLOR` below the threshold (not green) → assertions fail. (`LAYOUT_MAP["fast_noise"]` `range`/`dtick` happen to match by coincidence with no data.)
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -360,35 +360,29 @@ STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
     "steps": [[_NOISE_THR], ["green", "red"]],
     })
 
-# Thin red stripe straddling the threshold = a red reference "line" on the
-# fast_noise time-series. Half-width: 1% of the axis span, min 0.5 mV.
-_NOISE_LINE_HALF = max(0.5, 0.01 * _NOISE_CFG["noise_range"][1])
+# Green-below / red-above fill split at the per-Pi threshold on the fast_noise
+# time-series. Rendered faint via the inherited shape_opacity (0.2).
 NOISE_COLOR_TABLE_MAP = {
-    "fast_noise": [[_NOISE_THR - _NOISE_LINE_HALF, _NOISE_THR + _NOISE_LINE_HALF],
-                   ["rgba(0, 0, 0, 0)", "red", "rgba(0, 0, 0, 0)"]],
+    "fast_noise": [[_NOISE_THR],
+                   ["rgba(0, 160, 0, 0.15)", "rgba(200, 60, 60, 0.25)"]],
     }
 ```
 
-Then, where `NOISE_PLOT_CONTENT_ARGS` is built (currently line 1064), make the stripe render solid (the inherited `shape_opacity` is `0.2`):
-
-```python
-NOISE_PLOT_CONTENT_ARGS = dict(HISTORY_PLOT_CONTENT_ARGS)
-NOISE_PLOT_CONTENT_ARGS["plot_height"] = 512
-NOISE_PLOT_CONTENT_ARGS["shape_opacity"] = 1.0
-```
-
-Update the `NOISE_PLOT_METADATA` `section_description` wording from "The shaded band marks the AGS trigger threshold." to "The red line marks the AGS trigger threshold."
+Leave `NOISE_PLOT_CONTENT_ARGS` as-is (inherited `shape_opacity` `0.2` keeps the
+fill faint). Update the `NOISE_PLOT_METADATA` `section_description` wording from
+"The shaded band marks the AGS trigger threshold." to "The shaded band marks the
+AGS trigger threshold (green below, red above)."
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_noise_website.py -k "fast_noise_derived or noisefloor_gauge_wired or threshold_stripe" -v`
+Run: `python -m pytest tests/test_noise_website.py -k "fast_noise_derived or noisefloor_gauge_wired or threshold_fill" -v`
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add website/main.py tests/test_noise_website.py
-git commit -m "Wire per-sensor noise-floor axis, gauge zones, threshold line"
+git commit -m "Wire per-sensor noise-floor axis, gauge zones, threshold fill"
 ```
 
 ---
@@ -519,7 +513,7 @@ git commit -m "Add module-exec consistency regression for noise calibration"
 - Override + data-driven mechanism → Task 1 (`NOISE_OVERRIDES`, `_resolve_noise_config`).
 - Noise-floor axis `[0, 1.25×threshold]` + derived dtick → Task 1 (resolver) + Task 3 (wiring).
 - Noise-floor gauge red marker + green/red zones → Task 3.
-- Noise-floor time-series red threshold line → Task 3 (`NOISE_COLOR_TABLE_MAP` stripe + `shape_opacity=1.0`).
+- Noise-floor time-series threshold marking (green-below / red-above fill) → Task 3 (`NOISE_COLOR_TABLE_MAP` split at threshold).
 - DC-offset series autoscale (data-derived range, mandatory-range workaround) → Task 2 + Task 4.
 - DC-offset gauge `[-300,300]` + green/red at ±200 (constant) → Task 4.
 - Crash-guard / never-raise → Tasks 1, 2 (guards) + Task 5 (module-exec safety).
@@ -529,6 +523,6 @@ git commit -m "Add module-exec consistency regression for noise calibration"
 
 **Type consistency:** `_resolve_noise_config` returns `{"threshold_mv","noise_range","noise_dtick"}` — consumed identically in Task 3. `get_noise_offset_range_mv` returns a 2-list — consumed in Task 4. `steps` format `[domain, colors]` consistent with `generate_step_strings`. `OFFSET_GREEN_RED_MV`/`OFFSET_GAUGE_RANGE` defined in Task 1, used in Task 4.
 
-**Open execution note (flag to user before/at execution):** The spec table originally said the noise-floor *series* would be "green below / red above"; this plan instead renders a **thin red threshold line** (Task 3), matching the user's literal "red line at the threshold" wording. If a green-below/red-above fill is preferred instead, swap the `NOISE_COLOR_TABLE_MAP` stripe for `[[_NOISE_THR], ["rgba(0,160,0,0.15)", "rgba(200,60,60,0.25)"]]` and keep `shape_opacity` at `0.2`.
+**Resolved (user decision 2026-06-30):** noise-floor *series* threshold marking is a **green-below / red-above fill** (Task 3), not a thin line. The gauge keeps the red `threshold_value` marker plus green/red zones.
 
-**Deferred to deploy E2E (not unit-testable here):** actual rendered appearance of the red line and gauge zones on `hamma.dev/hamma2` — verify visually after deploy, per PR #68's existing verification step.
+**Deferred to deploy E2E (not unit-testable here):** actual rendered appearance of the fill and gauge zones on `hamma.dev/hamma2` — verify visually after deploy, per PR #68's existing verification step.
