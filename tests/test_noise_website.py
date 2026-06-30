@@ -123,16 +123,27 @@ def test_noise_plot_data_args_no_input_path(ns):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: offset layout range [0, 1000] on LAYOUT_MAP and gauge
+# Test 2: offset layout range and gauge wiring (data-derived; fallback used in
+# test env because no noise CSVs are present)
 # ---------------------------------------------------------------------------
 
 def test_layout_map_fast_offset_range(ns):
-    assert ns["LAYOUT_MAP"]["fast_offset"]["range"] == [0, 1000]
+    # Data-derived; no noise data in test env -> symmetric fallback.
+    assert ns["LAYOUT_MAP"]["fast_offset"]["range"] == [-300.0, 300.0]
 
 
 def test_dcoffset_gauge_range(ns):
     gauge = ns["STATUS_DASHBOARD_PLOTS"]["dcoffset"]
-    assert gauge["plot_params"]["range"] == [0, 1000]
+    assert gauge["plot_params"]["range"] == [-300, 300]
+
+
+def test_dcoffset_gauge_steps(ns):
+    params = ns["STATUS_DASHBOARD_PLOTS"]["dcoffset"]["plot_params"]
+    assert params["steps"] == [[-200, 200], ["red", "green", "red"]]
+
+
+def test_offset_green_red_constant(ns):
+    assert ns["OFFSET_GREEN_RED_MV"] == 200
 
 
 # ---------------------------------------------------------------------------

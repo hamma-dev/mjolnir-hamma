@@ -1157,6 +1157,21 @@ STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
     "steps": [[_NOISE_THR], ["green", "red"]],
     })
 
+# --- Apply DC-offset calibration --------------------------------------------
+_OFFSET_RANGE = get_noise_offset_range_mv()
+LAYOUT_MAP["fast_offset"] = {
+    "dtick": _nice_dtick(_OFFSET_RANGE[1] - _OFFSET_RANGE[0]),
+    "range": _OFFSET_RANGE,
+    "suffix": " mV",
+    }
+
+STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
+    "range": OFFSET_GAUGE_RANGE,
+    "dtick": 100,
+    "steps": [[-OFFSET_GREEN_RED_MV, OFFSET_GREEN_RED_MV],
+              ["red", "green", "red"]],
+    })
+
 # Green-below / red-above fill split at the per-Pi threshold on the fast_noise
 # time-series. Rendered faint via the inherited shape_opacity (0.2).
 NOISE_COLOR_TABLE_MAP = {
