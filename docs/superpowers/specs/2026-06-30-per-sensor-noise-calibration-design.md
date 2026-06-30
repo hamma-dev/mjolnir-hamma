@@ -49,7 +49,7 @@ Derivation when no override is present:
 | Knob | Derived value |
 |---|---|
 | noise threshold (red marker / band split) | `threshold_mv` |
-| noise-floor axis `range` | `[0, 1.25 * threshold_mv]` |
+| noise-floor axis `range` | `[0, max(1.25 * threshold_mv, observed_noise_max_mv * 1.1)]` (extended post-design after red-team review so a noise floor *above* threshold — the alarm case — stays on-axis instead of clipping; `observed_noise_max_mv` from `get_noise_floor_max_mv()`, 0 when no data → reverts to `1.25 * threshold`) |
 | noise-floor axis `dtick` | rounded "nice" step ≈ `range_hi / 5` |
 | DC-offset *series* axis `range` | data-derived (see below) |
 | DC-offset green/red demarcation | `±OFFSET_GREEN_RED_MV` (constant `200`) |
@@ -80,7 +80,11 @@ Gauge coloring is config-only: gauges already pull `steps` from `color_map` via
 
 ### Noise floor — gauge (`"noisefloor"`) and time-series subplot (`fast_noise`)
 
-- **Axis** (both): `range = [0, 1.25 * threshold_mv]`, `dtick =` derived nice step.
+- **Axis** (both): `range = [0, max(1.25 * threshold_mv, observed_noise_max_mv * 1.1)]`,
+  `dtick =` derived nice step. The `observed_noise_max_mv` term (from
+  `get_noise_floor_max_mv()`) keeps an above-threshold noise floor visible rather than
+  clipping it; with no data it is 0, so the axis reverts to `[0, 1.25 * threshold_mv]`.
+  The threshold marker / band split stays at `threshold_mv` regardless of the axis top.
 - **Gauge red marker:** `threshold_value = threshold_mv` (currently `0`).
 - **Gauge zones:** `color_map` entry for the noise gauge variable → green `[0, threshold]`,
   red `[threshold, range_hi]`.
