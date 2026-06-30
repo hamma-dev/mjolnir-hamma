@@ -1103,6 +1103,40 @@ def _resolve_noise_config(unit_n, threshold_mv, overrides=None):
             "noise_dtick": noise_dtick}
 
 
+def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
+                              unit_n=None, overrides=None):
+    """Symmetric padded DC-offset axis range (mV) from the offset data.
+
+    offset_range override wins; empty/NaN/error -> list(default). Never raises.
+    """
+    if n_days is None:
+        n_days = NOISE_PLOT_DAYS
+    if overrides is None:
+        overrides = NOISE_OVERRIDES
+    if unit_n is None:
+        unit_n = UNIT_N
+
+    try:
+        unit_override = overrides.get(unit_n, {})
+        ov_range = unit_override.get("offset_range")
+        if isinstance(ov_range, (list, tuple)) and len(ov_range) == 2:
+            return [float(ov_range[0]), float(ov_range[1])]
+    except Exception:
+        pass
+
+    try:
+        offset_mv = ingest_noise_data(n_days=n_days)["fast_offset"].dropna() * 1000
+        if offset_mv.empty:
+            return list(default)
+        magnitude = max(abs(float(offset_mv.min())),
+                        abs(float(offset_mv.max()))) * 1.1
+        if not math.isfinite(magnitude) or magnitude <= 0:
+            return list(default)
+        return [-magnitude, magnitude]
+    except Exception:
+        return list(default)
+
+
 NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
     default=DEFAULT_NOISE_THRESHOLD_MV)
 

@@ -264,6 +264,46 @@ def test_noise_overrides_ships_empty(ns):
 
 
 # ---------------------------------------------------------------------------
+# DC-offset data-derived range
+# ---------------------------------------------------------------------------
+
+def test_offset_range_from_sample(ns, tmp_noise_dir):
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = lambda n_days=None, data_dir=tmp_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=tmp_noise_dir, glob_pattern=glob_pattern)
+    try:
+        rng = ns["get_noise_offset_range_mv"](overrides={})
+        # sample offsets 0.012/0.013 V -> 12/13 mV; m = 13 * 1.1 = 14.3
+        assert rng[0] == -rng[1]
+        assert abs(rng[1] - 14.3) < 0.1
+    finally:
+        ns["ingest_noise_data"] = orig
+
+def test_offset_range_empty_fallback(ns, empty_noise_dir):
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = lambda n_days=None, data_dir=empty_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=empty_noise_dir, glob_pattern=glob_pattern)
+    try:
+        rng = ns["get_noise_offset_range_mv"](overrides={})
+        assert rng == [-300.0, 300.0]
+    finally:
+        ns["ingest_noise_data"] = orig
+
+def test_offset_range_override_wins(ns):
+    rng = ns["get_noise_offset_range_mv"](
+        unit_n=2, overrides={2: {"offset_range": [-500, 500]}})
+    assert rng == [-500.0, 500.0]
+
+def test_offset_range_never_raises(ns):
+    orig = ns["ingest_noise_data"]
+    def boom(*a, **k):
+        raise RuntimeError("ingest failure")
+    ns["ingest_noise_data"] = boom
+    try:
+        assert ns["get_noise_offset_range_mv"](overrides={}) == [-300.0, 300.0]
+    finally:
+        ns["ingest_noise_data"] = orig
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 
