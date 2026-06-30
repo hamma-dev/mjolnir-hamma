@@ -417,6 +417,82 @@ def test_wiring_with_real_threshold(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Alarm-axis clipping fix: axis top = max(1.25*threshold, observed_max*1.1)
+# ---------------------------------------------------------------------------
+
+def test_noise_floor_max_from_sample(ns, tmp_noise_dir):
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = lambda n_days=None, data_dir=tmp_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=tmp_noise_dir, glob_pattern=glob_pattern)
+    try:
+        # sample fast_noise 0.0045 V -> 4.5 mV
+        assert abs(ns["get_noise_floor_max_mv"]() - 4.5) < 0.01
+    finally:
+        ns["ingest_noise_data"] = orig
+
+def test_noise_floor_max_empty_default(ns, empty_noise_dir):
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = lambda n_days=None, data_dir=empty_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=empty_noise_dir, glob_pattern=glob_pattern)
+    try:
+        assert ns["get_noise_floor_max_mv"]() == 0.0
+    finally:
+        ns["ingest_noise_data"] = orig
+
+def test_noise_floor_max_never_raises(ns):
+    orig = ns["ingest_noise_data"]
+    def boom(*a, **k):
+        raise RuntimeError("ingest failure")
+    ns["ingest_noise_data"] = boom
+    try:
+        assert ns["get_noise_floor_max_mv"]() == 0.0
+    finally:
+        ns["ingest_noise_data"] = orig
+
+def test_resolve_config_threshold_dominates_when_noise_low(ns):
+    # observed max low -> 1.25*threshold wins
+    cfg = ns["_resolve_noise_config"](2, 50.0, observed_max_mv=20.0, overrides={})
+    assert cfg["noise_range"] == [0, 62.5]          # max(62.5, 22.0)
+
+def test_resolve_config_axis_extends_for_alarm(ns):
+    # observed max ABOVE threshold -> axis extends to keep it visible
+    cfg = ns["_resolve_noise_config"](2, 50.0, observed_max_mv=90.0, overrides={})
+    assert cfg["noise_range"] == [0, 99.0]          # max(62.5, 99.0)
+    assert cfg["noise_dtick"] > 0
+
+def test_resolve_config_default_observed_max_unchanged(ns):
+    # default observed_max_mv=0.0 keeps the pure 1.25*threshold behavior
+    cfg = ns["_resolve_noise_config"](2, 83.0, overrides={})
+    assert cfg["noise_range"] == [0, 1.25 * 83.0]
+
+def test_resolve_config_override_beats_observed_max(ns):
+    cfg = ns["_resolve_noise_config"](
+        2, 50.0, observed_max_mv=90.0, overrides={2: {"noise_range": [0, 250]}})
+    assert cfg["noise_range"] == [0, 250]
+
+def test_wiring_extends_axis_for_high_noise(tmp_path, monkeypatch):
+    """Module E2E: a sensor whose noise floor exceeds 1.25*threshold gets an
+    axis that fits it (alarm case stays visible), not a clipped [0,62.5]."""
+    noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
+    noise_dir.mkdir(parents=True)
+    # threshold 0.05 V -> 50 mV; fast_noise 0.090 V -> 90 mV (above threshold)
+    csv = (
+        "time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio\n"
+        "2026-06-26 14:23:01.123456+00:00,2026-06-26 14:23:01.000000+00:00,0.012,0.090,0.2,2.0,0.05,1.8\n"
+    )
+    (noise_dir / "noise_hamma02_2026-06-26.csv").write_text(csv)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _install_stubs()
+    ns2 = {}
+    exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
+    # 90 * 1.1 = 99.0 > 1.25*50 = 62.5  -> axis top = 99.0
+    assert ns2["LAYOUT_MAP"]["fast_noise"]["range"] == [0, 99.0]
+    params = ns2["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_params"]
+    assert params["range"] == [0, 99.0]
+    # threshold marker / band split stay at the threshold, not the axis top
+    assert params["threshold_value"] == 50.0
+    assert ns2["NOISE_COLOR_TABLE_MAP"]["fast_noise"][0] == [50.0]
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 

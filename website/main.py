@@ -1065,7 +1065,7 @@ def _coerce_positive_float(value):
     return out
 
 
-def _resolve_noise_config(unit_n, threshold_mv, overrides=None):
+def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=None):
     """Effective noise-floor layout for a unit. Override > derived > default.
 
     Never raises. Returns {"threshold_mv", "noise_range", "noise_dtick"}.
@@ -1085,8 +1085,13 @@ def _resolve_noise_config(unit_n, threshold_mv, overrides=None):
                  or _coerce_positive_float(threshold_mv)
                  or 80.0)
 
-    # Axis range: override -> [0, 1.25 * threshold].
-    noise_range = [0, 1.25 * threshold]
+    # Axis range: override -> [0, max(1.25*threshold, observed_max*1.1)] so a
+    # noise floor above threshold (the alarm case) stays on-axis.
+    derived_top = 1.25 * threshold
+    peak = _coerce_positive_float(observed_max_mv)
+    if peak is not None:
+        derived_top = max(derived_top, round(peak * 1.1, 10))
+    noise_range = [0, derived_top]
     ov_range = unit_override.get("noise_range")
     if (isinstance(ov_range, (list, tuple)) and len(ov_range) == 2):
         try:
@@ -1137,11 +1142,31 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
         return list(default)
 
 
+def get_noise_floor_max_mv(n_days=None, default=0.0):
+    """Max observed fast-channel noise floor (mV) over the window; default if none.
+
+    Used to extend the noise-floor axis so a noise floor above threshold stays
+    visible. Never raises.
+    """
+    if n_days is None:
+        n_days = NOISE_PLOT_DAYS
+    try:
+        noise_mv = ingest_noise_data(n_days=n_days)["fast_noise"].dropna() * 1000
+        if noise_mv.empty:
+            return default
+        peak = float(noise_mv.max())
+        if not math.isfinite(peak) or peak <= 0:
+            return default
+        return peak
+    except Exception:
+        return default
+
+
 NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
     default=DEFAULT_NOISE_THRESHOLD_MV)
 
 # --- Apply per-sensor noise-floor calibration -------------------------------
-_NOISE_CFG = _resolve_noise_config(UNIT_N, NOISE_THRESHOLD_MV)
+_NOISE_CFG = _resolve_noise_config(UNIT_N, NOISE_THRESHOLD_MV, get_noise_floor_max_mv())
 _NOISE_THR = _NOISE_CFG["threshold_mv"]
 
 LAYOUT_MAP["fast_noise"] = {
