@@ -1140,11 +1140,28 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
 NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
     default=DEFAULT_NOISE_THRESHOLD_MV)
 
-# Shaded "near/over threshold" band on the fast_noise subplot, split at the
-# per-Pi threshold (mV). generate_step_strings needs len(thresholds)==len(colors)-1.
+# --- Apply per-sensor noise-floor calibration -------------------------------
+_NOISE_CFG = _resolve_noise_config(UNIT_N, NOISE_THRESHOLD_MV)
+_NOISE_THR = _NOISE_CFG["threshold_mv"]
+
+LAYOUT_MAP["fast_noise"] = {
+    "dtick": _NOISE_CFG["noise_dtick"],
+    "range": _NOISE_CFG["noise_range"],
+    "suffix": " mV",
+    }
+
+STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
+    "range": _NOISE_CFG["noise_range"],
+    "dtick": _NOISE_CFG["noise_dtick"],
+    "threshold_value": _NOISE_THR,
+    "steps": [[_NOISE_THR], ["green", "red"]],
+    })
+
+# Green-below / red-above fill split at the per-Pi threshold on the fast_noise
+# time-series. Rendered faint via the inherited shape_opacity (0.2).
 NOISE_COLOR_TABLE_MAP = {
-    "fast_noise": [[NOISE_THRESHOLD_MV],
-                   [THEME_BG_ACCENT_COLOR, "rgba(200, 60, 60, 0.25)"]],
+    "fast_noise": [[_NOISE_THR],
+                   ["rgba(0, 160, 0, 0.15)", "rgba(200, 60, 60, 0.25)"]],
     }
 
 NOISE_PLOT_METADATA = {
@@ -1153,7 +1170,7 @@ NOISE_PLOT_METADATA = {
         "Fast-channel noise floor and DC offset (mV) per trigger, last "
         f"{NOISE_PLOT_DAYS} days, updated every "
         f"{STATUS_UPDATE_INTERVAL_SLOW_SECONDS} s. The shaded band marks the "
-        "AGS trigger threshold."
+        "AGS trigger threshold (green below, red above)."
         "\n\nHover to view values and click/drag to zoom in/out."),
     "section_nav_label": "Noise",
     "button_content": "",

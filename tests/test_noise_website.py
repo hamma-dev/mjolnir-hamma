@@ -304,6 +304,31 @@ def test_offset_range_never_raises(ns):
 
 
 # ---------------------------------------------------------------------------
+# Noise-floor wiring (no data in test env -> threshold 80 -> [0,100])
+# ---------------------------------------------------------------------------
+
+def test_layout_map_fast_noise_derived(ns):
+    assert ns["LAYOUT_MAP"]["fast_noise"]["range"] == [0, 100]
+    assert ns["LAYOUT_MAP"]["fast_noise"]["dtick"] == 20
+    assert ns["LAYOUT_MAP"]["fast_noise"]["suffix"] == " mV"
+
+def test_noisefloor_gauge_wired(ns):
+    params = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_params"]
+    assert params["range"] == [0, 100]
+    assert params["threshold_value"] == 80.0
+    assert params["steps"] == [[80.0], ["green", "red"]]
+
+def test_noise_color_table_is_threshold_fill(ns):
+    # fast_noise band: single split at the threshold, green below / red above.
+    domain, colors = ns["NOISE_COLOR_TABLE_MAP"]["fast_noise"]
+    assert domain == [80.0]
+    assert len(colors) == 2
+    # below-threshold colour is green-ish, above is red-ish
+    assert "0, 160, 0" in colors[0] or "green" in colors[0]
+    assert "200, 60, 60" in colors[1] or "red" in colors[1]
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 
