@@ -2,7 +2,6 @@
 
 import importlib.util
 import pathlib
-import subprocess
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -195,4 +194,19 @@ class TestPersist:
         with patch.object(ags, "send_ags_command", return_value="OK"):
             with patch.object(ags, "persist_startup") as mock_persist:
                 ags.set_threshold(1, 830, persist=False)
+            mock_persist.assert_not_called()
+
+    def test_persist_raises_on_write_failure(self, ags):
+        read_result = MagicMock(returncode=0, stdout=STARTUP_SAMPLE.encode())
+        write_result = MagicMock(returncode=1, stdout=b"", stderr=b"permission denied")
+        with patch.object(ags, "subprocess") as mock_sub:
+            mock_sub.run.side_effect = [read_result, write_result]
+            with pytest.raises(RuntimeError):
+                ags.persist_startup(["das_set_threshold", "1"],
+                                    "das_set_threshold 1 5")
+
+    def test_set_gain_no_persist_skips(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK"):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_gain("fast-e", 3, persist=False)
             mock_persist.assert_not_called()

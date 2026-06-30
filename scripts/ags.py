@@ -12,6 +12,8 @@ import time
 AGS_COMMAND_PORT = 8082
 SENSOR_IP = "10.10.10.1"
 SOCKET_BUFFER = 4096
+AGS_SSH_HOST = "hamma"
+STARTUP_PATH = "/ags/scripts/startup"
 
 GAIN_FACTOR = 6.024  # fixed analog factor; input-referred volts = ags_value / GAIN_FACTOR
 
@@ -85,9 +87,6 @@ def set_threshold(channel, millivolts, persist=False,
 
 GAIN_REGISTERS = {"fast-e": "8", "slow-e": "10"}
 GAIN_LEVELS = (0, 1, 2, 3)
-
-AGS_SSH_HOST = "hamma"
-STARTUP_PATH = "/ags/scripts/startup"
 
 
 def persist_startup(match_tokens, new_line, host=AGS_SSH_HOST):
