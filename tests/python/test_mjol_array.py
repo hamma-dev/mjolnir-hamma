@@ -386,3 +386,19 @@ class TestSetThresholdGain:
         with patch.object(mjol.MjolnirArray, "set_gain") as mock_set:
             arr.set_gain_array(ports=["2"], channel="slow-e", level=0)
         assert mock_set.call_args_list[0][0][0] == 10002
+
+
+class TestCliDispatch:
+    def test_set_threshold_cli(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "830"])
+        kwargs = mock_arr.call_args.kwargs
+        assert kwargs["channel"] == "1" and kwargs["millivolts"] == "830"
+        assert kwargs["persist"] is False
+
+    def test_set_gain_cli_with_persist(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_gain_array") as mock_arr:
+            mjol.main(["-a", "hamma", "--set-gain", "fast-e", "2", "--persist"])
+        kwargs = mock_arr.call_args.kwargs
+        assert kwargs["channel"] == "fast-e" and kwargs["level"] == "2"
+        assert kwargs["persist"] is True

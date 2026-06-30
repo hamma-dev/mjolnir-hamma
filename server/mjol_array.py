@@ -385,7 +385,7 @@ class MjolnirArray():
         return df
 
 
-def main():
+def main(argv=None):
     arg_parser = argparse.ArgumentParser(description="Bring the array up or down")
 
     arg_parser.add_argument(
@@ -420,6 +420,15 @@ def main():
                             default=False,
                             )
 
+    arg_parser.add_argument("--set-threshold", nargs=2,
+                            metavar=("CHANNEL", "MV"), default=None,
+                            help="Set threshold: channel (1|2) and mV")
+    arg_parser.add_argument("--set-gain", nargs=2,
+                            metavar=("CHANNEL", "LEVEL"), default=None,
+                            help="Set gain: channel (fast-e|slow-e) and level (0-3)")
+    arg_parser.add_argument("--persist", action="store_true", default=False,
+                            help="Also persist to /ags/scripts/startup")
+
     grp = arg_parser.add_mutually_exclusive_group()
     grp.add_argument("--up",
                      dest='bring_up',
@@ -435,7 +444,7 @@ def main():
                      help="Bring array down",
                      )
 
-    parsed_args = arg_parser.parse_args()
+    parsed_args = arg_parser.parse_args(argv)
 
     if parsed_args.ports is None:
         if parsed_args.array == 'hamma':
@@ -457,6 +466,16 @@ def main():
         _ = mj_array.status_array(ports=parsed_args.ports)
     elif parsed_args.do_trigger:
         mj_array.trigger_array(ports=parsed_args.ports)
+    elif parsed_args.set_threshold is not None:
+        channel, millivolts = parsed_args.set_threshold
+        mj_array.set_threshold_array(
+            ports=parsed_args.ports, channel=channel, millivolts=millivolts,
+            persist=parsed_args.persist)
+    elif parsed_args.set_gain is not None:
+        channel, level = parsed_args.set_gain
+        mj_array.set_gain_array(
+            ports=parsed_args.ports, channel=channel, level=level,
+            persist=parsed_args.persist)
     elif parsed_args.bring_up | parsed_args.bring_down:
         # Is it up or down?
         # bring_up = parsed_args.bring_up
