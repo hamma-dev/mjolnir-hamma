@@ -138,3 +138,17 @@ class TestRewriteStartup:
         text = "ds_enable\ndas_reset"  # no trailing newline
         out = ags.rewrite_startup(text, ["ds_enable"], "ds_enable")
         assert not out.endswith("\n")
+
+
+class TestParseStartupState:
+    def test_parses_thresholds_and_gains(self, ags):
+        state = ags.parse_startup_state(STARTUP_SAMPLE)
+        assert state["threshold_1_mv"] == pytest.approx(83, abs=1.0)
+        assert state["threshold_2_mv"] == 0.0
+        assert state["gain_fast"] == 1
+        assert state["gain_slow"] == 1
+
+    def test_missing_lines_absent(self, ags):
+        state = ags.parse_startup_state("ds_enable\ndas_reset\n")
+        assert "threshold_1_mv" not in state
+        assert "gain_fast" not in state

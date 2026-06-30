@@ -130,6 +130,24 @@ def rewrite_startup(text, match_tokens, new_line):
     return result
 
 
+def parse_startup_state(text):
+    """Parse persisted threshold (mV) and gain levels from startup-file text."""
+    state = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) >= 3 and toks[0] == "das_set_threshold":
+            channel = toks[1]
+            if channel in ("1", "2"):
+                state["threshold_{}_mv".format(channel)] = round(
+                    ags_to_mv(float(toks[2])), 1)
+        elif len(toks) >= 3 and toks[0] == "das_send_command":
+            if toks[1] == "8":
+                state["gain_fast"] = int(toks[2])
+            elif toks[1] == "10":
+                state["gain_slow"] = int(toks[2])
+    return state
+
+
 def main():
     parser_main = argparse.ArgumentParser(
         description=(
