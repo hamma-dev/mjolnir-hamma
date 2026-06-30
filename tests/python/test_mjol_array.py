@@ -354,3 +354,35 @@ class TestRunAgsCommand:
                 mock_sub.run.side_effect = RuntimeError("boom")
                 mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
         assert "[FAIL]" in capsys.readouterr().out
+
+
+class TestSetThresholdGain:
+    def test_set_threshold_builds_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_threshold(10002, 1, 830)
+        port, ags_args = mock_run.call_args[0][0], mock_run.call_args[0][1]
+        assert port == 10002
+        assert ags_args == ["set-threshold", "1", "830"]
+
+    def test_set_threshold_persist_appends_flag(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_threshold(10002, 1, 830, persist=True)
+        assert "--persist" in mock_run.call_args[0][1]
+
+    def test_set_gain_builds_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_gain(10002, "fast-e", 2)
+        assert mock_run.call_args[0][1] == ["set-gain", "fast-e", "2"]
+
+    def test_set_threshold_array_fans_out(self, mjol):
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol.MjolnirArray, "set_threshold") as mock_set:
+            arr.set_threshold_array(channel=1, millivolts=830)
+        called_ports = [c[0][0] for c in mock_set.call_args_list]
+        assert called_ports == [10002, 10003]
+
+    def test_set_gain_array_explicit_ports(self, mjol):
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol.MjolnirArray, "set_gain") as mock_set:
+            arr.set_gain_array(ports=["2"], channel="slow-e", level=0)
+        assert mock_set.call_args_list[0][0][0] == 10002

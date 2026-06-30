@@ -196,6 +196,28 @@ class MjolnirArray():
             port, [command], f"sending AGS '{command}'", quiet=quiet)
 
     @staticmethod
+    def set_threshold(port, channel, millivolts, persist=False, quiet=False):
+        ags_args = ["set-threshold", str(channel), str(millivolts)]
+        if persist:
+            ags_args.append("--persist")
+        MjolnirArray._run_ags_command(
+            port, ags_args,
+            f"set threshold ch{channel} = {millivolts} mV"
+            + (" (persist)" if persist else ""),
+            quiet=quiet)
+
+    @staticmethod
+    def set_gain(port, channel, level, persist=False, quiet=False):
+        ags_args = ["set-gain", str(channel), str(level)]
+        if persist:
+            ags_args.append("--persist")
+        MjolnirArray._run_ags_command(
+            port, ags_args,
+            f"set gain {channel} = {level}"
+            + (" (persist)" if persist else ""),
+            quiet=quiet)
+
+    @staticmethod
     def status_fcm(port):
         # Return a boolean if the FCM sensor is up (True) or down (False)
         # port is fully qualified
@@ -243,6 +265,24 @@ class MjolnirArray():
 
         for p in ports:
             MjolnirArray.trigger(p, command=command)
+
+    def set_threshold_array(self, ports=None, channel=None, millivolts=None,
+                            persist=False):
+        if ports is None:
+            ports = [10000 + i for i in self.sensors]
+        else:
+            ports = [10000 + int(p) for p in ports]
+        for p in ports:
+            MjolnirArray.set_threshold(p, channel, millivolts, persist=persist)
+
+    def set_gain_array(self, ports=None, channel=None, level=None,
+                       persist=False):
+        if ports is None:
+            ports = [10000 + i for i in self.sensors]
+        else:
+            ports = [10000 + int(p) for p in ports]
+        for p in ports:
+            MjolnirArray.set_gain(p, channel, level, persist=persist)
 
     def status_array(self, ports=None, quiet=False):
         # Get status report for a number of sensors in an array
