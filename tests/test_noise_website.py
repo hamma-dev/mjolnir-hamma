@@ -340,6 +340,23 @@ def test_noise_color_table_is_threshold_fill(ns):
 
 
 # ---------------------------------------------------------------------------
+# Module-exec consistency: no-data state is safe and self-consistent
+# ---------------------------------------------------------------------------
+
+def test_module_exec_no_data_is_safe_and_consistent(ns):
+    # With no noise data, all derived values resolve to documented fallbacks
+    # and the gauge/layout ranges agree with each other.
+    noise_layout = ns["LAYOUT_MAP"]["fast_noise"]
+    noise_gauge = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_params"]
+    assert noise_layout["range"] == noise_gauge["range"] == [0, 100]
+    assert noise_gauge["threshold_value"] == 80.0
+
+    offset_gauge = ns["STATUS_DASHBOARD_PLOTS"]["dcoffset"]["plot_params"]
+    assert offset_gauge["range"] == [-300, 300]
+    assert ns["LAYOUT_MAP"]["fast_offset"]["range"] == [-300.0, 300.0]
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 
