@@ -18,6 +18,12 @@ PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
 AUMMA_SENSORS = [41, 42, 43, ]
 
 
+# These deliberately re-check what ags.py validates on the Pi. mjol_array
+# runs on the VPS and ags.py on the sensor; they deploy as separate git
+# checkouts on different hosts and cannot share a module. Validating here
+# fails fast AND keeps unchecked operator input out of the ssh command line
+# (the values are interpolated into a remote shell command). ags.py remains
+# the authority on valid ranges; keep these in sync with it.
 def _validate_threshold_cli(channel, millivolts):
     if str(channel) not in ("1", "2"):
         raise ValueError("threshold channel must be 1 or 2")
@@ -269,33 +275,27 @@ class MjolnirArray():
         for p in ports:
             MjolnirArray.updown(p, bring_up)
 
+    def _resolve_ports(self, ports):
+        # Resolve sensor numbers (or None = all of this array's sensors) into
+        # fully-qualified tunnel ports (10000 + number).
+        if ports is None:
+            return [10000 + i for i in self.sensors]
+        return [10000 + int(p) for p in ports]
+
     def trigger_array(self, ports=None, command="das_manual_trigger"):
         # Send an AGS command (default: a manual trigger) to one or more sensors.
         # ports is mod 10000 (list). If None, use all of this array's sensors.
-        if ports is None:
-            ports = [10000 + i for i in self.sensors]
-        else:
-            ports = [10000 + int(p) for p in ports]  # Make this an integer
-
-        for p in ports:
+        for p in self._resolve_ports(ports):
             MjolnirArray.trigger(p, command=command)
 
     def set_threshold_array(self, ports=None, channel=None, millivolts=None,
                             persist=False):
-        if ports is None:
-            ports = [10000 + i for i in self.sensors]
-        else:
-            ports = [10000 + int(p) for p in ports]
-        for p in ports:
+        for p in self._resolve_ports(ports):
             MjolnirArray.set_threshold(p, channel, millivolts, persist=persist)
 
     def set_gain_array(self, ports=None, channel=None, level=None,
                        persist=False):
-        if ports is None:
-            ports = [10000 + i for i in self.sensors]
-        else:
-            ports = [10000 + int(p) for p in ports]
-        for p in ports:
+        for p in self._resolve_ports(ports):
             MjolnirArray.set_gain(p, channel, level, persist=persist)
 
     def status_array(self, ports=None, quiet=False):

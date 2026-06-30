@@ -223,6 +223,17 @@ class TestPersistGating:
                  'Set DAS Threshold 1 to 1.2048.')
         assert ags._reply_indicates_error(reply) is False
 
+    def test_reply_indicates_error_true_on_empty(self, ags):
+        # An empty/whitespace reply means no confirmation from the sensor.
+        assert ags._reply_indicates_error("") is True
+        assert ags._reply_indicates_error("   \n  ") is True
+
+    def test_set_threshold_skips_persist_on_empty_reply(self, ags):
+        with patch.object(ags, "send_ags_command", return_value=""):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_threshold(1, 100, persist=True)
+            mock_persist.assert_not_called()
+
     def test_set_threshold_skips_persist_on_firmware_error(self, ags):
         err = ('Use "help" command to display a list of commands.\n'
                'Error - Invalid threshold value: 12.048')

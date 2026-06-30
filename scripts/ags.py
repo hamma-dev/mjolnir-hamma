@@ -72,7 +72,13 @@ def _format_ags(ags_value):
 
 
 def _reply_indicates_error(reply):
-    """True if any line of an AGS reply signals a firmware error."""
+    """True if an AGS reply is empty/missing or signals a firmware error.
+
+    An empty or whitespace-only reply means the sensor did not confirm the
+    command (e.g. socket timeout with no data), so it must NOT gate a persist.
+    """
+    if not reply or not reply.strip():
+        return True
     return any(line.strip().startswith("Error") for line in reply.splitlines())
 
 

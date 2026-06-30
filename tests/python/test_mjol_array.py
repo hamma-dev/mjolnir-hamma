@@ -314,6 +314,15 @@ class TestTrigger:
         mock_sub.run.assert_not_called()
         assert "tunnel down, sending AGS 'das_manual_trigger' not sent." in capsys.readouterr().out
 
+    def test_trigger_pi_down_skips_quiet(self, mjol, capsys):
+        """With quiet=True, a down tunnel skips silently (no subprocess, no print)."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            with patch.object(mjol.MjolnirArray, 'status', return_value=False):
+                mjol.MjolnirArray.trigger(10002, quiet=True)
+
+        mock_sub.run.assert_not_called()
+        assert capsys.readouterr().out == ""
+
     def test_trigger_timeout_catches_exception(self, mjol):
         """On timeout, trigger should catch the exception and not raise."""
         with patch.object(mjol, 'subprocess') as mock_sub:
