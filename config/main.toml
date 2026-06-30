@@ -291,7 +291,7 @@ config_version = 1
     # Daily compression of data files on /media/pi
     [pipelines.daily_compression]
         _builder = "pipeline"
-        _enabled = true
+        _enabled = false
         period_s = 3600  # Check every hour; actual compression controlled by step update_time
         name = "Daily Data Compression"
         input_steps = [
