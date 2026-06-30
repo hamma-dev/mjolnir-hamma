@@ -35,3 +35,34 @@ class TestConversion:
     def test_negative_mv_rejected(self, ags):
         with pytest.raises(ValueError):
             ags.mv_to_ags(-1)
+
+
+class TestSetThreshold:
+    def test_sends_das_set_threshold(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            reply = ags.set_threshold(1, 830)
+        sent = mock_send.call_args[0][0]
+        toks = sent.split()
+        assert toks[0] == "das_set_threshold"
+        assert toks[1] == "1"
+        assert float(toks[2]) == pytest.approx(5.0, abs=1e-3)
+        assert reply == "OK"
+
+    def test_channel_2(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            ags.set_threshold(2, 83)
+        toks = mock_send.call_args[0][0].split()
+        assert toks[1] == "2"
+        assert float(toks[2]) == pytest.approx(0.5, abs=1e-3)
+
+    def test_rejects_bad_channel(self, ags):
+        with patch.object(ags, "send_ags_command") as mock_send:
+            with pytest.raises(ValueError):
+                ags.set_threshold(3, 83)
+            mock_send.assert_not_called()
+
+    def test_high_mv_sent_without_cap(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            ags.set_threshold(1, 5000)  # far above nominal full-scale
+        toks = mock_send.call_args[0][0].split()
+        assert float(toks[2]) == pytest.approx(ags.mv_to_ags(5000), abs=1e-3)

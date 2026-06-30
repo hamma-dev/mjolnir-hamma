@@ -60,6 +60,24 @@ def send_ags_command(command, host=SENSOR_IP, port=AGS_COMMAND_PORT):
     return reply_text
 
 
+THRESHOLD_CHANNELS = (1, 2)
+
+
+def _format_ags(ags_value):
+    return "{:g}".format(ags_value)
+
+
+def set_threshold(channel, millivolts, persist=False,
+                  host=SENSOR_IP, port=AGS_COMMAND_PORT):
+    """Set a DAC trigger threshold (input-referred mV) on a HAMMA2 sensor."""
+    channel = int(channel)
+    if channel not in THRESHOLD_CHANNELS:
+        raise ValueError("threshold channel must be 1 or 2")
+    ags_value = mv_to_ags(millivolts)
+    command = "das_set_threshold {} {}".format(channel, _format_ags(ags_value))
+    return send_ags_command(command, host=host, port=port)
+
+
 def main():
     parser_main = argparse.ArgumentParser(
         description=(
