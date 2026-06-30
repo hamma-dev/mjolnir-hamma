@@ -210,3 +210,34 @@ class TestPersist:
             with patch.object(ags, "persist_startup") as mock_persist:
                 ags.set_gain("fast-e", 3, persist=False)
             mock_persist.assert_not_called()
+
+
+class TestCli:
+    def test_set_threshold_subcommand(self, ags):
+        with patch.object(ags, "set_threshold", return_value="OK") as mock_set:
+            ags.main(["set-threshold", "1", "830"])
+        assert mock_set.call_args.kwargs.get("persist", False) is False
+        args = mock_set.call_args[0]
+        assert int(args[0]) == 1 and float(args[1]) == 830
+
+    def test_set_threshold_persist_flag(self, ags):
+        with patch.object(ags, "set_threshold", return_value="OK") as mock_set:
+            ags.main(["set-threshold", "1", "830", "--persist"])
+        assert mock_set.call_args.kwargs["persist"] is True
+
+    def test_set_gain_subcommand(self, ags):
+        with patch.object(ags, "set_gain", return_value="OK") as mock_set:
+            ags.main(["set-gain", "fast-e", "2"])
+        args = mock_set.call_args[0]
+        assert args[0] == "fast-e" and int(args[1]) == 2
+
+    def test_get_state_subcommand(self, ags):
+        result = MagicMock(returncode=0, stdout=STARTUP_SAMPLE.encode())
+        with patch.object(ags, "subprocess") as mock_sub:
+            mock_sub.run.return_value = result
+            ags.main(["get-state"])  # should not raise
+
+    def test_passthrough_preserved(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK") as mock_send:
+            ags.main(["das_reset"])
+        assert mock_send.call_args.kwargs["command"] == "das_reset"

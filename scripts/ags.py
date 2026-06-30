@@ -6,6 +6,7 @@
 import argparse
 import socket
 import subprocess
+import sys
 import time
 
 
@@ -177,22 +178,58 @@ def parse_startup_state(text):
     return state
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if argv and argv[0] == "set-threshold":
+        parser = argparse.ArgumentParser(prog="ags.py set-threshold")
+        parser.add_argument("channel", type=int, help="threshold channel (1 or 2)")
+        parser.add_argument("millivolts", type=float,
+                            help="input-referred threshold in mV")
+        parser.add_argument("--persist", action="store_true",
+                            help="also write /ags/scripts/startup")
+        ns = parser.parse_args(argv[1:])
+        print(set_threshold(ns.channel, ns.millivolts, persist=ns.persist))
+        return
+
+    if argv and argv[0] == "set-gain":
+        parser = argparse.ArgumentParser(prog="ags.py set-gain")
+        parser.add_argument("channel", choices=sorted(GAIN_REGISTERS),
+                            help="gain channel")
+        parser.add_argument("level", type=int, help="gain level (0-3)")
+        parser.add_argument("--persist", action="store_true",
+                            help="also write /ags/scripts/startup")
+        ns = parser.parse_args(argv[1:])
+        print(set_gain(ns.channel, ns.level, persist=ns.persist))
+        return
+
+    if argv and argv[0] == "get-state":
+        read = subprocess.run(
+            ["ssh", AGS_SSH_HOST, "cat {}".format(STARTUP_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if read.returncode != 0:
+            print("[FAIL] could not read startup: "
+                  + read.stderr.decode(errors="replace"))
+            return
+        state = parse_startup_state(read.stdout.decode())
+        for key in ("threshold_1_mv", "threshold_2_mv", "gain_fast", "gain_slow"):
+            if key in state:
+                print("{}: {}".format(key, state[key]))
+        return
+
+    # Generic passthrough (original behaviour)
     parser_main = argparse.ArgumentParser(
         description=(
-            "Send an AGS command to a HAMMA2 sensor."
-            "Send 'help' to list all commands supported by the sensor."),
+            "Send an AGS command to a HAMMA2 sensor. "
+            "Subcommands: set-threshold, set-gain, get-state. "
+            "Otherwise send a raw command; send 'help' for the sensor's list."),
         argument_default=argparse.SUPPRESS)
-
-    parser_main.add_argument(
-        "command", nargs="?", default="help",
-        help="The AGS command to send; send 'help' for a list.")
-    parser_main.add_argument(
-        "--host", help="The hostname/IP of the sensor (default 10.10.10.1)")
-    parser_main.add_argument(
-        "--port", help="The AGS command port of the sensor (default 8082)")
-
-    parsed_args = parser_main.parse_args()
+    parser_main.add_argument("command", nargs="?", default="help",
+                             help="The AGS command to send.")
+    parser_main.add_argument("--host", help="Sensor host/IP (default 10.10.10.1)")
+    parser_main.add_argument("--port", help="AGS command port (default 8082)")
+    parsed_args = parser_main.parse_args(argv)
     print(send_ags_command(**vars(parsed_args)))
 
 
