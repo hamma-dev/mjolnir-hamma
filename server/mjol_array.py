@@ -18,6 +18,26 @@ PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
 AUMMA_SENSORS = [41, 42, 43, ]
 
 
+# These deliberately re-check what ags.py validates on the Pi. mjol_array
+# runs on the VPS and ags.py on the sensor; they deploy as separate git
+# checkouts on different hosts and cannot share a module. Validating here
+# fails fast AND keeps unchecked operator input out of the ssh command line
+# (the values are interpolated into a remote shell command). ags.py remains
+# the authority on valid ranges; keep these in sync with it.
+def _validate_threshold_cli(channel, millivolts):
+    if str(channel) not in ("1", "2"):
+        raise ValueError("threshold channel must be 1 or 2")
+    if float(millivolts) < 0:
+        raise ValueError("threshold mV must be non-negative")
+
+
+def _validate_gain_cli(channel, level):
+    if channel not in ("fast-e", "slow-e"):
+        raise ValueError("gain channel must be fast-e or slow-e")
+    if int(level) not in (0, 1, 2, 3):
+        raise ValueError("gain level must be 0, 1, 2, or 3")
+
+
 class MjolnirArray():
 
     def __init__(self, sensors, sensor_name='Mjolnir'):
@@ -145,39 +165,31 @@ class MjolnirArray():
                   f"with code {out.returncode}.")
 
     @staticmethod
-    def trigger(port, command="das_manual_trigger", quiet=False):
-        # Send an AGS command (default: a manual trigger) to a sensor.
+    def _run_ags_command(port, ags_args, action_label, quiet=False, timeout=30):
+        # Run ags.py on the Pi over its autossh tunnel with the given args.
         # port is fully qualified (10000 + unit number).
-        # We reach the Pi over its autossh tunnel and run ags.py there; the
-        # AGS command port (10.10.10.1:8082) is only reachable from the Pi.
         sensor_num = port - 10000
 
-        # First, make sure the SSH tunnel for this Pi is reachable...
-        is_pi_up = MjolnirArray.status(port)
-
-        if not is_pi_up:
+        if not MjolnirArray.status(port):
             if not quiet:
                 print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
-                      f"not triggered.")
+                      f"{action_label} not sent.")
             return
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
-        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py', command]
+        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py'] + list(ags_args)
 
         if not quiet:
-            print(f"--- mj{sensor_num:02}: sending AGS '{command}' ---")
+            print(f"--- mj{sensor_num:02}: {action_label} ---")
 
         try:
             out = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-            )
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout)
         except subprocess.TimeoutExpired:
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: ags.py did not complete "
-                      f"in 30s.")
+                      f"in {timeout}s.")
             return
         except Exception as e:
             if not quiet:
@@ -187,7 +199,6 @@ class MjolnirArray():
         if quiet:
             return
 
-        # Surface the AGS reply so the operator sees the result.
         stdout = out.stdout.decode(errors="replace") if out.stdout else ""
         stderr = out.stderr.decode(errors="replace") if out.stderr else ""
         if stdout:
@@ -197,6 +208,34 @@ class MjolnirArray():
         if out.returncode != 0:
             print(f"[FAIL] mj{sensor_num:02}: ags.py exited "
                   f"with code {out.returncode}.")
+
+    @staticmethod
+    def trigger(port, command="das_manual_trigger", quiet=False):
+        # Send an AGS command (default: a manual trigger) to a sensor.
+        MjolnirArray._run_ags_command(
+            port, [command], f"sending AGS '{command}'", quiet=quiet)
+
+    @staticmethod
+    def set_threshold(port, channel, millivolts, persist=False, quiet=False):
+        ags_args = ["set-threshold", str(channel), str(millivolts)]
+        if persist:
+            ags_args.append("--persist")
+        MjolnirArray._run_ags_command(
+            port, ags_args,
+            f"set threshold ch{channel} = {millivolts} mV"
+            + (" (persist)" if persist else ""),
+            quiet=quiet)
+
+    @staticmethod
+    def set_gain(port, channel, level, persist=False, quiet=False):
+        ags_args = ["set-gain", str(channel), str(level)]
+        if persist:
+            ags_args.append("--persist")
+        MjolnirArray._run_ags_command(
+            port, ags_args,
+            f"set gain {channel} = {level}"
+            + (" (persist)" if persist else ""),
+            quiet=quiet)
 
     @staticmethod
     def status_fcm(port):
@@ -236,16 +275,28 @@ class MjolnirArray():
         for p in ports:
             MjolnirArray.updown(p, bring_up)
 
+    def _resolve_ports(self, ports):
+        # Resolve sensor numbers (or None = all of this array's sensors) into
+        # fully-qualified tunnel ports (10000 + number).
+        if ports is None:
+            return [10000 + i for i in self.sensors]
+        return [10000 + int(p) for p in ports]
+
     def trigger_array(self, ports=None, command="das_manual_trigger"):
         # Send an AGS command (default: a manual trigger) to one or more sensors.
         # ports is mod 10000 (list). If None, use all of this array's sensors.
-        if ports is None:
-            ports = [10000 + i for i in self.sensors]
-        else:
-            ports = [10000 + int(p) for p in ports]  # Make this an integer
-
-        for p in ports:
+        for p in self._resolve_ports(ports):
             MjolnirArray.trigger(p, command=command)
+
+    def set_threshold_array(self, ports=None, channel=None, millivolts=None,
+                            persist=False):
+        for p in self._resolve_ports(ports):
+            MjolnirArray.set_threshold(p, channel, millivolts, persist=persist)
+
+    def set_gain_array(self, ports=None, channel=None, level=None,
+                       persist=False):
+        for p in self._resolve_ports(ports):
+            MjolnirArray.set_gain(p, channel, level, persist=persist)
 
     def status_array(self, ports=None, quiet=False):
         # Get status report for a number of sensors in an array
@@ -348,7 +399,7 @@ class MjolnirArray():
         return df
 
 
-def main():
+def main(argv=None):
     arg_parser = argparse.ArgumentParser(description="Bring the array up or down")
 
     arg_parser.add_argument(
@@ -383,6 +434,15 @@ def main():
                             default=False,
                             )
 
+    arg_parser.add_argument("--set-threshold", nargs=2,
+                            metavar=("CHANNEL", "MV"), default=None,
+                            help="Set threshold: channel (1|2) and mV")
+    arg_parser.add_argument("--set-gain", nargs=2,
+                            metavar=("CHANNEL", "LEVEL"), default=None,
+                            help="Set gain: channel (fast-e|slow-e) and level (0-3)")
+    arg_parser.add_argument("--persist", action="store_true", default=False,
+                            help="Also persist to /ags/scripts/startup")
+
     grp = arg_parser.add_mutually_exclusive_group()
     grp.add_argument("--up",
                      dest='bring_up',
@@ -398,7 +458,7 @@ def main():
                      help="Bring array down",
                      )
 
-    parsed_args = arg_parser.parse_args()
+    parsed_args = arg_parser.parse_args(argv)
 
     if parsed_args.ports is None:
         if parsed_args.array == 'hamma':
@@ -420,6 +480,26 @@ def main():
         _ = mj_array.status_array(ports=parsed_args.ports)
     elif parsed_args.do_trigger:
         mj_array.trigger_array(ports=parsed_args.ports)
+    elif parsed_args.set_threshold is not None:
+        channel, millivolts = parsed_args.set_threshold
+        try:
+            _validate_threshold_cli(channel, millivolts)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
+        mj_array.set_threshold_array(
+            ports=parsed_args.ports, channel=channel, millivolts=millivolts,
+            persist=parsed_args.persist)
+    elif parsed_args.set_gain is not None:
+        channel, level = parsed_args.set_gain
+        try:
+            _validate_gain_cli(channel, level)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
+        mj_array.set_gain_array(
+            ports=parsed_args.ports, channel=channel, level=level,
+            persist=parsed_args.persist)
     elif parsed_args.bring_up | parsed_args.bring_down:
         # Is it up or down?
         # bring_up = parsed_args.bring_up
