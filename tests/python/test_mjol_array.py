@@ -280,13 +280,14 @@ class TestTrigger:
         kwargs = mock_sub.run.call_args[1]
         assert kwargs.get('timeout') == 30
 
-    def test_trigger_pi_down_skips(self, mjol):
+    def test_trigger_pi_down_skips(self, mjol, capsys):
         """If the tunnel is down, trigger should not call subprocess."""
         with patch.object(mjol, 'subprocess') as mock_sub:
             with patch.object(mjol.MjolnirArray, 'status', return_value=False):
-                mjol.MjolnirArray.trigger(10002, quiet=True)
+                mjol.MjolnirArray.trigger(10002)
 
         mock_sub.run.assert_not_called()
+        assert "tunnel down, sending AGS 'das_manual_trigger' not sent." in capsys.readouterr().out
 
     def test_trigger_timeout_catches_exception(self, mjol):
         """On timeout, trigger should catch the exception and not raise."""
@@ -335,3 +336,21 @@ class TestRunAgsCommand:
         cmd = mock_sub.run.call_args[0][0]
         assert "/home/pi/dev/mjolnir-hamma/scripts/ags.py" in cmd
         assert "das_manual_trigger" in cmd
+
+    def test_timeout_prints_fail(self, mjol, capsys):
+        import subprocess as _sp
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.TimeoutExpired = _sp.TimeoutExpired
+                mock_sub.run.side_effect = _sp.TimeoutExpired(cmd="ssh", timeout=30)
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+        assert "[FAIL]" in capsys.readouterr().out
+
+    def test_exception_prints_fail(self, mjol, capsys):
+        import subprocess as _sp
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.TimeoutExpired = _sp.TimeoutExpired
+                mock_sub.run.side_effect = RuntimeError("boom")
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+        assert "[FAIL]" in capsys.readouterr().out
