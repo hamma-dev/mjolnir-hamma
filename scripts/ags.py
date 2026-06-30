@@ -5,6 +5,7 @@
 # Standard library imports
 import argparse
 import socket
+import subprocess
 import time
 
 
@@ -75,11 +76,36 @@ def set_threshold(channel, millivolts, persist=False,
         raise ValueError("threshold channel must be 1 or 2")
     ags_value = mv_to_ags(millivolts)
     command = "das_set_threshold {} {}".format(channel, _format_ags(ags_value))
-    return send_ags_command(command, host=host, port=port)
+    reply = send_ags_command(command, host=host, port=port)
+    if persist:
+        persist_startup(["das_set_threshold", str(channel)],
+                        "das_set_threshold {} {}".format(channel, _format_ags(ags_value)))
+    return reply
 
 
 GAIN_REGISTERS = {"fast-e": "8", "slow-e": "10"}
 GAIN_LEVELS = (0, 1, 2, 3)
+
+AGS_SSH_HOST = "hamma"
+STARTUP_PATH = "/ags/scripts/startup"
+
+
+def persist_startup(match_tokens, new_line, host=AGS_SSH_HOST):
+    """Rewrite one line of the sensor's startup script via ssh, atomically."""
+    read = subprocess.run(
+        ["ssh", host, "cat {}".format(STARTUP_PATH)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    if read.returncode != 0:
+        raise RuntimeError("could not read {}: {}".format(
+            STARTUP_PATH, read.stderr.decode(errors="replace")))
+    new_text = rewrite_startup(read.stdout.decode(), match_tokens, new_line)
+    write_cmd = "cat > {0}.tmp && mv {0}.tmp {0}".format(STARTUP_PATH)
+    write = subprocess.run(
+        ["ssh", host, write_cmd], input=new_text.encode(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    if write.returncode != 0:
+        raise RuntimeError("could not write {}: {}".format(
+            STARTUP_PATH, write.stderr.decode(errors="replace")))
 
 
 def set_gain(channel, level, persist=False,
@@ -93,7 +119,11 @@ def set_gain(channel, level, persist=False,
         raise ValueError("gain level must be 0, 1, 2, or 3")
     register = GAIN_REGISTERS[channel]
     command = "das_send_command {} {}".format(register, level)
-    return send_ags_command(command, host=host, port=port)
+    reply = send_ags_command(command, host=host, port=port)
+    if persist:
+        persist_startup(["das_send_command", register],
+                        "das_send_command {} {}".format(register, level))
+    return reply
 
 
 def rewrite_startup(text, match_tokens, new_line):

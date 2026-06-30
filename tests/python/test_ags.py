@@ -2,6 +2,7 @@
 
 import importlib.util
 import pathlib
+import subprocess
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -152,3 +153,46 @@ class TestParseStartupState:
         state = ags.parse_startup_state("ds_enable\ndas_reset\n")
         assert "threshold_1_mv" not in state
         assert "gain_fast" not in state
+
+
+class TestPersist:
+    def test_persist_startup_reads_then_writes(self, ags):
+        read_result = MagicMock(returncode=0, stdout=STARTUP_SAMPLE.encode())
+        write_result = MagicMock(returncode=0)
+        with patch.object(ags, "subprocess") as mock_sub:
+            mock_sub.run.side_effect = [read_result, write_result]
+            ags.persist_startup(["das_set_threshold", "1"],
+                                "das_set_threshold 1 5")
+        # second call is the write; its input carries the rewritten file
+        write_call = mock_sub.run.call_args_list[1]
+        written = write_call.kwargs["input"].decode()
+        assert "das_set_threshold 1 5\n" in written
+        assert "das_set_threshold 2 0\n" in written
+
+    def test_persist_raises_on_read_failure(self, ags):
+        with patch.object(ags, "subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=1, stdout=b"",
+                                                  stderr=b"no route")
+            with pytest.raises(RuntimeError):
+                ags.persist_startup(["ds_enable"], "ds_enable")
+
+    def test_set_threshold_persist_calls_persist_startup(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK"):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_threshold(1, 830, persist=True)
+        match_tokens, new_line = mock_persist.call_args[0][0], mock_persist.call_args[0][1]
+        assert match_tokens == ["das_set_threshold", "1"]
+        assert new_line.split()[:2] == ["das_set_threshold", "1"]
+
+    def test_set_gain_persist_calls_persist_startup(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK"):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_gain("fast-e", 3, persist=True)
+        assert mock_persist.call_args[0][0] == ["das_send_command", "8"]
+        assert mock_persist.call_args[0][1] == "das_send_command 8 3"
+
+    def test_set_threshold_no_persist_skips(self, ags):
+        with patch.object(ags, "send_ags_command", return_value="OK"):
+            with patch.object(ags, "persist_startup") as mock_persist:
+                ags.set_threshold(1, 830, persist=False)
+            mock_persist.assert_not_called()
