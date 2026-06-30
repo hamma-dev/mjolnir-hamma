@@ -12,6 +12,21 @@ AGS_COMMAND_PORT = 8082
 SENSOR_IP = "10.10.10.1"
 SOCKET_BUFFER = 4096
 
+GAIN_FACTOR = 6.024  # fixed analog factor; input-referred volts = ags_value / GAIN_FACTOR
+
+
+def mv_to_ags(millivolts):
+    """Convert an input-referred threshold in mV to the AGS das value."""
+    millivolts = float(millivolts)
+    if millivolts < 0:
+        raise ValueError("threshold mV must be non-negative")
+    return millivolts / 1000.0 * GAIN_FACTOR
+
+
+def ags_to_mv(ags):
+    """Convert an AGS das value back to the input-referred threshold in mV."""
+    return float(ags) / GAIN_FACTOR * 1000.0
+
 
 def netcat(content, host, port, recieve_reply=True, timeout=1):
     recieved_data = None
