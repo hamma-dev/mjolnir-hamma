@@ -493,6 +493,66 @@ def test_wiring_extends_axis_for_high_noise(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fix A — bug_002: tolerate one bad timestamp in ingest_noise_data
+# ---------------------------------------------------------------------------
+
+def test_ingest_tolerates_one_bad_timestamp(ns, tmp_path):
+    csv = (
+        "time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio\n"
+        "2026-06-26 14:23:01.123456+00:00,2026-06-26 14:23:01.000000+00:00,0.012,0.0045,0.1,5.0,0.05,0.09\n"
+        "BADSTAMP,2026-06-26 14:24:01.000000+00:00,0.013,0.0046,0.1,5.0,0.05,0.09\n"
+        "2026-06-26 14:25:01.123456+00:00,2026-06-26 14:25:01.000000+00:00,0.014,0.0047,0.1,5.0,0.05,0.09\n"
+    )
+    (tmp_path / "noise_hamma02_2026-06-26.csv").write_text(csv)
+    df = ns["ingest_noise_data"](data_dir=tmp_path)
+    assert len(df) == 2                       # bad row dropped, 2 valid remain, no raise
+    assert isinstance(df.index, pd.DatetimeIndex)
+
+
+# ---------------------------------------------------------------------------
+# Fix B — bug_004: DC-offset gauge delta colors bipolar convention
+# ---------------------------------------------------------------------------
+
+def test_dcoffset_gauge_delta_colors_bipolar(ns):
+    params = ns["STATUS_DASHBOARD_PLOTS"]["dcoffset"]["plot_params"]
+    assert params["decreasing_color"] == "blue"
+    assert params["increasing_color"] == "orange"
+
+
+# ---------------------------------------------------------------------------
+# Fix C — bug_005: dead STANDARD_LAYOUTS / LAYOUT_MAP noise entries removed
+# ---------------------------------------------------------------------------
+
+def test_standard_layouts_has_no_dead_noise_entries(ns):
+    assert "noise_floor_mv" not in ns["STANDARD_LAYOUTS"]
+    assert "dc_offset_mv" not in ns["STANDARD_LAYOUTS"]
+    # wiring still provides the fast_* layout keys
+    assert "fast_noise" in ns["LAYOUT_MAP"]
+    assert "fast_offset" in ns["LAYOUT_MAP"]
+
+
+# ---------------------------------------------------------------------------
+# Fix D — bug_006: validate override ranges + clamp threshold marker on-axis
+# ---------------------------------------------------------------------------
+
+def test_resolve_config_rejects_nonfinite_or_inverted_override_range(ns):
+    for bad in ([float("nan"), 100], [0, float("inf")], [100, 50]):
+        cfg = ns["_resolve_noise_config"](2, 83.0, overrides={2: {"noise_range": bad}})
+        assert cfg["noise_range"] == [0, 1.25 * 83.0]     # fell through to derived
+
+def test_offset_range_rejects_nonfinite_or_inverted_override(ns):
+    for bad in ([float("nan"), 100], [500, -500], [0, float("inf")]):
+        rng = ns["get_noise_offset_range_mv"](unit_n=2, overrides={2: {"offset_range": bad}})
+        assert rng == [-300.0, 300.0]                     # rejected -> default (no data)
+
+def test_clamp_threshold_into_range(ns):
+    clamp = ns["_clamp"]
+    assert clamp(80, 0, 50) == 50       # above top -> top edge (visible)
+    assert clamp(80, 100, 200) == 100   # below bottom -> bottom edge
+    assert clamp(40, 0, 100) == 40      # within -> unchanged
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 

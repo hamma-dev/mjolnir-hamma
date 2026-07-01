@@ -111,8 +111,6 @@ STANDARD_LAYOUTS = {
     "trigger_rate": {"dtick": 20, "range": [0, 60], "suffix": ""},
     "gigabytes": {"dtick": 100, "range": [0, 500], "suffix": " GB"},
     "triggers_remaining": {"dtick": 6000, "range": [0, 24000], "suffix": ""},
-    "noise_floor_mv": {"dtick": 20, "range": [0, 100], "suffix": " mV"},
-    "dc_offset_mv": {"dtick": 200, "range": [0, 1000], "suffix": " mV"},
     }
 
 LAYOUT_MAP = {
@@ -143,8 +141,6 @@ LAYOUT_MAP = {
     "trigger_rate_1hr": STANDARD_LAYOUTS["trigger_rate"],
     "bytes_written": STANDARD_LAYOUTS["gigabytes"],
     "triggers_remaining": STANDARD_LAYOUTS["triggers_remaining"],
-    "fast_noise": STANDARD_LAYOUTS["noise_floor_mv"],
-    "fast_offset": STANDARD_LAYOUTS["dc_offset_mv"],
     }
 
 
@@ -722,8 +718,8 @@ STATUS_DASHBOARD_PLOTS = {
             "gauge_value": "NaN",
             "plot_mode": "gauge+number+delta",
             "delta_reference": "NaN",
-            "decreasing_color": "green",
-            "increasing_color": "red",
+            "decreasing_color": "blue",
+            "increasing_color": "orange",
             "dtick": 200,
             "range": [0, 1000],
             "steps": None,
@@ -987,7 +983,7 @@ def ingest_noise_data(n_days=None, data_dir=NOISE_DATA_DIR,
     raw = pd.concat(
         (pd.read_csv(f, on_bad_lines="warn") for f in files),
         ignore_index=True, sort=False)
-    raw["time"] = pd.to_datetime(raw["time"], utc=True).dt.tz_convert(None)
+    raw["time"] = pd.to_datetime(raw["time"], utc=True, errors="coerce").dt.tz_convert(None)
     raw = raw[raw["time"].notnull()]
     raw = raw.set_index("time", drop=False).sort_index()
     for col in NOISE_NUMERIC_COLUMNS:
@@ -1065,6 +1061,24 @@ def _coerce_positive_float(value):
     return out
 
 
+def _valid_range(pair):
+    """[lo, hi] floats if pair is a 2-seq of finite numbers with lo < hi, else None."""
+    if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+        return None
+    try:
+        lo, hi = float(pair[0]), float(pair[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or lo >= hi:
+        return None
+    return [lo, hi]
+
+
+def _clamp(value, lo, hi):
+    """Constrain value to [lo, hi]."""
+    return min(max(value, lo), hi)
+
+
 def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=None):
     """Effective noise-floor layout for a unit. Override > derived > default.
 
@@ -1092,12 +1106,9 @@ def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=N
     if peak is not None:
         derived_top = max(derived_top, round(peak * 1.1, 10))
     noise_range = [0, derived_top]
-    ov_range = unit_override.get("noise_range")
-    if (isinstance(ov_range, (list, tuple)) and len(ov_range) == 2):
-        try:
-            noise_range = [float(ov_range[0]), float(ov_range[1])]
-        except (TypeError, ValueError):
-            pass
+    ov_range = _valid_range(unit_override.get("noise_range"))
+    if ov_range is not None:
+        noise_range = ov_range
 
     # dtick: override -> derived from the range span.
     noise_dtick = (_coerce_positive_float(unit_override.get("noise_dtick"))
@@ -1123,9 +1134,9 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
 
     try:
         unit_override = overrides.get(unit_n, {})
-        ov_range = unit_override.get("offset_range")
-        if isinstance(ov_range, (list, tuple)) and len(ov_range) == 2:
-            return [float(ov_range[0]), float(ov_range[1])]
+        ov_range = _valid_range(unit_override.get("offset_range"))
+        if ov_range is not None:
+            return ov_range
     except Exception:
         pass
 
@@ -1168,6 +1179,8 @@ NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
 # --- Apply per-sensor noise-floor calibration -------------------------------
 _NOISE_CFG = _resolve_noise_config(UNIT_N, NOISE_THRESHOLD_MV, get_noise_floor_max_mv())
 _NOISE_THR = _NOISE_CFG["threshold_mv"]
+_NOISE_THR_ONAXIS = _clamp(
+    _NOISE_THR, _NOISE_CFG["noise_range"][0], _NOISE_CFG["noise_range"][1])
 
 LAYOUT_MAP["fast_noise"] = {
     "dtick": _NOISE_CFG["noise_dtick"],
@@ -1178,8 +1191,8 @@ LAYOUT_MAP["fast_noise"] = {
 STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
     "range": list(_NOISE_CFG["noise_range"]),
     "dtick": _NOISE_CFG["noise_dtick"],
-    "threshold_value": _NOISE_THR,
-    "steps": [[_NOISE_THR], ["green", "red"]],
+    "threshold_value": _NOISE_THR_ONAXIS,
+    "steps": [[_NOISE_THR_ONAXIS], ["green", "red"]],
     })
 
 # --- Apply DC-offset calibration --------------------------------------------
@@ -1200,7 +1213,7 @@ STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
 # Green-below / red-above fill split at the per-Pi threshold on the fast_noise
 # time-series. Rendered faint via the inherited shape_opacity (0.2).
 NOISE_COLOR_TABLE_MAP = {
-    "fast_noise": [[_NOISE_THR],
+    "fast_noise": [[_NOISE_THR_ONAXIS],
                    ["rgba(0, 160, 0, 0.15)", "rgba(200, 60, 60, 0.25)"]],
     }
 
