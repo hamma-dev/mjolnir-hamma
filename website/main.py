@@ -4,6 +4,7 @@
 import copy
 import datetime
 import itertools
+import math
 from pathlib import Path
 
 # Third party imports
@@ -80,6 +81,8 @@ VARIABLE_NAME_MAP = {
     "crc_errors_daily": "CRC Errors/Day",
     "bytes_written": "Data Written",
     "triggers_remaining": "Triggers Left",
+    "fast_noise": "Fast Noise Floor",
+    "fast_offset": "DC Offset",
     }
 
 
@@ -668,6 +671,66 @@ STATUS_DASHBOARD_PLOTS = {
             },
         "fast_update": False,
         },
+    "noisefloor": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("fast_noise"),
+            },
+        "plot_metadata": {
+            "plot_title": "Fast Noise Floor",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "green",
+            "increasing_color": "red",
+            "dtick": 20,
+            "range": [0, 100],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
+    "dcoffset": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("fast_offset"),
+            },
+        "plot_metadata": {
+            "plot_title": "DC Offset",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "blue",
+            "increasing_color": "orange",
+            "dtick": 200,
+            "range": [0, 1000],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
     }
 
 STATUS_DASHBOARD_METADATA = {
@@ -881,6 +944,311 @@ HISTORY_PLOT_ARGS = {
     "name_map": VARIABLE_NAME_MAP,
     "layout_map": LAYOUT_MAP,
     "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SLOW_SECONDS,
+    }
+
+
+# --- Noise panel (fast-channel noise floor + DC offset) ---
+
+NOISE_DATA_DIR = Path.home() / "brokkr" / "hamma" / "noise_diag"
+NOISE_GLOB_PATTERN = "noise_hamma??_????-??-??.csv"
+NOISE_CSV_COLUMNS = [
+    "time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
+    "fast_snr", "threshold", "noise_thresh_ratio",
+    ]
+NOISE_NUMERIC_COLUMNS = [
+    "fast_offset", "fast_noise", "fast_vpp",
+    "fast_snr", "threshold", "noise_thresh_ratio",
+    ]
+NOISE_PLOT_DAYS = 30
+DEFAULT_NOISE_THRESHOLD_MV = 80.0  # fleet-typical AGS threshold; fallback only
+
+NOISE_PLOT_SUBPLOTS = {
+    "fast_noise": {},
+    "fast_offset": {},
+    }
+
+
+def ingest_noise_data(n_days=None, data_dir=NOISE_DATA_DIR,
+                      glob_pattern=NOISE_GLOB_PATTERN):
+    """Load + index the local noise_diag CSVs (volts). Empty-safe."""
+    files = sorted(Path(data_dir).glob(glob_pattern))
+    if n_days is not None:
+        files = files[-n_days:]
+    if not files:
+        return pd.DataFrame(
+            {col: pd.Series(dtype="float64") for col in NOISE_NUMERIC_COLUMNS},
+            index=pd.DatetimeIndex([], name="time"),
+            )
+    raw = pd.concat(
+        (pd.read_csv(f, on_bad_lines="warn") for f in files),
+        ignore_index=True, sort=False)
+    raw["time"] = pd.to_datetime(raw["time"], utc=True, errors="coerce").dt.tz_convert(None)
+    raw = raw[raw["time"].notnull()]
+    raw = raw.set_index("time", drop=False).sort_index()
+    for col in NOISE_NUMERIC_COLUMNS:
+        if col in raw.columns:
+            # A malformed numeric value becomes NaN (plots as a gap) silently.
+            raw[col] = pd.to_numeric(raw[col], errors="coerce").astype("float64")
+    return raw
+
+
+def get_latest_noise_threshold_mv(default=None, n_days=1):
+    try:
+        threshold_v = ingest_noise_data(n_days=n_days)["threshold"].dropna()
+        if threshold_v.empty:
+            return default
+        return float(threshold_v.iloc[-1]) * 1000
+    except Exception:
+        return default
+
+
+def _noise_plot_preprocess(_full_data):
+    """Self-load noise (ignores telemetry full_data); V->mV. NEVER raises."""
+    try:
+        noise = ingest_noise_data(n_days=NOISE_PLOT_DAYS).copy()
+        for column in ("fast_noise", "fast_offset"):
+            noise[column] = noise[column] * 1000
+        return noise
+    except Exception:
+        return pd.DataFrame(
+            {col: pd.Series(dtype="float64") for col in NOISE_PLOT_SUBPLOTS},
+            index=pd.DatetimeIndex([], name="time"),
+            )
+
+
+def _noise_gauge_series(column):
+    """Latest noise Series in mV for a dashboard gauge; empty-safe."""
+    try:
+        return ingest_noise_data(n_days=1)[column] * 1000
+    except Exception:
+        return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+
+
+# --- Per-sensor noise calibration -------------------------------------------
+# Optional manual overrides, keyed by unit number. Empty = pure data-driven.
+#   {unit_n: {"threshold_mv": float, "noise_range": [lo, hi],
+#             "noise_dtick": float, "offset_range": [lo, hi]}}
+NOISE_OVERRIDES = {}
+
+OFFSET_GREEN_RED_MV = 200      # DC-offset green/red demarcation (fleet constant)
+OFFSET_GAUGE_RANGE = [-300, 300]
+
+
+def _nice_dtick(span, divisions=5):
+    """A 'nice' tick step (1/2/2.5/5 x 10**n) close to span/divisions."""
+    try:
+        raw = float(span) / divisions
+        if not math.isfinite(raw) or raw <= 0:
+            return 1
+        mag = 10 ** math.floor(math.log10(raw))
+        for mult in (1, 2, 2.5, 5, 10):
+            if raw <= mult * mag:
+                return mult * mag
+        return 10 * mag
+    except Exception:
+        return 1
+
+
+def _coerce_positive_float(value):
+    """Return float(value) if finite and > 0, else None."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out <= 0:
+        return None
+    return out
+
+
+def _valid_range(pair):
+    """[lo, hi] floats if pair is a 2-seq of finite numbers with lo < hi, else None."""
+    if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+        return None
+    try:
+        lo, hi = float(pair[0]), float(pair[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)) or lo >= hi:
+        return None
+    return [lo, hi]
+
+
+def _clamp(value, lo, hi):
+    """Constrain value to [lo, hi]."""
+    return min(max(value, lo), hi)
+
+
+def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=None):
+    """Effective noise-floor layout for a unit. Override > derived > default.
+
+    Never raises. Returns {"threshold_mv", "noise_range", "noise_dtick"}.
+    """
+    if overrides is None:
+        overrides = NOISE_OVERRIDES
+    unit_override = {}
+    try:
+        candidate = overrides.get(unit_n, {})
+        if isinstance(candidate, dict):
+            unit_override = candidate
+    except Exception:
+        unit_override = {}
+
+    # Threshold: override -> data-derived -> 80 mV default.
+    threshold = (_coerce_positive_float(unit_override.get("threshold_mv"))
+                 or _coerce_positive_float(threshold_mv)
+                 or 80.0)
+
+    # Axis range: override -> [0, max(1.25*threshold, observed_max*1.1)] so a
+    # noise floor above threshold (the alarm case) stays on-axis.
+    derived_top = 1.25 * threshold
+    peak = _coerce_positive_float(observed_max_mv)
+    if peak is not None:
+        derived_top = max(derived_top, round(peak * 1.1, 10))
+    noise_range = [0, derived_top]
+    ov_range = _valid_range(unit_override.get("noise_range"))
+    if ov_range is not None:
+        noise_range = ov_range
+
+    # dtick: override -> derived from the range span.
+    noise_dtick = (_coerce_positive_float(unit_override.get("noise_dtick"))
+                   or _nice_dtick(noise_range[1] - noise_range[0]))
+
+    return {"threshold_mv": threshold,
+            "noise_range": noise_range,
+            "noise_dtick": noise_dtick}
+
+
+def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
+                              unit_n=None, overrides=None):
+    """Symmetric padded DC-offset axis range (mV) from the offset data.
+
+    offset_range override wins; empty/NaN/error -> list(default). Never raises.
+    """
+    if n_days is None:
+        n_days = NOISE_PLOT_DAYS
+    if overrides is None:
+        overrides = NOISE_OVERRIDES
+    if unit_n is None:
+        unit_n = UNIT_N
+
+    try:
+        unit_override = overrides.get(unit_n, {})
+        ov_range = _valid_range(unit_override.get("offset_range"))
+        if ov_range is not None:
+            return ov_range
+    except Exception:
+        pass
+
+    try:
+        offset_mv = ingest_noise_data(n_days=n_days)["fast_offset"].dropna() * 1000
+        if offset_mv.empty:
+            return list(default)
+        magnitude = max(abs(float(offset_mv.min())),
+                        abs(float(offset_mv.max()))) * 1.1
+        if not math.isfinite(magnitude) or magnitude <= 0:
+            return list(default)
+        return [-magnitude, magnitude]
+    except Exception:
+        return list(default)
+
+
+def get_noise_floor_max_mv(n_days=None, default=0.0):
+    """Max observed fast-channel noise floor (mV) over the window; default if none.
+
+    Used to extend the noise-floor axis so a noise floor above threshold stays
+    visible. Never raises.
+    """
+    if n_days is None:
+        n_days = NOISE_PLOT_DAYS
+    try:
+        noise_mv = ingest_noise_data(n_days=n_days)["fast_noise"].dropna() * 1000
+        if noise_mv.empty:
+            return default
+        peak = float(noise_mv.max())
+        if not math.isfinite(peak) or peak <= 0:
+            return default
+        return peak
+    except Exception:
+        return default
+
+
+NOISE_THRESHOLD_MV = get_latest_noise_threshold_mv(
+    default=DEFAULT_NOISE_THRESHOLD_MV)
+
+# --- Apply per-sensor noise-floor calibration -------------------------------
+_NOISE_CFG = _resolve_noise_config(UNIT_N, NOISE_THRESHOLD_MV, get_noise_floor_max_mv())
+_NOISE_THR = _NOISE_CFG["threshold_mv"]
+_NOISE_THR_ONAXIS = _clamp(
+    _NOISE_THR, _NOISE_CFG["noise_range"][0], _NOISE_CFG["noise_range"][1])
+
+LAYOUT_MAP["fast_noise"] = {
+    "dtick": _NOISE_CFG["noise_dtick"],
+    "range": list(_NOISE_CFG["noise_range"]),
+    "suffix": " mV",
+    }
+
+STATUS_DASHBOARD_PLOTS["noisefloor"]["plot_params"].update({
+    "range": list(_NOISE_CFG["noise_range"]),
+    "dtick": _NOISE_CFG["noise_dtick"],
+    "threshold_value": _NOISE_THR_ONAXIS,
+    "steps": [[_NOISE_THR_ONAXIS], ["green", "red"]],
+    })
+
+# --- Apply DC-offset calibration --------------------------------------------
+_OFFSET_RANGE = get_noise_offset_range_mv()
+LAYOUT_MAP["fast_offset"] = {
+    "dtick": _nice_dtick(_OFFSET_RANGE[1] - _OFFSET_RANGE[0]),
+    "range": list(_OFFSET_RANGE),
+    "suffix": " mV",
+    }
+
+STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
+    "range": list(OFFSET_GAUGE_RANGE),
+    "dtick": 100,
+    "steps": [[-OFFSET_GREEN_RED_MV, OFFSET_GREEN_RED_MV],
+              ["red", "green", "red"]],
+    })
+
+# Green-below / red-above fill split at the per-Pi threshold on the fast_noise
+# time-series. Rendered faint via the inherited shape_opacity (0.2).
+NOISE_COLOR_TABLE_MAP = {
+    "fast_noise": [[_NOISE_THR_ONAXIS],
+                   ["rgba(0, 160, 0, 0.15)", "rgba(200, 60, 60, 0.25)"]],
+    }
+
+NOISE_PLOT_METADATA = {
+    "section_title": "Noise Floor",
+    "section_description": (
+        "Fast-channel noise floor and DC offset (mV) per trigger, last "
+        f"{NOISE_PLOT_DAYS} days, updated every "
+        f"{STATUS_UPDATE_INTERVAL_SLOW_SECONDS} s. The shaded band marks the "
+        "AGS trigger threshold (green below, red above)."
+        "\n\nHover to view values and click/drag to zoom in/out."),
+    "section_nav_label": "Noise",
+    "button_content": "",
+    "button_type": "",
+    "button_link": "",
+    "button_position": "",
+    "button_newtab": "",
+    }
+
+NOISE_PLOT_DATA_ARGS = {
+    "plot_subplots": NOISE_PLOT_SUBPLOTS,
+    "preprocess_fn": _noise_plot_preprocess,
+    "round_floats": 4,
+    "index_converter": lambda index: index.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+NOISE_PLOT_CONTENT_ARGS = dict(HISTORY_PLOT_CONTENT_ARGS)
+NOISE_PLOT_CONTENT_ARGS["plot_height"] = 512
+
+NOISE_PLOT_ARGS = {
+    "data_args": NOISE_PLOT_DATA_ARGS,
+    "content_args": NOISE_PLOT_CONTENT_ARGS,
+    "name_map": VARIABLE_NAME_MAP,
+    "layout_map": LAYOUT_MAP,
+    "color_map": NOISE_COLOR_TABLE_MAP,
     "update_interval_seconds": STATUS_UPDATE_INTERVAL_SLOW_SECONDS,
     }
 
@@ -1124,6 +1492,11 @@ SENSOR_PAGE_BLOCKS = {
         "type": "plot",
         "metadata": HISTORY_PLOT_METADATA,
         "args": HISTORY_PLOT_ARGS,
+        },
+    "noise": {
+        "type": "plot",
+        "metadata": NOISE_PLOT_METADATA,
+        "args": NOISE_PLOT_ARGS,
         },
     "raw": {
         "type": "table",
