@@ -39,22 +39,30 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
                  output_path=None,
                  filename_template=None,
                  alert_threshold_frac=0.8,
-                 alert_cooldown_s=3600,
+                 alert_persist_count=3,
+                 reset_after_under=2,
                  method=None,
                  key_file=None,
                  channel=None,
                  **output_step_kwargs):
         super().__init__(**output_step_kwargs)
         self._last_run_time = None
-        self._was_over = False
-        self._last_alert_time = None
+        self._over_count = 0
+        self._under_count = 0
         self.min_update_time = min_update_time
         self.medsize = medsize
         self.min_pretrigger_ms = min_pretrigger_ms
         self.output_path = output_path if output_path is not None else Path()
         self.filename_template = filename_template
         self.alert_threshold_frac = alert_threshold_frac
-        self.alert_cooldown_s = alert_cooldown_s
+        self.alert_persist_count = alert_persist_count if alert_persist_count >= 1 else 1
+        self.reset_after_under = reset_after_under if reset_after_under >= 1 else 1
+        if (self.alert_persist_count != alert_persist_count
+                or self.reset_after_under != reset_after_under):
+            self.logger.warning(
+                "noise_diag: alert_persist_count/reset_after_under must be >= 1; "
+                "clamped to %d/%d.",
+                self.alert_persist_count, self.reset_after_under)
         from notifiers import Notifier
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -119,22 +127,27 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             "noise_thresh_ratio": float(ratio),
         }
 
-    def _maybe_alert(self, metrics, now):
-        """Send a notification on a rising edge over the threshold fraction."""
-        ratio = metrics["noise_thresh_ratio"]
-        over = ratio >= self.alert_threshold_frac
-        if over and not self._was_over:
-            in_cooldown = (
-                self._last_alert_time is not None
-                and (now - self._last_alert_time).total_seconds() < self.alert_cooldown_s)
-            if not in_cooldown:
-                pct = int(round(ratio * 100))
-                msg = ("Noise floor high: %.4f V = %d%% of threshold %.4f V"
-                       % (metrics["fast_noise"], pct, metrics["threshold"]))
-                self.logger.info(msg)
-                self.notifier.send(_sensor_prefix() + msg)
-                self._last_alert_time = now
-        self._was_over = over
+    def _maybe_alert(self, metrics):
+        """Fire once when the noise floor has been over the threshold fraction
+        for alert_persist_count readings. Hysteresis: the run only resets after
+        reset_after_under consecutive under-threshold readings, so a lone dip
+        mid-episode neither re-arms nor re-fires the alarm."""
+        over = metrics["noise_thresh_ratio"] >= self.alert_threshold_frac
+        if over:
+            self._over_count += 1
+            self._under_count = 0
+        else:
+            self._under_count += 1
+            if self._under_count >= self.reset_after_under:
+                self._over_count = 0
+        if over and self._over_count == self.alert_persist_count:   # exactly once per episode
+            pct = int(round(metrics["noise_thresh_ratio"] * 100))
+            msg = ("Noise floor sustained high: %.4f V = %d%% of threshold "
+                   "%.4f V (%d readings over threshold)"
+                   % (metrics["fast_noise"], pct, metrics["threshold"],
+                      self._over_count))
+            self.logger.info(msg)
+            self.notifier.send(_sensor_prefix() + msg)
 
     def execute(self, input_data=None):
         if self._last_run_time is None:
@@ -145,7 +158,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
                 metrics = self._compute(input_data)
                 if metrics is not None:
                     self._write_csv(metrics, input_data['time'].value)
-                    self._maybe_alert(metrics, input_data['time'].value)
+                    self._maybe_alert(metrics)
                 self._last_run_time = input_data['time']
         except Exception as e:
             self.logger.error(
