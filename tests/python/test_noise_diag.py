@@ -174,22 +174,20 @@ def test_write_csv_creates_header_then_appends(tmp_path):
     assert lines[2].startswith("2026-06-23T17:01:00,")
 
 
-def _alert_step(module, persist=3, reset_after_under=2, re_alert_interval_s=21600):
+def _alert_step(module, sustain_s=300, reset_after_under=2):
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.logger = MagicMock()
     step.notifier = MagicMock()
-    step.alert_threshold_frac = 0.8
-    step.alert_persist_count = persist
+    step.alert_threshold_frac = 0.9
+    step.alert_sustain_s = sustain_s
     step.reset_after_under = reset_after_under
-    step.re_alert_interval_s = re_alert_interval_s
-    step._over_count = 0
+    step._over_since = None
     step._under_count = 0
-    step._last_alert_time = None
     return step
 
 
 def _m(ratio):
-    return {"noise_thresh_ratio": ratio, "fast_noise": 0.075, "threshold": 0.083}
+    return {"noise_thresh_ratio": ratio, "fast_noise": 0.085, "threshold": 0.083}
 
 
 def _drive(step, module, ratios, start=None, dt=60):
@@ -200,80 +198,56 @@ def _drive(step, module, ratios, start=None, dt=60):
             step._maybe_alert(_m(r), start + timedelta(seconds=i * dt))
 
 
-def test_no_alert_before_persist_count():
+def test_no_alert_before_sustain_elapsed():
     module = load_module()
-    step = _alert_step(module)
-    _drive(step, module, [0.9, 0.92])            # only 2 of 3
+    step = _alert_step(module, sustain_s=300)          # 5 min
+    _drive(step, module, [0.95] * 5)                   # t0..240 (< 300)
     assert step.notifier.send.call_count == 0
 
 
-def test_alert_fires_on_nth_over_reading():
+def test_alert_after_sustain_elapsed():
     module = load_module()
-    step = _alert_step(module)
-    _drive(step, module, [0.9, 0.92, 0.95])      # 3rd over -> fire
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [0.95] * 6)                   # t0..300 -> fire at t300
     assert step.notifier.send.call_count == 1
 
 
-def test_no_repeat_alert_while_sustained():
+def test_renags_every_sustain_window():
     module = load_module()
-    step = _alert_step(module)
-    _drive(step, module, [0.9, 0.92, 0.95, 0.96, 0.97])
-    assert step.notifier.send.call_count == 1
-
-
-def test_single_dips_do_not_reset_or_refire():
-    module = load_module()
-    step = _alert_step(module)                    # N=3, M=2
-    _drive(step, module, [0.9, 0.92, 0.95, 0.5, 0.95, 0.5, 0.95])
-    assert step.notifier.send.call_count == 1     # lone dips never re-fire
-
-
-def test_single_dip_during_rampup_still_fires():
-    module = load_module()
-    step = _alert_step(module)                    # N=3, M=2
-    _drive(step, module, [0.9, 0.92, 0.5, 0.95])  # dip at idx 2 doesn't reset
-    assert step.notifier.send.call_count == 1
-
-
-def test_two_consecutive_dips_reset():
-    module = load_module()
-    step = _alert_step(module)                    # N=3, M=2
-    _drive(step, module, [0.9, 0.92, 0.5, 0.5, 0.9, 0.92])
-    assert step.notifier.send.call_count == 0     # reset before reaching 3
-
-
-def test_new_episode_after_full_reset_fires_again():
-    module = load_module()
-    step = _alert_step(module)                    # N=3, M=2
-    _drive(step, module, [0.9, 0.92, 0.95,        # episode 1 -> fire
-                          0.4, 0.4,               # M under -> reset
-                          0.9, 0.92, 0.95])       # episode 2 -> fire
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [0.95] * 12)                  # fires t300 and t600
     assert step.notifier.send.call_count == 2
 
 
-def test_persist_count_is_configurable():
+def test_single_dip_does_not_reset_clock():
     module = load_module()
-    step = _alert_step(module, persist=2)
-    _drive(step, module, [0.9, 0.92])             # 2nd over with N=2 -> fire
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.95, 0.95, 0.95])  # dip@i2 tolerated
+    assert step.notifier.send.call_count == 1          # clock survived -> fire at t300
+
+
+def test_two_consecutive_dips_reset_clock():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.5, 0.95, 0.95])   # 2 dips reset @i3
+    assert step.notifier.send.call_count == 0          # clock restarted@i4(t240); t300 only 60s in
+
+
+def test_new_episode_after_recovery_eventually_fires():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.5] + [0.95] * 6)  # reset, then fresh 300s run
     assert step.notifier.send.call_count == 1
 
 
-def test_reset_after_under_of_one_resets_on_single_dip():
+def test_alert_message_says_stuck_with_pct_and_minutes():
     module = load_module()
-    step = _alert_step(module, reset_after_under=1)   # M=1: single dip resets
-    # With M=1 the dip at idx 2 resets, so the run never reaches 3 -> no fire.
-    # (Same sequence with the default M=2 WOULD fire, so this exercises M.)
-    _drive(step, module, [0.9, 0.92, 0.5, 0.9])
-    assert step.notifier.send.call_count == 0
-
-
-def test_alert_text_includes_count_and_pct():
-    module = load_module()
-    step = _alert_step(module)
-    _drive(step, module, [0.9, 0.92, 0.95])
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [1.02] * 6)                   # ratio 1.02 -> 102%
     sent = step.notifier.send.call_args[0][0]
-    assert "readings over threshold" in sent
-    assert "95%" in sent
+    assert "stuck" in sent
+    assert "102%" in sent
+    assert "min" in sent
     assert sent.startswith("mj00 (Lab): ")
 
 
@@ -294,50 +268,17 @@ def test_execute_swallows_exceptions_and_passes_through():
     step.logger.error.assert_called()
 
 
-def test_persist_count_and_reset_clamped_to_at_least_one():
-    module = load_module()
-    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
-        step = module.NoiseDiag(alert_persist_count=0, reset_after_under=0)
-    assert step.alert_persist_count == 1
-    assert step.reset_after_under == 1
-    step.logger.warning.assert_called()
-
-
-def test_still_elevated_refires_after_interval():
-    module = load_module()
-    step = _alert_step(module, re_alert_interval_s=300)   # 5 min
-    _drive(step, module, [0.9] * 12)                      # onset@i2(t120); still@i7(t420)
-    assert step.notifier.send.call_count == 2
-    msgs = [c[0][0] for c in step.notifier.send.call_args_list]
-    assert "sustained high" in msgs[0]
-    assert "STILL elevated" in msgs[1]
-
-
-def test_still_elevated_not_before_interval():
-    module = load_module()
-    step = _alert_step(module, re_alert_interval_s=300)
-    _drive(step, module, [0.9] * 6)                       # onset@t120; last t300 (180s<300)
-    assert step.notifier.send.call_count == 1
-
-
-def test_recovery_clears_realert_clock_next_is_onset():
-    module = load_module()
-    step = _alert_step(module, re_alert_interval_s=300)
-    _drive(step, module, [0.9, 0.9, 0.9, 0.4, 0.4, 0.9, 0.9, 0.9])  # onset, recover, onset
-    assert step.notifier.send.call_count == 2
-    msgs = [c[0][0] for c in step.notifier.send.call_args_list]
-    assert all("sustained high" in m for m in msgs)       # both onset, no STILL
-
-
-def test_still_elevated_disabled_when_interval_zero():
-    module = load_module()
-    step = _alert_step(module, re_alert_interval_s=0)
-    _drive(step, module, [0.9] * 20)
-    assert step.notifier.send.call_count == 1             # onset only
-
-
-def test_default_alert_threshold_frac_is_90pct():
+def test_default_alert_sustain_is_1800_and_frac_090():
     module = load_module()
     with patch.dict("sys.modules", {"notifiers": MagicMock()}):
         step = module.NoiseDiag()
+    assert step.alert_sustain_s == 1800
     assert step.alert_threshold_frac == 0.9
+
+
+def test_reset_after_under_clamped_to_at_least_one():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag(reset_after_under=0)
+    assert step.reset_after_under == 1
+    step.logger.warning.assert_called()

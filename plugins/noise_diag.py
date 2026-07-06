@@ -39,35 +39,29 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
                  output_path=None,
                  filename_template=None,
                  alert_threshold_frac=0.9,
-                 alert_persist_count=3,
+                 alert_sustain_s=1800,
                  reset_after_under=2,
-                 re_alert_interval_s=21600,
                  method=None,
                  key_file=None,
                  channel=None,
                  **output_step_kwargs):
         super().__init__(**output_step_kwargs)
         self._last_run_time = None
-        self._over_count = 0
+        self._over_since = None
         self._under_count = 0
-        self._last_alert_time = None
         self.min_update_time = min_update_time
         self.medsize = medsize
         self.min_pretrigger_ms = min_pretrigger_ms
         self.output_path = output_path if output_path is not None else Path()
         self.filename_template = filename_template
         self.alert_threshold_frac = alert_threshold_frac
-        self.alert_persist_count = alert_persist_count if alert_persist_count >= 1 else 1
+        self.alert_sustain_s = (alert_sustain_s
+                                if (alert_sustain_s and alert_sustain_s > 0) else 1800)
         self.reset_after_under = reset_after_under if reset_after_under >= 1 else 1
-        if (self.alert_persist_count != alert_persist_count
-                or self.reset_after_under != reset_after_under):
+        if self.reset_after_under != reset_after_under:
             self.logger.warning(
-                "noise_diag: alert_persist_count/reset_after_under must be >= 1; "
-                "clamped to %d/%d.",
-                self.alert_persist_count, self.reset_after_under)
-        self.re_alert_interval_s = (re_alert_interval_s
-                                    if (re_alert_interval_s and re_alert_interval_s > 0)
-                                    else 0)
+                "noise_diag: reset_after_under must be >= 1; clamped to %d.",
+                self.reset_after_under)
         from notifiers import Notifier
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -133,35 +127,30 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         }
 
     def _maybe_alert(self, metrics, now):
-        """Fire once when the floor first sustains alert_persist_count over-threshold
-        readings (onset). While the episode stays open (not yet reset by
-        reset_after_under under-readings), re-fire a 'STILL elevated' heartbeat every
-        re_alert_interval_s. Recovery clears the clock so the next rise is a fresh
-        onset. Hysteresis: a lone dip neither resets nor re-fires."""
+        """Alert when the noise floor has stayed at/above the threshold fraction
+        continuously for alert_sustain_s (tolerating up to reset_after_under-1
+        consecutive dips). Re-fires every alert_sustain_s while it stays elevated,
+        so a real problem keeps nagging until fixed. reset_after_under consecutive
+        under-threshold readings end the episode (recovery)."""
         over = metrics["noise_thresh_ratio"] >= self.alert_threshold_frac
         if over:
-            self._over_count += 1
             self._under_count = 0
+            if self._over_since is None:
+                self._over_since = now
+            elif (now - self._over_since).total_seconds() >= self.alert_sustain_s:
+                pct = int(round(metrics["noise_thresh_ratio"] * 100))
+                mins = int(round((now - self._over_since).total_seconds() / 60.0))
+                msg = ("Noise floor stuck >= %d%% of threshold for %d+ min: "
+                       "%.4f V = %d%% of threshold %.4f V"
+                       % (int(round(self.alert_threshold_frac * 100)), mins,
+                          metrics["fast_noise"], pct, metrics["threshold"]))
+                self.logger.info(msg)
+                self.notifier.send(_sensor_prefix() + msg)
+                self._over_since = now   # restart clock -> nag every alert_sustain_s
         else:
             self._under_count += 1
             if self._under_count >= self.reset_after_under:
-                self._over_count = 0
-                self._last_alert_time = None
-        onset = over and self._over_count == self.alert_persist_count
-        still = (over and self._over_count > self.alert_persist_count
-                 and self.re_alert_interval_s
-                 and self._last_alert_time is not None
-                 and (now - self._last_alert_time).total_seconds() >= self.re_alert_interval_s)
-        if onset or still:
-            pct = int(round(metrics["noise_thresh_ratio"] * 100))
-            state = "STILL elevated" if still else "sustained high"
-            msg = ("Noise floor %s: %.4f V = %d%% of threshold %.4f V "
-                   "(%d readings over threshold)"
-                   % (state, metrics["fast_noise"], pct, metrics["threshold"],
-                      self._over_count))
-            self.logger.info(msg)
-            self.notifier.send(_sensor_prefix() + msg)
-            self._last_alert_time = now
+                self._over_since = None
 
     def execute(self, input_data=None):
         if self._last_run_time is None:
