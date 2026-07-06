@@ -174,15 +174,17 @@ def test_write_csv_creates_header_then_appends(tmp_path):
     assert lines[2].startswith("2026-06-23T17:01:00,")
 
 
-def _alert_step(module, persist=3, reset_after_under=2):
+def _alert_step(module, persist=3, reset_after_under=2, re_alert_interval_s=21600):
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.logger = MagicMock()
     step.notifier = MagicMock()
     step.alert_threshold_frac = 0.8
     step.alert_persist_count = persist
     step.reset_after_under = reset_after_under
+    step.re_alert_interval_s = re_alert_interval_s
     step._over_count = 0
     step._under_count = 0
+    step._last_alert_time = None
     return step
 
 
@@ -190,10 +192,12 @@ def _m(ratio):
     return {"noise_thresh_ratio": ratio, "fast_noise": 0.075, "threshold": 0.083}
 
 
-def _drive(step, module, ratios):
+def _drive(step, module, ratios, start=None, dt=60):
+    if start is None:
+        start = datetime(2026, 6, 23, 17, 0, 0)
     with patch.object(module, "_sensor_prefix", return_value="mj00 (Lab): "):
-        for r in ratios:
-            step._maybe_alert(_m(r))
+        for i, r in enumerate(ratios):
+            step._maybe_alert(_m(r), start + timedelta(seconds=i * dt))
 
 
 def test_no_alert_before_persist_count():
@@ -297,3 +301,43 @@ def test_persist_count_and_reset_clamped_to_at_least_one():
     assert step.alert_persist_count == 1
     assert step.reset_after_under == 1
     step.logger.warning.assert_called()
+
+
+def test_still_elevated_refires_after_interval():
+    module = load_module()
+    step = _alert_step(module, re_alert_interval_s=300)   # 5 min
+    _drive(step, module, [0.9] * 12)                      # onset@i2(t120); still@i7(t420)
+    assert step.notifier.send.call_count == 2
+    msgs = [c[0][0] for c in step.notifier.send.call_args_list]
+    assert "sustained high" in msgs[0]
+    assert "STILL elevated" in msgs[1]
+
+
+def test_still_elevated_not_before_interval():
+    module = load_module()
+    step = _alert_step(module, re_alert_interval_s=300)
+    _drive(step, module, [0.9] * 6)                       # onset@t120; last t300 (180s<300)
+    assert step.notifier.send.call_count == 1
+
+
+def test_recovery_clears_realert_clock_next_is_onset():
+    module = load_module()
+    step = _alert_step(module, re_alert_interval_s=300)
+    _drive(step, module, [0.9, 0.9, 0.9, 0.4, 0.4, 0.9, 0.9, 0.9])  # onset, recover, onset
+    assert step.notifier.send.call_count == 2
+    msgs = [c[0][0] for c in step.notifier.send.call_args_list]
+    assert all("sustained high" in m for m in msgs)       # both onset, no STILL
+
+
+def test_still_elevated_disabled_when_interval_zero():
+    module = load_module()
+    step = _alert_step(module, re_alert_interval_s=0)
+    _drive(step, module, [0.9] * 20)
+    assert step.notifier.send.call_count == 1             # onset only
+
+
+def test_default_alert_threshold_frac_is_90pct():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag()
+    assert step.alert_threshold_frac == 0.9
