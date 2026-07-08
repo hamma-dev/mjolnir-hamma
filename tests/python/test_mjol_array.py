@@ -198,6 +198,31 @@ class TestArgparse:
         assert mjol.AUMMA_SENSORS == [41, 42, 43]
 
 
+class TestCliValidation:
+    def test_bad_threshold_channel_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "9", "830"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_injection_attempt_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "8; rm -rf /"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_bad_gain_level_rejected(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_gain_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-gain", "fast-e", "9"])
+        mock_arr.assert_not_called()
+        assert "[ERROR]" in capsys.readouterr().out
+
+    def test_valid_threshold_still_dispatches(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "830"])
+        mock_arr.assert_called_once()
+
+
 class TestStatusServices:
     """Tests for MjolnirArray.status_services()."""
 
@@ -280,13 +305,23 @@ class TestTrigger:
         kwargs = mock_sub.run.call_args[1]
         assert kwargs.get('timeout') == 30
 
-    def test_trigger_pi_down_skips(self, mjol):
+    def test_trigger_pi_down_skips(self, mjol, capsys):
         """If the tunnel is down, trigger should not call subprocess."""
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            with patch.object(mjol.MjolnirArray, 'status', return_value=False):
+                mjol.MjolnirArray.trigger(10002)
+
+        mock_sub.run.assert_not_called()
+        assert "tunnel down, sending AGS 'das_manual_trigger' not sent." in capsys.readouterr().out
+
+    def test_trigger_pi_down_skips_quiet(self, mjol, capsys):
+        """With quiet=True, a down tunnel skips silently (no subprocess, no print)."""
         with patch.object(mjol, 'subprocess') as mock_sub:
             with patch.object(mjol.MjolnirArray, 'status', return_value=False):
                 mjol.MjolnirArray.trigger(10002, quiet=True)
 
         mock_sub.run.assert_not_called()
+        assert capsys.readouterr().out == ""
 
     def test_trigger_timeout_catches_exception(self, mjol):
         """On timeout, trigger should catch the exception and not raise."""
@@ -305,3 +340,99 @@ class TestTrigger:
 
         called_ports = [c[0][0] for c in mock_trigger.call_args_list]
         assert called_ports == [10002, 10003]
+
+
+class TestRunAgsCommand:
+    def test_skips_when_tunnel_down(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "status", return_value=False):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+                mock_sub.run.assert_not_called()
+        assert "[SKIP]" in capsys.readouterr().out
+
+    def test_runs_ags_with_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"OK", stderr=b"")
+                mock_sub.TimeoutExpired = Exception
+                mjol.MjolnirArray._run_ags_command(
+                    10002, ["set-threshold", "1", "830"], "set thr")
+        cmd = mock_sub.run.call_args[0][0]
+        assert "/home/pi/dev/mjolnir-hamma/scripts/ags.py" in cmd
+        assert cmd[-3:] == ["set-threshold", "1", "830"]
+
+    def test_trigger_still_invokes_ags_command(self, mjol):
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"OK", stderr=b"")
+                mock_sub.TimeoutExpired = Exception
+                mjol.MjolnirArray.trigger(10002)
+        cmd = mock_sub.run.call_args[0][0]
+        assert "/home/pi/dev/mjolnir-hamma/scripts/ags.py" in cmd
+        assert "das_manual_trigger" in cmd
+
+    def test_timeout_prints_fail(self, mjol, capsys):
+        import subprocess as _sp
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.TimeoutExpired = _sp.TimeoutExpired
+                mock_sub.run.side_effect = _sp.TimeoutExpired(cmd="ssh", timeout=30)
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+        assert "[FAIL]" in capsys.readouterr().out
+
+    def test_exception_prints_fail(self, mjol, capsys):
+        import subprocess as _sp
+        with patch.object(mjol.MjolnirArray, "status", return_value=True):
+            with patch.object(mjol, "subprocess") as mock_sub:
+                mock_sub.TimeoutExpired = _sp.TimeoutExpired
+                mock_sub.run.side_effect = RuntimeError("boom")
+                mjol.MjolnirArray._run_ags_command(10002, ["das_reset"], "x")
+        assert "[FAIL]" in capsys.readouterr().out
+
+
+class TestSetThresholdGain:
+    def test_set_threshold_builds_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_threshold(10002, 1, 830)
+        port, ags_args = mock_run.call_args[0][0], mock_run.call_args[0][1]
+        assert port == 10002
+        assert ags_args == ["set-threshold", "1", "830"]
+
+    def test_set_threshold_persist_appends_flag(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_threshold(10002, 1, 830, persist=True)
+        assert "--persist" in mock_run.call_args[0][1]
+
+    def test_set_gain_builds_args(self, mjol):
+        with patch.object(mjol.MjolnirArray, "_run_ags_command") as mock_run:
+            mjol.MjolnirArray.set_gain(10002, "fast-e", 2)
+        assert mock_run.call_args[0][1] == ["set-gain", "fast-e", "2"]
+
+    def test_set_threshold_array_fans_out(self, mjol):
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol.MjolnirArray, "set_threshold") as mock_set:
+            arr.set_threshold_array(channel=1, millivolts=830)
+        called_ports = [c[0][0] for c in mock_set.call_args_list]
+        assert called_ports == [10002, 10003]
+
+    def test_set_gain_array_explicit_ports(self, mjol):
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol.MjolnirArray, "set_gain") as mock_set:
+            arr.set_gain_array(ports=["2"], channel="slow-e", level=0)
+        assert mock_set.call_args_list[0][0][0] == 10002
+
+
+class TestCliDispatch:
+    def test_set_threshold_cli(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array") as mock_arr:
+            mjol.main(["-p", "2", "--set-threshold", "1", "830"])
+        kwargs = mock_arr.call_args.kwargs
+        assert kwargs["channel"] == "1" and kwargs["millivolts"] == "830"
+        assert kwargs["persist"] is False
+
+    def test_set_gain_cli_with_persist(self, mjol):
+        with patch.object(mjol.MjolnirArray, "set_gain_array") as mock_arr:
+            mjol.main(["-a", "hamma", "--set-gain", "fast-e", "2", "--persist"])
+        kwargs = mock_arr.call_args.kwargs
+        assert kwargs["channel"] == "fast-e" and kwargs["level"] == "2"
+        assert kwargs["persist"] is True
