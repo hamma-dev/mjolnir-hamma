@@ -174,37 +174,81 @@ def test_write_csv_creates_header_then_appends(tmp_path):
     assert lines[2].startswith("2026-06-23T17:01:00,")
 
 
-def _alert_step(module):
+def _alert_step(module, sustain_s=300, reset_after_under=2):
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.logger = MagicMock()
     step.notifier = MagicMock()
-    step.alert_threshold_frac = 0.8
-    step.alert_cooldown_s = 3600
-    step._was_over = False
-    step._last_alert_time = None
+    step.alert_threshold_frac = 0.9
+    step.alert_sustain_s = sustain_s
+    step.reset_after_under = reset_after_under
+    step._over_since = None
+    step._under_count = 0
     return step
 
 
-def test_alert_fires_on_rising_edge_only():
-    module = load_module()
-    step = _alert_step(module)
-    t0 = datetime(2026, 6, 23, 17, 0, 0)
-    with patch.object(module, "_sensor_prefix", return_value="mj00 (Lab): "):
-        step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0)
-        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=60))
-        step._maybe_alert({"noise_thresh_ratio": 0.92, "fast_noise": 0.076, "threshold": 0.083}, t0 + timedelta(seconds=120))
-    assert step.notifier.send.call_count == 1  # only the crossing
+def _m(ratio):
+    return {"noise_thresh_ratio": ratio, "fast_noise": 0.085, "threshold": 0.083}
 
 
-def test_alert_respects_cooldown_after_reset():
-    module = load_module()
-    step = _alert_step(module)
-    t0 = datetime(2026, 6, 23, 17, 0, 0)
+def _drive(step, module, ratios, start=None, dt=60):
+    if start is None:
+        start = datetime(2026, 6, 23, 17, 0, 0)
     with patch.object(module, "_sensor_prefix", return_value="mj00 (Lab): "):
-        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0)  # fire
-        step._maybe_alert({"noise_thresh_ratio": 0.5, "fast_noise": 0.04, "threshold": 0.083}, t0 + timedelta(seconds=60))  # drop
-        step._maybe_alert({"noise_thresh_ratio": 0.9, "fast_noise": 0.075, "threshold": 0.083}, t0 + timedelta(seconds=120))  # within cooldown
+        for i, r in enumerate(ratios):
+            step._maybe_alert(_m(r), start + timedelta(seconds=i * dt))
+
+
+def test_no_alert_before_sustain_elapsed():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300)          # 5 min
+    _drive(step, module, [0.95] * 5)                   # t0..240 (< 300)
+    assert step.notifier.send.call_count == 0
+
+
+def test_alert_after_sustain_elapsed():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [0.95] * 6)                   # t0..300 -> fire at t300
     assert step.notifier.send.call_count == 1
+
+
+def test_renags_every_sustain_window():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [0.95] * 12)                  # fires t300 and t600
+    assert step.notifier.send.call_count == 2
+
+
+def test_single_dip_does_not_reset_clock():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.95, 0.95, 0.95])  # dip@i2 tolerated
+    assert step.notifier.send.call_count == 1          # clock survived -> fire at t300
+
+
+def test_two_consecutive_dips_reset_clock():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.5, 0.95, 0.95])   # 2 dips reset @i3
+    assert step.notifier.send.call_count == 0          # clock restarted@i4(t240); t300 only 60s in
+
+
+def test_new_episode_after_recovery_eventually_fires():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300, reset_after_under=2)
+    _drive(step, module, [0.95, 0.95, 0.5, 0.5] + [0.95] * 6)  # reset, then fresh 300s run
+    assert step.notifier.send.call_count == 1
+
+
+def test_alert_message_says_stuck_with_pct_and_minutes():
+    module = load_module()
+    step = _alert_step(module, sustain_s=300)
+    _drive(step, module, [1.02] * 6)                   # ratio 1.02 -> 102%
+    sent = step.notifier.send.call_args[0][0]
+    assert "stuck" in sent
+    assert "102%" in sent
+    assert "min" in sent
+    assert sent.startswith("mj00 (Lab): ")
 
 
 def test_execute_swallows_exceptions_and_passes_through():
@@ -222,3 +266,19 @@ def test_execute_swallows_exceptions_and_passes_through():
         out = step.execute(input_data)
     assert out is input_data
     step.logger.error.assert_called()
+
+
+def test_default_alert_sustain_is_1800_and_frac_090():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag()
+    assert step.alert_sustain_s == 1800
+    assert step.alert_threshold_frac == 0.9
+
+
+def test_reset_after_under_clamped_to_at_least_one():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag(reset_after_under=0)
+    assert step.reset_after_under == 1
+    step.logger.warning.assert_called()

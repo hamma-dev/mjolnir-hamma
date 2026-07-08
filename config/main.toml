@@ -80,8 +80,9 @@ config_version = 1
         min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
         output_path = "noise_diag"
         filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
-        alert_threshold_frac = 0.8
-        alert_cooldown_s = 3600
+        alert_threshold_frac = 0.9
+        alert_sustain_s = 1800        # noise must stay >= threshold_frac this long (30 min) before alerting; nags every 30 min
+        reset_after_under = 2         # consecutive under-threshold readings to reset (hysteresis)
         method = "gchat"
         channel = "status"
         key_file = "/home/pi/.googlechat"
