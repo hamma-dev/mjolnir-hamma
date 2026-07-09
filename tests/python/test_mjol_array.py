@@ -160,6 +160,38 @@ class TestStatusLatestTrigger:
         assert 'num_sat' in result
         assert 'time' in result
 
+    def test_works_without_numpy(self, mjol):
+        """Must not require numpy: the operator runs `mjol_array --status`
+        under the system python (/usr/bin/python), which has no numpy. Only
+        the brokkr plugin runs under the ltgenv python that has numpy.
+        """
+        import sys
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0,
+                stdout="{'threshold': 0.5, 'num_sat': 8, 'time': 1234567890}",
+            )
+            # Make `import numpy` raise ImportError, exactly as on the VPS
+            # system python, for the duration of the call.
+            with patch.dict(sys.modules, {'numpy': None}):
+                result = mjol.MjolnirArray.status_latest_trigger(10001)
+
+        assert result['threshold'] == 0.5
+        assert result['num_sat'] == 8
+        assert result['time'] is not None
+
+    def test_failure_path_works_without_numpy(self, mjol):
+        """The nan fallback path must also not reference numpy."""
+        import sys
+        import math
+        with patch.object(mjol, 'subprocess') as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=1, stdout="")
+            with patch.dict(sys.modules, {'numpy': None}):
+                result = mjol.MjolnirArray.status_latest_trigger(10001)
+
+        assert math.isnan(result['threshold'])
+        assert math.isnan(result['num_sat'])
+
 
 class TestPiSshCmd:
     """Tests for MjolnirArray._pi_ssh_cmd()."""

@@ -90,7 +90,28 @@ class MjolnirArray():
         # port is fully qualified
 
         import ast
-        import numpy as np
+
+        # numpy is only present under the ltgenv python (the brokkr plugin
+        # context). The VPS operator runs `mjol_array --status` under the
+        # system python, which has no numpy -- so degrade gracefully to
+        # stdlib equivalents. When numpy IS present the behaviour is
+        # byte-identical to before (np.datetime64 / np.nan), so the
+        # log.hamma.dev dashboard is unaffected.
+        try:
+            import numpy as np
+            _nan = np.nan
+
+            def _to_time(epoch_s):
+                return np.datetime64(int(epoch_s), 's')
+        except ImportError:
+            import datetime as _datetime
+            _nan = float('nan')
+
+            def _to_time(epoch_s):
+                # timezone.utc is available since 3.2 (unlike datetime.UTC,
+                # which is 3.11+); keeps this 3.6+ compatible and warning-free.
+                return _datetime.datetime.fromtimestamp(
+                    int(epoch_s), _datetime.timezone.utc)
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
         cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
@@ -100,12 +121,12 @@ class MjolnirArray():
             if out.returncode:
                 raise Exception
             ret_val = ast.literal_eval(out.stdout)
-            ret_val['time'] = np.datetime64(int(ret_val['time']), 's')
+            ret_val['time'] = _to_time(ret_val['time'])
         except Exception:
             ret_val = dict()
-            ret_val['threshold'] = np.nan
-            ret_val['num_sat'] = np.nan
-            ret_val['time'] = np.nan
+            ret_val['threshold'] = _nan
+            ret_val['num_sat'] = _nan
+            ret_val['time'] = _nan
 
         return ret_val
 
