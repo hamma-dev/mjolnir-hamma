@@ -112,15 +112,27 @@ install_brokkr() {
     # --- Step 4: Install Python packages ---
     log_step "[Brokkr 4/4] Installing Python packages..."
 
+    # gpiozero 2.0 dropped Python 3.7 support (it imports importlib.metadata,
+    # which does not exist on 3.7), breaking `import gpiozero` and relay.py on
+    # Buster. Pin <2.0 on Python 3.7; newer Python can take the current release.
+    # (HAM-84 — mirrors the cartopy version-detection in install_pyltg.)
+    local python_minor
+    python_minor=$(python3 -c "import sys; print(sys.version_info.minor)")
+    local gpiozero_spec="gpiozero"
+    if [[ "$python_minor" -le 7 ]]; then
+        gpiozero_spec="gpiozero<2.0"
+        log_info "Python 3.$python_minor detected, pinning $gpiozero_spec (HAM-84)"
+    fi
+
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "pip install $INSTALL_PATH/brokkr (as pi user)"
         log_dry_run "pip install $INSTALL_PATH/serviceinstaller (as pi user)"
         log_dry_run "pip install $INSTALL_PATH/notifiers (as pi user)"
-        log_dry_run "pip install gpiozero RPi.GPIO (as pi user)"
+        log_dry_run "pip install $gpiozero_spec RPi.GPIO (as pi user)"
         manifest_add "pip_install" "package" "$INSTALL_PATH/brokkr" "user" "pi"
         manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "user" "pi"
         manifest_add "pip_install" "package" "$INSTALL_PATH/notifiers" "user" "pi"
-        manifest_add "pip_install" "package" "gpiozero RPi.GPIO" "user" "pi"
+        manifest_add "pip_install" "package" "$gpiozero_spec RPi.GPIO" "user" "pi"
     else
         # Run as pi user to ensure correct ownership
         # Use non-editable installs to avoid .pth file issues with sudo
@@ -128,8 +140,8 @@ install_brokkr() {
         sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
         sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/notifiers'"
 
-        # GPIO packages for relay control
-        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install gpiozero RPi.GPIO"
+        # GPIO packages for relay control (gpiozero pinned per HAM-84 above)
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$gpiozero_spec' RPi.GPIO"
 
         log_success "Python packages installed"
     fi

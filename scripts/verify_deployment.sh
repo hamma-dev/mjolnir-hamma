@@ -286,6 +286,48 @@ check_brokkr_status() {
     fi
 }
 
+check_post_install_config() {
+    print_section "Post-Install Configuration"
+
+    # Timezone must be UTC — a local timezone silently costs the daily
+    # compression plugin hours of quiet-time each day (HAM-71).
+    local tz
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
+    if [[ "$tz" == "UTC" || "$tz" == "Etc/UTC" ]]; then
+        pass "Timezone is UTC"
+    else
+        fail "Timezone is '$tz' (expected UTC) — run: sudo timedatectl set-timezone UTC"
+    fi
+
+    # gpiozero must import in ltgenv — gpiozero 2.0 on Python 3.7 raises
+    # ModuleNotFoundError and breaks relay.py (HAM-84).
+    local ltgenv_py="/home/pi/dev/ltgenv/bin/python"
+    if [[ -x "$ltgenv_py" ]]; then
+        if "$ltgenv_py" -c "import gpiozero" 2>/dev/null; then
+            pass "gpiozero imports in ltgenv"
+        else
+            fail "gpiozero fails to import in ltgenv (pin gpiozero<2.0 on Python 3.7 — HAM-84)"
+        fi
+    else
+        skip "ltgenv python not found — cannot check gpiozero"
+    fi
+
+    # .googlechat key enables state_monitor notifications (HAM-118). Optional,
+    # so a miss is a warning, not a failure.
+    if [[ -f /home/pi/.googlechat ]]; then
+        pass ".googlechat notification key present"
+    else
+        warn ".googlechat key missing — state_monitor notifications disabled (HAM-118)"
+    fi
+
+    # datasync user enables hamma_download.py pulls (HAM-80).
+    if id datasync >/dev/null 2>&1; then
+        pass "datasync user exists"
+    else
+        warn "datasync user missing — hamma_download.py cannot pull data (HAM-80)"
+    fi
+}
+
 check_server_connection() {
     print_section "Server Connection"
 
@@ -425,6 +467,7 @@ main() {
     check_wifi_services
     check_file_setup
     check_brokkr_status
+    check_post_install_config
 
     if $full_check; then
         check_server_connection

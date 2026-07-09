@@ -44,6 +44,7 @@ SKIP_BROKKR=false
 SKIP_HARDWARE=false
 SKIP_EXTRAS=false
 SKIP_HAMMA=false
+SKIP_POSTINSTALL=false
 CELLULAR_APN=""
 GENERATE_HAMMA_KEY=false
 HAMMA_ONLY=false
@@ -62,6 +63,7 @@ print_usage() {
     echo "  --skip-hardware     Skip hardware setup"
     echo "  --skip-extras       Skip sindri/pyltg/hamma installation"
     echo "  --skip-hamma        Skip HAMMA installation (requires SSH key for private repo)"
+    echo "  --skip-postinstall  Skip post-install config (.googlechat key, datasync user)"
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Cellular options:"
@@ -100,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-extras)
             SKIP_EXTRAS=true
+            shift
+            ;;
+        --skip-postinstall)
+            SKIP_POSTINSTALL=true
             shift
             ;;
         --skip-hamma)
@@ -372,6 +378,25 @@ if [[ "$SKIP_EXTRAS" != "true" ]]; then
     fi
 else
     log_info "Skipping additional software (--skip-extras)"
+fi
+
+echo ""
+
+# ============================================================================
+# PHASE 7: Post-install configuration
+# ============================================================================
+# Small, documented-but-previously-manual steps that kept getting skipped on
+# bring-up (HAM-120 umbrella). All best-effort — a failure here logs a warning
+# and never aborts the install.
+log_info "=== Phase 7: Post-install configuration ==="
+echo ""
+
+if [[ "$SKIP_POSTINSTALL" != "true" ]]; then
+    source "$SCRIPT_DIR/lib/software.sh"
+    fetch_notification_key      # HAM-118: .googlechat key for state_monitor
+    setup_datasync_local        # HAM-80: datasync account for hamma_download.py
+else
+    log_info "Skipping post-install configuration (--skip-postinstall)"
 fi
 
 echo ""

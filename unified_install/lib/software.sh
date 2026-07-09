@@ -359,3 +359,86 @@ EOT
         log_success "HAMMA installation complete!"
     fi
 }
+
+# --- Fetch Google Chat notification key ---
+# The brokkr state_monitor plugin needs /home/pi/.googlechat to send
+# notifications (low-space, disconnect, low-power). Without it, state_monitor
+# throws FileNotFoundError every cycle and all notifications are silently off.
+# The key lives on the server; pull it here so the manual scp (documented in
+# README.md Step 6 but never invoked) is no longer needed. (HAM-118)
+#
+# Best-effort: needs pi's id_rsa authorized on hamma.dev first. If that isn't
+# set up yet, warn and continue — never abort the install over a missing key.
+fetch_notification_key() {
+    local key_src="pi@hamma.dev:/home/pi/.googlechat"
+    local key_dst="/home/pi/.googlechat"
+
+    log_step "Fetching Google Chat notification key..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "scp $key_src $key_dst (as pi user, best-effort)"
+        manifest_add "command" "cmd" "scp $key_src $key_dst" "user" "pi" "best_effort" "true"
+        return 0
+    fi
+
+    if [[ -f "$key_dst" ]]; then
+        log_info ".googlechat already present, skipping fetch"
+        return 0
+    fi
+
+    # Run as pi so the fetch uses pi's SSH identity and the file lands pi-owned.
+    if sudo -H -u pi scp -o BatchMode=yes -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no "$key_src" "$key_dst" 2>/dev/null; then
+        chown pi:pi "$key_dst" 2>/dev/null || true
+        log_success "Fetched .googlechat notification key"
+    else
+        log_warn "Could not fetch .googlechat key (pi's key may not be authorized on hamma.dev yet)"
+        log_warn "state_monitor notifications stay disabled until you run manually:"
+        log_warn "  sudo -H -u pi scp $key_src $key_dst"
+    fi
+}
+
+# --- Set up local datasync user ---
+# The datasync user lets hamma_download.py pull data from this unit via rsync.
+# scripts/setup_datasync.sh does this remotely (from a workstation over the
+# jump host); this does the on-Pi plumbing during install so future units are
+# pre-provisioned. (HAM-80)
+#
+# Note: the login key (bitzer@matrix pubkey) is NOT available locally during
+# install, so authorized_keys is left for the operator / setup_datasync.sh to
+# populate. This step only creates the account, group membership, .ssh dir and
+# /media/pi permissions — the tedious part. Best-effort, non-fatal.
+setup_datasync_local() {
+    log_step "Setting up local datasync user..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "useradd -m -s /bin/bash datasync"
+        log_dry_run "usermod -a -G pi datasync"
+        log_dry_run "mkdir -p /home/datasync/.ssh (mode 700, owned datasync)"
+        log_dry_run "chmod o+rx /media/pi/"
+        manifest_add "command" "cmd" "useradd -m -s /bin/bash datasync" "sudo" "true"
+        manifest_add "command" "cmd" "usermod -a -G pi datasync" "sudo" "true"
+        manifest_add "mkdir" "path" "/home/datasync/.ssh"
+        manifest_add "command" "cmd" "chmod o+rx /media/pi/" "sudo" "true"
+        return 0
+    fi
+
+    if id datasync >/dev/null 2>&1; then
+        log_info "datasync user already exists, skipping creation"
+    else
+        useradd -m -s /bin/bash datasync || {
+            log_warn "Could not create datasync user (continuing)"
+            return 0
+        }
+    fi
+
+    usermod -a -G pi datasync || log_warn "Could not add datasync to pi group"
+    mkdir -p /home/datasync/.ssh && chmod 700 /home/datasync/.ssh
+    chown -R datasync:datasync /home/datasync/.ssh
+    # Let datasync traverse pi's removable-media mounts for rsync
+    chmod o+rx /media/pi/ 2>/dev/null || log_warn "/media/pi not present yet (set o+rx after drives mount)"
+
+    log_success "datasync account provisioned (local plumbing)"
+    log_warn "Install the pull-side public key into /home/datasync/.ssh/authorized_keys"
+    log_warn "  (e.g. via scripts/setup_datasync.sh --key <pubkey> <sensor_num>)"
+}
