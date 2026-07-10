@@ -278,8 +278,10 @@ log_step "Updating mjolnir-hamma repository..."
 
 REPO_PATH="/home/pi/dev/mjolnir-hamma"
 REPO_URL="https://github.com/hamma-dev/mjolnir-hamma.git"
-# TODO: Update this branch when releasing or changing version branches
-REPO_BRANCH="0.3.x"
+# Current mjolnir-hamma version branch. The self-update below only pulls when
+# the unit is already on this branch, so a stale value silently skips updates.
+# TODO: bump on each version-branch change (last: 0.3.x -> 0.4.x).
+REPO_BRANCH="0.4.x"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "git -C $REPO_PATH remote set-url origin $REPO_URL"
