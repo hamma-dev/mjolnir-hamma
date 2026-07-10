@@ -433,8 +433,12 @@ setup_datasync_local() {
     fi
 
     usermod -a -G pi datasync || log_warn "Could not add datasync to pi group"
-    mkdir -p /home/datasync/.ssh && chmod 700 /home/datasync/.ssh
-    chown -R datasync:datasync /home/datasync/.ssh
+    # Guard every command: this step is best-effort and must never abort the
+    # install under set -e (e.g. an odd /home/datasync state on a re-run).
+    { mkdir -p /home/datasync/.ssh && chmod 700 /home/datasync/.ssh; } \
+        || log_warn "Could not create /home/datasync/.ssh"
+    chown -R datasync:datasync /home/datasync/.ssh 2>/dev/null \
+        || log_warn "Could not set /home/datasync/.ssh ownership"
     # Let datasync traverse pi's removable-media mounts for rsync
     chmod o+rx /media/pi/ 2>/dev/null || log_warn "/media/pi not present yet (set o+rx after drives mount)"
 

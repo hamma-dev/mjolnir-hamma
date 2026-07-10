@@ -130,6 +130,57 @@ class TestDatasyncUser:
             "/media/pi permission not set for datasync"
 
 
+class TestBestEffortNonFatal:
+    """Phase 7 steps must never abort the install under set -e, even when their
+    privileged commands fail. Runtime (non-dry-run) coverage of the guards.
+
+    The harness sources software.sh under `set -e` and shadows every mutating
+    command with a shell function so nothing touches the real system; some are
+    forced to fail to exercise the guards. Reaching the END marker proves the
+    function returned instead of aborting.
+    """
+
+    def _harness(self, unified_install_dir, func_call):
+        lib = unified_install_dir / "lib"
+        script = f"""
+            set -e
+            source '{lib}/common.sh'
+            source '{lib}/software.sh'
+            # Sandbox: shadow all mutating commands; force the ones the guards
+            # must tolerate to FAIL, so an unguarded command would trip set -e.
+            id() {{ return 1; }}            # datasync user "absent" -> useradd path
+            useradd() {{ return 0; }}
+            usermod() {{ return 1; }}       # forced failure (guarded)
+            mkdir() {{ return 0; }}
+            chmod() {{ return 1; }}         # forced failure (guarded)
+            chown() {{ return 1; }}         # forced failure (guarded)
+            scp() {{ return 1; }}           # forced failure (guarded)
+            sudo() {{ "$@"; }}              # strip sudo, run the (stubbed) command
+            DRY_RUN=false
+            {func_call}
+            echo "HARNESS_REACHED_END"
+        """
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    def test_setup_datasync_local_never_aborts(self, unified_install_dir):
+        r = self._harness(unified_install_dir, "setup_datasync_local")
+        assert "HARNESS_REACHED_END" in r.stdout, (
+            "setup_datasync_local aborted under set -e when a command failed "
+            f"(best-effort contract violated).\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+
+    def test_fetch_notification_key_never_aborts(self, unified_install_dir, tmp_path):
+        # Point HOME at an empty tmp dir so the key_dst existence check is false
+        # and the scp path (forced-fail) is exercised.
+        r = self._harness(unified_install_dir, "fetch_notification_key")
+        assert "HARNESS_REACHED_END" in r.stdout, (
+            "fetch_notification_key aborted under set -e on scp failure.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+
+
 class TestSkipPostinstall:
     """--skip-postinstall must suppress the Phase 7 operations."""
 
