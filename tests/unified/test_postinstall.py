@@ -134,6 +134,52 @@ class TestDatasyncUser:
             "/media/pi permission not set for datasync"
 
 
+class TestNotifiersEditable:
+    """HAM-158: notifiers installed editable so git-pulls deploy."""
+
+    def test_notifiers_editable(self, unified_install_dir, tmp_path):
+        manifest = _run_install(unified_install_dir, tmp_path / "notif")
+        notif = [op for op in manifest["operations"]
+                 if op.get("type") == "pip_install" and "notifiers" in op.get("package", "")]
+        assert notif, "notifiers pip_install op missing"
+        assert notif[0].get("editable") == "true", \
+            f"notifiers should be installed editable, got: {notif[0]}"
+
+    def test_brokkr_and_sindri_stay_non_editable(self, unified_install_dir, tmp_path):
+        """Guard: only notifiers flips to editable, not brokkr/serviceinstaller."""
+        manifest = _run_install(unified_install_dir, tmp_path / "notif2")
+        for pkg in ("brokkr", "serviceinstaller"):
+            ops = [op for op in manifest["operations"]
+                   if op.get("type") == "pip_install"
+                   and op.get("package", "").endswith(pkg)]
+            assert ops, f"{pkg} pip_install op missing"
+            assert ops[0].get("editable") != "true", f"{pkg} should stay non-editable"
+
+
+class TestLegacyServiceCleanup:
+    """sensor-log #43/#9: retired pre-default units removed on install."""
+
+    def test_legacy_units_removed(self, unified_install_dir, tmp_path):
+        manifest = _run_install(unified_install_dir, tmp_path / "legacy")
+        cmds = [op.get("cmd", "") for op in manifest["operations"]
+                if op.get("type") == "command"]
+        assert any("rm -f /etc/systemd/system/autossh-hamma.service" in c for c in cmds), \
+            "legacy autossh-hamma.service not scheduled for removal"
+        assert any("rm -f /etc/systemd/system/brokkr-hamma.service" in c for c in cmds), \
+            "legacy brokkr-hamma.service not scheduled for removal"
+
+
+class TestOwnershipNormalize:
+    """sensor-log #78/#11/#33: pi paths normalized to pi ownership."""
+
+    def test_ownership_normalized(self, unified_install_dir, tmp_path):
+        manifest = _run_install(unified_install_dir, tmp_path / "own")
+        cmds = [op.get("cmd", "") for op in manifest["operations"]
+                if op.get("type") == "command"]
+        assert any("chown -R pi:pi /home/pi/dev" in c for c in cmds), \
+            "pi ownership normalization of /home/pi/dev missing"
+
+
 class TestBestEffortNonFatal:
     """Phase 7 steps must never abort the install under set -e, even when their
     privileged commands fail. Runtime (non-dry-run) coverage of the guards.
@@ -159,6 +205,8 @@ class TestBestEffortNonFatal:
             chmod() {{ return 1; }}         # forced failure (guarded)
             chown() {{ return 1; }}         # forced failure (guarded)
             scp() {{ return 1; }}           # forced failure (guarded)
+            systemctl() {{ return 1; }}     # forced failure (guarded)
+            rm() {{ return 1; }}            # forced failure (guarded)
             sudo() {{ "$@"; }}              # strip sudo, run the (stubbed) command
             DRY_RUN=false
             {func_call}
@@ -180,6 +228,22 @@ class TestBestEffortNonFatal:
         r = self._harness(unified_install_dir, "fetch_notification_key")
         assert "HARNESS_REACHED_END" in r.stdout, (
             "fetch_notification_key aborted under set -e on scp failure.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+
+    def test_normalize_pi_ownership_never_aborts(self, unified_install_dir):
+        r = self._harness(unified_install_dir, "normalize_pi_ownership")
+        assert "HARNESS_REACHED_END" in r.stdout, (
+            "normalize_pi_ownership aborted under set -e on chown/chmod failure.\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+
+    def test_cleanup_legacy_services_never_aborts(self, unified_install_dir):
+        r = self._harness(unified_install_dir, "cleanup_legacy_services")
+        assert "HARNESS_REACHED_END" in r.stdout, (
+            "cleanup_legacy_services aborted under set -e.\n"
             f"stdout: {r.stdout}\nstderr: {r.stderr}"
         )
         assert r.returncode == 0, f"non-zero exit: {r.returncode}"

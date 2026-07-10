@@ -395,8 +395,10 @@ echo ""
 
 if [[ "$SKIP_POSTINSTALL" != "true" ]]; then
     source "$SCRIPT_DIR/lib/software.sh"
+    cleanup_legacy_services     # sensor-log #43/#9: drop retired pre-default units
     fetch_notification_key      # HAM-118: .googlechat key for state_monitor
     setup_datasync_local        # HAM-80: datasync account for hamma_download.py
+    normalize_pi_ownership      # sensor-log #78/#11/#33: fix root-owned pi paths
 else
     log_info "Skipping post-install configuration (--skip-postinstall)"
 fi

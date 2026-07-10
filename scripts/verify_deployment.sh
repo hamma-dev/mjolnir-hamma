@@ -326,6 +326,31 @@ check_post_install_config() {
     else
         warn "datasync user missing — hamma_download.py cannot pull data (HAM-80)"
     fi
+
+    # pi-owned paths must not be root-owned (breaks git pull / pip). Recurring
+    # fallout from `sudo` without -H on older installs (sensor-log #78/#11/#33).
+    check_file_ownership "/home/pi/dev/mjolnir-hamma" "pi" "mjolnir-hamma repo owned by pi"
+    if [[ -e /home/pi/.ssh/config ]]; then
+        check_file_ownership "/home/pi/.ssh/config" "pi" "SSH config owned by pi"
+    fi
+}
+
+check_hamma_repo_access() {
+    print_section "HAMMA Repo Access (deploy key)"
+
+    if [[ ! -d /home/pi/dev/hamma/.git ]]; then
+        skip "hamma repo not present — cannot test deploy key"
+        return
+    fi
+
+    # The private pbitzer/hamma repo needs the ed25519 deploy key authorized on
+    # GitHub. Key generation is automated, but authorization is a manual step
+    # that gets missed (sensor-log #11). ls-remote exercises the key.
+    if sudo -H -u pi git -C /home/pi/dev/hamma ls-remote >/dev/null 2>&1; then
+        pass "hamma deploy key authorized (git ls-remote works)"
+    else
+        fail "hamma deploy key not working — add id_ed25519.pub to pbitzer/hamma deploy keys"
+    fi
 }
 
 check_server_connection() {
@@ -471,6 +496,7 @@ main() {
 
     if $full_check; then
         check_server_connection
+        check_hamma_repo_access
     else
         print_section "Server Connection"
         skip "Use --full to test server connection"

@@ -127,18 +127,21 @@ install_brokkr() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "pip install $INSTALL_PATH/brokkr (as pi user)"
         log_dry_run "pip install $INSTALL_PATH/serviceinstaller (as pi user)"
-        log_dry_run "pip install $INSTALL_PATH/notifiers (as pi user)"
+        log_dry_run "pip install -e $INSTALL_PATH/notifiers (as pi user, editable)"
         log_dry_run "pip install $gpiozero_spec RPi.GPIO (as pi user)"
         manifest_add "pip_install" "package" "$INSTALL_PATH/brokkr" "user" "pi"
         manifest_add "pip_install" "package" "$INSTALL_PATH/serviceinstaller" "user" "pi"
-        manifest_add "pip_install" "package" "$INSTALL_PATH/notifiers" "user" "pi"
+        manifest_add "pip_install" "package" "$INSTALL_PATH/notifiers" "user" "pi" "editable" "true"
         manifest_add "pip_install" "package" "$gpiozero_spec RPi.GPIO" "user" "pi"
     else
         # Run as pi user to ensure correct ownership
         # Use non-editable installs to avoid .pth file issues with sudo
         sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/brokkr'"
         sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/serviceinstaller'"
-        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$INSTALL_PATH/notifiers'"
+        # notifiers editable so on-sensor `git pull` reaches brokkr (HAM-158).
+        # Safe: pip runs as pi into a pi-owned venv + pi-owned source (the
+        # "no editable with sudo" rule targets pip-as-root; see HAM-163).
+        sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install -e '$INSTALL_PATH/notifiers'"
 
         # GPIO packages for relay control (gpiozero pinned per HAM-84 above)
         sudo -H -u pi bash -c "source '$VENV_PATH/bin/activate' && pip install '$gpiozero_spec' RPi.GPIO"

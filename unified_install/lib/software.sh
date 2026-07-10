@@ -449,3 +449,73 @@ setup_datasync_local() {
     log_warn "Install the pull-side public key into /home/datasync/.ssh/authorized_keys"
     log_warn "  (e.g. via scripts/setup_datasync.sh --key <pubkey> <sensor_num>)"
 }
+
+# --- Remove legacy systemd units ---
+# Pre-"-default" unit names get left behind when re-installing older units and
+# compete with the current -default units for the tunnel port / config. Remove
+# the known-legacy names. Best-effort, non-fatal. (sensor-log #43, #9)
+cleanup_legacy_services() {
+    log_step "Removing legacy systemd units..."
+
+    # Current names are autossh-hamma-default / brokkr-hamma-default; these
+    # bare names are the retired pre-default units, safe to remove.
+    local legacy=(autossh-hamma.service brokkr-hamma.service)
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local svc
+        for svc in "${legacy[@]}"; do
+            log_dry_run "disable + rm + reset-failed $svc (if present)"
+            manifest_add "command" "cmd" "rm -f /etc/systemd/system/$svc" "sudo" "true" "best_effort" "true"
+        done
+        return 0
+    fi
+
+    local removed=0 svc unit
+    for svc in "${legacy[@]}"; do
+        unit="/etc/systemd/system/$svc"
+        [[ -f "$unit" ]] || continue
+        log_info "Removing legacy $svc"
+        systemctl disable --now "$svc" 2>/dev/null || true
+        rm -f "$unit" 2>/dev/null || log_warn "Could not remove $unit"
+        systemctl reset-failed "$svc" 2>/dev/null || true
+        removed=$((removed + 1))
+    done
+    if [[ "$removed" -gt 0 ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+        log_success "Removed $removed legacy unit(s)"
+    else
+        log_info "No legacy units present"
+    fi
+}
+
+# --- Normalize ownership of pi-owned paths ---
+# Any step that ran `sudo` without -H (older installs) left repos, .ssh, and
+# venvs root-owned, which breaks `git pull` ("dubious ownership") and pip. A
+# best-effort belt-and-suspenders pass so that recurring breakage can't ship.
+# (sensor-log #78, #11, #33)
+normalize_pi_ownership() {
+    log_step "Normalizing pi ownership of home paths..."
+
+    local paths=(/home/pi/dev /home/pi/.ssh /home/pi/.config)
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local p
+        for p in "${paths[@]}"; do
+            log_dry_run "chown -R pi:pi $p"
+            manifest_add "command" "cmd" "chown -R pi:pi $p" "sudo" "true" "best_effort" "true"
+        done
+        log_dry_run "chmod 755 /etc/systemd/system"
+        manifest_add "command" "cmd" "chmod 755 /etc/systemd/system" "sudo" "true" "best_effort" "true"
+        return 0
+    fi
+
+    local p
+    for p in "${paths[@]}"; do
+        [[ -e "$p" ]] || continue
+        chown -R pi:pi "$p" 2>/dev/null || log_warn "Could not normalize ownership of $p"
+    done
+    # /etc/systemd/system left mode 644 (no traverse bit) blocks unit reads.
+    chmod 755 /etc/systemd/system 2>/dev/null || log_warn "Could not set /etc/systemd/system mode"
+
+    log_success "Ownership normalized"
+}
