@@ -370,8 +370,9 @@ EOT
 # Best-effort: needs pi's id_rsa authorized on hamma.dev first. If that isn't
 # set up yet, warn and continue — never abort the install over a missing key.
 fetch_notification_key() {
-    local key_src="pi@hamma.dev:/home/pi/.googlechat"
+    local key_src="pi@www.hamma.dev:/home/pi/.googlechat"
     local key_dst="/home/pi/.googlechat"
+    local scp_err
 
     log_step "Fetching Google Chat notification key..."
 
@@ -387,12 +388,14 @@ fetch_notification_key() {
     fi
 
     # Run as pi so the fetch uses pi's SSH identity and the file lands pi-owned.
-    if sudo -H -u pi scp -o BatchMode=yes -o ConnectTimeout=10 \
-            -o StrictHostKeyChecking=no "$key_src" "$key_dst" 2>/dev/null; then
+    # Capture stderr so the warning shows the real cause (auth vs DNS vs
+    # unreachable) — DNS on cellular units is a known recurring failure mode.
+    if scp_err=$(sudo -H -u pi scp -o BatchMode=yes -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no "$key_src" "$key_dst" 2>&1); then
         chown pi:pi "$key_dst" 2>/dev/null || true
         log_success "Fetched .googlechat notification key"
     else
-        log_warn "Could not fetch .googlechat key (pi's key may not be authorized on hamma.dev yet)"
+        log_warn "Could not fetch .googlechat key: ${scp_err:-unknown error}"
         log_warn "state_monitor notifications stay disabled until you run manually:"
         log_warn "  sudo -H -u pi scp $key_src $key_dst"
     fi

@@ -20,11 +20,14 @@ import textwrap
 import pytest
 
 
-def _run_install(unified_install_dir, work_dir, extra_args=None, path_prepend=None):
+def _run_install(unified_install_dir, work_dir, extra_args=None, path_prepend=None,
+                 return_result=False):
     """Run install.sh --wifi --dry-run and return the parsed manifest.
 
     By default brokkr and post-install run (only packages/hardware/extras are
     skipped) so the gpiozero and Phase 7 operations land in the manifest.
+    With return_result=True, returns (manifest, CompletedProcess) so callers
+    can also assert on stdout.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = work_dir / "manifest.json"
@@ -47,7 +50,8 @@ def _run_install(unified_install_dir, work_dir, extra_args=None, path_prepend=No
     )
     if not manifest_file.exists():
         pytest.fail(f"Manifest not created.\nstdout: {result.stdout}\nstderr: {result.stderr}")
-    return json.loads(manifest_file.read_text())
+    manifest = json.loads(manifest_file.read_text())
+    return (manifest, result) if return_result else manifest
 
 
 def _pip_packages(manifest):
@@ -185,8 +189,20 @@ class TestSkipPostinstall:
     """--skip-postinstall must suppress the Phase 7 operations."""
 
     def test_skip_postinstall_suppresses_ops(self, unified_install_dir, tmp_path):
-        manifest = _run_install(unified_install_dir, tmp_path / "skip",
-                                extra_args=["--skip-postinstall"])
+        manifest, result = _run_install(unified_install_dir, tmp_path / "skip",
+                                        extra_args=["--skip-postinstall"],
+                                        return_result=True)
         blob = json.dumps(manifest)
         assert ".googlechat" not in blob, "googlechat op present despite --skip-postinstall"
         assert "datasync" not in blob, "datasync op present despite --skip-postinstall"
+        # Positively confirm the skip branch actually executed (not just that
+        # Phase 7 happens to emit nothing for some unrelated reason).
+        assert "Skipping post-install configuration" in result.stdout, \
+            f"skip branch did not run.\nstdout: {result.stdout}"
+
+    def test_postinstall_runs_by_default(self, unified_install_dir, tmp_path):
+        """Positive control: without the flag, Phase 7 ops ARE present."""
+        manifest = _run_install(unified_install_dir, tmp_path / "noskip")
+        blob = json.dumps(manifest)
+        assert ".googlechat" in blob, "googlechat op missing in a normal run"
+        assert "datasync" in blob, "datasync op missing in a normal run"
