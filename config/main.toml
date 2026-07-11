@@ -58,6 +58,8 @@ config_version = 1
         channel = "status"
         key_file = "/home/pi/.googlechat"
         scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
+        scrub_cooldown_s = 1800  # min seconds between auto-scrub launches while low (level-triggered retry)
+        scrub_log = "/home/pi/brokkr/hamma/log/hamma_scrub_auto.log"  # capture auto-scrub output (diagnose futile/failed scrubs)
 
     # Step to create HAMMA plot
     [steps.hamma_plot]

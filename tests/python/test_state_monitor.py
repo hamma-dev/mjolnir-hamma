@@ -115,16 +115,19 @@ def _make_monitor(**overrides):
 
 
 class TestCheckSensorDriveBoundary:
-    """check_sensor_drive must fire when pre lands exactly on low_space.
+    """check_sensor_drive fires whenever bytes_remaining is below low_space.
 
-    Real-world miss (mj07, 2026-05-28 15:25:03 UTC):
-    bytes_remaining went from 100.0 -> 99.96 GB. Strict `>` against
-    low_space=100 missed the edge. After that, bytes_remaining only
-    decreased, so no future edge could ever fire.
+    As of the mj05 fix (2026-07-11) the check is LEVEL-triggered, not edge-
+    triggered: it fires on any below-threshold sample (rate-limited by a
+    cooldown), so the old edge-only miss modes are moot. Historical context:
+    - mj07 (2026-05-28): 100.0 -> 99.96 GB missed by strict `>`.
+    - mj05 (2026-07-11): edge fired at most once; a single missed/ineffective
+      scrub let the drive fill to 0 with no retry.
+    Level-triggering removes both. `now == low_space` is still NOT below.
     """
 
     def test_pre_exactly_at_threshold_fires(self):
-        """pre = low_space exactly; now below -> fires."""
+        """pre = low_space exactly; now below -> fires (level-triggered)."""
         m = _make_monitor(low_space=100)
         m._previous_data = {"bytes_remaining": _dv(100.0)}
         with patch.object(m, "_spawn_scrub") as spawn:
@@ -142,14 +145,17 @@ class TestCheckSensorDriveBoundary:
         spawn.assert_called_once()
         assert msg is not None
 
-    def test_both_below_threshold_no_fire(self):
-        """No edge if already below: pre=50, now=45 -> no fire."""
+    def test_both_below_threshold_fires_level_triggered(self):
+        """Already below (pre=50, now=45) -> STILL fires. This is the mj05 fix:
+        the old edge-only check did NOT fire here, so a drive that sat below
+        threshold never got a retry. Level-triggering fires every low sample
+        (cooldown-gated)."""
         m = _make_monitor(low_space=100)
         m._previous_data = {"bytes_remaining": _dv(50.0)}
         with patch.object(m, "_spawn_scrub") as spawn:
             msg = m.check_sensor_drive({"bytes_remaining": _dv(45.0)})
-        spawn.assert_not_called()
-        assert msg is None
+        spawn.assert_called_once()
+        assert msg is not None
 
     def test_both_above_threshold_no_fire(self):
         """No edge if still above: pre=200, now=150 -> no fire."""

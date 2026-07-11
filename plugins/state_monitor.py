@@ -6,6 +6,7 @@ from math import nan
 import shlex
 import shutil
 import subprocess
+import time
 
 # Third party imports
 from notifiers import Notifier
@@ -40,6 +41,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_pi_space=5,
         enable_drive_checks=True,
         scrub_command="",
+        scrub_cooldown_s=1800,
+        scrub_log="",
         **output_step_kwargs,
         ):
         """
@@ -73,6 +76,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_command : str, optional
             Shell command to run hamma_scrub.py when drive space is low.
             If empty (default), no scrub is spawned. Protected by flock.
+        scrub_cooldown_s : numeric, optional
+            Minimum seconds between successive auto-scrub launches while the
+            drive remains below `low_space`. The check is level-triggered (fires
+            whenever space is low, not only on the high->low edge), so this
+            cooldown rate-limits retries. Default 1800 (30 min).
+        scrub_log : str, optional
+            Path to append the spawned scrub's stdout/stderr to. If empty
+            (default), scrub output is discarded (DEVNULL). Set this so a scrub
+            that runs but frees nothing is diagnosable instead of silent.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -92,6 +104,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
         self.scrub_command = scrub_command
+        self.scrub_cooldown_s = scrub_cooldown_s
+        self.scrub_log = scrub_log
+        # Level-trigger state: monotonic timestamp of the last successful scrub
+        # launch (for cooldown), and whether we are currently in the low-space
+        # state (so we alert on descent-entry and on each respawn, not every cycle).
+        self._last_scrub_time = None
+        self._low_space_active = False
 
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -342,32 +361,95 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Message to send depending on the check, or None if no message.
 
         """
-        space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
-        # Use >= for `pre` so a previous sample sitting exactly on the
-        # threshold still counts as above it. Strict `>` silently misses
-        # the edge when pre lands on low_space (a real case on mj07:
-        # 100.0 -> 99.96 with low_space=100 never fired).
-        if (space_now < self.low_space) and (space_pre >= self.low_space):
-            self._spawn_scrub()
+        space_now, _space_pre = self.now_then(input_data, 'bytes_remaining')
+
+        # Numeric-robust: 'NA' becomes nan (now_then), and other non-numeric
+        # values (None, '', unexpected strings) cannot be assessed. Skip them
+        # rather than comparing -- a comparison would raise TypeError, which
+        # run_checks swallows as an error, silently leaving the drive
+        # unmonitored (the mj05 failure class).
+        if not isinstance(space_now, (int, float)) or space_now != space_now:
+            return None
+
+        if space_now >= self.low_space:
+            # Healthy: re-arm so the next descent below the threshold alerts.
+            self._low_space_active = False
+            return None
+
+        # Below threshold. LEVEL-TRIGGERED (not edge): spawn a scrub whenever
+        # space is low, rate-limited by a cooldown -- so a single missed or
+        # ineffective scrub no longer dooms the drive. (The mj05 incident was a
+        # one-shot high->low edge trigger with no retry.) Alert on descent-entry
+        # and on each (re)spawn, so a persistently full drive escalates instead
+        # of going silent after one message.
+        spawned = self._maybe_spawn_scrub()
+        first_entry = not self._low_space_active
+        self._low_space_active = True
+        if first_entry or spawned:
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
 
+    def _maybe_spawn_scrub(self):
+        """Spawn a scrub if configured and outside the cooldown window.
+
+        Returns True only if a scrub was actually launched this call.
+        (The empty/whitespace scrub_command guard lives in `_spawn_scrub`,
+        which returns False without launching.)
+        """
+        now = time.monotonic()
+        if (self._last_scrub_time is not None
+                and (now - self._last_scrub_time) < self.scrub_cooldown_s):
+            return False
+        # Stamp the cooldown only on a successful launch, so a failed launch
+        # (flock/OSError) is retried on the next low sample instead of blocked.
+        # _last_scrub_time is in-memory and resets on brokkr restart, which
+        # biases toward scrubbing (the safe direction) after a reboot loop.
+        if self._spawn_scrub():
+            self._last_scrub_time = now
+            return True
+        return False
+
     def _spawn_scrub(self):
-        """Spawn detached scrub process if scrub_command is configured."""
+        """Spawn a detached scrub process if scrub_command is configured.
+
+        Returns True on a successful launch, False otherwise. If `scrub_log` is
+        set, the scrub's combined stdout/stderr is appended there so a scrub
+        that runs but frees nothing is diagnosable instead of silently lost.
+        """
         if not self.scrub_command or not self.scrub_command.strip():
-            return
+            return False
         lock_file = "/tmp/hamma_scrub.lock"
+        log_fh = None
+        out = subprocess.DEVNULL
+        err = subprocess.DEVNULL
         try:
+            if self.scrub_log:
+                try:
+                    log_fh = open(self.scrub_log, "ab")
+                    out = log_fh
+                    err = subprocess.STDOUT
+                except OSError as e:
+                    self.logger.warning(
+                        "Could not open scrub_log %s (%s); discarding scrub output",
+                        self.scrub_log, e)
             cmd = ["flock", "-n", lock_file] + shlex.split(self.scrub_command)
             subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
                 start_new_session=True,
             )
             self.logger.info("Spawned scrub: %s", " ".join(cmd))
+            return True
         except (OSError, ValueError) as e:
             self.logger.error("Failed to spawn scrub: %s", e)
+            return False
+        finally:
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
 
     def check_battery_voltage(self, input_data):
         """
