@@ -21,7 +21,7 @@ import pytest
 
 
 def _run_install(unified_install_dir, work_dir, extra_args=None, path_prepend=None,
-                 return_result=False):
+                 return_result=False, skip_hardware=True):
     """Run install.sh --wifi --dry-run and return the parsed manifest.
 
     By default brokkr and post-install run (only packages/hardware/extras are
@@ -39,8 +39,9 @@ def _run_install(unified_install_dir, work_dir, extra_args=None, path_prepend=No
     if path_prepend:
         env["PATH"] = f"{path_prepend}:{env['PATH']}"
 
-    args = ["01", "--wifi", "--dry-run",
-            "--skip-packages", "--skip-hardware", "--skip-extras"]
+    args = ["01", "--wifi", "--dry-run", "--skip-packages", "--skip-extras"]
+    if skip_hardware:
+        args.append("--skip-hardware")
     if extra_args:
         args += extra_args
 
@@ -178,6 +179,30 @@ class TestOwnershipNormalize:
                 if op.get("type") == "command"]
         assert any("chown -R pi:pi /home/pi/dev" in c for c in cmds), \
             "pi ownership normalization of /home/pi/dev missing"
+
+
+class TestMountpointCleanup:
+    """sensor-log #52: stale-mountpoint cleanup oneshot installed + enabled."""
+
+    def test_cleanup_unit_installed_and_enabled(self, unified_install_dir, tmp_path):
+        manifest = _run_install(unified_install_dir, tmp_path / "mp", skip_hardware=False)
+        unit = "hamma-cleanup-stale-mountpoints.service"
+        copies = [op for op in manifest["operations"]
+                  if op.get("type") == "copy" and unit in op.get("dst", "")]
+        assert copies, f"{unit} not copied into /etc/systemd/system"
+        enables = [op for op in manifest["operations"]
+                   if op.get("type") == "systemctl" and op.get("action") == "enable"
+                   and unit in op.get("service", "")]
+        assert enables, f"{unit} not enabled"
+
+    def test_cleanup_unit_file_is_valid(self, repo_root):
+        """The shipped unit must be well-formed and safe (rmdir-only)."""
+        unit = repo_root / "files" / "hamma-cleanup-stale-mountpoints.service"
+        text = unit.read_text()
+        assert "Type=oneshot" in text
+        assert "Before=udisks2.service" in text, "must run before udisks auto-mount"
+        assert "rmdir" in text and "rm -rf" not in text, \
+            "cleanup must use rmdir (empty-only), never rm -rf"
 
 
 class TestBestEffortNonFatal:
