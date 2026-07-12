@@ -3,6 +3,7 @@ Plugin to monitor state variables from the charge controller.
 """
 
 from math import nan
+import glob
 import shlex
 import shutil
 import subprocess
@@ -43,6 +44,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_command="",
         scrub_cooldown_s=1800,
         scrub_log="",
+        recovery_low_gb=25,
+        hs_stale_s=900,
+        futile_scrub_alert_after=3,
         **output_step_kwargs,
         ):
         """
@@ -85,6 +89,19 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Path to append the spawned scrub's stdout/stderr to. If empty
             (default), scrub output is discarded (DEVNULL). Set this so a scrub
             that runs but frees nothing is diagnosable instead of silent.
+        recovery_low_gb : numeric, optional
+            Alert when the roomiest `/media/pi/DATA??` recovery-target drive has
+            less than this many GB free (the "nowhere left to recover to"
+            condition). Default 25. Alert-only; never spawns a scrub.
+        hs_stale_s : numeric, optional
+            Alert when no numeric `bytes_remaining` (Health & Status) has been
+            seen from the AGS for this many seconds (the AGS is silent /
+            reboot-looping). Default 900. Independent of AGS-pushed telemetry
+            value; catches the gap `check_ping` misses.
+        futile_scrub_alert_after : int, optional
+            Alert when the auto-scrub has re-fired this many consecutive times
+            while the drive stays below `low_space` without clearing (scrubbing
+            isn't working; a human should intervene). Default 3.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -111,6 +128,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # state (so we alert on descent-entry and on each respawn, not every cycle).
         self._last_scrub_time = None
         self._low_space_active = False
+        # v2 disk-safety monitors
+        self.recovery_low_gb = recovery_low_gb
+        self.hs_stale_s = hs_stale_s
+        self.futile_scrub_alert_after = futile_scrub_alert_after
+        self._recovery_low_active = False   # Layer 1 alert latch
+        self._hs_stale_active = False       # Layer 2 alert latch
+        self._last_numeric_hs_time = None   # Layer 2 staleness clock (lazy-init)
+        self._scrub_respawn_count = 0       # Layer 3 consecutive low-state respawns
+        self._futile_scrub_alerted = False  # Layer 3 one-shot latch
 
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -225,6 +251,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if self.enable_drive_checks:
             checks.insert(0, self.check_drive)
             checks.append(self.check_sensor_drive)
+            checks.append(self.check_recovery_drives)
+            checks.append(self.check_hs_staleness)
 
         for check_fn in checks:
             try:
@@ -372,8 +400,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             return None
 
         if space_now >= self.low_space:
-            # Healthy: re-arm so the next descent below the threshold alerts.
+            # Healthy: re-arm so the next descent below the threshold alerts, and
+            # reset the futile-scrub-loop tracking (the scrub cleared the drive).
             self._low_space_active = False
+            self._scrub_respawn_count = 0
+            self._futile_scrub_alerted = False
             return None
 
         # Below threshold. LEVEL-TRIGGERED (not edge): spawn a scrub whenever
@@ -383,8 +414,22 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # and on each (re)spawn, so a persistently full drive escalates instead
         # of going silent after one message.
         spawned = self._maybe_spawn_scrub()
+        if spawned:
+            self._scrub_respawn_count += 1
         first_entry = not self._low_space_active
         self._low_space_active = True
+
+        # Futile-scrub-loop escalation: the scrub keeps re-firing but the drive
+        # is not clearing. A symptom alert -- it does not classify *why* (nothing
+        # purgeable vs purged-but-still-full), only that scrubbing isn't working,
+        # so a human should intervene. One-shot until the drive recovers.
+        if (self._scrub_respawn_count >= self.futile_scrub_alert_after
+                and not self._futile_scrub_alerted):
+            self._futile_scrub_alerted = True
+            return (f"Auto-scrub re-fired {self._scrub_respawn_count}x without "
+                    f"clearing low space ({space_now:.1f} GB) -- manual "
+                    f"intervention needed")
+
         if first_entry or spawned:
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
@@ -450,6 +495,85 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                     log_fh.close()
                 except OSError:
                     pass
+
+    def check_recovery_drives(self, input_data):
+        """
+        Check free space on the mj-side recovery-target drives (/media/pi/DATA??).
+
+        These are where brokkr writes live science data AND where the scrubber
+        recovers AGS triggers. If they all fill, brokkr can't write and recovery
+        has nowhere to land. A single drive at 100% is normal (rotation), so we
+        alert only when the *roomiest* drive is low. Local and telemetry-
+        independent (no AGS dependency). Alert-only -- a full DATA drive is not
+        fixed by scrubbing the AGS.
+
+        Returns
+        -------
+        str | None
+            Message if the roomiest drive is below `recovery_low_gb`, else None.
+        """
+        paths = glob.glob("/media/pi/DATA??")
+        if not paths:
+            # No DATA drives resolved -- leave the "no drives" alert to check_drive.
+            return None
+        frees = []
+        for path in paths:
+            try:
+                frees.append(shutil.disk_usage(path).free)
+            except OSError:
+                # Drive unmounted mid-check; skip it rather than aborting.
+                continue
+        if not frees:
+            # Non-empty glob but every path errored -- avoid max([]) ValueError.
+            return None
+
+        threshold = self.recovery_low_gb * (2 ** 30)
+        best_free = max(frees)
+        if best_free >= threshold:
+            self._recovery_low_active = False  # re-arm
+            return None
+        if self._recovery_low_active:
+            return None  # already alerted this descent
+        self._recovery_low_active = True
+        below = sum(1 for f in frees if f < threshold)
+        return (f"Recovery drives low: best DATA?? has {best_free / (2 ** 30):.1f} GB "
+                f"free ({below}/{len(frees)} below {self.recovery_low_gb} GB)")
+
+    def check_hs_staleness(self, input_data):
+        """
+        Alert if the AGS has stopped sending Health & Status (`bytes_remaining`).
+
+        This is telemetry-*presence* monitoring, independent of the value. It
+        fires precisely when the value-based `check_sensor_drive` goes blind: the
+        AGS app crashed / is reboot-looping, so `bytes_remaining` is continuously
+        NA. It is NOT redundant with `check_ping` -- ping hits the AGS Pi kernel
+        (which comes up every ~60 s boot in a reboot loop, so `bad_ping` resets
+        below `ping_max`), whereas this catches "AGS pingable but not sending
+        data" (the gap that let a prior reboot loop run ~5.5 days unnoticed).
+
+        Returns
+        -------
+        str | None
+            Message if H&S has been stale longer than `hs_stale_s`, else None.
+        """
+        now = time.monotonic()
+        if self._last_numeric_hs_time is None:
+            self._last_numeric_hs_time = now  # lazy-init from first call
+        hs_now, _ = self.now_then(input_data, 'bytes_remaining')
+
+        # Same numeric guard as check_sensor_drive: 'NA' -> nan, and None/''
+        # /unexpected values are non-numeric. A numeric sample = H&S is flowing.
+        if isinstance(hs_now, (int, float)) and hs_now == hs_now:
+            self._last_numeric_hs_time = now  # reset clock BEFORE measuring
+            self._hs_stale_active = False
+            return None
+
+        gap = now - self._last_numeric_hs_time
+        if gap > self.hs_stale_s and not self._hs_stale_active:
+            self._hs_stale_active = True
+            return (f"H&S from AGS stale for {gap / 60:.0f} min -- AGS may be "
+                    f"silent / reboot-looping")
+        return None
 
     def check_battery_voltage(self, input_data):
         """

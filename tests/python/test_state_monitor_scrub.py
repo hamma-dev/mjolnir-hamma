@@ -79,6 +79,10 @@ def make_monitor(scrub_command="", low_space=100, space_previous=150,
     mon.scrub_log = scrub_log
     mon._last_scrub_time = last_scrub_time
     mon._low_space_active = low_space_active
+    # v2 futile-scrub-loop state (check_sensor_drive reads these)
+    mon.futile_scrub_alert_after = 3
+    mon._scrub_respawn_count = 0
+    mon._futile_scrub_alerted = False
     mon.logger = MagicMock()
     mon._previous_data = make_input_data(space_previous)
     return mon

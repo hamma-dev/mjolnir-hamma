@@ -60,6 +60,9 @@ config_version = 1
         scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
         scrub_cooldown_s = 1800  # min seconds between auto-scrub launches while low (level-triggered retry)
         scrub_log = "/home/pi/brokkr/hamma/log/hamma_scrub_auto.log"  # capture auto-scrub output (diagnose futile/failed scrubs)
+        recovery_low_gb = 25  # alert if the roomiest /media/pi/DATA?? drive has less than this GB free
+        hs_stale_s = 900  # alert if no numeric bytes_remaining (H&S) from the AGS for this many seconds
+        futile_scrub_alert_after = 3  # alert if the auto-scrub re-fires this many times without clearing low space
 
     # Step to create HAMMA plot
     [steps.hamma_plot]
