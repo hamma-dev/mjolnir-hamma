@@ -346,7 +346,8 @@ check_hamma_repo_access() {
     # The private pbitzer/hamma repo needs the ed25519 deploy key authorized on
     # GitHub. Key generation is automated, but authorization is a manual step
     # that gets missed (sensor-log #11). ls-remote exercises the key.
-    if sudo -H -u pi git -C /home/pi/dev/hamma ls-remote >/dev/null 2>&1; then
+    if sudo -H -u pi env GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10' \
+            git -C /home/pi/dev/hamma ls-remote >/dev/null 2>&1; then
         pass "hamma deploy key authorized (git ls-remote works)"
     else
         fail "hamma deploy key not working — add id_ed25519.pub to pbitzer/hamma deploy keys"

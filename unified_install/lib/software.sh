@@ -393,6 +393,7 @@ fetch_notification_key() {
     if scp_err=$(sudo -H -u pi scp -o BatchMode=yes -o ConnectTimeout=10 \
             -o StrictHostKeyChecking=no "$key_src" "$key_dst" 2>&1); then
         chown pi:pi "$key_dst" 2>/dev/null || true
+        chmod 600 "$key_dst" 2>/dev/null || true  # webhook token — keep it private
         log_success "Fetched .googlechat notification key"
     else
         log_warn "Could not fetch .googlechat key: ${scp_err:-unknown error}"
@@ -460,19 +461,21 @@ cleanup_legacy_services() {
     # Current names are autossh-hamma-default / brokkr-hamma-default; these
     # bare names are the retired pre-default units, safe to remove.
     local legacy=(autossh-hamma.service brokkr-hamma.service)
+    # Overridable for tests (defaults to the real path).
+    local systemd_dir="${LEGACY_SYSTEMD_DIR:-/etc/systemd/system}"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         local svc
         for svc in "${legacy[@]}"; do
             log_dry_run "disable + rm + reset-failed $svc (if present)"
-            manifest_add "command" "cmd" "rm -f /etc/systemd/system/$svc" "sudo" "true" "best_effort" "true"
+            manifest_add "command" "cmd" "rm -f $systemd_dir/$svc" "sudo" "true" "best_effort" "true"
         done
         return 0
     fi
 
     local removed=0 svc unit
     for svc in "${legacy[@]}"; do
-        unit="/etc/systemd/system/$svc"
+        unit="$systemd_dir/$svc"
         [[ -f "$unit" ]] || continue
         log_info "Removing legacy $svc"
         systemctl disable --now "$svc" 2>/dev/null || true
@@ -496,7 +499,13 @@ cleanup_legacy_services() {
 normalize_pi_ownership() {
     log_step "Normalizing pi ownership of home paths..."
 
-    local paths=(/home/pi/dev /home/pi/.ssh /home/pi/.config)
+    # Overridable for tests (defaults to the real pi-owned paths).
+    local paths
+    if [[ -n "${PI_OWN_PATHS:-}" ]]; then
+        read -ra paths <<< "$PI_OWN_PATHS"
+    else
+        paths=(/home/pi/dev /home/pi/.ssh /home/pi/.config)
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         local p

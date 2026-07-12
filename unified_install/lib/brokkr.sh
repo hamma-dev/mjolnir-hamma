@@ -117,7 +117,9 @@ install_brokkr() {
     # Buster. Pin <2.0 on Python 3.7; newer Python can take the current release.
     # (HAM-84 — mirrors the cartopy version-detection in install_pyltg.)
     local python_minor
-    python_minor=$(python3 -c "import sys; print(sys.version_info.minor)")
+    # Fall back to a high value if the probe yields nothing, so an empty result
+    # doesn't silently pin (bash treats "" as 0 in [[ -le ]]).
+    python_minor=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo 99)
     local gpiozero_spec="gpiozero"
     if [[ "$python_minor" -le 7 ]]; then
         gpiozero_spec="gpiozero<2.0"

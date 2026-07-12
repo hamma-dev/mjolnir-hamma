@@ -1,15 +1,19 @@
 """
-Tests for the HAM-120 install-gap fixes.
+Tests for the HAM-120 install-gap fixes and follow-on install hardening.
 
-These run install.sh in --dry-run mode and assert the manifest contains the
-new post-install operations:
+Most tests run install.sh in --dry-run mode and assert the manifest contains the
+expected operations; TestBestEffortNonFatal instead sources the lib functions
+under `set -e` in a sandbox to prove the Phase 7 steps never abort the install.
 
-  - HAM-84:  gpiozero is installed, pinned <2.0 on Python 3.7
-  - HAM-118: .googlechat notification key is fetched from the server
-  - HAM-80:  datasync user is provisioned locally
-
-All assertions are against the dry-run manifest, matching the pattern in
-test_script_execution.py.
+Coverage:
+  - HAM-84:  gpiozero installed, pinned <2.0 on Python <=3.7 (auto-heal above)
+  - HAM-118: .googlechat notification key fetched from the server
+  - HAM-80:  datasync user provisioned locally
+  - HAM-158: notifiers installed editable
+  - legacy systemd unit cleanup, pi-ownership normalization
+  - stale-mountpoint cleanup oneshot (install + unit-file validity)
+  - --skip-postinstall gating (with positive control)
+  - best-effort / non-fatal behavior of every Phase 7 step under set -e
 """
 
 import json
@@ -200,7 +204,14 @@ class TestMountpointCleanup:
         unit = repo_root / "files" / "hamma-cleanup-stale-mountpoints.service"
         text = unit.read_text()
         assert "Type=oneshot" in text
-        assert "Before=udisks2.service" in text, "must run before udisks auto-mount"
+        # Load-bearing ordering: must run before the mounter (brokkr / multi-user).
+        assert "Before=multi-user.target" in text, "must be ordered before multi-user.target"
+        # [Install]/WantedBy is required or `systemctl enable` is a silent no-op
+        # and the whole feature is dead.
+        assert "[Install]" in text and "WantedBy=multi-user.target" in text, \
+            "unit needs [Install] WantedBy or enable does nothing"
+        # ExecStart must target the DATA?? glob — the actual thing being fixed.
+        assert "/media/pi/DATA??" in text, "ExecStart must target the /media/pi/DATA?? glob"
         assert "rmdir" in text and "rm -rf" not in text, \
             "cleanup must use rmdir (empty-only), never rm -rf"
 
@@ -215,7 +226,7 @@ class TestBestEffortNonFatal:
     function returned instead of aborting.
     """
 
-    def _harness(self, unified_install_dir, func_call):
+    def _harness(self, unified_install_dir, func_call, prelude=""):
         lib = unified_install_dir / "lib"
         script = f"""
             set -e
@@ -232,46 +243,62 @@ class TestBestEffortNonFatal:
             scp() {{ return 1; }}           # forced failure (guarded)
             systemctl() {{ return 1; }}     # forced failure (guarded)
             rm() {{ return 1; }}            # forced failure (guarded)
-            sudo() {{ "$@"; }}              # strip sudo, run the (stubbed) command
+            # Strip sudo's own flags (-H, -u <user>, ...) so the SHADOWED command
+            # is what actually runs — otherwise "sudo -H -u pi scp" would exec
+            # "-H" and never reach the scp shadow.
+            sudo() {{ while [[ "${{1:-}}" == -* ]]; do if [[ "$1" == "-u" ]]; then shift 2; else shift; fi; done; "$@"; }}
             DRY_RUN=false
+            {prelude}
             {func_call}
             echo "HARNESS_REACHED_END"
         """
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
-    def test_setup_datasync_local_never_aborts(self, unified_install_dir):
-        r = self._harness(unified_install_dir, "setup_datasync_local")
+    def _assert_reached_end(self, r, func):
         assert "HARNESS_REACHED_END" in r.stdout, (
-            "setup_datasync_local aborted under set -e when a command failed "
+            f"{func} aborted under set -e when a command failed "
             f"(best-effort contract violated).\nstdout: {r.stdout}\nstderr: {r.stderr}"
         )
-        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+        assert r.returncode == 0, f"non-zero exit: {r.returncode}\nstderr: {r.stderr}"
 
-    def test_fetch_notification_key_never_aborts(self, unified_install_dir, tmp_path):
-        # Point HOME at an empty tmp dir so the key_dst existence check is false
-        # and the scp path (forced-fail) is exercised.
+    def test_setup_datasync_local_never_aborts(self, unified_install_dir):
+        r = self._harness(unified_install_dir, "setup_datasync_local")
+        self._assert_reached_end(r, "setup_datasync_local")
+        # The forced-fail usermod guard must have fired (proves we reached the body).
+        assert "Could not add datasync to pi group" in r.stdout
+
+    def test_fetch_notification_key_never_aborts(self, unified_install_dir):
+        # /home/pi/.googlechat is absent on the test host, so the scp branch runs;
+        # the fixed sudo shim ensures the scp shadow (forced-fail) is exercised.
         r = self._harness(unified_install_dir, "fetch_notification_key")
-        assert "HARNESS_REACHED_END" in r.stdout, (
-            "fetch_notification_key aborted under set -e on scp failure.\n"
-            f"stdout: {r.stdout}\nstderr: {r.stderr}"
-        )
-        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+        self._assert_reached_end(r, "fetch_notification_key")
+        assert "Could not fetch .googlechat key" in r.stdout, \
+            "scp-failure guard not exercised (sudo shim may not reach the scp shadow)"
 
     def test_normalize_pi_ownership_never_aborts(self, unified_install_dir):
-        r = self._harness(unified_install_dir, "normalize_pi_ownership")
-        assert "HARNESS_REACHED_END" in r.stdout, (
-            "normalize_pi_ownership aborted under set -e on chown/chmod failure.\n"
-            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        # Point PI_OWN_PATHS at real tmp dirs so the per-path chown guard actually
+        # runs (with chown forced to fail), not just the trailing chmod.
+        # `command mkdir` bypasses the shadowed no-op mkdir so the dirs really exist.
+        prelude = (
+            'D=$(mktemp -d); command mkdir -p "$D/dev" "$D/.ssh"; '
+            'export PI_OWN_PATHS="$D/dev $D/.ssh"'
         )
-        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+        r = self._harness(unified_install_dir, "normalize_pi_ownership", prelude=prelude)
+        self._assert_reached_end(r, "normalize_pi_ownership")
+        assert "Could not normalize ownership" in r.stdout, \
+            "per-path chown guard not exercised"
 
     def test_cleanup_legacy_services_never_aborts(self, unified_install_dir):
-        r = self._harness(unified_install_dir, "cleanup_legacy_services")
-        assert "HARNESS_REACHED_END" in r.stdout, (
-            "cleanup_legacy_services aborted under set -e.\n"
-            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        # Point LEGACY_SYSTEMD_DIR at a tmp dir containing the legacy unit files
+        # so the loop body (systemctl/rm/reset-failed, all forced-fail) runs.
+        prelude = (
+            'D=$(mktemp -d); : > "$D/autossh-hamma.service"; : > "$D/brokkr-hamma.service"; '
+            'export LEGACY_SYSTEMD_DIR="$D"'
         )
-        assert r.returncode == 0, f"non-zero exit: {r.returncode}"
+        r = self._harness(unified_install_dir, "cleanup_legacy_services", prelude=prelude)
+        self._assert_reached_end(r, "cleanup_legacy_services")
+        assert "Could not remove" in r.stdout, \
+            "rm-failure guard not exercised (loop body did not run)"
 
 
 class TestSkipPostinstall:
