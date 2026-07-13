@@ -157,8 +157,20 @@ that is exactly the regime the level-triggered `xx` purge covers between timer t
 **Measured (mj05 → AGS, Jul 13):** per-file purge baseline **~100 s / 500 files** (plain
 per-op SSH); **batched over one `ControlMaster` connection: 0.163 s / ~480 files** (4
 chunked `rm` calls) — a **~600×** speedup. Purge ceases to be a bottleneck; a full scrub's
-cost collapses onto the MJ scan (~20 s), which §3.3's incremental scan then attacks. A fast
-scrub of ~20–30 s against the 200 GB purge start leaves ~16 min of max-rate runway.
+cost collapses onto the MJ scan (~20 s), which the incremental scan below then attacks. A
+fast scrub of ~20–30 s against the 200 GB purge start leaves ~16 min of max-rate runway.
+
+**Prototype validated on-sensor (mj05, Jul 13, Python 3.7.3, real files):** the implemented
+`open_control_master` + batched `purge_ags_files` deleted 230 throwaway AGS files in
+**0.117 s** vs a **~63 s** plain-per-file baseline (~500×), confirmed the drive empty after,
+and tore the master down cleanly. See `perf(scrub)` commit; 26 unit tests.
+
+**Scan-cost-under-load finding (important, drives the incremental scan):** the same day,
+under active AGS recording, a full scrub's **AGS scan alone rose from ~1 s to 99 s** (9 →
+35 files) and the MJ scan stretched to minutes — pure USB read/write contention with the
+live recording. Once purge is ~free, the scan is *the* bottleneck, and it inflates exactly
+when the system is busiest. The incremental scan (below) is therefore not optional polish —
+it is the load-bearing piece for keeping a periodic scrub cheap.
 
 
 - **Persistent SSH** to the AGS via `ControlMaster`/`ControlPersist` (one connection reused
