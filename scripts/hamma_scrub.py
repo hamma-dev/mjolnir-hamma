@@ -13,6 +13,7 @@ Usage:
 
 # Standard library imports
 import argparse
+import contextlib
 import glob
 import json
 import logging
@@ -52,6 +53,12 @@ MIN_FREE_SPACE = 104857600  # 100MB minimum free space on target drive
 RECOVER_TIMEOUT = 60  # seconds per dd extraction
 ORPHAN_MAX_AGE = 3600  # seconds (1 hour) before orphaned temps are deleted
 
+# SSH / throughput constants
+SSH_CONNECT_TIMEOUT = 10  # seconds to establish an SSH connection (fail fast)
+CONTROL_PERSIST = 60      # seconds the shared ControlMaster lingers after last use
+PURGE_CHUNK_SIZE = 100    # AGS files deleted per batched `rm` (one SSH round-trip)
+PURGE_TIMEOUT = 30        # seconds per batched delete chunk
+
 # Exit codes
 EXIT_OK = 0
 EXIT_MISSING = 1
@@ -65,6 +72,106 @@ GPS_UTC_OFFSET_OFFSET = 86  # float32
 GPS_SUBSECOND_OFFSET = 94   # uint32
 GPS_ECC_OFFSET = 98         # uint32
 GPS_EPOCH = 315964800        # UTC epoch for GPS week 0
+
+
+def ssh_cmd(host, remote_command, control_path=None):
+    """Build an ssh command list for a remote command on the AGS.
+
+    Adds ``BatchMode`` (never prompt) and ``ConnectTimeout`` (fail fast on a
+    sick/unreachable AGS). When ``control_path`` is given, routes over an
+    existing ControlMaster socket so many calls reuse one connection.
+
+    Parameters
+    ----------
+    host : str
+        SSH host (e.g. ``hamma``).
+    remote_command : str
+        The command to run on the remote host.
+    control_path : str or None
+        Path to a ControlMaster socket to reuse, or None for a fresh connection.
+
+    Returns
+    -------
+    list of str
+        The argv for ``subprocess.run``/``Popen``.
+    """
+    cmd = ["ssh", "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT)]
+    if control_path:
+        cmd += ["-o", "ControlPath={}".format(control_path)]
+    cmd += [host, remote_command]
+    return cmd
+
+
+def open_control_master(host):
+    """Start a shared SSH ControlMaster to ``host``; return its socket path.
+
+    Reusing the socket lets many ``ssh_cmd`` calls skip the per-connection
+    handshake (~16x faster per round-trip, measured). The master lingers
+    ``CONTROL_PERSIST`` seconds after the last use, so it self-closes even
+    without an explicit teardown.
+
+    Parameters
+    ----------
+    host : str
+        SSH host (e.g. ``hamma``).
+
+    Returns
+    -------
+    str or None
+        ControlMaster socket path, or None if setup failed (callers then fall
+        back to per-call connections transparently).
+    """
+    control_path = "/tmp/hamma_scrub_cm_{}.sock".format(os.getpid())
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+             "-o", "ControlMaster=yes",
+             "-o", "ControlPersist={}".format(CONTROL_PERSIST),
+             "-o", "ControlPath={}".format(control_path),
+             host, "true"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=SSH_CONNECT_TIMEOUT + 5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning("ControlMaster setup error (%s); using per-call SSH", e)
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            "ControlMaster setup failed (%s); using per-call SSH",
+            result.stderr.decode('utf-8', errors='replace').strip())
+        return None
+    return control_path
+
+
+def close_control_master(host, control_path):
+    """Tear down a ControlMaster socket opened by ``open_control_master``."""
+    if not control_path:
+        return
+    try:
+        subprocess.run(
+            ["ssh", "-o", "ControlPath={}".format(control_path),
+             "-O", "exit", host],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+@contextlib.contextmanager
+def ssh_control_master(host):
+    """Context-manager form of :func:`open_control_master` with teardown.
+
+    Yields the socket path (or None if setup failed) and always closes the
+    master on exit.
+    """
+    control_path = open_control_master(host)
+    try:
+        yield control_path
+    finally:
+        close_control_master(host, control_path)
 
 
 def extract_headers(fileobj, file_size, filename):
@@ -399,7 +506,7 @@ def decode_strider_output(data):
     return entries
 
 
-def scan_ags_files(ags_host, ags_path):
+def scan_ags_files(ags_host, ags_path, control_path=None):
     """Run remote strider on AGS sensor and collect headers.
 
     Parameters
@@ -454,9 +561,11 @@ def scan_ags_files(ags_host, ags_path):
         if local_tmp is not None and os.path.exists(local_tmp):
             os.unlink(local_tmp)
 
-    run_cmd = ["ssh", ags_host,
-               "python3 {script} {path}; rm -f {script}".format(
-                   script=remote_script, path=ags_path)]
+    run_cmd = ssh_cmd(
+        ags_host,
+        "python3 {script} {path}; rm -f {script}".format(
+            script=remote_script, path=ags_path),
+        control_path=control_path)
     logger.debug("Running: %s", " ".join(run_cmd))
 
     result = subprocess.run(
@@ -740,7 +849,8 @@ def select_target_drive(mj_path, min_free=MIN_FREE_SPACE):
     return None
 
 
-def extract_trigger(ags_host, ags_path, filename, offset, size):
+def extract_trigger(ags_host, ags_path, filename, offset, size,
+                    control_path=None):
     """Extract a single trigger from AGS via SSH dd.
 
     Parameters
@@ -755,6 +865,8 @@ def extract_trigger(ags_host, ags_path, filename, offset, size):
         Byte offset in file.
     size : int
         Total bytes to extract (header + payload + padding).
+    control_path : str or None
+        ControlMaster socket to reuse for the SSH call.
 
     Returns
     -------
@@ -766,7 +878,7 @@ def extract_trigger(ags_host, ags_path, filename, offset, size):
         "dd if={} iflag=skip_bytes,count_bytes bs=4096"
         " skip={} count={} status=none"
     ).format(filepath, offset, size)
-    cmd = ["ssh", ags_host, dd_cmd]
+    cmd = ssh_cmd(ags_host, dd_cmd, control_path=control_path)
     logger.debug("Extracting: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -972,8 +1084,15 @@ def identify_purgeable_files(ags_entries, mj_headers, recovery_results=None):
     return {"purgeable": purgeable, "retained": retained}
 
 
-def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
-    """Delete AGS files via SSH.
+def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
+                    control_path=None):
+    """Delete AGS files via SSH, batched over one connection.
+
+    Files are deleted in chunks of ``PURGE_CHUNK_SIZE`` — a single
+    ``rm -f f1 f2 ...`` per chunk (one SSH round-trip) rather than one SSH per
+    file. Reusing a ControlMaster socket (``control_path``) collapses the
+    per-file cost by ~16x; batching collapses the round-trip count. Chunk
+    status maps to every file in the chunk (delete succeeds/fails as a unit).
 
     Parameters
     ----------
@@ -985,6 +1104,8 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
         Filenames to delete.
     dry_run : bool
         If True, log what would be deleted but take no action.
+    control_path : str or None
+        ControlMaster socket to reuse for the SSH calls.
 
     Returns
     -------
@@ -993,50 +1114,45 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
         and optional error.
     """
     results = []
-    for fname in filenames:
-        remote_path = "{}/{}".format(ags_path, fname)
+
+    def _record(chunk, status, error):
+        for fname in chunk:
+            results.append({"filename": fname, "status": status, "error": error})
+
+    for start in range(0, len(filenames), PURGE_CHUNK_SIZE):
+        chunk = filenames[start:start + PURGE_CHUNK_SIZE]
 
         if dry_run:
-            logger.info("Would delete: %s:%s", ags_host, remote_path)
-            results.append({
-                "filename": fname,
-                "status": "dry_run",
-                "error": None,
-            })
+            for fname in chunk:
+                logger.info("Would delete: %s:%s/%s", ags_host, ags_path, fname)
+            _record(chunk, "dry_run", None)
             continue
 
-        cmd = ["ssh", ags_host, "rm " + shlex.quote(remote_path)]
-        logger.info("Deleting: %s:%s", ags_host, remote_path)
+        remote_paths = [
+            shlex.quote("{}/{}".format(ags_path, fname)) for fname in chunk
+        ]
+        rm_command = "rm -f " + " ".join(remote_paths)
+        cmd = ssh_cmd(ags_host, rm_command, control_path=control_path)
+        logger.info("Deleting %d AGS file(s) on %s", len(chunk), ags_host)
         try:
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=15,
+                timeout=PURGE_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            logger.warning("Timeout deleting %s on %s", fname, ags_host)
-            results.append({
-                "filename": fname,
-                "status": "failed",
-                "error": "SSH timeout (15s)",
-            })
+            logger.warning("Timeout deleting %d file(s) on %s",
+                           len(chunk), ags_host)
+            _record(chunk, "failed", "SSH timeout ({}s)".format(PURGE_TIMEOUT))
             continue
 
         if result.returncode != 0:
             stderr = result.stderr.decode('utf-8', errors='replace').strip()
-            logger.warning("Failed to delete %s: %s", fname, stderr)
-            results.append({
-                "filename": fname,
-                "status": "failed",
-                "error": stderr,
-            })
+            logger.warning("Failed to delete chunk on %s: %s", ags_host, stderr)
+            _record(chunk, "failed", stderr)
         else:
-            results.append({
-                "filename": fname,
-                "status": "deleted",
-                "error": None,
-            })
+            _record(chunk, "deleted", None)
 
     return results
 
@@ -1071,7 +1187,8 @@ def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
     return count
 
 
-def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
+def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False,
+                     control_path=None):
     """Recover missing triggers from AGS to MJ DATA drives.
 
     Parameters
@@ -1174,7 +1291,8 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
             continue
 
         # Extract trigger via SSH dd
-        data = extract_trigger(ags_host, ags_path, src_file, src_offset, size)
+        data = extract_trigger(ags_host, ags_path, src_file, src_offset, size,
+                               control_path=control_path)
         if data is None:
             results.append({
                 "source_file": src_file,
@@ -1579,6 +1697,11 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         "warnings": [],
     }
 
+    # Recovery + purge reuse one SSH connection (per-op cost ~16x lower).
+    # It self-closes via ControlPersist; close_control_master() below is the
+    # happy-path teardown, with ControlPersist as the exception backstop.
+    control_path = open_control_master(ags_host)
+
     # Recovery flow
     recovery_results = None
     if recover and comparison["missing_on_mj"]:
@@ -1589,6 +1712,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         )
         recovery_results = recover_triggers(
             candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
+            control_path=control_path,
         )
         recovered_count = len([r for r in recovery_results
                                if r["status"] == "recovered"])
@@ -1623,7 +1747,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         if eligibility["purgeable"]:
             purge_deletions = purge_ags_files(
                 ags_host, ags_path, eligibility["purgeable"],
-                dry_run=dry_run,
+                dry_run=dry_run, control_path=control_path,
             )
         else:
             purge_deletions = []
@@ -1647,6 +1771,8 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             "retained": eligibility["retained"],
             "dry_run": dry_run,
         }
+
+    close_control_master(ags_host, control_path)
 
     if json_output:
         print(format_json_report(results, ags_host,

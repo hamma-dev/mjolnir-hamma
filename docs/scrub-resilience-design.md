@@ -154,6 +154,13 @@ that is exactly the regime the level-triggered `xx` purge covers between timer t
 
 ### 3.3 Make the scrub fast (so it can survive surges)
 
+**Measured (mj05 → AGS, Jul 13):** per-file purge baseline **~100 s / 500 files** (plain
+per-op SSH); **batched over one `ControlMaster` connection: 0.163 s / ~480 files** (4
+chunked `rm` calls) — a **~600×** speedup. Purge ceases to be a bottleneck; a full scrub's
+cost collapses onto the MJ scan (~20 s), which §3.3's incremental scan then attacks. A fast
+scrub of ~20–30 s against the 200 GB purge start leaves ~16 min of max-rate runway.
+
+
 - **Persistent SSH** to the AGS via `ControlMaster`/`ControlPersist` (one connection reused
   for all `dd`/`rm`): measured **16× per-op speedup** (0.29 s → 0.018 s). Add
   `-o BatchMode=yes -o ConnectTimeout=10` so a sick AGS fails fast instead of hanging.

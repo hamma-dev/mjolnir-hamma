@@ -397,12 +397,16 @@ class TestScanAgsFiles:
             "10.10.10.1:/tmp/hamma_strider.py",
         ]
 
-        # SSH runs the deployed script (no stdin piping)
-        assert run_call[0][0] == [
-            "ssh", "10.10.10.1",
+        # SSH runs the deployed script (no stdin piping). Command is built via
+        # ssh_cmd(), so it carries BatchMode/ConnectTimeout opts; host and the
+        # remote command are the last two argv elements.
+        run_argv = run_call[0][0]
+        assert run_argv[0] == "ssh"
+        assert "BatchMode=yes" in run_argv
+        assert run_argv[-2] == "10.10.10.1"
+        assert run_argv[-1] == (
             "python3 /tmp/hamma_strider.py /ags/data; "
-            "rm -f /tmp/hamma_strider.py",
-        ]
+            "rm -f /tmp/hamma_strider.py")
 
         # Local temp file written and cleaned up
         mock_write.assert_called_once_with(
@@ -1468,9 +1472,10 @@ class TestPurgeAgsFiles:
 
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert cmd[1] == "hamma"
-        # shlex.quote wraps paths with spaces in single quotes
-        assert "'/ags/data/ags file.bin'" in cmd[2]
+        assert "hamma" in cmd
+        # remote rm command is the last argv element; path is shlex-quoted
+        assert "'/ags/data/ags file.bin'" in cmd[-1]
+        assert cmd[-1].startswith("rm -f ")
 
 
 class TestRecoveryReport:
@@ -1829,6 +1834,14 @@ class TestCLI:
 class TestMain:
     """Test main() integration."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_control_master(self, hamma_scrub):
+        """run() opens a real SSH ControlMaster; stub it out in unit tests."""
+        with patch.object(hamma_scrub, "open_control_master",
+                          return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"):
+            yield
+
     def test_exit_code_0_all_match(self, hamma_scrub):
         """All matched -> exit code 0."""
         hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
@@ -2157,6 +2170,14 @@ class TestMain:
 class TestRunSinceAuto:
     """Test --since auto integration in run()."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_control_master(self, hamma_scrub):
+        """run() opens a real SSH ControlMaster; stub it out in unit tests."""
+        with patch.object(hamma_scrub, "open_control_master",
+                          return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"):
+            yield
+
     def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
         """run() with since='auto' derives cutoff from AGS entries."""
         hdr = _make_gps_header()
@@ -2229,3 +2250,127 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             assert rc == hamma_scrub.EXIT_SSH_ERROR
+
+
+class TestSshCmd:
+    """Test the ssh command builder (BatchMode/ConnectTimeout + optional ControlMaster)."""
+
+    def test_basic_command_has_host_and_remote(self, hamma_scrub):
+        cmd = hamma_scrub.ssh_cmd("hamma", "rm -f /x")
+        assert cmd[0] == "ssh"
+        assert "hamma" in cmd
+        assert cmd[-1] == "rm -f /x"
+
+    def test_includes_batchmode_and_connecttimeout(self, hamma_scrub):
+        joined = " ".join(hamma_scrub.ssh_cmd("hamma", "true"))
+        assert "BatchMode=yes" in joined
+        assert "ConnectTimeout=" in joined
+
+    def test_no_control_path_by_default(self, hamma_scrub):
+        joined = " ".join(hamma_scrub.ssh_cmd("hamma", "true"))
+        assert "ControlPath" not in joined
+
+    def test_control_path_added_when_given(self, hamma_scrub):
+        joined = " ".join(
+            hamma_scrub.ssh_cmd("hamma", "true", control_path="/tmp/cm.sock"))
+        assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestPurgeBatching:
+    """Purge deletes in chunks over one connection, not one SSH per file."""
+
+    def _ok(self):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b''
+        return m
+
+    def test_one_ssh_call_per_chunk_not_per_file(self, hamma_scrub):
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False)
+        # 250 files, chunk size 100 -> 3 calls, not 250
+        assert mock_run.call_count == 3
+        assert len(results) == 250
+        assert all(r["status"] == "deleted" for r in results)
+
+    def test_chunk_command_deletes_multiple_files(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        remote = mock_run.call_args[0][0][-1]
+        assert "/ags/data/a.bin" in remote
+        assert "/ags/data/b.bin" in remote
+
+    def test_chunk_failure_marks_all_in_chunk_failed(self, hamma_scrub):
+        m = MagicMock()
+        m.returncode = 255
+        m.stderr = b'Connection closed by remote host'
+        with patch("subprocess.run", return_value=m):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        assert all(r["status"] == "failed" for r in results)
+        assert "Connection closed" in results[0]["error"]
+
+    def test_passes_control_path_through(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin"], dry_run=False,
+                control_path="/tmp/cm.sock")
+        joined = " ".join(mock_run.call_args[0][0])
+        assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestSshControlMaster:
+    """Test the shared-connection context manager."""
+
+    def _ok(self):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b''
+        return m
+
+    def test_yields_socket_path_on_success(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is not None
+                assert isinstance(cp, str)
+
+    def test_yields_none_when_master_fails(self, hamma_scrub):
+        bad = MagicMock()
+        bad.returncode = 255
+        bad.stderr = b'connect failed'
+        with patch("subprocess.run", return_value=bad):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is None
+
+    def test_yields_none_on_setup_timeout(self, hamma_scrub):
+        with patch("subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=15)):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is None
+
+    def test_tears_down_master_on_exit(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            with hamma_scrub.ssh_control_master("hamma"):
+                pass
+        last_cmd = mock_run.call_args_list[-1][0][0]
+        assert "-O" in last_cmd
+        assert "exit" in last_cmd
+
+
+class TestExtractTriggerControlPath:
+    """extract_trigger routes through ssh_cmd and honors control_path."""
+
+    def test_control_path_in_ssh_command(self, hamma_scrub):
+        header, body = _make_trigger()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = header + body
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "ags001.bin", 1000, len(header + body),
+                control_path="/tmp/cm.sock")
+        joined = " ".join(mock_run.call_args[0][0])
+        assert "ControlPath=/tmp/cm.sock" in joined
