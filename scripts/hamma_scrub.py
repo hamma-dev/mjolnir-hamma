@@ -79,6 +79,12 @@ DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 # adds no SD wear; a reboot just costs one full scan.
 DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.json"
 
+# Durable per-run CSV of MJ-scan cache performance (hit-rate over time). Unlike
+# the /dev/shm status/cache, this lives on disk so a cold scan (cache lost
+# between runs) leaves a reviewable trail. Rotated by the same log tooling.
+DEFAULT_METRICS_FILE = os.path.expanduser(
+    "~/brokkr/hamma/log/scrub_metrics.csv")
+
 # Exit codes
 EXIT_OK = 0
 EXIT_MISSING = 1
@@ -444,6 +450,46 @@ def _refresh_cache_dirs(cache_file, dirs):
         _save_scan_cache(cache_file, cache)
 
 
+SCAN_METRICS_HEADER = (
+    "utc,dirs_cached,dirs_total,cold,scan_seconds,recovered,purged")
+
+
+def write_scan_metrics(path, mj, recovered, purged):
+    """Append one CSV row summarizing this run's MJ-scan cache performance.
+
+    Durable (unlike the /dev/shm status file), so cache hit-rate can be reviewed
+    over time. A ``cold`` row (0 dirs cached over a large total) flags that the
+    cache was lost between runs -- the signal to catch a real-world cache miss.
+    When the cache is disabled (full scanner, no ``cache_hits``) the cache
+    columns are left blank rather than reporting a bogus cold flag. ``path`` of
+    None disables it; best-effort, never raises.
+    """
+    if not path:
+        return
+    try:
+        hits = mj.get("cache_hits")
+        total = mj.get("dirs_total")
+        if hits is None or total is None:
+            hits_s = total_s = cold_s = ""      # full scanner: no cache stats
+        else:
+            hits_s, total_s = str(hits), str(total)
+            cold_s = "1" if (total > 0 and hits == 0) else "0"
+        utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = "{},{},{},{},{},{},{}\n".format(
+            utc, hits_s, total_s, cold_s,
+            round(mj.get("elapsed", 0), 1), recovered, purged)
+        new_file = not os.path.exists(path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a") as f:
+            if new_file:
+                f.write(SCAN_METRICS_HEADER + "\n")
+            f.write(row)
+    except OSError as e:
+        logger.debug("Could not write scan metrics %s: %s", path, e)
+
+
 def scan_mj_files(base_path, since=None, cache_file=None):
     """Scan local mjolnir .bin files and collect headers.
 
@@ -537,6 +583,7 @@ def _scan_mj_incremental(base_path, since, cache_file):
         "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
         "cache_hits": cache_hits,
+        "dirs_total": len(new_cache),
     }
 
 
@@ -1897,13 +1944,18 @@ def _build_parser():
              "headers instead of re-reading every file (default: %(default)s; "
              "empty string forces a full scan every run)",
     )
+    parser.add_argument(
+        "--metrics-file", default=DEFAULT_METRICS_FILE,
+        help="Durable CSV appended one row per run with MJ-scan cache "
+             "hit-rate/timing (default: %(default)s; empty string disables)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
         purge=False, status_file=DEFAULT_STATUS_FILE,
-        mj_cache=DEFAULT_MJ_CACHE):
+        mj_cache=DEFAULT_MJ_CACHE, metrics_file=DEFAULT_METRICS_FILE):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1983,11 +2035,13 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
         write_status(status_file, "done", recovered=0, purged=0)
+        write_scan_metrics(metrics_file, mj, 0, 0)
         return EXIT_OK
 
     if mj["file_count"] == 0 and mj["skipped"] == 0:
         logger.error("No DATA drives or .bin files found at %s", mj_path)
         write_status(status_file, "error", error="no MJ drives/files")
+        write_scan_metrics(metrics_file, mj, 0, 0)
         return EXIT_NO_DATA
 
     comparison = compare_headers(ags["entries"], mj["headers"])
@@ -2093,11 +2147,11 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                 "dry_run": dry_run,
             }
 
-    write_status(
-        status_file, "done",
-        recovered=len([r for r in (recovery_results or [])
-                       if r["status"] == "recovered"]),
-        purged=len((purge_results or {}).get("deleted", [])))
+    recovered_n = len([r for r in (recovery_results or [])
+                       if r["status"] == "recovered"])
+    purged_n = len((purge_results or {}).get("deleted", []))
+    write_status(status_file, "done", recovered=recovered_n, purged=purged_n)
+    write_scan_metrics(metrics_file, mj, recovered_n, purged_n)
 
     if json_output:
         print(format_json_report(results, ags_host,
@@ -2145,6 +2199,7 @@ def main():
         purge=args.purge,
         status_file=args.status_file or None,
         mj_cache=args.mj_cache or None,
+        metrics_file=args.metrics_file or None,
     )
     sys.exit(rc)
 

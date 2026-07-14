@@ -411,6 +411,21 @@ When it does roll out, two things do **not** happen automatically and must be in
 
 ## Changelog
 
+- **v4 (mj05 hardware validation + cache hardening):** Ran the scrubber on mj05
+  against real `/ags/data` (AGS stopped): recovered to `DATA56`, purged 78 files,
+  freed ~72GB, retained the 1 corrupt + active file (recover-before-delete held).
+  Resilience features confirmed live: bounded 5.6s AGS scan, honest logging,
+  tmpfs heartbeat advancing. Incremental MJ-scan cache proven at scale —
+  **174× speedup** (1587s cold → 9.1s warm, 1191/1193 dirs cached on 1193 dirs);
+  an initial "cache never hits" report was chased to ground and shown to be
+  *not* a bug (RemoveIPC is off, no cleaner exists, aged cache still hits).
+  Two follow-ups landed: (1) `_refresh_cache_dirs()` refreshes the cache entries
+  for dirs that recovery wrote into (the cache is saved mid-scan, pre-recover, so
+  those dirs were re-read next run); (2) `write_scan_metrics()` appends a durable
+  per-run CSV (`~/brokkr/hamma/log/scrub_metrics.csv`: dirs_cached/total, cold
+  flag, scan_seconds, recovered, purged) so cache hit-rate is reviewable over
+  time and a real-world cold scan leaves a trail. `scrub_auto_recover` still off
+  (#81 unchanged).
 - **v3 (final capstone pass):** Closed the deploy/coverage gaps from the two integration/
   completeness reviews. Code: `low_space` now accepted-and-ignored (won't crash mj54's
   override, C1); `scrub_auto_recover` default flipped to **false** (bench-gate, M1); added a

@@ -1854,12 +1854,13 @@ class TestMain:
 
     @pytest.fixture(autouse=True)
     def _stub_control_master(self, hamma_scrub):
-        """run() opens a real SSH ControlMaster + writes a status file to the
-        real home; stub both out in unit tests."""
+        """run() opens a real SSH ControlMaster + writes a status/metrics file
+        to the real home; stub them out in unit tests."""
         with patch.object(hamma_scrub, "open_control_master",
                           return_value=None), \
              patch.object(hamma_scrub, "close_control_master"), \
-             patch.object(hamma_scrub, "write_status"):
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"):
             yield
 
     def test_exit_code_0_all_match(self, hamma_scrub):
@@ -2192,12 +2193,13 @@ class TestRunSinceAuto:
 
     @pytest.fixture(autouse=True)
     def _stub_control_master(self, hamma_scrub):
-        """run() opens a real SSH ControlMaster + writes a status file to the
-        real home; stub both out in unit tests."""
+        """run() opens a real SSH ControlMaster + writes a status/metrics file
+        to the real home; stub them out in unit tests."""
         with patch.object(hamma_scrub, "open_control_master",
                           return_value=None), \
              patch.object(hamma_scrub, "close_control_master"), \
-             patch.object(hamma_scrub, "write_status"):
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"):
             yield
 
     def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
@@ -2474,6 +2476,7 @@ class TestRunControlMasterWiring:
         with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
              patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
              patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"), \
              patch.object(hamma_scrub, "open_control_master",
                           return_value=sentinel) as mock_open, \
              patch.object(hamma_scrub, "close_control_master") as mock_close, \
@@ -2720,3 +2723,43 @@ class TestIncrementalScan:
         assert not os.path.exists(missing)          # nothing created from nothing
         hamma_scrub._refresh_cache_dirs(None, [str(tmp_path)])   # None cache
         hamma_scrub._refresh_cache_dirs(str(tmp_path / "c.json"), [])  # no dirs
+
+
+class TestScanMetrics:
+    """A durable per-run CSV of MJ-scan cache performance (hit-rate over time)."""
+
+    HEADER = "utc,dirs_cached,dirs_total,cold,scan_seconds,recovered,purged"
+
+    def test_writes_header_then_row(self, hamma_scrub, tmp_path):
+        path = str(tmp_path / "m.csv")
+        mj = {"cache_hits": 1191, "dirs_total": 1193, "elapsed": 9.14}
+        hamma_scrub.write_scan_metrics(path, mj, recovered=4, purged=78)
+        lines = open(path).read().splitlines()
+        assert lines[0] == self.HEADER
+        # utc is field 0; the rest are the recorded values (warm scan -> cold=0)
+        assert lines[1].split(",")[1:] == ["1191", "1193", "0", "9.1", "4", "78"]
+
+    def test_appends_without_duplicating_header_and_flags_cold(
+            self, hamma_scrub, tmp_path):
+        path = str(tmp_path / "m.csv")
+        cold = {"cache_hits": 0, "dirs_total": 1193, "elapsed": 500.0}
+        hamma_scrub.write_scan_metrics(path, cold, recovered=0, purged=0)
+        hamma_scrub.write_scan_metrics(path, cold, recovered=0, purged=0)
+        lines = open(path).read().splitlines()
+        assert lines.count(self.HEADER) == 1        # header written once
+        assert len(lines) == 3                       # header + 2 rows
+        assert lines[1].split(",")[3] == "1"         # 0/1193 -> cold flagged
+
+    def test_full_scanner_has_blank_cache_fields(self, hamma_scrub, tmp_path):
+        """When the cache is disabled (full scanner), there are no cache stats;
+        the row records blanks rather than a bogus cold flag."""
+        path = str(tmp_path / "m.csv")
+        hamma_scrub.write_scan_metrics(
+            path, {"elapsed": 3.0}, recovered=1, purged=2)
+        row = open(path).read().splitlines()[1].split(",")
+        assert row[1] == "" and row[2] == "" and row[3] == ""   # no cache stats
+
+    def test_none_path_is_noop(self, hamma_scrub, tmp_path):
+        hamma_scrub.write_scan_metrics(
+            None, {"cache_hits": 1, "dirs_total": 1, "elapsed": 1.0}, 0, 0)
+        assert not (tmp_path / "m.csv").exists()
