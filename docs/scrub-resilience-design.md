@@ -332,10 +332,13 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
    are arithmetic starting points.
 3. **Incremental-scan cache invalidation** (compression rewrites, udisks suffixed mounts
    `DATA071`) — fall back to full scan on cache miss/anomaly.
-4. **`bytes_remaining` = `/ags/data` free** is established empirically (fills to 0; scrub
-   targets the same drive; 448.96 ≈ 462 GB). This **contradicts an internal MEMORY note**
-   claiming it is sensor-internal storage, not the AGS drive — resolve/correct that note
-   before building the thresholds on it.
+4. **`bytes_remaining` = free space at the `/ags/data` mount on the AGS Pi, in GB** —
+   **user-confirmed 2026-07-14**, consistent with the empirical read (fills to 0; scrub targets
+   the same mount; 448.96 ≈ 462 GB) and with the df cross-check on mj03/mj08. Do *not*
+   over-specify the medium: `/ags/data` is usually a USB drive but can be internal/SD on some
+   units (mj54 lacks the USB drive, HAM-110). Thresholds key off this signal; the residual
+   risk is only that it goes **NA** when the AGS is dark (§6/§3.4, mitigated by the
+   `hs_stale_cycles` watchdog), not that it points at the wrong drive.
 5. **ControlMaster socket** is `/tmp/hamma_scrub_cm_<pid>.sock` — PID reuse after a hard
    crash can collide with a stale socket (degrades to slow per-call SSH, silently). Consider
    `%C`-hashed paths or stale-unlink. And `/tmp`-full during a disk-fill disables the
