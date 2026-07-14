@@ -105,7 +105,9 @@ def _make_monitor(**overrides):
         method="gchat",
         channel="status",
         key_file="/dev/null",
-        low_space=100,
+        purge_space=200,
+        alert_space=75,
+        scrub_cooldown_s=1800,
         power_delim=15,
         enable_drive_checks=True,
     )
@@ -114,58 +116,78 @@ def _make_monitor(**overrides):
     return monitor
 
 
-class TestCheckSensorDriveBoundary:
-    """check_sensor_drive must fire when pre lands exactly on low_space.
-
-    Real-world miss (mj07, 2026-05-28 15:25:03 UTC):
-    bytes_remaining went from 100.0 -> 99.96 GB. Strict `>` against
-    low_space=100 missed the edge. After that, bytes_remaining only
-    decreased, so no future edge could ever fire.
+class TestTwoThresholdDrain:
+    """check_sensor_drive is LEVEL-triggered across two thresholds (§3.4):
+    drain while free < purge_space; alert (once) when free < alert_space
+    despite the draining. The old edge trigger fired once at the crossing and
+    never retried -- the mj05 failure mode this replaces.
     """
 
-    def test_pre_exactly_at_threshold_fires(self):
-        """pre = low_space exactly; now below -> fires."""
-        m = _make_monitor(low_space=100)
-        m._previous_data = {"bytes_remaining": _dv(100.0)}
-        with patch.object(m, "_spawn_scrub") as spawn:
-            msg = m.check_sensor_drive({"bytes_remaining": _dv(99.96)})
-        spawn.assert_called_once()
-        assert msg is not None
-        assert "99.9" in msg or "100.0" in msg or "99.96" in msg
+    def _prev(self, m, v=250.0):
+        m._previous_data = {"bytes_remaining": _dv(v)}
 
-    def test_pre_above_now_below_fires(self):
-        """Standard down-cross: pre clearly above, now clearly below -> fires."""
-        m = _make_monitor(low_space=100)
-        m._previous_data = {"bytes_remaining": _dv(150.0)}
+    def test_above_purge_threshold_no_spawn_no_alert(self):
+        m = _make_monitor()
+        self._prev(m)
         with patch.object(m, "_spawn_scrub") as spawn:
-            msg = m.check_sensor_drive({"bytes_remaining": _dv(80.0)})
-        spawn.assert_called_once()
-        assert msg is not None
-
-    def test_both_below_threshold_no_fire(self):
-        """No edge if already below: pre=50, now=45 -> no fire."""
-        m = _make_monitor(low_space=100)
-        m._previous_data = {"bytes_remaining": _dv(50.0)}
-        with patch.object(m, "_spawn_scrub") as spawn:
-            msg = m.check_sensor_drive({"bytes_remaining": _dv(45.0)})
+            msg = m.check_sensor_drive({"bytes_remaining": _dv(220.0)})
         spawn.assert_not_called()
         assert msg is None
 
-    def test_both_above_threshold_no_fire(self):
-        """No edge if still above: pre=200, now=150 -> no fire."""
-        m = _make_monitor(low_space=100)
-        m._previous_data = {"bytes_remaining": _dv(200.0)}
+    def test_below_purge_above_alert_drains_no_alert(self):
+        """150 GB: below purge(200) but above alert(75) -> drain, no alert."""
+        m = _make_monitor()
+        self._prev(m)
         with patch.object(m, "_spawn_scrub") as spawn:
             msg = m.check_sensor_drive({"bytes_remaining": _dv(150.0)})
-        spawn.assert_not_called()
-        assert msg is None
+        spawn.assert_called_once()   # level-triggered drain
+        assert msg is None           # no alert in the purge band
 
-    def test_now_exactly_at_threshold_no_fire(self):
-        """now exactly on threshold is NOT below; spec is strict `now <`."""
-        m = _make_monitor(low_space=100)
-        m._previous_data = {"bytes_remaining": _dv(150.0)}
+    def test_below_alert_drains_and_alerts_once(self):
+        m = _make_monitor()
+        self._prev(m)
         with patch.object(m, "_spawn_scrub") as spawn:
-            msg = m.check_sensor_drive({"bytes_remaining": _dv(100.0)})
+            msg1 = m.check_sensor_drive({"bytes_remaining": _dv(50.0)})
+            msg2 = m.check_sensor_drive({"bytes_remaining": _dv(45.0)})
+        assert msg1 is not None and "50.0" in msg1
+        assert msg2 is None          # one-shot alert
+        spawn.assert_called_once()   # cooldown holds the 2nd spawn
+
+    def test_level_trigger_fires_even_when_already_below(self):
+        """Unlike the old edge trigger: pre already below purge still drains."""
+        m = _make_monitor()
+        self._prev(m, v=150.0)       # previous ALSO below purge
+        with patch.object(m, "_spawn_scrub") as spawn:
+            m.check_sensor_drive({"bytes_remaining": _dv(140.0)})
+        spawn.assert_called_once()
+
+    def test_cooldown_gates_repeat_spawns(self):
+        m = _make_monitor(scrub_cooldown_s=1800)
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub") as spawn:
+            m.check_sensor_drive({"bytes_remaining": _dv(150.0)})  # spawns
+            m.check_sensor_drive({"bytes_remaining": _dv(148.0)})  # within cooldown
+        spawn.assert_called_once()
+        # After the cooldown elapses, a fresh spawn is allowed.
+        m._last_scrub_spawn = None
+        with patch.object(m, "_spawn_scrub") as spawn2:
+            m.check_sensor_drive({"bytes_remaining": _dv(146.0)})
+        spawn2.assert_called_once()
+
+    def test_alert_rearms_after_recovery_above_purge(self):
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub"):
+            assert m.check_sensor_drive({"bytes_remaining": _dv(50.0)}) is not None
+            # recover above purge -> re-arm
+            assert m.check_sensor_drive({"bytes_remaining": _dv(210.0)}) is None
+            assert m.check_sensor_drive({"bytes_remaining": _dv(50.0)}) is not None
+
+    def test_na_reading_no_spawn_no_alert(self):
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub") as spawn:
+            msg = m.check_sensor_drive({"bytes_remaining": _dv("NA")})
         spawn.assert_not_called()
         assert msg is None
 

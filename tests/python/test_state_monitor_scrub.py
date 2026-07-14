@@ -70,12 +70,17 @@ def make_input_data(bytes_remaining):
     return {"bytes_remaining": FakeDataValue(bytes_remaining)}
 
 
-def make_monitor(scrub_command="", low_space=100, space_previous=150,
+def make_monitor(scrub_command="", purge_space=200, alert_space=75,
+                 scrub_cooldown_s=1800, space_previous=250,
                  scrub_hang_timeout_s=900, scrub_status_file="/tmp/nonexistent",
                  scrub_auto_recover=True, scrub_log=""):
     """Create a StateMonitor instance with test defaults."""
     mon = StateMonitor.__new__(StateMonitor)
-    mon.low_space = low_space
+    mon.purge_space = purge_space
+    mon.alert_space = alert_space
+    mon.scrub_cooldown_s = scrub_cooldown_s
+    mon._last_scrub_spawn = None
+    mon._low_space_alerted = False
     mon.scrub_command = scrub_command
     mon.logger = MagicMock()
     mon._previous_data = make_input_data(space_previous)
@@ -93,7 +98,8 @@ def make_monitor(scrub_command="", low_space=100, space_previous=150,
 # --- Tests ---
 
 class TestScrubSpawning:
-    """Test that check_sensor_drive spawns scrub on threshold crossing."""
+    """check_sensor_drive drains (spawns) whenever free < purge_space --
+    level-triggered, not on a one-shot edge (§3.4)."""
 
     @pytest.fixture(autouse=True)
     def _lock_free(self):
@@ -102,69 +108,43 @@ class TestScrubSpawning:
                           return_value="free"):
             yield
 
-    def test_scrub_spawned_on_low_space(self):
-        """When space drops below threshold, scrub process is spawned."""
+    def test_scrub_spawned_below_purge(self):
+        """Free below purge_space -> scrub spawned (no alert above alert_space)."""
         mon = make_monitor(
-            scrub_command="python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto",
-            space_previous=150,
-        )
+            scrub_command="python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto")
+        with patch("subprocess.Popen") as mock_popen:
+            msg = mon.check_sensor_drive(make_input_data(90))  # 75 < 90 < 200
+        assert msg is None                 # purge band: drain, no alert
+        mock_popen.assert_called_once()
+        assert "flock" in mock_popen.call_args[0][0][0]
 
+    def test_spawns_even_when_previous_also_below(self):
+        """Level, not edge: already below on the prior sample still drains."""
+        mon = make_monitor(scrub_command="python3 /path/to/scrub.py",
+                           space_previous=80)
+        with patch("subprocess.Popen") as mock_popen:
+            mon.check_sensor_drive(make_input_data(70))
+        mock_popen.assert_called_once()
+
+    def test_no_scrub_when_command_empty(self):
+        mon = make_monitor(scrub_command="")
         with patch("subprocess.Popen") as mock_popen:
             msg = mon.check_sensor_drive(make_input_data(90))
-
-        assert msg is not None
-        mock_popen.assert_called_once()
-        popen_cmd = mock_popen.call_args[0][0]
-        assert "flock" in popen_cmd[0]
-
-    def test_no_scrub_when_already_below(self):
-        """No scrub if space was already below threshold (not a crossing)."""
-        mon = make_monitor(
-            scrub_command="python3 /path/to/scrub.py --recover --purge --since auto",
-            space_previous=80,
-        )
-
-        with patch("subprocess.Popen") as mock_popen:
-            msg = mon.check_sensor_drive(make_input_data(70))
-
         assert msg is None
         mock_popen.assert_not_called()
 
-    def test_no_scrub_when_command_empty(self):
-        """No scrub if scrub_command is empty."""
-        mon = make_monitor(scrub_command="", space_previous=150)
-
-        with patch("subprocess.Popen") as mock_popen:
-            msg = mon.check_sensor_drive(make_input_data(90))
-
-        assert msg is not None  # alert still fires
-        mock_popen.assert_not_called()
-
     def test_scrub_failure_logged_not_raised(self):
-        """If Popen fails, error is logged but check_sensor_drive still returns."""
-        mon = make_monitor(
-            scrub_command="python3 /path/to/scrub.py",
-            space_previous=150,
-        )
-
+        mon = make_monitor(scrub_command="python3 /path/to/scrub.py")
         with patch("subprocess.Popen", side_effect=OSError("flock not found")):
-            msg = mon.check_sensor_drive(make_input_data(90))
-
-        assert msg is not None
+            mon.check_sensor_drive(make_input_data(90))  # must not raise
         mon.logger.error.assert_called()
 
     def test_flock_uses_lock_file(self):
-        """Popen command uses flock with a specific lock file."""
         mon = make_monitor(
-            scrub_command="python3 /path/to/scrub.py --recover --purge --since auto",
-            space_previous=150,
-        )
-
+            scrub_command="python3 /path/to/scrub.py --recover --purge --since auto")
         with patch("subprocess.Popen") as mock_popen:
             mon.check_sensor_drive(make_input_data(90))
-
         popen_cmd = mock_popen.call_args[0][0]
-        # Should be: flock -n /tmp/hamma_scrub.lock <scrub_command>
         assert popen_cmd[0] == "flock"
         assert popen_cmd[1] == "-n"
         assert "hamma_scrub.lock" in popen_cmd[2]
@@ -174,13 +154,10 @@ class TestScrubSpawning:
         assert popen_kwargs["stderr"] == subprocess.DEVNULL
 
     def test_no_scrub_when_command_whitespace_only(self):
-        """No scrub if scrub_command is whitespace-only."""
-        mon = make_monitor(scrub_command="   ", space_previous=150)
-
+        mon = make_monitor(scrub_command="   ")
         with patch("subprocess.Popen") as mock_popen:
             msg = mon.check_sensor_drive(make_input_data(90))
-
-        assert msg is not None  # alert still fires
+        assert msg is None
         mock_popen.assert_not_called()
 
 

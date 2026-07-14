@@ -50,7 +50,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self,
         method=None,
         power_delim=1,
-        low_space=100,
+        purge_space=200,
+        alert_space=75,
+        scrub_cooldown_s=300,
         ping_max=3,
         channel=None,
         key_file=None,
@@ -75,9 +77,17 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             The delimiter between normal power and low power.
             If power falls below this value, it is considered low
             and a notification will be generated.
-        low_space : numeric, optional
-            If the number of gigabytes remaining falls below this threshold, generate
-            a notification.
+        purge_space : numeric, optional
+            GB free on the AGS drive below which to run the scrub proactively
+            (level-triggered, every scrub_cooldown_s). No alert -- this is the
+            "drain harder" band. Default 200.
+        alert_space : numeric, optional
+            GB free below which to alert: free fell this far *despite* the
+            purging, so purge is losing. Default 75 (< purge_space).
+        scrub_cooldown_s : numeric, optional
+            Minimum seconds between level-triggered scrub launches while free is
+            below purge_space (retry cadence). Default 300 (5 min) -- more responsive
+            than the 15-min §3.3 timer, which is the coarse backstop.
         ping_max : int, optional
             The maximum number of consecutive ping errors before we send an error message
             via `method`. Any ping errors are still logged locally.
@@ -119,7 +129,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # Setup simpleeval parser and class initial state
         self._previous_data = None
         self.power_delim = power_delim
-        self.low_space = low_space
+        # Two-threshold drain/escalation on the AGS drive (§3.4). purge_space =
+        # proactive-drain band; alert_space = "purge is losing" alarm.
+        self.purge_space = purge_space
+        self.alert_space = alert_space
+        self.scrub_cooldown_s = scrub_cooldown_s
+        self._last_scrub_spawn = None   # monotonic; level-trigger retry gate
+        self._low_space_alerted = False
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
         self.low_pi_space = low_pi_space*1000000000
@@ -369,12 +385,18 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         return None
 
     def check_sensor_drive(self, input_data):
-        """
-        Check the remaining space on sensor.
+        """Two-threshold drain + escalation on the AGS drive (§3.4).
 
-        This will check to see how much space is remaining on a sensor USB drive.
-        If it falls below the value given by the class attribute `low_space`,
-        send a message and optionally spawn a scrub process.
+        LEVEL-triggered, not edge (the old edge fired once at the crossing and
+        never retried -- the mj05 failure mode). While free < `purge_space`, run
+        the scrub every `scrub_cooldown_s` (proactive drain, more responsive
+        than the §3.3 timer). If free falls below `alert_space` *despite* the
+        purging -- purge is losing -- alert once (re-arm when free recovers
+        above `purge_space`).
+
+        Fair-weather layer: `bytes_remaining` goes NA when the AGS is dark, so a
+        non-numeric reading is skipped; the §3.3 timer + §3.2 stuck-detector
+        cover the AGS-dark case.
 
         Parameters
         ----------
@@ -384,18 +406,40 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         Returns
         -------
         str | None
-            Message to send depending on the check, or None if no message.
-
+            Alert message when free first drops below `alert_space`, else None.
         """
-        space_now, space_pre = self.now_then(input_data, 'bytes_remaining')
-        # Use >= for `pre` so a previous sample sitting exactly on the
-        # threshold still counts as above it. Strict `>` silently misses
-        # the edge when pre lands on low_space (a real case on mj07:
-        # 100.0 -> 99.96 with low_space=100 never fired).
-        if (space_now < self.low_space) and (space_pre >= self.low_space):
-            self._spawn_scrub()
-            return f"Remaining GB on drive is {space_now:.1f}"
+        space_now, _space_pre = self.now_then(input_data, 'bytes_remaining')
+        if not isinstance(space_now, (int, float)) or space_now != space_now:
+            return None  # NA / non-numeric -> can't evaluate
+        if space_now >= self.purge_space:
+            # Healthy: re-arm the alert and the immediate-spawn on next descent.
+            self._low_space_alerted = False
+            self._last_scrub_spawn = None
+            return None
+        # Below the purge threshold: drain proactively (level-triggered + cooldown).
+        self._maybe_spawn_scrub()
+        # Below the alert threshold too: purge is losing -> alert once.
+        if space_now < self.alert_space and not self._low_space_alerted:
+            self._low_space_alerted = True
+            return ("Sensor drive low: {:.1f} GB free (below {:g} GB) and still "
+                    "falling despite auto-scrub -- intervention may be needed"
+                    .format(space_now, self.alert_space))
         return None
+
+    def _maybe_spawn_scrub(self):
+        """Spawn a scrub at most once per `scrub_cooldown_s` (level-trigger retry).
+
+        The cooldown stops check_sensor_drive from re-attempting every 60 s
+        monitor cycle while free stays below `purge_space`. `_spawn_scrub`
+        itself no-ops (via the flock probe) if a scrub is already running.
+        """
+        now = time.monotonic()
+        if (self._last_scrub_spawn is not None
+                and now - self._last_scrub_spawn < self.scrub_cooldown_s):
+            return False
+        self._last_scrub_spawn = now
+        self._spawn_scrub()
+        return True
 
     def _scrub_lock_state(self):
         """Return 'held', 'free', or 'unknown' for the scrub flock.

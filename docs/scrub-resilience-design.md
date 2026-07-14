@@ -213,6 +213,11 @@ A systemd timer (~15 min) that runs the scrub regardless of `bytes_remaining`.
 
 ### 3.4 Two-threshold escalation — fair-weather improvement (would NOT have prevented mj05)
 
+**Built:** `check_sensor_drive` in `state_monitor.py` is now level-triggered across
+`purge_space=200` / `alert_space=75` (replacing the single edge-triggered `low_space`);
+`_maybe_spawn_scrub` gates re-spawns to `scrub_cooldown_s=1800`; NA readings are skipped
+(fair-weather). Config keys in `main.toml`; tests in `test_state_monitor.py::TestTwoThresholdDrain`.
+
 Split `low_space` into a **purge** and a higher-urgency **alert** threshold, level-evaluated:
 
 - **Purge at `xx = 200 GB` free**: while free < `xx`, run the scrub every cooldown

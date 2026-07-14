@@ -52,7 +52,9 @@ config_version = 1
     [steps.state_monitor]
         _preset = "state_monitor.outputs.plugin"
         power_delim = 15  # delimiter between normal power and low power
-        low_space = 100  # if # of GB is less than this, generate a notification
+        purge_space = 200  # GB free on the AGS drive below which to drain proactively (level-triggered, no alert)
+        alert_space = 75   # GB free below which to alert: falling despite the auto-scrub (purge losing)
+        scrub_cooldown_s = 300  # min seconds between level-triggered scrub launches while below purge_space (more responsive than the 15-min timer)
         ping_max = 3  # after this many pings, send chat message
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"
