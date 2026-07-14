@@ -282,6 +282,37 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
 
 ---
 
+## §3.2 as-built + red-team corrections (honest scope)
+
+Built and reviewed (3 adversarial reviewers). **What §3.2 genuinely delivers:** it
+eliminates the *permanently-stuck lock* (the §1.1b silent-no-op mode) and the DEVNULL
+blindness, and auto-recovers **as soon as the AGS is reachable again**. **What it does NOT
+do (and no code can):** prevent the `/ags/data` fill while the AGS itself is wedged — killing
+a hung scrub frees the lock, not AGS bytes; only a *completed purge* drains the drive, and
+that needs a reachable AGS. Re-using the freed lock relies on the re-spawn below **plus the
+§3.3 timer** as the real backstop (the space trigger is edge-based and won't re-fire).
+
+Corrections applied after review (all three were CRITICAL false-kill or fail-open vectors):
+- **Heartbeat on tmpfs (`/dev/shm`), not the SD root.** The SD fills from logs during the
+  incident (HAM-112/113); a heartbeat that can't be written would make a healthy scrub look
+  hung. tmpfs stays writable when the SD is full.
+- **Detection by heartbeat *advancement* in the monitor's own `monotonic` clock**, never the
+  scrub's wall-clock `timestamp`. Immune to (a) sensor clock skew / NTP steps (a future
+  timestamp no longer disables detection; a backward step no longer false-kills) and (b) a
+  stale heartbeat left by a *previous* run (grace is counted from when the monitor first sees
+  the lock held, so a fresh scrub is never judged against an old file).
+- **Re-spawn after a successful kill** so the freed lock is used (§3.3 timer is the backstop).
+- Kill-path test hardening: assert the process **group** (not the pid) is `SIGKILL`ed, and
+  that the PID-reuse guard actually guards (both mutations now caught); `_pid_is_scrub`
+  matches `hamma_scrub.py`, not a loose substring; `write_status` atomicity asserted by
+  mechanism (temp + `os.replace`).
+
+**Deployment gate:** `scrub_auto_recover=true` is defensible now that the false-kill vectors
+are closed, but it kills processes — validate on a bench/idle unit (inject a real hung scrub)
+before enabling fleet-wide. The durable `scrub_log` on the SD still self-disables (→DEVNULL)
+under a full SD; accepted (degrades to old behavior; the tmpfs heartbeat is the load-bearing
+signal).
+
 ## Changelog
 
 - **v2 (post red-team):** Re-ranked §3 — silent-failure-mode elimination (§3.1) and

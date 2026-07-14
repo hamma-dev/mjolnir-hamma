@@ -2504,3 +2504,14 @@ class TestWriteStatus:
         hamma_scrub.write_status(p, "done", purged=5)
         data = json.loads(pathlib.Path(p).read_text())
         assert data["phase"] == "done" and data["purged"] == 5
+
+    def test_writes_via_temp_then_os_replace(self, hamma_scrub, tmp_path):
+        # Atomicity MECHANISM: writes go to a temp path then os.replace onto the
+        # target (a reader never sees a torn file). A non-atomic direct write
+        # would fail this.
+        p = str(tmp_path / "status.json")
+        with patch("os.replace", wraps=os.replace) as mock_replace:
+            hamma_scrub.write_status(p, "scan", purged=0)
+        assert mock_replace.call_count == 1
+        src, dst = mock_replace.call_args[0]
+        assert src == p + ".tmp" and dst == p

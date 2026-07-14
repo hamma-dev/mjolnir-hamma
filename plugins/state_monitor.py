@@ -25,8 +25,8 @@ import brokkr.utils.output
 SCRUB_LOCK_FILE = "/tmp/hamma_scrub.lock"
 # Heartbeat/status file the scrub writes as it advances (must match
 # hamma_scrub.DEFAULT_STATUS_FILE); read to tell a working scrub from a hung one.
-DEFAULT_SCRUB_STATUS_FILE = os.path.expanduser(
-    "~/brokkr/hamma/log/hamma_scrub_status.json")
+# On tmpfs so it stays writable when the SD root fills (the incident condition).
+DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 # Durable log capturing the scrub's own stdout/stderr (mj05 ran blind because
 # this was DEVNULL'd). Rotated at SCRUB_LOG_MAX_BYTES so it can't fill the disk.
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
@@ -132,7 +132,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.scrub_status_file = scrub_status_file
         self.scrub_auto_recover = scrub_auto_recover
         self.scrub_log = scrub_log
-        self._scrub_first_held = None
+        self._scrub_first_held = None      # monotonic; when lock streak began
+        self._scrub_last_progress = None   # monotonic; last heartbeat advance
+        self._scrub_progress_token = None  # last-seen heartbeat identity
         self._stuck_scrub_alerted = False
 
         self.notifier = Notifier(
@@ -510,7 +512,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                     "utf-8", "replace")
         except OSError:
             return False
-        return "hamma_scrub" in cmdline
+        return "hamma_scrub.py" in cmdline
 
     def _recover_stuck_scrub(self, status):
         """Kill a genuinely-hung scrub to free the lock. Returns True if killed.
@@ -540,17 +542,33 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             "Killed hung scrub PID %s (process group) to free the lock", pid)
         return True
 
+    @staticmethod
+    def _progress_token(status):
+        """Identity of a heartbeat -- changes whenever the scrub advances.
+
+        We compare tokens for *change* across cycles; we never interpret the
+        scrub's ``timestamp`` as an absolute time, so a skewed/NTP-stepped
+        sensor clock can neither disable detection nor cause a false kill.
+        """
+        if not status:
+            return None
+        return (status.get("pid"), status.get("timestamp"),
+                status.get("phase"), status.get("recovered"),
+                status.get("purged"))
+
     def check_scrub_health(self, input_data):
         """Detect and (optionally) recover a *hung* scrub -- progress-gated.
 
-        "Hung" is defined as: the lock is held AND the scrub has made no
-        progress (stale heartbeat) for `scrub_hang_timeout_s`. This
-        distinguishes a hang from a legitimately long recovery (which keeps the
-        heartbeat fresh), avoiding cry-wolf. On a genuine hang, if
-        `scrub_auto_recover` is set, kill the stale scrub to free the lock
-        (self-healing -- a timer alone can't do this); alert once either way.
-        Re-arms when the lock frees. 'unknown' lock state (e.g. disk full) is
-        treated as suspicious, not free.
+        "Hung" = the lock is held AND the heartbeat has not *advanced* for
+        `scrub_hang_timeout_s`, measured in the monitor's own ``monotonic``
+        clock. Advancement (not absolute heartbeat age) distinguishes a hang
+        from a long legit recovery (fresh heartbeat) -> no cry-wolf; monotonic
+        + change-detection makes it immune to sensor clock skew and to a stale
+        heartbeat left by a *previous* run (grace is counted from the moment
+        THIS monitor first saw the lock held, not from the file's timestamp).
+        On a genuine hang, if `scrub_auto_recover`, kill the stale scrub AND
+        re-spawn a fresh one to use the freed lock; alert once either way.
+        'unknown' lock state (e.g. disk full) is treated as suspicious.
 
         Parameters
         ----------
@@ -567,34 +585,44 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         state = self._scrub_lock_state()
         if state == "free":
             self._scrub_first_held = None
+            self._scrub_last_progress = None
+            self._scrub_progress_token = None
             self._stuck_scrub_alerted = False
             return None
 
-        # held or unknown -> a scrub may be running/hung; measure progress
+        # held or unknown -> a scrub may be running/hung; track PROGRESS
         now = time.monotonic()
+        token = self._progress_token(self._read_scrub_status())
         if self._scrub_first_held is None:
+            # New held-streak: start the clock NOW and record (but do not judge)
+            # any pre-existing heartbeat -- it may belong to a previous run.
             self._scrub_first_held = now
-        status = self._read_scrub_status()
-        hb = status.get("timestamp") if status else None
-        if isinstance(hb, (int, float)):
-            progress_age = time.time() - hb          # time since last heartbeat
-        else:
-            progress_age = now - self._scrub_first_held  # no heartbeat fallback
+            self._scrub_last_progress = now
+            self._scrub_progress_token = token
+            return None
+        if token is not None and token != self._scrub_progress_token:
+            self._scrub_progress_token = token
+            self._scrub_last_progress = now  # heartbeat advanced -> progress
 
-        if progress_age <= self.scrub_hang_timeout_s:
-            return None  # fresh heartbeat (working) or not held long enough yet
+        idle = now - self._scrub_last_progress
+        if idle <= self.scrub_hang_timeout_s:
+            return None  # progressing, or not yet idle long enough
 
-        # Genuine hang: lock held with no progress for scrub_hang_timeout_s
+        # Genuine hang: lock held with no heartbeat advance for the timeout
         recovered = False
         if self.scrub_auto_recover:
+            status = self._read_scrub_status()
             recovered = self._recover_stuck_scrub(status)
+            if recovered:
+                self._scrub_first_held = None  # streak ends; re-measure next hold
+                self._spawn_scrub()  # use the freed lock (a timer is the backstop)
         if self._stuck_scrub_alerted:
             return None
         self._stuck_scrub_alerted = True
-        action = ("killed the stale scrub to free the lock" if recovered
+        action = ("killed the stale scrub and re-spawned" if recovered
                   else "manual intervention needed")
-        return ("Auto-scrub hung: lock held with no progress for {:.0f}s -- {}"
-                .format(progress_age, action))
+        return ("Auto-scrub hung: lock held, no progress for {:.0f}s -- {}"
+                .format(idle, action))
 
     def check_battery_voltage(self, input_data):
         """

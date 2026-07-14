@@ -84,6 +84,8 @@ def make_monitor(scrub_command="", low_space=100, space_previous=150,
     mon.scrub_auto_recover = scrub_auto_recover
     mon.scrub_log = scrub_log
     mon._scrub_first_held = None
+    mon._scrub_last_progress = None
+    mon._scrub_progress_token = None
     mon._stuck_scrub_alerted = False
     return mon
 
@@ -229,74 +231,125 @@ class TestScrubLockHonesty:
 
 
 class TestCheckScrubHealth:
-    """Progress-gated hung-scrub detection: a scrub is hung only if the lock is
-    held AND its heartbeat is stale -- so a long legit recovery (fresh
-    heartbeat) is NOT flagged. On a genuine hang, recover (kill) + alert once."""
+    """Hung-scrub detection is gated on heartbeat *advancement* measured in the
+    monitor's own monotonic clock -- immune to sensor clock skew and to a stale
+    heartbeat from a previous run; a long legit recovery (advancing heartbeat)
+    is never flagged. On a genuine hang: kill + re-spawn + alert once."""
 
     def _mon(self, **kw):
         kw.setdefault("scrub_command", "python3 scrub.py")
         kw.setdefault("scrub_hang_timeout_s", 900)
         return make_monitor(**kw)
 
-    def test_no_alert_when_heartbeat_fresh(self):
-        """Lock held but scrub is progressing (recent heartbeat) -> no alert."""
-        mon = self._mon()
-        fresh = {"pid": 111, "timestamp": time.time()}  # just now
-        with patch.object(StateMonitor, "_scrub_lock_state",
-                          return_value="held"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=fresh):
-            assert mon.check_scrub_health(make_input_data(50)) is None
-        assert mon._stuck_scrub_alerted is False
+    def _idle_streak(self, mon, token, idle_s=1000):
+        """Put mon into an established held-streak idle for idle_s seconds."""
+        mon._scrub_first_held = time.monotonic() - idle_s - 1
+        mon._scrub_last_progress = time.monotonic() - idle_s
+        mon._scrub_progress_token = token
 
-    def test_alerts_and_recovers_when_heartbeat_stale(self):
-        """Lock held + heartbeat stale beyond timeout -> hung: kill + alert."""
-        mon = self._mon(scrub_hang_timeout_s=900, scrub_auto_recover=True)
-        stale = {"pid": 222, "timestamp": time.time() - 1000}  # 1000s ago
+    def test_fresh_streak_gives_grace_ignoring_stale_file(self):
+        """First cycle the lock is seen held -> grace, even if a stale status
+        file from a PREVIOUS run is present (guards the stale-file false-kill)."""
+        mon = self._mon()
+        old = {"pid": 999, "timestamp": time.time() - 99999}  # ancient prev run
         with patch.object(StateMonitor, "_scrub_lock_state",
                           return_value="held"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=stale), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=old), \
+             patch.object(StateMonitor, "_recover_stuck_scrub") as mock_recover:
+            assert mon.check_scrub_health(make_input_data(50)) is None
+        mock_recover.assert_not_called()
+        assert mon._scrub_first_held is not None
+
+    def test_advancing_heartbeat_never_hangs(self):
+        """Idle-looking streak, but the heartbeat token ADVANCES -> progress."""
+        mon = self._mon()
+        s1 = {"pid": 5, "timestamp": 1, "phase": "recover", "recovered": 2}
+        self._idle_streak(mon, StateMonitor._progress_token(s1))
+        s2 = dict(s1, recovered=3)  # advanced (more recovered) -> new token
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s2), \
+             patch.object(StateMonitor, "_recover_stuck_scrub") as mock_recover:
+            assert mon.check_scrub_health(make_input_data(50)) is None
+        mock_recover.assert_not_called()
+
+    def test_stale_heartbeat_hangs_recovers_and_respawns(self):
+        """Idle streak with NO token advance -> hung: kill + re-spawn + alert."""
+        mon = self._mon(scrub_auto_recover=True)
+        s = {"pid": 22, "timestamp": 1, "phase": "recover", "recovered": 2}
+        self._idle_streak(mon, StateMonitor._progress_token(s))
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s), \
              patch.object(StateMonitor, "_recover_stuck_scrub",
-                          return_value=True) as mock_recover:
+                          return_value=True) as mock_recover, \
+             patch.object(StateMonitor, "_spawn_scrub") as mock_spawn:
             msg = mon.check_scrub_health(make_input_data(50))
-        mock_recover.assert_called_once_with(stale)
+        mock_recover.assert_called_once()
+        mock_spawn.assert_called_once()          # freed lock is re-used
         assert msg is not None and "hung" in msg.lower()
+
+    def test_clock_skew_immune_future_timestamp_still_hangs(self):
+        """A heartbeat timestamp in the FUTURE (NTP skew) must not disable
+        detection: detection is by token-change, not absolute time."""
+        mon = self._mon(scrub_auto_recover=False)
+        s = {"pid": 7, "timestamp": time.time() + 999999}  # far future
+        self._idle_streak(mon, StateMonitor._progress_token(s))
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s):
+            assert mon.check_scrub_health(make_input_data(50)) is not None
 
     def test_no_kill_when_auto_recover_disabled(self):
         mon = self._mon(scrub_auto_recover=False)
-        stale = {"pid": 3, "timestamp": time.time() - 1000}
+        s = {"pid": 3, "timestamp": 1}
+        self._idle_streak(mon, StateMonitor._progress_token(s))
         with patch.object(StateMonitor, "_scrub_lock_state",
                           return_value="held"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=stale), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s), \
              patch.object(StateMonitor, "_recover_stuck_scrub") as mock_recover:
             msg = mon.check_scrub_health(make_input_data(50))
         mock_recover.assert_not_called()
         assert msg is not None and "manual" in msg.lower()
 
     def test_no_heartbeat_uses_held_duration_fallback(self):
-        """No status file: not hung until the lock has been held > timeout."""
-        mon = self._mon(scrub_hang_timeout_s=900)
+        """No status file at all: not hung until the lock has been held (in the
+        monitor's monotonic clock) longer than the timeout."""
+        mon = self._mon()
+        self._idle_streak(mon, None)
         with patch.object(StateMonitor, "_scrub_lock_state",
                           return_value="held"), \
              patch.object(StateMonitor, "_read_scrub_status",
                           return_value=None), \
              patch.object(StateMonitor, "_recover_stuck_scrub",
                           return_value=False):
-            # First sighting: held-duration ~0 -> not hung yet
+            assert mon.check_scrub_health(make_input_data(50)) is not None
+
+    def test_boundary_not_hung_at_exact_timeout(self):
+        """idle == timeout is NOT hung (<= is grace); just over IS. Pin
+        monotonic so the boundary is exact (catches <= vs < mutations)."""
+        mon = self._mon(scrub_hang_timeout_s=900)
+        s = {"pid": 9, "timestamp": 1}
+        mon._scrub_first_held = 9000                       # established streak
+        mon._scrub_progress_token = StateMonitor._progress_token(s)
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s), \
+             patch.object(StateMonitor, "_recover_stuck_scrub",
+                          return_value=False), \
+             patch("time.monotonic", return_value=10000):
+            mon._scrub_last_progress = 10000 - 900  # idle == 900 exactly
             assert mon.check_scrub_health(make_input_data(50)) is None
-            # Simulate the lock having first been seen held long ago
-            mon._scrub_first_held = time.monotonic() - 1000
+            mon._scrub_last_progress = 10000 - 901  # idle == 901
             assert mon.check_scrub_health(make_input_data(50)) is not None
 
     def test_alert_is_one_shot_and_re_arms_on_free(self):
         mon = self._mon(scrub_auto_recover=False)
-        stale = {"pid": 4, "timestamp": time.time() - 1000}
+        s = {"pid": 4, "timestamp": 1}
+        self._idle_streak(mon, StateMonitor._progress_token(s))
         with patch.object(StateMonitor, "_scrub_lock_state",
                           return_value="held"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=stale):
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s):
             assert mon.check_scrub_health(make_input_data(50)) is not None  # alert
             assert mon.check_scrub_health(make_input_data(50)) is None      # quiet
         with patch.object(StateMonitor, "_scrub_lock_state",
@@ -304,21 +357,13 @@ class TestCheckScrubHealth:
             assert mon.check_scrub_health(make_input_data(50)) is None
         assert mon._scrub_first_held is None
         assert mon._stuck_scrub_alerted is False
-        with patch.object(StateMonitor, "_scrub_lock_state",
-                          return_value="held"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=stale):
-            assert mon.check_scrub_health(make_input_data(50)) is not None  # re-arm
 
-    def test_unknown_lock_state_is_suspicious_not_free(self):
+    def test_unknown_lock_state_starts_streak_not_reset(self):
         """'unknown' (disk full) must not reset -- it counts toward a hang."""
         mon = self._mon()
         with patch.object(StateMonitor, "_scrub_lock_state",
                           return_value="unknown"), \
-             patch.object(StateMonitor, "_read_scrub_status",
-                          return_value=None), \
-             patch.object(StateMonitor, "_recover_stuck_scrub",
-                          return_value=False):
+             patch.object(StateMonitor, "_read_scrub_status", return_value=None):
             mon.check_scrub_health(make_input_data(50))
             assert mon._scrub_first_held is not None  # streak started, not reset
 
@@ -364,19 +409,27 @@ class TestScrubLockState:
 class TestRecoverStuckScrub:
     """Self-healing: kill a genuinely-hung scrub, guarded against PID reuse."""
 
-    def test_kills_verified_scrub_process_group(self):
+    def test_kills_the_process_GROUP_not_the_pid(self):
+        # pid and pgid differ, so a mutation killpg(pid) instead of
+        # killpg(getpgid(pid)) is caught.
         mon = make_monitor()
         with patch.object(StateMonitor, "_pid_is_scrub", return_value=True), \
-             patch("os.getpgid", return_value=555), \
+             patch("os.getpgid", return_value=777) as mock_getpgid, \
              patch("os.killpg") as mock_killpg:
             assert mon._recover_stuck_scrub({"pid": 555}) is True
-        mock_killpg.assert_called_once_with(555, signal.SIGKILL)
+        mock_getpgid.assert_called_once_with(555)
+        mock_killpg.assert_called_once_with(777, signal.SIGKILL)
 
-    def test_does_not_kill_recycled_pid(self):
+    def test_pid_reuse_guard_prevents_kill(self):
+        # getpgid is valid here, so the ONLY thing preventing a kill is the
+        # _pid_is_scrub guard -- dropping the guard makes this test fail.
         mon = make_monitor()
-        with patch.object(StateMonitor, "_pid_is_scrub", return_value=False), \
+        with patch.object(StateMonitor, "_pid_is_scrub",
+                          return_value=False) as mock_guard, \
+             patch("os.getpgid", return_value=777), \
              patch("os.killpg") as mock_killpg:
             assert mon._recover_stuck_scrub({"pid": 999}) is False
+        mock_guard.assert_called_once_with(999)
         mock_killpg.assert_not_called()
 
     def test_no_pid_cannot_recover(self):

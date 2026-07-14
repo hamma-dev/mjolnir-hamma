@@ -68,8 +68,10 @@ SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
 # Heartbeat/status file the scrub updates as it advances, so the monitor
 # (state_monitor.check_scrub_health) can tell a working scrub from a hung one
 # (progress, not just lock age) and safely recover only genuine hangs.
-DEFAULT_STATUS_FILE = os.path.expanduser(
-    "~/brokkr/hamma/log/hamma_scrub_status.json")
+# On tmpfs (/dev/shm), NOT the SD root: the SD fills from logs during the exact
+# incident (HAM-112/113), and a heartbeat that can't be written would make a
+# healthy scrub look hung. tmpfs stays writable when the SD is full.
+DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 
 # Exit codes
 EXIT_OK = 0
