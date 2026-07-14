@@ -244,6 +244,34 @@ class TestTwoThresholdDrain:
         assert any("alert_space" in str(c) for c in
                    m.logger.warning.call_args_list)
 
+    def test_accepts_and_ignores_legacy_low_space(self):
+        """A stale per-unit `low_space` override must NOT crash construction
+        (brokkr's Executable has no **kwargs) -- accept + warn + ignore."""
+        m = _make_monitor(low_space=10)  # must not raise
+        assert not hasattr(m, "low_space")
+        assert any("low_space" in str(c) for c in
+                   m.logger.warning.call_args_list)
+
+    def test_scrub_auto_recover_defaults_off(self):
+        """The SIGKILL self-heal ships OFF (bench-validation gate)."""
+        m = _make_monitor()  # no explicit scrub_auto_recover
+        assert m.scrub_auto_recover is False
+
+    def test_hs_staleness_alerts_when_ags_dark(self):
+        """Persistent NA bytes_remaining (AGS dark) -> alert once, reset on
+        a numeric reading -- so a fill isn't missed silently."""
+        m = _make_monitor(hs_stale_cycles=3)
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub"):
+            assert m.check_sensor_drive({"bytes_remaining": _dv("NA")}) is None
+            assert m.check_sensor_drive({"bytes_remaining": _dv("NA")}) is None
+            msg = m.check_sensor_drive({"bytes_remaining": _dv("NA")})   # 3rd
+            assert msg is not None and "NA" in msg
+            assert m.check_sensor_drive({"bytes_remaining": _dv("NA")}) is None  # one-shot
+            # numeric reading clears the watchdog and re-arms it
+            assert m.check_sensor_drive({"bytes_remaining": _dv(220.0)}) is None
+            assert m._hs_stale_count == 0 and m._hs_stale_alerted is False
+
 
 class TestCheckPowerBoundary:
     """check_power must fire when prior power lands exactly on power_delim."""

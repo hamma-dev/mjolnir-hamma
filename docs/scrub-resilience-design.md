@@ -301,7 +301,7 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
 | PR #78 `scrub_log` | **Kept & promoted** — observability (§3.2) is now second-priority, not an afterthought. |
 | PR #80 Layer 1 `check_recovery_drives` | **Out of scope** — mj-pi `DATA??` fullness is a separate effort. |
 | PR #80 Layer 2 H&S staleness watchdog | **Folded in** — cheap signal; but note (§3.3) it shares the AGS-reachability dependency. |
-| PR #80 Layer 3 futile-scrub alert | **Kept** (§3.2). |
+| PR #80 Layer 3 futile-scrub alert | **Partly reframed, not fully built.** §3.2 builds the *stuck/hung*-scrub alert (lock held, heartbeat not advancing) — NOT a per-run "scrub completed but freed ~0 bytes" delta check. The operator-facing half of "futile" (space keeps falling *despite* auto-scrubs) is covered instead by `alert_space=75` (§3.4). A true per-scrub freed-bytes assertion is unbuilt (would need a stable free-space read before/after, which is exactly the NA-prone signal). |
 
 ---
 
@@ -341,6 +341,14 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
    `%C`-hashed paths or stale-unlink. And `/tmp`-full during a disk-fill disables the
    multiplexing exactly when needed — log the degradation.
 6. Per-unit variation (mj05 `nochargecontroller`; PAMMA differs) — thresholds configurable.
+7. **Observability rides the SD; durable observability is a *hard dependency* on HAM-112/113.**
+   The tmpfs heartbeat (`/dev/shm`) is the load-bearing *live* signal and survives an SD fill,
+   but the **post-mortem** — the durable `scrub_log` on the SD — self-disables (→DEVNULL) once
+   the SD floods with brokkr/rsyslog spam (the exact incident condition, HAM-112/113, both
+   still To Do). So a repeat could still leave *no on-disk trace of the scrub run* even with
+   this work deployed. The two are complementary, not substitutes: this effort makes the
+   *live* state visible and recoverable; HAM-112/113 is what makes the *forensic* record
+   survive. Ship both or accept the forensic gap.
 
 ---
 
@@ -375,8 +383,40 @@ before enabling fleet-wide. The durable `scrub_log` on the SD still self-disable
 under a full SD; accepted (degrades to old behavior; the tmpfs heartbeat is the load-bearing
 signal).
 
+## 7. Deployment notes (branch-only; nothing deployed)
+
+This whole effort lives on `feature/scrub-resilience` and is **not deployed anywhere**.
+When it does roll out, two things do **not** happen automatically and must be in the runbook:
+
+1. **The systemd timer only auto-installs on a fresh `unified_install` run.** The install step
+   (`unified_install/lib/brokkr.sh` "Config 5/5") copies the units and `enable --now
+   hamma-scrub.timer`. **Already-deployed units get nothing from a `git pull`** — the timer,
+   `.service`, and `.sh` wrapper must be copied and enabled by hand (same class of gap as the
+   DNS/40-eth0 redeploy). Until then those units still rely solely on the level-triggered
+   spawn from `check_sensor_drive`.
+2. **Clean the per-unit `low_space` override before pushing config.** mj54 carries a local
+   `low_space=10` (sensor-log#41). The new plugin **accepts + warns + ignores** `low_space`
+   (so it will not crash the pipeline, C1), but the override is now dead config — replace it
+   with per-unit `purge_space`/`alert_space` in `~/.config/brokkr/hamma/*.toml` so the unit
+   actually drains at the intended point instead of silently falling back to the fleet default.
+3. **`scrub_auto_recover` ships `false`.** The SIGKILL self-heal stays off until it is validated
+   on a bench/idle unit by injecting a genuinely hung scrub (§3.2 deployment gate). Flip to
+   `true` per-unit only after that.
+
+---
+
 ## Changelog
 
+- **v3 (final capstone pass):** Closed the deploy/coverage gaps from the two integration/
+  completeness reviews. Code: `low_space` now accepted-and-ignored (won't crash mj54's
+  override, C1); `scrub_auto_recover` default flipped to **false** (bench-gate, M1); added a
+  telemetry-staleness watchdog (`hs_stale_cycles`) so a *dark* AGS — `bytes_remaining` NA —
+  alerts instead of silently going unmonitored (GAP2); `purge_ags_files` now writes a
+  per-chunk heartbeat so a long purge can't be misread as hung (GAP1). Docs: corrected the
+  Layer-3 "futile-scrub alert" claim (stuck≠futile; operator half is `alert_space`, GAP3);
+  added the HAM-112/113 *hard dependency* for durable forensics (§6.7, GAP5); added this
+  Deployment-notes section (timer not auto-installed on existing units + mj54 cleanup, M2).
+  All 258 scrub-suite tests green.
 - **v2 (post red-team):** Re-ranked §3 — silent-failure-mode elimination (§3.1) and
   observability (§3.2) promoted above the timer (§3.3), which is demoted to steady-state
   drain and no longer called the "backbone." Downgraded "the trigger fired" → "should have

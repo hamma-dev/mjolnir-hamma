@@ -53,6 +53,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         purge_space=200,
         alert_space=75,
         scrub_cooldown_s=300,
+        hs_stale_cycles=15,
         ping_max=3,
         channel=None,
         key_file=None,
@@ -61,8 +62,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_command="",
         scrub_hang_timeout_s=900,
         scrub_status_file=DEFAULT_SCRUB_STATUS_FILE,
-        scrub_auto_recover=True,
+        scrub_auto_recover=False,
         scrub_log=DEFAULT_SCRUB_LOG,
+        low_space=None,   # DEPRECATED: replaced by purge_space/alert_space
         **output_step_kwargs,
         ):
         """
@@ -88,6 +90,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Minimum seconds between level-triggered scrub launches while free is
             below purge_space (retry cadence). Default 300 (5 min) -- more responsive
             than the 15-min §3.3 timer, which is the coarse backstop.
+        hs_stale_cycles : int, optional
+            Alert once if the sensor's `bytes_remaining` reads NA this many
+            consecutive monitor cycles (default 15, ~15 min). NA means the AGS is
+            dark, so every space-based decision is blind and `/ags/data` can fill
+            unseen -- this watchdog is the only thing that speaks up in that state.
+            Reset (and re-armed) by any numeric reading.
         ping_max : int, optional
             The maximum number of consecutive ping errors before we send an error message
             via `method`. Any ping errors are still logged locally.
@@ -111,11 +119,17 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_status_file : str, optional
             Path to the scrub's heartbeat/status JSON (progress signal).
         scrub_auto_recover : bool, optional
-            If True (default), kill a genuinely-hung scrub to free the lock
-            (self-healing); else only alert.
+            If True, kill a genuinely-hung scrub to free the lock (self-healing);
+            else only alert. Default **False** -- this SIGKILLs a process group,
+            so it stays off until validated on a bench unit (§3.2 deploy gate).
         scrub_log : str, optional
             Durable file capturing the scrub's stdout/stderr (rotated); empty
             string disables (falls back to DEVNULL).
+        low_space : numeric, optional
+            **Deprecated.** The old single edge-triggered threshold, replaced by
+            purge_space/alert_space (§3.4). Accepted only so a stale per-unit
+            override (e.g. mj54's `low_space=10`) does not crash pipeline build --
+            it is warned about and otherwise ignored.
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -136,6 +150,20 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.scrub_cooldown_s = scrub_cooldown_s
         self._last_scrub_spawn = None   # monotonic; level-trigger retry gate
         self._low_space_alerted = False
+        # Telemetry-staleness watchdog: bytes_remaining goes NA when the AGS is
+        # dark, so the two-threshold path is blind exactly then -- alert instead
+        # of silently missing a fill (the mj05 condition).
+        self.hs_stale_cycles = hs_stale_cycles
+        self._hs_stale_count = 0
+        self._hs_stale_alerted = False
+        # Legacy config compatibility: a deployed per-unit override may still set
+        # `low_space` (removed in favour of purge_space/alert_space). Accept and
+        # ignore it -- brokkr's Executable.__init__ has no **kwargs, so an
+        # unconsumed key would crash the whole telemetry pipeline at build time.
+        if low_space is not None:
+            self.logger.warning(
+                "state_monitor: `low_space=%s` is deprecated and ignored; use "
+                "purge_space/alert_space", low_space)
         if alert_space >= purge_space:
             self.logger.warning(
                 "state_monitor: alert_space (%s) >= purge_space (%s) -- the "
@@ -415,7 +443,20 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         """
         space_now, _space_pre = self.now_then(input_data, 'bytes_remaining')
         if not isinstance(space_now, (int, float)) or space_now != space_now:
-            return None  # NA / non-numeric -> can't evaluate
+            # NA / non-numeric: can't evaluate space. Persistent NA means the
+            # AGS is dark (not sending H&S) -- the drive can fill unseen, so
+            # alert once rather than fail silent (the mj05 blind spot).
+            self._hs_stale_count += 1
+            if (self._hs_stale_count >= self.hs_stale_cycles
+                    and not self._hs_stale_alerted):
+                self._hs_stale_alerted = True
+                return ("AGS telemetry (bytes_remaining) NA for {} cycles -- "
+                        "the AGS may be dark/unreachable; /ags/data can fill "
+                        "unseen".format(self._hs_stale_count))
+            return None
+        # Numeric reading: AGS is reporting -> clear the staleness watchdog.
+        self._hs_stale_count = 0
+        self._hs_stale_alerted = False
         if space_now >= self.purge_space:
             # Healthy: re-arm the alert and the immediate-spawn on next descent.
             self._low_space_alerted = False

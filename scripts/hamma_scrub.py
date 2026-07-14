@@ -1300,7 +1300,7 @@ def identify_purgeable_files(ags_entries, mj_headers, recovery_results=None):
 
 
 def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
-                    control_path=None):
+                    control_path=None, status_file=None):
     """Delete AGS files via SSH, batched over one connection.
 
     Files are deleted in chunks of ``PURGE_CHUNK_SIZE`` — a single
@@ -1321,6 +1321,10 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
         If True, log what would be deleted but take no action.
     control_path : str or None
         ControlMaster socket to reuse for the SSH calls.
+    status_file : str or None
+        If given, write a ``purge``-phase heartbeat (``purged``/``total``) to
+        this status file after each chunk, so a long purge advances the progress
+        token and the monitor's hung-scrub detector does not misjudge it as stuck.
 
     Returns
     -------
@@ -1336,6 +1340,13 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
 
     for start in range(0, len(filenames), PURGE_CHUNK_SIZE):
         chunk = filenames[start:start + PURGE_CHUNK_SIZE]
+        # Per-chunk heartbeat: purge over a wedging SSH pipe can take a while;
+        # advancing the heartbeat here lets the monitor's hung-scrub detector
+        # tell a working purge from a stalled one (else a long purge could look
+        # hung and be killed).
+        write_status(status_file, "purge",
+                     purged=sum(1 for r in results if r["status"] == "deleted"),
+                     total=len(filenames))
 
         if dry_run:
             for fname in chunk:
@@ -2018,6 +2029,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                 purge_deletions = purge_ags_files(
                     ags_host, ags_path, eligibility["purgeable"],
                     dry_run=dry_run, control_path=control_path,
+                    status_file=status_file,
                 )
             else:
                 purge_deletions = []

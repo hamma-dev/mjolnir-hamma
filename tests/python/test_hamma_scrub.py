@@ -2320,6 +2320,20 @@ class TestPurgeBatching:
         assert len(results) == 250
         assert all(r["status"] == "deleted" for r in results)
 
+    def test_writes_per_chunk_heartbeat(self, hamma_scrub):
+        """A long purge advances the heartbeat per chunk so the monitor can't
+        mistake a working purge for a hung one (GAP: purge was heartbeat-blind)."""
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]  # 3 chunks
+        with patch.object(hamma_scrub, "write_status") as mock_ws, \
+             patch("subprocess.run", return_value=self._ok()):
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False,
+                status_file="/tmp/s.json")
+        purge_beats = [c for c in mock_ws.call_args_list
+                       if len(c.args) >= 2 and c.args[1] == "purge"]
+        assert len(purge_beats) == 3
+        assert all(c.args[0] == "/tmp/s.json" for c in purge_beats)
+
     def test_chunk_command_deletes_multiple_files(self, hamma_scrub):
         with patch("subprocess.run", return_value=self._ok()) as mock_run:
             hamma_scrub.purge_ags_files(

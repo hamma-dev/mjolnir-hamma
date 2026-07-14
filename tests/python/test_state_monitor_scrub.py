@@ -81,6 +81,9 @@ def make_monitor(scrub_command="", purge_space=200, alert_space=75,
     mon.scrub_cooldown_s = scrub_cooldown_s
     mon._last_scrub_spawn = None
     mon._low_space_alerted = False
+    mon.hs_stale_cycles = 15
+    mon._hs_stale_count = 0
+    mon._hs_stale_alerted = False
     mon.scrub_command = scrub_command
     mon.logger = MagicMock()
     mon._previous_data = make_input_data(space_previous)
