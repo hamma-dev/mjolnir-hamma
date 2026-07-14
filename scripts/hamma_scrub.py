@@ -1148,9 +1148,35 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
             continue
 
         if result.returncode != 0:
+            # `rm -f f1..fN` exits non-zero if ANY file errored, but it still
+            # deleted the others. Marking the whole chunk "failed" would lie
+            # (the report would under-count deletions during a disk-fill).
+            # Retry per-file to attribute status correctly -- only failing
+            # chunks pay the per-file cost; healthy chunks stay batched-fast.
             stderr = result.stderr.decode('utf-8', errors='replace').strip()
-            logger.warning("Failed to delete chunk on %s: %s", ags_host, stderr)
-            _record(chunk, "failed", stderr)
+            logger.warning("Batched delete on %s returned non-zero (%s); "
+                           "retrying per-file to attribute status",
+                           ags_host, stderr)
+            for fname, quoted in zip(chunk, remote_paths):
+                one_cmd = ssh_cmd(ags_host, "rm -f " + quoted,
+                                  control_path=control_path)
+                try:
+                    one = subprocess.run(
+                        one_cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, timeout=PURGE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    results.append({"filename": fname, "status": "failed",
+                                    "error": "SSH timeout ({}s)".format(
+                                        PURGE_TIMEOUT)})
+                    continue
+                if one.returncode == 0:
+                    results.append({"filename": fname, "status": "deleted",
+                                    "error": None})
+                else:
+                    results.append({
+                        "filename": fname, "status": "failed",
+                        "error": one.stderr.decode(
+                            'utf-8', errors='replace').strip()})
         else:
             _record(chunk, "deleted", None)
 
@@ -1698,81 +1724,78 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     }
 
     # Recovery + purge reuse one SSH connection (per-op cost ~16x lower).
-    # It self-closes via ControlPersist; close_control_master() below is the
-    # happy-path teardown, with ControlPersist as the exception backstop.
-    control_path = open_control_master(ags_host)
-
-    # Recovery flow
+    # The context manager guarantees teardown even if recover/purge raise
+    # (the bare open/close pair leaked the socket on exceptions).
     recovery_results = None
-    if recover and comparison["missing_on_mj"]:
-        cleanup_orphaned_temps(mj_path)
-        candidates = filter_recovery_candidates(
-            comparison["missing_on_mj"], ags["entries"],
-            since_cutoff=since_cutoff,
-        )
-        recovery_results = recover_triggers(
-            candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
-            control_path=control_path,
-        )
-        recovered_count = len([r for r in recovery_results
-                               if r["status"] == "recovered"])
-        failed_count = len([r for r in recovery_results
-                            if r["status"] == "failed"])
-        if recovered_count:
-            logger.info("Recovery: %d succeeded", recovered_count)
-        if failed_count:
-            logger.warning("Recovery: %d failed", failed_count)
-
-    # Update mj_headers and missing list with recovered triggers
-    if recovery_results:
-        recovered_headers = set()
-        for r in recovery_results:
-            if r["status"] == "recovered":
-                mj["headers"].add(r["header"])
-                recovered_headers.add(r["header"])
-        if recovered_headers:
-            comparison["missing_on_mj"] = [
-                e for e in comparison["missing_on_mj"]
-                if e["header"] not in recovered_headers
-            ]
-            results["missing_on_mj"] = comparison["missing_on_mj"]
-            results["matched"] += len(recovered_headers)
-
-    # Purge flow
     purge_results = None
-    if purge:
-        eligibility = identify_purgeable_files(
-            ags["entries"], mj["headers"], recovery_results,
-        )
-        if eligibility["purgeable"]:
-            purge_deletions = purge_ags_files(
-                ags_host, ags_path, eligibility["purgeable"],
-                dry_run=dry_run, control_path=control_path,
+    with ssh_control_master(ags_host) as control_path:
+        # Recovery flow
+        if recover and comparison["missing_on_mj"]:
+            cleanup_orphaned_temps(mj_path)
+            candidates = filter_recovery_candidates(
+                comparison["missing_on_mj"], ags["entries"],
+                since_cutoff=since_cutoff,
             )
-        else:
-            purge_deletions = []
+            recovery_results = recover_triggers(
+                candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
+                control_path=control_path,
+            )
+            recovered_count = len([r for r in recovery_results
+                                   if r["status"] == "recovered"])
+            failed_count = len([r for r in recovery_results
+                                if r["status"] == "failed"])
+            if recovered_count:
+                logger.info("Recovery: %d succeeded", recovered_count)
+            if failed_count:
+                logger.warning("Recovery: %d failed", failed_count)
 
-        deleted_names = [d["filename"] for d in purge_deletions
-                         if d["status"] == "deleted"]
-        failed_purge = [d for d in purge_deletions
-                        if d["status"] == "failed"]
+        # Update mj_headers and missing list with recovered triggers
+        if recovery_results:
+            recovered_headers = set()
+            for r in recovery_results:
+                if r["status"] == "recovered":
+                    mj["headers"].add(r["header"])
+                    recovered_headers.add(r["header"])
+            if recovered_headers:
+                comparison["missing_on_mj"] = [
+                    e for e in comparison["missing_on_mj"]
+                    if e["header"] not in recovered_headers
+                ]
+                results["missing_on_mj"] = comparison["missing_on_mj"]
+                results["matched"] += len(recovered_headers)
 
-        if deleted_names:
-            logger.info("Purge: deleted %d AGS files", len(deleted_names))
-        if failed_purge:
-            logger.warning("Purge: %d deletions failed", len(failed_purge))
+        # Purge flow
+        if purge:
+            eligibility = identify_purgeable_files(
+                ags["entries"], mj["headers"], recovery_results,
+            )
+            if eligibility["purgeable"]:
+                purge_deletions = purge_ags_files(
+                    ags_host, ags_path, eligibility["purgeable"],
+                    dry_run=dry_run, control_path=control_path,
+                )
+            else:
+                purge_deletions = []
 
-        # Normalize to flat filename lists for reports (matching spec JSON shape)
-        purge_results = {
-            "deleted": [d["filename"] for d in purge_deletions
-                        if d["status"] in ("deleted", "dry_run")],
-            "failed": [{"filename": d["filename"], "error": d["error"]}
-                       for d in purge_deletions if d["status"] == "failed"],
-            "retained": eligibility["retained"],
-            "dry_run": dry_run,
-        }
+            deleted_names = [d["filename"] for d in purge_deletions
+                             if d["status"] == "deleted"]
+            failed_purge = [d for d in purge_deletions
+                            if d["status"] == "failed"]
 
-    close_control_master(ags_host, control_path)
+            if deleted_names:
+                logger.info("Purge: deleted %d AGS files", len(deleted_names))
+            if failed_purge:
+                logger.warning("Purge: %d deletions failed", len(failed_purge))
+
+            # Flatten to filename lists for reports (matching spec JSON shape)
+            purge_results = {
+                "deleted": [d["filename"] for d in purge_deletions
+                            if d["status"] in ("deleted", "dry_run")],
+                "failed": [{"filename": d["filename"], "error": d["error"]}
+                           for d in purge_deletions if d["status"] == "failed"],
+                "retained": eligibility["retained"],
+                "dry_run": dry_run,
+            }
 
     if json_output:
         print(format_json_report(results, ags_host,

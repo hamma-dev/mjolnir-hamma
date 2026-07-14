@@ -2313,6 +2313,47 @@ class TestPurgeBatching:
         assert all(r["status"] == "failed" for r in results)
         assert "Connection closed" in results[0]["error"]
 
+    def test_partial_chunk_failure_attributes_per_file(self, hamma_scrub):
+        """A batched delete that returns non-zero retries per-file, so files
+        that WERE deleted are not mis-reported as failed. `rm -f a b c` can
+        delete a and c while erroring on b yet exit non-zero -- the report
+        must not claim all three failed (it would lie during a disk-fill)."""
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            calls["n"] += 1
+            remote = cmd[-1]
+            m = MagicMock()
+            if calls["n"] == 1:
+                # the batched `rm -f a b c` -- one file errored -> non-zero
+                m.returncode = 1
+                m.stderr = b"rm: /ags/data/b.bin: Permission denied"
+            else:
+                # per-file retries: only b.bin fails
+                fails = "b.bin" in remote
+                m.returncode = 1 if fails else 0
+                m.stderr = b"rm: Permission denied" if fails else b""
+            return m
+
+        with patch("subprocess.run", side_effect=fake_run):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin", "c.bin"],
+                dry_run=False)
+        by = {r["filename"]: r["status"] for r in results}
+        assert by == {"a.bin": "deleted", "b.bin": "failed", "c.bin": "deleted"}
+
+    @pytest.mark.parametrize("nfiles,expected_calls", [
+        (0, 0), (1, 1), (99, 1), (100, 1), (101, 2), (200, 2), (250, 3)])
+    def test_chunk_boundaries(self, hamma_scrub, nfiles, expected_calls):
+        """Exact-multiple boundaries: no spurious empty trailing chunk."""
+        files = ["f{}.bin".format(i) for i in range(nfiles)]
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False)
+        assert mock_run.call_count == expected_calls
+        assert len(results) == nfiles
+        assert all(r["status"] == "deleted" for r in results)
+
     def test_passes_control_path_through(self, hamma_scrub):
         with patch("subprocess.run", return_value=self._ok()) as mock_run:
             hamma_scrub.purge_ags_files(
@@ -2374,3 +2415,39 @@ class TestExtractTriggerControlPath:
                 control_path="/tmp/cm.sock")
         joined = " ".join(mock_run.call_args[0][0])
         assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestRunControlMasterWiring:
+    """run() must open ONE ControlMaster, thread its socket to BOTH recover
+    and purge, and close it. This is the integration seam the leaf tests miss;
+    without it, dropping control_path (or the open/close) passes silently.
+    Deliberately NO autouse control-master stub here."""
+
+    def test_control_path_threaded_to_recover_and_purge_and_closed(
+            self, hamma_scrub):
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": set(), "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 1.0}
+        sentinel = "/tmp/sentinel_cm.sock"
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "open_control_master",
+                          return_value=sentinel) as mock_open, \
+             patch.object(hamma_scrub, "close_control_master") as mock_close, \
+             patch.object(hamma_scrub, "recover_triggers",
+                          return_value=[]) as mock_recover, \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": ["f.bin"],
+                                        "retained": []}), \
+             patch.object(hamma_scrub, "purge_ags_files",
+                          return_value=[]) as mock_purge:
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            recover=True, purge=True)
+
+        mock_open.assert_called_once_with("hamma")
+        assert mock_recover.call_args.kwargs.get("control_path") == sentinel
+        assert mock_purge.call_args.kwargs.get("control_path") == sentinel
+        mock_close.assert_called_once_with("hamma", sentinel)

@@ -8,28 +8,28 @@ job is to offload triggers from `/ags/data` to the mj-pi and purge what's confir
 
 **Non-goals (explicitly out of scope):**
 - **mj-pi `/media/pi/DATA??` drive fullness.** A full MJ recovery drive is a *different*
-  problem with a *different* remedy (rotate/replace the drive), not something the scrub
-  fixes. It matters here only as a *precondition* (recover needs somewhere to land — §3.3);
-  monitoring/alerting on it belongs in a separate MJ-drive-management effort, not here.
-  (See the DATA55 observation in §1 — a real standing issue, filed separately.)
+  problem with a *different* remedy (rotate/replace the drive). It matters here only as a
+  *precondition* (recover needs somewhere to land). Monitoring it belongs in a separate
+  MJ-drive-management effort. (DATA55 has been 100 % full since June 1 — file separately.)
 - The AGS reboot loop / VL805 USB wedge (hardware; fixed by cold power-cycle).
 
-**Status:** design. Supersedes the direction of PR #78 (scrub-trigger-fix) and PR #80
-(disk-safety-monitors) — their useful pieces are folded in below; their framing (an
-edge-vs-level trigger fix) is not the root cause.
+**Status:** design, **re-ranked after adversarial (red-team) review** — see the changelog at
+the end. Supersedes the direction of PR #78 (scrub-trigger-fix) and PR #80
+(disk-safety-monitors); their useful pieces are folded in. **Their framing (an edge-vs-level
+trigger fix) is not the root cause — and neither is a timer (see §2/§3).**
 
 ---
 
 ## 1. What actually happened (mj05, Jul 9–13 2026)
 
-Reconstructed from the telemetry CSVs and recovered-file forensics on mj05. `/ags/data`
-is the AGS USB drive (462 GB); `bytes_remaining` (H&S "Disk Remaining") is its free space.
+Reconstructed from telemetry CSVs and recovered-file forensics on mj05. `/ags/data` is the
+AGS USB drive (462 GB); `bytes_remaining` (H&S "Disk Remaining") is its free space.
 
 | Time (UTC) | Evidence | State |
 |---|---|---|
-| Jul 9 20:56 | telemetry 100.22 → 99.54 (clean, no NA) | free crosses `low_space`=100 GB |
-| Jul 9 20:56 → Jul 10 17:59 | **monotonic** 100 → 0, no upward tick | 21 h fill, **no purge freed a byte** |
-| entire fill window | **zero `*_recovered.bin` written** | scrub silent |
+| Jul 9 20:56 | telemetry 100.22 → 99.54 (clean, no NA in CSV) | free crosses `low_space`=100 GB |
+| Jul 9 20:56 → Jul 10 17:59 | **monotonic** 100 → 0, no upward tick | 21 h fill, no purge visibly freed space |
+| entire fill window | **zero `*_recovered.bin` written** | scrub did no recovery |
 | Jul 10 18:00 → Jul 11 03:34 | telemetry pinned at 0 | drive FULL ~10 h, data loss |
 | Jul 11 03:34 | first & only recovered-file cluster (5 files) | one scrub, ~31 h late |
 | Jul 11 ~04:20 → dark | free reads frozen 448.96 then NA; ping flaps | AGS drive drops → reboot loop |
@@ -37,164 +37,175 @@ is the AGS USB drive (462 GB); `bytes_remaining` (H&S "Disk Remaining") is its f
 
 Causal chain (settled): **`/ags/data` full → AGS reboot cycle → USB/FPGA (VL805) wedged →
 persistent reboots** until the operator stopped AGS (~Jul 11 12:00) and cold-cycled Jul 13.
-The reboot/USB half is understood and out of scope here.
+The reboot/USB half is understood and out of scope.
 
-### What we proved about the scrubber
+### What we can and cannot claim about the scrubber
 
-1. **The trigger fired.** In the deployed code (`0.4.x @ 426ff2b`), `check_sensor_drive`
-   does `if (space_now < low_space) and (space_pre >= low_space): self._spawn_scrub()`.
-   At the crossing that is `(99.54 < 100) and (100.22 >= 100)` → **True**. The scrub
-   spawned. The failure is **downstream of the trigger** — this is why an edge-vs-level
-   trigger change (PR #78) does not address the root cause.
-2. **The spawned scrub freed nothing.** `bytes_remaining` fell 100 → 0 *monotonically*.
-   Any successful purge would show sawtooth; there is none. No purge freed space in 21 h.
-3. **It had somewhere to write.** DATA56 had 851 GB free throughout (the Jul 11 recovery
-   landed there). "No landing zone" is ruled out *for this incident*.
-4. **Why the pass failed is unrecoverable.** The scrub's output was `DEVNULL`'d, and the
-   journal plus all 10 rotated `brokkr_hamma_005.log.*` files were overwritten within
-   **7 minutes** by reboot-loop error spam (HAM-112). No trace survives.
+1. **The trigger *should* have fired — but we cannot prove it *effectively* did.** In the
+   deployed code (`0.4.x @ 426ff2b`), `check_sensor_drive` does
+   `if (space_now < low_space) and (space_pre >= low_space): self._spawn_scrub()`. At the
+   crossing that is `(99.54 < 100) and (100.22 >= 100)` → **True**, so the *edge condition*
+   was met. But "condition met" ≠ "a scrub ran and did work." `_spawn_scrub` wraps the
+   command in **`flock -n`** (non-blocking) and logs `"Spawned scrub"` **unconditionally**
+   after `Popen` succeeds — *before* `flock` has acquired anything. So if a **prior scrub was
+   hung** holding the lock, the spawn is a **silent no-op** and even the log line would have
+   lied. **Two possibilities are indistinguishable from the destroyed evidence:** (a) a scrub
+   ran and freed nothing, or (b) the spawn silently no-op'd against a hung prior scrub. They
+   have *different fixes*. (Verified downstream: the deployed scrub had **no** fail-fast SSH
+   and a **3600 s** scan timeout — so a scan against the degrading AGS could hang up to an
+   hour, and with `flock -n` + the single-shot edge, one hang stalls the safety net for the
+   whole window. This makes (b) a live, code-supported hypothesis, not a footnote.)
+2. **No purge *visibly* freed space — strongly indicated, not proven.** `bytes_remaining`
+   fell 100 → 0 monotonically with no up-tick. At the observed ~5 GB/hr, a purge freeing even
+   a few GB *would* show (a 3 GB purge erases ~36 min of inflow in one 1-min sample), so this
+   inference is sound **at this rate**. It would NOT hold at the design's "max rate"
+   (12.5 GB/min), and it rests on the same `bytes_remaining` signal we elsewhere call
+   unreliable — so: *strongly indicated for the fill window, not proven.*
+3. **It had somewhere to write.** DATA56 had 851 GB free throughout. "No landing zone" is
+   ruled out for this incident.
+4. **Why it failed is unrecoverable.** Scrub output was `DEVNULL`'d; the journal + all 10
+   rotated `brokkr_hamma_005.log.*` were overwritten within **7 minutes** by reboot-loop
+   spam (HAM-112). No trace survives.
 
 ### What the current system tells us (measured Jul 13, healthy)
 
-- A full dry-run scrub (`--recover --purge -n --since auto`) completes in **21.5 s**, of
-  which **19.8 s is the MJ header scan** (40,565 files); it correctly finds 1 missing
-  trigger, 7 purgeable files. **The code path works** — the Jul 9–11 failure was
-  **condition-dependent** (sustained storm + a degrading AGS), not an always-broken scrub.
-- **Throughput is the constraint.** `recover` issues one `ssh "dd…"` **per trigger**;
-  `purge` issues one `ssh "rm…"` **per file** — sequential, plain SSH, no batching, no
-  persistent connection. Measured round-trip to the AGS: **0.29 s each plain vs 0.018 s
-  with `ControlMaster`** (16×). Purging ~444 files ≈ **2 min of SSH overhead on a healthy
-  AGS**, far worse on a degrading one. `select_target_drive` is also re-called *per
-  trigger*, each time `os.listdir`-ing all 904 DATA55 dirs.
-- **The recovery landing zone was fine.** DATA56 had 851 GB free throughout — "no landing
-  zone" is ruled out as a cause here. (Aside, out of scope: DATA55 has been 100 % full
-  since June 1, unmonitored — a real standing mj-pi issue to file separately, not something
-  this scrub spec addresses.)
-- **The trigger telemetry failed exactly when needed.** As the AGS degraded,
-  `bytes_remaining` went to 0/NA. Any purge decision that *reads* `bytes_remaining` is
-  blind in precisely this state.
+- A full dry-run scrub completes in ~21.5 s healthy, but under **active AGS recording** the
+  **AGS scan alone rose ~1 s → 99 s** and the MJ scan to minutes (see §3.5). The code path
+  works; the Jul 9–11 failure was **condition-dependent** (storm + degrading AGS).
+- **Throughput:** `recover` = one `ssh dd` per trigger, `purge` = one `ssh rm` per file —
+  sequential plain SSH. Round-trip 0.29 s plain / 0.018 s multiplexed.
+- **Telemetry failed when needed:** as the AGS degraded, `bytes_remaining` went NA. Any
+  decision that *reads* `bytes_remaining` is blind in exactly this state.
 
 ---
 
-## 2. Root cause
+## 2. Root cause (honest version)
 
-Not a single bug. The safety net is **reactive, single-shot, blind, and throughput-
-limited**, and it depends on a telemetry signal that fails under the very condition it
-must handle:
+**The specific mechanism is unrecoverable** (§1.4). What we *can* name is a set of
+structural defects, and — critically — **we must design for the failure mode we cannot rule
+out (a hung / silently-no-op'd scrub), not just the one that's easier to fix (a scrub that
+ran but was too slow).**
 
-- **Reactive + single-shot:** it fires only on the downward `low_space` *crossing*. By the
-  time free space crosses the threshold you are already behind, and the trigger gives
-  exactly one attempt — no retry while space stays low.
-- **Blind:** the scrub runs with `DEVNULL`'d output; nobody can see whether it ran, hung on
-  the `flock`, crashed, or purged nothing. The one incident where we needed the record, the
-  logs were destroyed within minutes.
-- **Throughput-limited:** per-item sequential SSH means a heavy scrub can take minutes to
-  tens of minutes — potentially longer than the fill window it is racing.
-- **Telemetry-dependent:** the trigger reads `bytes_remaining`, which went NA as the AGS
-  degraded.
+- **Silent single-point failure (the one the timer does NOT fix).** `flock -n` turns a
+  hung prior scrub into a silent no-op for every subsequent spawn; the spawn-side log lies;
+  the edge is single-shot so it never retries. A single hang → zero effective scrubs for the
+  whole window, invisibly.
+- **Blind.** `DEVNULL`'d output; the logs that might have caught it were destroyed in
+  minutes.
+- **No fail-fast.** Deployed SSH had no `ConnectTimeout`/`BatchMode`; the scan could hang up
+  to 3600 s against a sick AGS, holding the lock.
+- **Reactive + single-shot + telemetry-dependent.** Fires only on the downward crossing, one
+  attempt, off a signal (`bytes_remaining`) that went NA.
+- **Throughput-limited.** Per-item sequential SSH; a heavy scrub can outlast its fill window.
 
-At max trigger rate (≈500 triggers ≈ 100 GB in ~8 min ⇒ ~12.5 GB/min) a slow, single-shot,
-blind scrub cannot keep pace. At the *observed* incident rate (~5 GB/hr) it could have —
-had it simply **kept running**.
+**The trap to avoid:** PR #78 was tangential because it fixed trigger *arming* when the
+trigger provably armed. A **timer**, made the headline, is tangential *in the same way* if
+the real cause was a hang — more timer ticks just no-op against the held lock. So the timer
+is **not** the primary fix. The primary fixes are the ones that make a hang **impossible to
+happen silently** and **visible when it does**.
 
 ---
 
-## 3. Design
+## 3. Design — re-ranked
 
-Four changes, layered. The first is the backbone; the rest harden it.
+Ordered by how directly each addresses the failure mode we cannot rule out (the hang), not
+by how appealing it sounds.
 
-### 3.1 Timer-driven periodic scrub (backbone)
+### 3.1 Kill the silent-failure modes (THE fix for a hang) — highest priority
 
-Run the scrub on a **systemd timer (~15 min)**, independent of `bytes_remaining`.
+- **Make `_spawn_scrub` honest about the lock.** Today it logs success whether or not
+  `flock` acquired. Have it detect and log/report lock contention explicitly (e.g. probe
+  `flock -n` acquisition, or have the scrub itself write a start/end record) so "a prior
+  scrub is still running" is *visible*, not silent.
+- **Bound the scan timeout.** Drop the scrub's `subprocess.run(timeout=3600)` scan cap to
+  minutes. This is the single value that bounds worst-case lock-hold time; until it drops,
+  `flock -n` + 3600 s = a scrub can wedge the safety net for an hour.
+- **Fail-fast SSH.** `-o BatchMode=yes -o ConnectTimeout=10` on every AGS call so a sick AGS
+  fails fast instead of hanging toward the cap. *(Built — see `perf(scrub)`; this is the
+  most incident-relevant part of that commit, more than the speedup.)*
+- **Stuck-lock detection + recovery.** If `flock` fails to acquire for N consecutive cycles,
+  alert (a prior scrub is hung) and consider killing/replacing the stale holder.
 
-- **Why a timer, not the low-space trigger:** it is **telemetry-independent** — it runs
-  whether or not `bytes_remaining` is reporting, which is the failure that broke this
-  incident. It keeps `/ags/data` drained in steady state so free space never *approaches*
-  the threshold under normal storms.
-- **Write-cost is not a concern** (evaluated): the scrub is read-dominated. The MJ scan is
-  pure reads (`relatime` vfat ⇒ no atime writes within a day); `recover` writes only
-  genuinely-missing triggers (~0–1/run in steady state); `purge` is KB-scale vfat metadata
-  deletes. Against the ~120 GB/day these drives already log 24/7, the timer adds **< 1 %**
-  write load — a rounding error on a 2 TB SSD's ~600–1200 TBW. Add `noatime` to be safe.
-- **The real timer cost is I/O contention**, not wear: a 20 s full scan every 15 min
-  competes with the write pipeline for USB bandwidth. Mitigated by the incremental scan
-  (§3.3).
-- Implementation: a `hamma-scrub.timer` + `hamma-scrub.service` (oneshot) running the
-  scrub as `pi`. Keep the existing `flock -n /tmp/hamma_scrub.lock` so timer and any
-  threshold-driven run can never overlap.
+### 3.2 Observability (so the next incident is diagnosable) — second
 
-### 3.2 Two-threshold escalation (on top of the timer, when telemetry is available)
+- **Persistent, rotation-safe scrub log** (`scrub_log`, from PR #78): every run's
+  scan/recover/purge **counts, per-phase timings, errors, and lock-acquisition result**.
+  Never `DEVNULL`. Without this, the next incident is as blind as this one.
+- **Futile-scrub alert:** consecutive runs that purge 0 files while free space keeps falling
+  → alert ("running but not freeing space") — the symptom the 21-h ramp never surfaced.
+- **Honest spawn-side logging** (pairs with §3.1) so the state_monitor side can't lie about a
+  no-op'd spawn.
 
-Split the single `low_space` into a **purge** threshold and a higher-urgency **alert**
-threshold, both level-evaluated on the 60 s monitor cycle:
+### 3.3 Timer-driven periodic scrub — steady-state drain, NOT the cure for a hang
 
-- **Purge at `xx = 200 GB` free** (higher): while free < `xx`, run the scrub every cooldown
-  (level-triggered, *not* a one-shot edge). This is proactive draining that starts well
-  before the situation is critical and is more responsive (every few minutes) than the
-  15-min timer. **No alert** — this is normal "working hard."
-- **Alert at `yy = 75 GB` free** (lower): fire a distinct notification only if free space
-  punches *through* `xx` down to `yy` **despite** the purging. That means **purge is
-  losing** — the safety net is failing and a human is needed. Debounced (alert once on
-  entry; re-arm when free climbs back above `yy`). If space stabilizes above `yy`, silence.
+A systemd timer (~15 min) that runs the scrub regardless of `bytes_remaining`.
 
-The `xx → yy` band (200 → 75 GB = 125 GB ≈ 10 min of max-rate runway) is the window where
-purge gets to prove it can keep up before anyone is paged.
+- **What it genuinely buys:** it keeps `/ags/data` drained in steady state so free space
+  never *approaches* the threshold under normal storms, and it removes the **telemetry**
+  dependency (doesn't read `bytes_remaining`).
+- **What it does NOT buy (correction after review):** it is **not** "telemetry-independent
+  backbone" — it removes the telemetry dependency but **inherits the AGS-reachability
+  dependency, which is the thing that actually broke.** A timer firing into a rebooting AGS
+  still fails/hangs (now fast, *if* §3.1's fail-fast is deployed). And against a hung scrub
+  holding `flock -n`, **every timer tick no-ops** — the timer adds firing cadence, not
+  hang-recovery. It is only load-bearing once §3.1 is in place.
+- **Write-cost is not a concern** (evaluated): scrub is read-dominated (scan = reads, vfat
+  `relatime`; recover writes ~0–1/run steady-state; purge = KB vfat metadata). < 1 % of the
+  ~120 GB/day these drives already log. Add `noatime`.
+- Keep `flock -n` so timer and threshold runs can't overlap — **but only after §3.1 makes a
+  held lock visible**, else the timer just multiplies silent no-ops.
 
-**Parameter justification** (drive 462 GB; max fill 12.5 GB/min; fast scrub target 1–2 min):
+### 3.4 Two-threshold escalation — fair-weather improvement (would NOT have prevented mj05)
 
-| Knob | Value | Rationale |
+Split `low_space` into a **purge** and a higher-urgency **alert** threshold, level-evaluated:
+
+- **Purge at `xx = 200 GB` free**: while free < `xx`, run the scrub every cooldown
+  (level-triggered, not one-shot). Proactive draining before it's critical.
+- **Alert at `yy = 75 GB` free**: fire only if free punches *through* `xx` to `yy` **despite**
+  purging — i.e. **purge is losing**. Debounced; re-arm above `yy`.
+
+**Honest caveats (post-review):**
+- Both thresholds **read `bytes_remaining`**, which went NA in the failure mode — so this
+  layer is **blind exactly when it mattered**. It's a good-weather improvement.
+- **It would not have prevented this incident.** The scrub had ~21 h of runway after the
+  crossing and used none of it — *time was never the binding constraint*. Raising 100→200 GB
+  just moves the single edge-spawn earlier; if that spawn no-op'd (§1.1b), 200 vs 100 changes
+  nothing. 200/75 are reasonable belt-and-suspenders, **not** the fix.
+
+| Knob | Value | Rationale (arithmetic, not evidence) |
 |---|---|---|
-| timer interval | 15 min | steady-state drain; at observed ~5 GB/hr only ~1.25 GB accrues/interval |
-| `xx` purge start | 200 GB free | ~16 min max-rate runway to empty; comfortably above a fast scrub |
-| `yy` alert | 75 GB free | ~6 min max-rate runway left when paged — urgent but actionable; at observed rate ~15 h |
+| timer interval | 15 min | steady-state drain; observed ~5 GB/hr ⇒ ~1.25 GB/interval |
+| `xx` purge start | 200 GB free | ~16 min max-rate runway above a fast scrub |
+| `yy` alert | 75 GB free | ~6 min max-rate runway when paged; ~15 h at observed rate |
 
-At **max** rate the 15-min timer alone is too coarse (187 GB can accrue between ticks) —
-that is exactly the regime the level-triggered `xx` purge covers between timer ticks. At
-**observed** rate the timer alone suffices. The two mechanisms cover different regimes.
+### 3.5 Make the scrub fast + incremental scan — hardening (claims corrected)
 
-### 3.3 Make the scrub fast (so it can survive surges)
-
-**Measured (mj05 → AGS, Jul 13):** per-file purge baseline **~100 s / 500 files** (plain
-per-op SSH); **batched over one `ControlMaster` connection: 0.163 s / ~480 files** (4
-chunked `rm` calls) — a **~600×** speedup. Purge ceases to be a bottleneck; a full scrub's
-cost collapses onto the MJ scan (~20 s), which the incremental scan below then attacks. A
-fast scrub of ~20–30 s against the 200 GB purge start leaves ~16 min of max-rate runway.
-
-**Prototype validated on-sensor (mj05, Jul 13, Python 3.7.3, real files):** the implemented
-`open_control_master` + batched `purge_ags_files` deleted 230 throwaway AGS files in
-**0.117 s** vs a **~63 s** plain-per-file baseline (~500×), confirmed the drive empty after,
-and tore the master down cleanly. See `perf(scrub)` commit; 26 unit tests.
-
-**Scan-cost-under-load finding (important, drives the incremental scan):** the same day,
-under active AGS recording, a full scrub's **AGS scan alone rose from ~1 s to 99 s** (9 →
-35 files) and the MJ scan stretched to minutes — pure USB read/write contention with the
-live recording. Once purge is ~free, the scan is *the* bottleneck, and it inflates exactly
-when the system is busiest. The incremental scan (below) is therefore not optional polish —
-it is the load-bearing piece for keeping a periodic scrub cheap.
-
-
-- **Persistent SSH** to the AGS via `ControlMaster`/`ControlPersist` (one connection reused
-  for all `dd`/`rm`): measured **16× per-op speedup** (0.29 s → 0.018 s). Add
-  `-o BatchMode=yes -o ConnectTimeout=10` so a sick AGS fails fast instead of hanging.
-- **Batch the deletes:** one `ssh "rm f1 f2 … fN"` (chunked) instead of N round-trips.
-- **Fix `select_target_drive`:** compute the target **once per run**, not per trigger
-  (drop the per-trigger `os.listdir` over 904 dirs).
-- **Incremental MJ scan:** cache the confirmed-header set keyed by hourly dir; on each run
-  scan only new/changed hours. Cuts the 20 s scan to near-zero in steady state, removing
-  the I/O-contention cost of a frequent timer.
-- **Tighten timeouts:** the 3600 s scan cap lets one futile pass hold the lock for an hour;
-  reduce to minutes now that SSH is fast and fails fast.
-
-### 3.4 Observability + failure detection (so the next incident is diagnosable)
-
-- **Persistent, rotation-safe scrub log** (`scrub_log`, already added in PR #78): capture
-  every run's scan/recover/purge **counts, per-phase timings, errors, and lock-acquisition
-  result**. Never `DEVNULL`.
-- **Futile-scrub alert:** if consecutive runs purge 0 files while free space keeps falling,
-  alert ("scrub running but not freeing space"). This is the symptom the 21-h silent ramp
-  never surfaced.
-- **Stuck-lock detection:** if `flock` fails to acquire for N consecutive runs, alert (a
-  prior scrub is hung).
+- **Batch the deletes** (one `rm -f f1…fN` per 100 files) — **this is the robust win**, and
+  it works even on plain SSH (fewer round-trips). *Built.*
+- **Persistent SSH (`ControlMaster`)** — **credit corrected:** the headline "600×" is
+  *batching × multiplexing*; **batching alone gets ~100×** without ControlMaster's fragility.
+  And ControlMaster **self-disables in the failure mode** — on a sick AGS, `open_control_master`
+  fails → fallback to per-call SSH = the slow baseline. So the speedup is *fair-weather*; the
+  incident-relevant part of the same commit is the fail-fast flags (§3.1), not the speed.
+- **Measurement honesty (corrected):**
+  - Lab: batched+CM 0.163 s vs ~100 s / 500 files. On-sensor: 0.117 s vs ~63 s / 230 files.
+    Real, but **the on-sensor files were 0-byte throwaways** (the earlier "real AGS files"
+    wording was wrong — corrected in the commit trailer). Real 20 MB triggers cost *more* to
+    `rm` on vfat (cluster-chain freeing); the 0.117 s is a **floor**, not a representative
+    number for real payloads.
+  - **`recover` was never measured on-sensor.** The 16×/round-trip does **not** transfer to
+    `recover`'s `dd` of ~20 MB payloads (transfer-bound, not handshake-bound). Recover
+    throughput under storm rate is **unvalidated**.
+- **Incremental MJ scan** — cache the confirmed-header set per hourly dir; scan only new
+  hours. **This is the load-bearing scan fix**, because the scan — not purge — is the real
+  wall-clock driver: under active recording the AGS scan hit **99 s** (attribution to USB
+  I/O contention is a **hypothesis**, confounded by a 4× file-count rise; not isolated).
+  Note the shipped `perf(scrub)` commit does **not** speed the scan (it runs before the
+  ControlMaster opens, by design — a single call gets no multiplexing benefit).
+- **`select_target_drive` once per run**, not per trigger (drops a per-trigger `os.listdir`
+  over 904 dirs). Minor for *this* incident (0 triggers recovered during the fill).
+- **`--since auto` for the timer path** needs pinning down — under a storm it pushes the MJ
+  scan back over many dirs, undercutting the incremental-scan win.
 
 ---
 
@@ -202,41 +213,61 @@ it is the load-bearing piece for keeping a periodic scrub cheap.
 
 | Prior work | Disposition |
 |---|---|
-| PR #78 edge→level trigger + cooldown | **Reframed.** Level-triggering survives as the `xx` purge behavior, but as *part of* the two-threshold + timer design, not as "the fix." The trigger was never the failure. |
-| PR #78 `scrub_log` | **Kept** — it is the one directly useful piece (§3.4). |
-| PR #80 Layer 1 `check_recovery_drives` | **Out of scope** — mj-pi `DATA??` fullness is a separate MJ-drive-management issue, not part of keeping `/ags/data` clean. Belongs in its own effort. |
-| PR #80 Layer 2 H&S staleness watchdog | **Folded in** — the timer's telemetry-independence is the structural answer; a staleness alert remains useful as a cheap signal. |
-| PR #80 Layer 3 futile-scrub alert | **Kept** (§3.4). |
+| PR #78 edge→level trigger + cooldown | **Reframed** — level-triggering survives as the `xx` purge behavior (§3.4), not "the fix." |
+| PR #78 `scrub_log` | **Kept & promoted** — observability (§3.2) is now second-priority, not an afterthought. |
+| PR #80 Layer 1 `check_recovery_drives` | **Out of scope** — mj-pi `DATA??` fullness is a separate effort. |
+| PR #80 Layer 2 H&S staleness watchdog | **Folded in** — cheap signal; but note (§3.3) it shares the AGS-reachability dependency. |
+| PR #80 Layer 3 futile-scrub alert | **Kept** (§3.2). |
 
 ---
 
 ## 5. Test plan
 
-- **Unit (pytest):** two-threshold state machine (purge below `xx`, alert crossing `yy`,
-  debounce/re-arm, no alert while `yy < free < xx`); `select_target_drive` called once;
-  batched-delete command construction; incremental-scan cache hit/miss; futile/stuck
-  detection latches.
-- **Scrub-script:** ControlMaster path (mock ssh), batched `rm` chunking, timeout/fail-fast
-  behavior, dry-run still deletes nothing.
-- **Integration (on a bench/idle unit):** timer fires and completes; a forced near-full
-  condition drives purge below `xx`, alert at `yy`, recovery re-arms; measure real scrub
-  wall-clock with ControlMaster+batch vs baseline.
-- **Load reproduction:** near-full `/ags/data` + synthetic sustained influx, instrumentation
-  on — confirm the scrub keeps pace or that the futile alert fires. This is the test the
-  original incident lacked.
+- **Unit (pytest):** honest-lock logging + stuck-lock latch; bounded scan timeout; two-
+  threshold state machine (purge below `xx`, alert crossing `yy`, debounce/re-arm);
+  `select_target_drive` once; batched-delete chunking incl. **exact-multiple boundaries** and
+  **partial-chunk per-file attribution**; **`run()`-level ControlMaster wiring** (open →
+  thread to recover+purge → close); incremental-scan cache hit/miss; futile-scrub latch.
+  *(The batched-purge/ControlMaster/run-wiring tests exist; the rest are TODO.)*
+- **Integration (bench/idle unit):** timer fires; a forced near-full condition drives purge
+  below `xx`, alert at `yy`; **inject a hung scrub and verify §3.1 makes it visible + a timer
+  tick does NOT silently no-op.** Measure real scrub wall-clock incl. **recover** (unmeasured
+  so far).
+- **Load reproduction:** near-full `/ags/data` + sustained influx, instrumentation on —
+  confirm the scrub keeps pace *or* the futile/stuck alert fires. The test the incident
+  lacked.
 
 ---
 
 ## 6. Open questions / risks
 
-1. **Fast-scrub wall-clock under load** is still to be *measured*, not assumed — §5 load
-   test sets `xx`/timer definitively. Values in §3.2 are starting points.
-2. **Incremental-scan cache invalidation** (compression rewrites files, udisks suffixed
-   mounts `DATA071`) — must fall back to a full scan on cache miss/anomaly.
-3. **Timer + brokkr write contention** during a real storm — the incremental scan should
-   remove most of it; verify under load.
-4. **`bytes_remaining` = `/ags/data` free** is established empirically here (fills to 0,
-   scrub targets the same drive, 448.96 GB ceiling ≈ 462 GB drive). This **contradicts an
-   older internal note** claiming it is *not* the AGS drive — that note should be corrected.
-5. Per-unit variation (mj05 is `nochargecontroller`, no ttyUSB; PAMMA units differ) — keep
-   thresholds configurable per unit.
+1. **Which failure mode actually occurred is unrecoverable** (hang vs ran-but-freed-nothing).
+   The design now covers both, but §3 priorities assume the hang is at least as likely — if
+   later evidence points to "ran but slow," the timer (§3.3) rises in value.
+2. **Fast-scrub wall-clock under load** must be *measured* (recover especially); §3.4 values
+   are arithmetic starting points.
+3. **Incremental-scan cache invalidation** (compression rewrites, udisks suffixed mounts
+   `DATA071`) — fall back to full scan on cache miss/anomaly.
+4. **`bytes_remaining` = `/ags/data` free** is established empirically (fills to 0; scrub
+   targets the same drive; 448.96 ≈ 462 GB). This **contradicts an internal MEMORY note**
+   claiming it is sensor-internal storage, not the AGS drive — resolve/correct that note
+   before building the thresholds on it.
+5. **ControlMaster socket** is `/tmp/hamma_scrub_cm_<pid>.sock` — PID reuse after a hard
+   crash can collide with a stale socket (degrades to slow per-call SSH, silently). Consider
+   `%C`-hashed paths or stale-unlink. And `/tmp`-full during a disk-fill disables the
+   multiplexing exactly when needed — log the degradation.
+6. Per-unit variation (mj05 `nochargecontroller`; PAMMA differs) — thresholds configurable.
+
+---
+
+## Changelog
+
+- **v2 (post red-team):** Re-ranked §3 — silent-failure-mode elimination (§3.1) and
+  observability (§3.2) promoted above the timer (§3.3), which is demoted to steady-state
+  drain and no longer called the "backbone." Downgraded "the trigger fired" → "should have
+  fired / may have silently no-op'd" (§1.1) and "no purge, proved" → "strongly indicated,
+  rate-dependent" (§1.2). Corrected the fast-scrub claims (§3.5): batching-vs-multiplexing
+  credit, self-disables on sick AGS, 0-byte throwaway files, recover unmeasured, scan-
+  contention a hypothesis. Noted the two-threshold layer is blind in the failure mode and
+  would not have prevented mj05 (§3.4). Added the ControlMaster socket/`/tmp` risks (§6.5).
+- **v1:** timer-first design (superseded).
