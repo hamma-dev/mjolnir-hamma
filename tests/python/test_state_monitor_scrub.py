@@ -1,7 +1,9 @@
 """Tests for state_monitor scrub-on-low-space integration."""
 
 import importlib.util
+import signal
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -69,15 +71,19 @@ def make_input_data(bytes_remaining):
 
 
 def make_monitor(scrub_command="", low_space=100, space_previous=150,
-                 stuck_scrub_cycles=10):
+                 scrub_hang_timeout_s=900, scrub_status_file="/tmp/nonexistent",
+                 scrub_auto_recover=True, scrub_log=""):
     """Create a StateMonitor instance with test defaults."""
     mon = StateMonitor.__new__(StateMonitor)
     mon.low_space = low_space
     mon.scrub_command = scrub_command
     mon.logger = MagicMock()
     mon._previous_data = make_input_data(space_previous)
-    mon.stuck_scrub_cycles = stuck_scrub_cycles
-    mon._scrub_lock_held_cycles = 0
+    mon.scrub_hang_timeout_s = scrub_hang_timeout_s
+    mon.scrub_status_file = scrub_status_file
+    mon.scrub_auto_recover = scrub_auto_recover
+    mon.scrub_log = scrub_log
+    mon._scrub_first_held = None
     mon._stuck_scrub_alerted = False
     return mon
 
@@ -90,8 +96,8 @@ class TestScrubSpawning:
     @pytest.fixture(autouse=True)
     def _lock_free(self):
         """These tests assume no prior scrub is running (lock free)."""
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=False):
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"):
             yield
 
     def test_scrub_spawned_on_low_space(self):
@@ -192,89 +198,146 @@ class TestScrubConfig:
 
 class TestScrubLockHonesty:
     """_spawn_scrub must not spawn -- and must not silently claim success --
-    when a prior scrub still holds the lock (the mj05 flock -n no-op)."""
+    when a prior scrub holds the lock (the mj05 flock -n no-op), and must not
+    spawn into an unreadable lock (disk full)."""
 
     def test_no_spawn_when_lock_held(self):
         mon = make_monitor(scrub_command="python3 scrub.py", space_previous=150)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True), \
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
              patch("subprocess.Popen") as mock_popen:
             mon.check_sensor_drive(make_input_data(90))
         mock_popen.assert_not_called()
         mon.logger.warning.assert_called()  # honest: it says it did NOT spawn
 
+    def test_no_spawn_when_lock_unknown(self):
+        mon = make_monitor(scrub_command="python3 scrub.py", space_previous=150)
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="unknown"), \
+             patch("subprocess.Popen") as mock_popen:
+            mon.check_sensor_drive(make_input_data(90))
+        mock_popen.assert_not_called()
+        mon.logger.warning.assert_called()
+
     def test_spawns_when_lock_free(self):
         mon = make_monitor(scrub_command="python3 scrub.py", space_previous=150)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=False), \
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"), \
              patch("subprocess.Popen") as mock_popen:
             mon.check_sensor_drive(make_input_data(90))
         mock_popen.assert_called_once()
 
 
 class TestCheckScrubHealth:
-    """Per-cycle stuck-lock detection: the lock held across many cycles means
-    a prior scrub is hung (the failure mode a timer cannot fix)."""
+    """Progress-gated hung-scrub detection: a scrub is hung only if the lock is
+    held AND its heartbeat is stale -- so a long legit recovery (fresh
+    heartbeat) is NOT flagged. On a genuine hang, recover (kill) + alert once."""
 
-    def _mon(self, cycles=3):
-        return make_monitor(scrub_command="python3 scrub.py",
-                            stuck_scrub_cycles=cycles)
+    def _mon(self, **kw):
+        kw.setdefault("scrub_command", "python3 scrub.py")
+        kw.setdefault("scrub_hang_timeout_s", 900)
+        return make_monitor(**kw)
 
-    def test_alerts_after_threshold_consecutive_held_cycles(self):
-        mon = self._mon(cycles=3)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
-            assert mon.check_scrub_health(make_input_data(50)) is None   # 1
-            assert mon.check_scrub_health(make_input_data(50)) is None   # 2
-            msg = mon.check_scrub_health(make_input_data(50))            # 3
-        assert msg is not None and "hung" in msg.lower()
-
-    def test_alert_is_one_shot(self):
-        mon = self._mon(cycles=1)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
-            assert mon.check_scrub_health(make_input_data(50)) is not None
+    def test_no_alert_when_heartbeat_fresh(self):
+        """Lock held but scrub is progressing (recent heartbeat) -> no alert."""
+        mon = self._mon()
+        fresh = {"pid": 111, "timestamp": time.time()}  # just now
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=fresh):
             assert mon.check_scrub_health(make_input_data(50)) is None
-
-    def test_resets_when_lock_frees(self):
-        mon = self._mon(cycles=2)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
-            mon.check_scrub_health(make_input_data(50))  # 1 held
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=False):
-            assert mon.check_scrub_health(make_input_data(50)) is None
-        assert mon._scrub_lock_held_cycles == 0
         assert mon._stuck_scrub_alerted is False
 
-    def test_re_arms_after_recovery(self):
-        mon = self._mon(cycles=1)
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
-            assert mon.check_scrub_health(make_input_data(50)) is not None
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
+    def test_alerts_and_recovers_when_heartbeat_stale(self):
+        """Lock held + heartbeat stale beyond timeout -> hung: kill + alert."""
+        mon = self._mon(scrub_hang_timeout_s=900, scrub_auto_recover=True)
+        stale = {"pid": 222, "timestamp": time.time() - 1000}  # 1000s ago
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=stale), \
+             patch.object(StateMonitor, "_recover_stuck_scrub",
+                          return_value=True) as mock_recover:
+            msg = mon.check_scrub_health(make_input_data(50))
+        mock_recover.assert_called_once_with(stale)
+        assert msg is not None and "hung" in msg.lower()
+
+    def test_no_kill_when_auto_recover_disabled(self):
+        mon = self._mon(scrub_auto_recover=False)
+        stale = {"pid": 3, "timestamp": time.time() - 1000}
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=stale), \
+             patch.object(StateMonitor, "_recover_stuck_scrub") as mock_recover:
+            msg = mon.check_scrub_health(make_input_data(50))
+        mock_recover.assert_not_called()
+        assert msg is not None and "manual" in msg.lower()
+
+    def test_no_heartbeat_uses_held_duration_fallback(self):
+        """No status file: not hung until the lock has been held > timeout."""
+        mon = self._mon(scrub_hang_timeout_s=900)
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=None), \
+             patch.object(StateMonitor, "_recover_stuck_scrub",
                           return_value=False):
-            mon.check_scrub_health(make_input_data(50))
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
+            # First sighting: held-duration ~0 -> not hung yet
+            assert mon.check_scrub_health(make_input_data(50)) is None
+            # Simulate the lock having first been seen held long ago
+            mon._scrub_first_held = time.monotonic() - 1000
             assert mon.check_scrub_health(make_input_data(50)) is not None
 
+    def test_alert_is_one_shot_and_re_arms_on_free(self):
+        mon = self._mon(scrub_auto_recover=False)
+        stale = {"pid": 4, "timestamp": time.time() - 1000}
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=stale):
+            assert mon.check_scrub_health(make_input_data(50)) is not None  # alert
+            assert mon.check_scrub_health(make_input_data(50)) is None      # quiet
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"):
+            assert mon.check_scrub_health(make_input_data(50)) is None
+        assert mon._scrub_first_held is None
+        assert mon._stuck_scrub_alerted is False
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=stale):
+            assert mon.check_scrub_health(make_input_data(50)) is not None  # re-arm
+
+    def test_unknown_lock_state_is_suspicious_not_free(self):
+        """'unknown' (disk full) must not reset -- it counts toward a hang."""
+        mon = self._mon()
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="unknown"), \
+             patch.object(StateMonitor, "_read_scrub_status",
+                          return_value=None), \
+             patch.object(StateMonitor, "_recover_stuck_scrub",
+                          return_value=False):
+            mon.check_scrub_health(make_input_data(50))
+            assert mon._scrub_first_held is not None  # streak started, not reset
+
     def test_no_op_when_no_scrub_command(self):
-        mon = self._mon(cycles=1)
+        mon = self._mon()
         mon.scrub_command = ""
-        with patch.object(StateMonitor, "_scrub_lock_is_held",
-                          return_value=True):
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"):
             assert mon.check_scrub_health(make_input_data(50)) is None
 
 
-class TestScrubLockProbe:
-    """The real flock(2) probe interoperates with `flock -n`."""
+class TestScrubLockState:
+    """The real flock(2) tri-state probe interoperates with `flock -n`."""
 
     def test_free_when_unlocked(self, tmp_path):
         mon = make_monitor()
         lock = str(tmp_path / "scrub.lock")
         with patch.object(MODULE, "SCRUB_LOCK_FILE", lock):
-            assert mon._scrub_lock_is_held() is False
+            assert mon._scrub_lock_state() == "free"
 
     def test_held_when_locked_by_another_fd(self, tmp_path):
         import fcntl
@@ -285,7 +348,87 @@ class TestScrubLockProbe:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             with patch.object(MODULE, "SCRUB_LOCK_FILE", lock):
-                assert mon._scrub_lock_is_held() is True
+                assert mon._scrub_lock_state() == "held"
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+    def test_unknown_when_lockfile_unopenable(self):
+        """os.open failure (e.g. ENOSPC on a full disk) -> 'unknown', not
+        'free' -- the detector must not go blind during a disk-full event."""
+        mon = make_monitor()
+        with patch("os.open", side_effect=OSError("ENOSPC")):
+            assert mon._scrub_lock_state() == "unknown"
+
+
+class TestRecoverStuckScrub:
+    """Self-healing: kill a genuinely-hung scrub, guarded against PID reuse."""
+
+    def test_kills_verified_scrub_process_group(self):
+        mon = make_monitor()
+        with patch.object(StateMonitor, "_pid_is_scrub", return_value=True), \
+             patch("os.getpgid", return_value=555), \
+             patch("os.killpg") as mock_killpg:
+            assert mon._recover_stuck_scrub({"pid": 555}) is True
+        mock_killpg.assert_called_once_with(555, signal.SIGKILL)
+
+    def test_does_not_kill_recycled_pid(self):
+        mon = make_monitor()
+        with patch.object(StateMonitor, "_pid_is_scrub", return_value=False), \
+             patch("os.killpg") as mock_killpg:
+            assert mon._recover_stuck_scrub({"pid": 999}) is False
+        mock_killpg.assert_not_called()
+
+    def test_no_pid_cannot_recover(self):
+        mon = make_monitor()
+        with patch("os.killpg") as mock_killpg:
+            assert mon._recover_stuck_scrub(None) is False
+            assert mon._recover_stuck_scrub({}) is False
+        mock_killpg.assert_not_called()
+
+
+class TestScrubLogRedirect:
+    """The scrub's stdout/stderr go to a durable log, not DEVNULL (the mj05
+    incident ran blind because output was DEVNULL'd)."""
+
+    def test_output_redirected_to_scrub_log(self, tmp_path):
+        log = str(tmp_path / "sub" / "scrub.log")
+        mon = make_monitor(scrub_command="python3 scrub.py", scrub_log=log)
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"), \
+             patch("subprocess.Popen") as mock_popen:
+            mon._spawn_scrub()
+        kwargs = mock_popen.call_args[1]
+        assert kwargs["stdout"] is not subprocess.DEVNULL   # a real file
+        assert kwargs["stderr"] == subprocess.STDOUT        # merged into it
+
+    def test_devnull_when_no_scrub_log(self):
+        mon = make_monitor(scrub_command="python3 scrub.py", scrub_log="")
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"), \
+             patch("subprocess.Popen") as mock_popen:
+            mon._spawn_scrub()
+        kwargs = mock_popen.call_args[1]
+        assert kwargs["stdout"] == subprocess.DEVNULL
+        assert kwargs["stderr"] == subprocess.DEVNULL
+
+    def test_falls_back_to_devnull_when_log_unwritable(self):
+        mon = make_monitor(scrub_command="python3 scrub.py",
+                           scrub_log="/proc/nope/scrub.log")
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"), \
+             patch("subprocess.Popen") as mock_popen:
+            mon._spawn_scrub()
+        kwargs = mock_popen.call_args[1]
+        assert kwargs["stdout"] == subprocess.DEVNULL
+
+    def test_rotates_when_oversized(self, tmp_path):
+        log = tmp_path / "scrub.log"
+        log.write_bytes(b"x" * 10)
+        mon = make_monitor(scrub_command="python3 scrub.py", scrub_log=str(log))
+        with patch.object(MODULE, "SCRUB_LOG_MAX_BYTES", 5), \
+             patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="free"), \
+             patch("subprocess.Popen"):
+            mon._spawn_scrub()
+        assert (tmp_path / "scrub.log.1").exists()  # old log rotated aside

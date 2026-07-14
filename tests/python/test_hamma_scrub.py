@@ -1854,10 +1854,12 @@ class TestMain:
 
     @pytest.fixture(autouse=True)
     def _stub_control_master(self, hamma_scrub):
-        """run() opens a real SSH ControlMaster; stub it out in unit tests."""
+        """run() opens a real SSH ControlMaster + writes a status file to the
+        real home; stub both out in unit tests."""
         with patch.object(hamma_scrub, "open_control_master",
                           return_value=None), \
-             patch.object(hamma_scrub, "close_control_master"):
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_status"):
             yield
 
     def test_exit_code_0_all_match(self, hamma_scrub):
@@ -2190,10 +2192,12 @@ class TestRunSinceAuto:
 
     @pytest.fixture(autouse=True)
     def _stub_control_master(self, hamma_scrub):
-        """run() opens a real SSH ControlMaster; stub it out in unit tests."""
+        """run() opens a real SSH ControlMaster + writes a status file to the
+        real home; stub both out in unit tests."""
         with patch.object(hamma_scrub, "open_control_master",
                           return_value=None), \
-             patch.object(hamma_scrub, "close_control_master"):
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_status"):
             yield
 
     def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
@@ -2452,6 +2456,7 @@ class TestRunControlMasterWiring:
         sentinel = "/tmp/sentinel_cm.sock"
         with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
              patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
              patch.object(hamma_scrub, "open_control_master",
                           return_value=sentinel) as mock_open, \
              patch.object(hamma_scrub, "close_control_master") as mock_close, \
@@ -2469,3 +2474,33 @@ class TestRunControlMasterWiring:
         assert mock_recover.call_args.kwargs.get("control_path") == sentinel
         assert mock_purge.call_args.kwargs.get("control_path") == sentinel
         mock_close.assert_called_once_with("hamma", sentinel)
+
+
+class TestWriteStatus:
+    """Scrub writes an atomic heartbeat/status file for the monitor to read."""
+
+    def test_writes_json_with_timestamp_phase_pid_counts(self, hamma_scrub,
+                                                         tmp_path):
+        p = str(tmp_path / "sub" / "status.json")  # dir does not exist yet
+        hamma_scrub.write_status(p, "purge", recovered=2, purged=10)
+        data = json.loads(pathlib.Path(p).read_text())
+        assert data["phase"] == "purge"
+        assert data["recovered"] == 2 and data["purged"] == 10
+        assert data["pid"] == os.getpid()
+        assert isinstance(data["timestamp"], (int, float))
+
+    def test_none_path_is_noop(self, hamma_scrub):
+        hamma_scrub.write_status(None, "scan")  # must not raise
+
+    def test_write_failure_is_swallowed(self, hamma_scrub):
+        # Unwritable location -> logged at debug, never raised (status is
+        # best-effort; a failed heartbeat must not crash the scrub).
+        hamma_scrub.write_status("/proc/cannot/write/status.json", "scan")
+
+    def test_atomic_replace_used(self, hamma_scrub, tmp_path):
+        # Overwriting an existing status file must not leave a partial file.
+        p = str(tmp_path / "status.json")
+        hamma_scrub.write_status(p, "scan", purged=0)
+        hamma_scrub.write_status(p, "done", purged=5)
+        data = json.loads(pathlib.Path(p).read_text())
+        assert data["phase"] == "done" and data["purged"] == 5

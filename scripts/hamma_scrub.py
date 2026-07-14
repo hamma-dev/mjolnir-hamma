@@ -65,6 +65,12 @@ PURGE_TIMEOUT = 30        # seconds per batched delete chunk
 # stall the safety net for an hour. 600s is ~6x the observed worst case (~99s).
 SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
 
+# Heartbeat/status file the scrub updates as it advances, so the monitor
+# (state_monitor.check_scrub_health) can tell a working scrub from a hung one
+# (progress, not just lock age) and safely recover only genuine hangs.
+DEFAULT_STATUS_FILE = os.path.expanduser(
+    "~/brokkr/hamma/log/hamma_scrub_status.json")
+
 # Exit codes
 EXIT_OK = 0
 EXIT_MISSING = 1
@@ -178,6 +184,38 @@ def ssh_control_master(host):
         yield control_path
     finally:
         close_control_master(host, control_path)
+
+
+def write_status(path, phase, **counts):
+    """Atomically write the scrub heartbeat/status file (best-effort).
+
+    Records ``pid``, ``phase``, a wall-clock ``timestamp`` (the heartbeat), and
+    any running ``counts`` (e.g. recovered=, purged=). Written via temp-file +
+    ``os.replace`` so a reader never sees a partial file. Failures are logged at
+    debug and swallowed -- a heartbeat that can't be written must never crash
+    or block the scrub. ``path`` of None is a no-op.
+
+    Parameters
+    ----------
+    path : str or None
+        Destination status file, or None to disable.
+    phase : str
+        Current phase: 'start', 'scan', 'recover', 'purge', 'done', 'error'.
+    **counts
+        Extra fields to record (e.g. recovered, purged, missing).
+    """
+    if not path:
+        return
+    payload = {"pid": os.getpid(), "phase": phase, "timestamp": time.time()}
+    payload.update(counts)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug("Could not write status file %s: %s", path, e)
 
 
 def extract_headers(fileobj, file_size, filename):
@@ -1220,7 +1258,7 @@ def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
 
 
 def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False,
-                     control_path=None):
+                     control_path=None, status_file=None):
     """Recover missing triggers from AGS to MJ DATA drives.
 
     Parameters
@@ -1247,6 +1285,11 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False,
     results = []
 
     for candidate in candidates:
+        # Heartbeat per trigger: recover is the long phase, so this is the
+        # granularity the monitor needs to tell "grinding" from "hung".
+        write_status(status_file, "recover", recovered=len(
+            [r for r in results if r["status"] == "recovered"]),
+            total=len(candidates))
         src_file = candidate["filename"]
         src_offset = candidate["offset"]
         trig_idx = candidate["index"]
@@ -1629,12 +1672,17 @@ def _build_parser():
         "--purge", action="store_true",
         help="After recovery, delete AGS files fully confirmed on MJ (requires --recover)",
     )
+    parser.add_argument(
+        "--status-file", default=DEFAULT_STATUS_FILE,
+        help="Heartbeat/status JSON the scrub updates as it advances "
+             "(default: %(default)s; empty string disables)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
-        purge=False):
+        purge=False, status_file=DEFAULT_STATUS_FILE):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1656,12 +1704,15 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         If True, show what would be recovered without transferring.
     purge : bool
         If True, delete AGS files fully confirmed on MJ after recovery.
+    status_file : str or None
+        Heartbeat/status file to update as the scrub advances (None disables).
 
     Returns
     -------
     int
         Exit code.
     """
+    write_status(status_file, "start")
     if dry_run and not recover:
         logger.warning("--dry-run has no effect without --recover")
 
@@ -1686,10 +1737,12 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info("Filtering MJ directories to >= %s", since_cutoff)
 
     # AGS scan runs first (needed for auto-detect and comparison)
+    write_status(status_file, "scan")
     try:
         ags = scan_ags_files(ags_host, ags_path)
     except RuntimeError as e:
         logger.error("AGS scan failed: %s", e)
+        write_status(status_file, "error", error="ags scan failed")
         return EXIT_SSH_ERROR
 
     # Auto-detect: derive cutoff from the scanned AGS entries
@@ -1701,14 +1754,17 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info(
                 "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
+    write_status(status_file, "scan_mj")
     mj = scan_mj_files(mj_path, since=since_cutoff)
 
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
+        write_status(status_file, "done", recovered=0, purged=0)
         return EXIT_OK
 
     if mj["file_count"] == 0 and mj["skipped"] == 0:
         logger.error("No DATA drives or .bin files found at %s", mj_path)
+        write_status(status_file, "error", error="no MJ drives/files")
         return EXIT_NO_DATA
 
     comparison = compare_headers(ags["entries"], mj["headers"])
@@ -1737,6 +1793,8 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     with ssh_control_master(ags_host) as control_path:
         # Recovery flow
         if recover and comparison["missing_on_mj"]:
+            write_status(status_file, "recover", recovered=0,
+                         missing=len(comparison["missing_on_mj"]))
             cleanup_orphaned_temps(mj_path)
             candidates = filter_recovery_candidates(
                 comparison["missing_on_mj"], ags["entries"],
@@ -1744,7 +1802,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             )
             recovery_results = recover_triggers(
                 candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
-                control_path=control_path,
+                control_path=control_path, status_file=status_file,
             )
             recovered_count = len([r for r in recovery_results
                                    if r["status"] == "recovered"])
@@ -1772,6 +1830,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
 
         # Purge flow
         if purge:
+            write_status(status_file, "purge")
             eligibility = identify_purgeable_files(
                 ags["entries"], mj["headers"], recovery_results,
             )
@@ -1802,6 +1861,12 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                 "retained": eligibility["retained"],
                 "dry_run": dry_run,
             }
+
+    write_status(
+        status_file, "done",
+        recovered=len([r for r in (recovery_results or [])
+                       if r["status"] == "recovered"]),
+        purged=len((purge_results or {}).get("deleted", [])))
 
     if json_output:
         print(format_json_report(results, ags_host,
@@ -1847,6 +1912,7 @@ def main():
         recover=args.recover,
         dry_run=args.dry_run,
         purge=args.purge,
+        status_file=args.status_file or None,
     )
     sys.exit(rc)
 
