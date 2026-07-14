@@ -107,7 +107,7 @@ def _make_monitor(**overrides):
         key_file="/dev/null",
         purge_space=200,
         alert_space=75,
-        scrub_cooldown_s=1800,
+        scrub_cooldown_s=300,
         power_delim=15,
         enable_drive_checks=True,
     )
@@ -190,6 +190,59 @@ class TestTwoThresholdDrain:
             msg = m.check_sensor_drive({"bytes_remaining": _dv("NA")})
         spawn.assert_not_called()
         assert msg is None
+
+    def test_at_purge_threshold_is_healthy(self):
+        """free == purge_space (200) is healthy: no spawn, no alert."""
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub") as spawn:
+            msg = m.check_sensor_drive({"bytes_remaining": _dv(200.0)})
+        spawn.assert_not_called()
+        assert msg is None
+
+    def test_at_alert_threshold_drains_no_alert(self):
+        """free == alert_space (75) is in the drain band: spawn, no alert."""
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub") as spawn:
+            msg = m.check_sensor_drive({"bytes_remaining": _dv(75.0)})
+        spawn.assert_called_once()
+        assert msg is None
+
+    def test_alert_rearms_in_drain_band(self):
+        """Re-arm on recovery into the drain band, not only full recovery --
+        an oscillation below alert_space pages each time (hysteresis)."""
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub"):
+            assert m.check_sensor_drive({"bytes_remaining": _dv(50.0)}) is not None
+            # recover into [alert_space, purge_space) -> re-arm
+            assert m.check_sensor_drive({"bytes_remaining": _dv(150.0)}) is None
+            assert m.check_sensor_drive({"bytes_remaining": _dv(50.0)}) is not None
+
+    def test_noop_spawn_does_not_consume_cooldown(self):
+        """A no-op spawn (lock held -> _spawn_scrub returns False) must NOT arm
+        the cooldown, so the next cycle re-attempts (M3)."""
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub", return_value=False) as spawn:
+            m.check_sensor_drive({"bytes_remaining": _dv(150.0)})
+            m.check_sensor_drive({"bytes_remaining": _dv(148.0)})
+        assert spawn.call_count == 2
+        assert m._last_scrub_spawn is None
+
+    def test_successful_spawn_arms_cooldown(self):
+        m = _make_monitor()
+        self._prev(m)
+        with patch.object(m, "_spawn_scrub", return_value=True) as spawn:
+            m.check_sensor_drive({"bytes_remaining": _dv(150.0)})
+            m.check_sensor_drive({"bytes_remaining": _dv(148.0)})  # gated
+        spawn.assert_called_once()
+
+    def test_misconfig_alert_ge_purge_warns(self):
+        m = _make_monitor(purge_space=75, alert_space=200)
+        assert any("alert_space" in str(c) for c in
+                   m.logger.warning.call_args_list)
 
 
 class TestCheckPowerBoundary:

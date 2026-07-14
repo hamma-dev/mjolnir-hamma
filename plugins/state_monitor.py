@@ -136,6 +136,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.scrub_cooldown_s = scrub_cooldown_s
         self._last_scrub_spawn = None   # monotonic; level-trigger retry gate
         self._low_space_alerted = False
+        if alert_space >= purge_space:
+            self.logger.warning(
+                "state_monitor: alert_space (%s) >= purge_space (%s) -- the "
+                "'purge is losing' alert will fire on every routine drain; "
+                "expected alert_space < purge_space", alert_space, purge_space)
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
         self.low_pi_space = low_pi_space*1000000000
@@ -418,28 +423,38 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             return None
         # Below the purge threshold: drain proactively (level-triggered + cooldown).
         self._maybe_spawn_scrub()
-        # Below the alert threshold too: purge is losing -> alert once.
-        if space_now < self.alert_space and not self._low_space_alerted:
+        if space_now >= self.alert_space:
+            # Drain band [alert_space, purge_space): draining, no alert. Re-arm
+            # the alert here (hysteresis) so a fresh drop below alert_space in a
+            # later oscillation pages again -- not just once per full recovery.
+            self._low_space_alerted = False
+            return None
+        # Below the alert threshold: purge is losing -> alert once.
+        if not self._low_space_alerted:
             self._low_space_alerted = True
-            return ("Sensor drive low: {:.1f} GB free (below {:g} GB) and still "
-                    "falling despite auto-scrub -- intervention may be needed"
-                    .format(space_now, self.alert_space))
+            return ("Sensor drive critically low: {:.1f} GB free (below the "
+                    "{:g} GB alert floor); auto-scrub is running -- "
+                    "intervention may be needed".format(
+                        space_now, self.alert_space))
         return None
 
     def _maybe_spawn_scrub(self):
         """Spawn a scrub at most once per `scrub_cooldown_s` (level-trigger retry).
 
-        The cooldown stops check_sensor_drive from re-attempting every 60 s
-        monitor cycle while free stays below `purge_space`. `_spawn_scrub`
-        itself no-ops (via the flock probe) if a scrub is already running.
+        The cooldown stops check_sensor_drive from re-launching every 60 s
+        monitor cycle. It is armed only when a scrub *actually launches* -- a
+        no-op attempt (lock held by a running scrub, or a spawn error) does NOT
+        consume the cooldown, so we re-probe the (cheap) flock every cycle and
+        launch the instant the lock frees.
         """
         now = time.monotonic()
         if (self._last_scrub_spawn is not None
                 and now - self._last_scrub_spawn < self.scrub_cooldown_s):
             return False
-        self._last_scrub_spawn = now
-        self._spawn_scrub()
-        return True
+        if self._spawn_scrub():
+            self._last_scrub_spawn = now
+            return True
+        return False
 
     def _scrub_lock_state(self):
         """Return 'held', 'free', or 'unknown' for the scrub flock.
@@ -508,25 +523,32 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         made the spawn a silent no-op *and the log lied* (the mj05 failure).
         Here we probe the lock first and log the truth, and capture the scrub's
         output to a durable log (mj05 ran blind on DEVNULL'd output).
+
+        Returns
+        -------
+        bool
+            True iff a scrub was actually launched (so the level-trigger's
+            cooldown is armed only on a real launch, not a no-op).
         """
         if not self.scrub_command or not self.scrub_command.strip():
-            return
+            return False
         state = self._scrub_lock_state()
         if state == "held":
             self.logger.warning(
                 "Scrub NOT spawned: a prior scrub still holds %s "
                 "(possibly hung -- see check_scrub_health)", SCRUB_LOCK_FILE)
-            return
+            return False
         if state == "unknown":
             self.logger.warning(
                 "Scrub NOT spawned: lock %s unreadable (disk full?)",
                 SCRUB_LOCK_FILE)
-            return
+            return False
         log_fh = self._open_scrub_log()
         if log_fh is not None:
             out, err = log_fh, subprocess.STDOUT  # capture stderr into the log
         else:
             out, err = subprocess.DEVNULL, subprocess.DEVNULL
+        launched = False
         try:
             cmd = ["flock", "-n", SCRUB_LOCK_FILE] + shlex.split(
                 self.scrub_command)
@@ -538,11 +560,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             )
             self.logger.info("Scrub spawned (lock was free): %s",
                              " ".join(cmd))
+            launched = True
         except (OSError, ValueError) as e:
             self.logger.error("Failed to spawn scrub: %s", e)
         finally:
             if log_fh is not None:
                 log_fh.close()  # Popen dup'd the fd; the parent can close
+        return launched
 
     def _pid_is_scrub(self, pid):
         """True if `pid` is (still) a running hamma_scrub process.

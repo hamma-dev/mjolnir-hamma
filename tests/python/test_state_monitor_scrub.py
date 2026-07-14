@@ -71,7 +71,7 @@ def make_input_data(bytes_remaining):
 
 
 def make_monitor(scrub_command="", purge_space=200, alert_space=75,
-                 scrub_cooldown_s=1800, space_previous=250,
+                 scrub_cooldown_s=300, space_previous=250,
                  scrub_hang_timeout_s=900, scrub_status_file="/tmp/nonexistent",
                  scrub_auto_recover=True, scrub_log=""):
     """Create a StateMonitor instance with test defaults."""

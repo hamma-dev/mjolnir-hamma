@@ -215,8 +215,17 @@ A systemd timer (~15 min) that runs the scrub regardless of `bytes_remaining`.
 
 **Built:** `check_sensor_drive` in `state_monitor.py` is now level-triggered across
 `purge_space=200` / `alert_space=75` (replacing the single edge-triggered `low_space`);
-`_maybe_spawn_scrub` gates re-spawns to `scrub_cooldown_s=1800`; NA readings are skipped
-(fair-weather). Config keys in `main.toml`; tests in `test_state_monitor.py::TestTwoThresholdDrain`.
+`_maybe_spawn_scrub` gates re-launches to `scrub_cooldown_s=300` (5 min, so it's more
+responsive than the 15-min §3.3 timer), stamped **only on an actual launch** (a no-op while
+the lock is held doesn't burn the cooldown); NA readings are skipped (fair-weather). Config
+keys in `main.toml`; tests in `test_state_monitor.py::TestTwoThresholdDrain`.
+
+**Red-team corrections:** the alert re-arms on recovery into the drain band (≥ `alert_space`,
+hysteresis) not only above `purge_space`, so a unit oscillating around the floor pages each
+new dip rather than once ever; `__init__` warns if `alert_space >= purge_space`; the alert
+wording no longer claims "still falling" (it states the level + that the scrub is running).
+**Release note:** the 75–200 GB *purge band is now silent by design* — the old edge-trigger's
+"Remaining GB on drive" message is gone; the first operator page is at `alert_space=75`.
 
 Split `low_space` into a **purge** and a higher-urgency **alert** threshold, level-evaluated:
 
