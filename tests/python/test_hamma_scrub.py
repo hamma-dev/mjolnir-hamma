@@ -374,7 +374,7 @@ class TestScanAgsFiles:
         """AGS scan timeout is bounded to minutes (SCAN_TIMEOUT), not the old
         3600s cap: a hung scan holds the scrub lock for its whole timeout, so
         an hour-long cap lets one hung scan stall the safety net for an hour."""
-        assert hamma_scrub.SCAN_TIMEOUT <= 900
+        assert hamma_scrub.SCAN_TIMEOUT == 600
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = b''

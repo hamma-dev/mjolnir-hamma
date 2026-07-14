@@ -58,10 +58,11 @@ SSH_CONNECT_TIMEOUT = 10  # seconds to establish an SSH connection (fail fast)
 CONTROL_PERSIST = 60      # seconds the shared ControlMaster lingers after last use
 PURGE_CHUNK_SIZE = 100    # AGS files deleted per batched `rm` (one SSH round-trip)
 PURGE_TIMEOUT = 30        # seconds per batched delete chunk
-# Bounds worst-case lock-hold time: an auto-scrub runs under `flock -n`, so a
-# hung scan blocks every subsequent spawn for its whole timeout. The old 3600s
-# cap let one hung scan stall the safety net for an hour; minutes is enough for
-# a legitimately large scan under load (observed worst case ~99s).
+# Bounds the SCAN phase's contribution to lock-hold time -- NOT the whole scrub:
+# recover is per-trigger (RECOVER_TIMEOUT) and purge per-chunk (PURGE_TIMEOUT),
+# so the aggregate scan+recover+purge lock-hold is NOT bounded by this alone.
+# An auto-scrub runs under `flock -n`; the old 3600s scan cap let one hung scan
+# stall the safety net for an hour. 600s is ~6x the observed worst case (~99s).
 SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
 
 # Exit codes

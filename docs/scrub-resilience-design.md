@@ -111,30 +111,52 @@ happen silently** and **visible when it does**.
 Ordered by how directly each addresses the failure mode we cannot rule out (the hang), not
 by how appealing it sounds.
 
-### 3.1 Kill the silent-failure modes (THE fix for a hang) — highest priority
+### 3.1 Make silent failure impossible + visible (partially built) — highest priority
 
-- **Make `_spawn_scrub` honest about the lock.** Today it logs success whether or not
-  `flock` acquired. Have it detect and log/report lock contention explicitly (e.g. probe
-  `flock -n` acquisition, or have the scrub itself write a start/end record) so "a prior
-  scrub is still running" is *visible*, not silent.
-- **Bound the scan timeout.** Drop the scrub's `subprocess.run(timeout=3600)` scan cap to
-  minutes. This is the single value that bounds worst-case lock-hold time; until it drops,
-  `flock -n` + 3600 s = a scrub can wedge the safety net for an hour.
-- **Fail-fast SSH.** `-o BatchMode=yes -o ConnectTimeout=10` on every AGS call so a sick AGS
-  fails fast instead of hanging toward the cap. *(Built — see `perf(scrub)`; this is the
-  most incident-relevant part of that commit, more than the speedup.)*
-- **Stuck-lock detection + recovery.** If `flock` fails to acquire for N consecutive cycles,
-  alert (a prior scrub is hung) and consider killing/replacing the stale holder.
+**Built (commit `§3.1`), and honestly bounded by red-team review:**
+- **Fail-fast SSH** (`BatchMode` + `ConnectTimeout=10`) + **bounded scan timeout** (3600 →
+  `SCAN_TIMEOUT=600 s`). Real, unconditional wins: they shorten a hung scan's lock-hold from
+  up to an hour to ≤10 min. *(But 600 s bounds only the scan phase; recover/purge are
+  bounded per-item, not in aggregate — so total lock-hold is still not capped. §3.2.)*
+- **Honest `_spawn_scrub`** — probes the lock (real `flock(2)`, interoperates with the
+  spawned `flock -n`) and logs whether it actually spawned vs. skipped, instead of logging
+  "Spawned" unconditionally. **Limit:** only useful if the log survives — and mj05's logs
+  were destroyed in 7 min (HAM-112). So this is load-bearing only *with* §3.2's durable log.
+- **Stuck-lock detector** `check_scrub_health` — alerts once if the lock is held for
+  `stuck_scrub_cycles` (default 10 ≈ 10 min) consecutive cycles. **Three limits found in
+  review, all deferred to §3.2 because they need a *progress signal*:**
+  1. **Alert-only, no recovery.** It *narrates* a hang; it does not free the lock. The drive
+     still fills until a human acts (mj05: ~2 days unwatched).
+  2. **Lock-age ≠ progress → cry-wolf.** A legit large recovery (60 s/trigger, unbounded
+     aggregate) can hold the lock > 10 cycles → false "hung" alert. Can't distinguish
+     "grinding" from "hung" without a heartbeat.
+  3. **`/tmp`-full blind spot.** During a disk-full event the lockfile can be uncreatable
+     (`ENOSPC`) → the probe currently fails to "free" → the alert *cannot fire in the exact
+     incident it targets*, and `_spawn_scrub` resumes lying. Needs a tri-state
+     (held/free/**unknown**) where the detector escalates "unknown" but the spawner does not
+     suppress the scrub.
 
-### 3.2 Observability (so the next incident is diagnosable) — second
+**Conclusion:** §3.1's detection/visibility half is built; its **teeth (safe recovery) and
+robustness (no cry-wolf, no disk-full blind spot) all require a progress heartbeat** — which
+is §3.2. §3.1 and §3.2 are therefore implemented together (see §3.2).
 
-- **Persistent, rotation-safe scrub log** (`scrub_log`, from PR #78): every run's
-  scan/recover/purge **counts, per-phase timings, errors, and lock-acquisition result**.
-  Never `DEVNULL`. Without this, the next incident is as blind as this one.
+### 3.2 Progress heartbeat → durable log, real stuck-detection, self-healing — second (carries §3.1's teeth)
+
+The scrub writes a **heartbeat** (timestamp + phase + running counts) to a durable,
+rotation-safe file as it advances. Everything §3.1 couldn't do safely follows from it:
+- **Persistent, rotation-safe scrub log** (`scrub_log`, from PR #78): scan/recover/purge
+  counts, per-phase timings, errors, lock result. Survives the reboot-spam, so §3.1's honest
+  logging becomes durable.
+- **Progress-gated stuck detection:** redefine "stuck" as **lock held AND heartbeat stale**
+  (not just lock-age). This kills the cry-wolf false positive (a working recovery keeps the
+  heartbeat fresh) and is the only safe basis for auto-recovery.
+- **Self-healing recovery (§3.1's dropped teeth):** on a *genuine* hang (lock held +
+  heartbeat stale beyond threshold), **kill the stale scrub + free the lock** so the next
+  cycle re-spawns. Safe precisely because the heartbeat proves it's hung, not working.
+- **Tri-state lock probe** (held/free/unknown) so the `/tmp`-full case escalates in the
+  detector without suppressing the scrub in the spawner.
 - **Futile-scrub alert:** consecutive runs that purge 0 files while free space keeps falling
-  → alert ("running but not freeing space") — the symptom the 21-h ramp never surfaced.
-- **Honest spawn-side logging** (pairs with §3.1) so the state_monitor side can't lie about a
-  no-op'd spawn.
+  → "running but not freeing space" (the symptom the 21-h ramp never surfaced).
 
 ### 3.3 Timer-driven periodic scrub — steady-state drain, NOT the cure for a hang
 
