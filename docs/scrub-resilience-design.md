@@ -275,8 +275,17 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
   scan); it self-prunes (dirs not seen are dropped) and falls back to a full re-read on any
   cache anomaly (corrupt file, changed signature). `--mj-cache ""` forces a full scan. The
   full scanner (`_scan_mj_full`) is unchanged and used when no cache is configured. Tests:
-  `test_hamma_scrub.py::TestIncrementalScan` (10, incl. a patched `_read_dir_headers` proving
-  cache hits don't re-read, parity-vs-full-scan, corrupt-cache fallback, self-prune).
+  `test_hamma_scrub.py::TestIncrementalScan` (13, incl. a patched `_read_dir_headers` proving
+  older-dir cache hits don't re-read, parity-vs-full-scan, corrupt-cache fallback, self-prune).
+  **Red-team corrections (2 CRITICAL):** (1) cache is **JSON, not pickle** — `/dev/shm` is
+  world-writable (1777), so unpickling it was a local-RCE-as-`pi` vector; JSON stores headers
+  as hex and can't execute code on load. (2) brokkr **append-writes** `.bin` in place
+  (`mode="ab"`, no atomic rename) on **2 s-granularity vfat**, so an in-place completion can
+  leave `(mtime, count)` unchanged → stale header → wrong purge; fixed by **always
+  re-reading the newest hourly dir per drive** (the only one brokkr appends to — past dirs are
+  immutable once the hour rolls over). Tests pin both signature components on non-newest dirs
+  and the in-place-growth case. `duplicate_count` legitimately diverges from the full scanner
+  for cross-dir dups (log stat only, never a control input — commented).
 - **`select_target_drive` once per run**, not per trigger (drops a per-trigger `os.listdir`
   over 904 dirs). Minor for *this* incident (0 triggers recovered during the fill).
 - **`--since auto` for the timer path** needs pinning down — under a storm it pushes the MJ

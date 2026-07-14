@@ -17,7 +17,6 @@ import contextlib
 import glob
 import json
 import logging
-import pickle
 import math
 import os
 import re
@@ -78,7 +77,7 @@ DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 # (mtime, .bin-count) signature, so unchanged dirs are reused instead of
 # re-reading every file's header (the ~99s-under-load MJ scan). On tmpfs so it
 # adds no SD wear; a reboot just costs one full scan.
-DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.pkl"
+DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.json"
 
 # Exit codes
 EXIT_OK = 0
@@ -347,33 +346,51 @@ def _parse_since(since_str):
 
 
 def _load_scan_cache(path):
-    """Load the incremental MJ-scan cache; {} on any problem (safe fallback)."""
+    """Load the incremental MJ-scan cache; {} on any problem (safe fallback).
+
+    JSON, NOT pickle: the cache lives on world-writable tmpfs (`/dev/shm` is
+    mode 1777), so unpickling it would be a local code-execution vector as the
+    scrub's user. JSON stores headers as hex and can never execute code on load.
+    """
     try:
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, EOFError, ValueError, pickle.UnpicklingError,
-            AttributeError):
+        with open(path) as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            k: {"sig": tuple(v["sig"]),
+                "headers": {bytes.fromhex(h) for h in v["headers"]},
+                "file_count": v["file_count"],
+                "skipped": v["skipped"]}
+            for k, v in raw.items()
+        }
+    except (OSError, ValueError, KeyError, TypeError):
         return {}
 
 
 def _save_scan_cache(path, cache):
-    """Atomically persist the MJ-scan cache (best-effort; never raises)."""
+    """Atomically persist the MJ-scan cache as JSON (best-effort; never raises)."""
     try:
+        raw = {k: {"sig": list(v["sig"]),
+                   "headers": sorted(h.hex() for h in v["headers"]),
+                   "file_count": v["file_count"],
+                   "skipped": v["skipped"]}
+               for k, v in cache.items()}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(tmp, "w") as f:
+            json.dump(raw, f)
         os.replace(tmp, path)
-    except (OSError, pickle.PicklingError) as e:
+    except (OSError, TypeError, ValueError) as e:
         logger.debug("Could not write MJ-scan cache %s: %s", path, e)
 
 
 def _read_dir_headers(subdir, bin_names):
     """Read the 128-byte header of each .bin in one hourly dir.
 
-    Returns (headers set, file_count, skipped). Isolated so both the full and
-    incremental scanners share identical per-file semantics.
+    Returns (headers set, file_count, skipped). Used by the incremental scanner
+    for the dirs it must (re)read; the full scanner has its own inline read with
+    identical per-file semantics (the parity test keeps them in lockstep).
     """
     headers = set()
     skipped = 0
@@ -410,12 +427,16 @@ def scan_mj_files(base_path, since=None, cache_file=None):
 def _scan_mj_incremental(base_path, since, cache_file):
     """MJ scan that re-reads only new/changed hourly dirs; reuses the rest.
 
-    A written HAMMA .bin file never changes, so a directory whose
-    ``(mtime, .bin-count)`` signature matches the cache has the same headers --
-    reuse them without touching the files. Only the current (being-written)
-    hour and any genuinely new dirs pay the per-file read cost. The cache lives
-    on tmpfs (no SD wear) and self-prunes (dirs not seen this run are dropped);
-    any anomaly falls back to a full re-read of that dir.
+    A directory whose ``(mtime, .bin-count)`` signature matches the cache is
+    reused without touching its files. TWO safety rules make this sound despite
+    brokkr append-writing .bin in place on 2 s-granularity vfat (so an in-place
+    completion may leave the signature unchanged):
+      1. the newest hourly dir per drive -- the one brokkr is actively
+         appending to -- is ALWAYS re-read (never cache-hit);
+      2. once an hour rolls over, brokkr writes the next hour's dir, so past
+         dirs are immutable and safe to cache.
+    The cache lives on tmpfs (no SD wear), self-prunes (dirs not seen are
+    dropped), and falls back to a full re-read on any anomaly.
     """
     t0 = time.time()
     old_cache = _load_scan_cache(cache_file)
@@ -432,6 +453,8 @@ def _scan_mj_incremental(base_path, since, cache_file):
         except OSError as e:
             logger.warning("Error scanning %s: %s, skipping", drive, e)
             continue
+        # First pass: the qualifying hourly dirs (cheap; per-dir, not per-file).
+        subdirs = []
         for name in names:
             subdir = os.path.join(drive, name)
             if name == "compressed" or not os.path.isdir(subdir):
@@ -439,6 +462,9 @@ def _scan_mj_incremental(base_path, since, cache_file):
             if since and name < since:
                 dirs_skipped += 1
                 continue
+            subdirs.append((name, subdir))
+        newest = subdirs[-1][0] if subdirs else None  # names are sorted
+        for name, subdir in subdirs:
             try:
                 bin_names = sorted(
                     e for e in os.listdir(subdir) if e.endswith(".bin"))
@@ -446,7 +472,9 @@ def _scan_mj_incremental(base_path, since, cache_file):
             except OSError:
                 continue
             cached = old_cache.get(subdir)
-            if cached is not None and cached.get("sig") == sig:
+            # Force-read the actively-written newest dir (rule 1).
+            if (name != newest and cached is not None
+                    and cached.get("sig") == sig):
                 dir_headers = cached["headers"]
                 dir_files = cached["file_count"]
                 dir_skipped = cached["skipped"]
@@ -462,6 +490,9 @@ def _scan_mj_incremental(base_path, since, cache_file):
 
     _save_scan_cache(cache_file, new_cache)
     elapsed = time.time() - t0
+    # NOTE: this differs from _scan_mj_full's per-file dup count for headers
+    # duplicated ACROSS hourly dirs; it is a log stat only, never a control input
+    # (compare_headers/identify_purgeable_files use the `headers` set alone).
     duplicate_count = max(0, file_count - skipped - len(headers))
     logger.info("MJ scan (incremental): %d unique from %d files, "
                 "%d/%d dirs cached (%.1fs)", len(headers), file_count,

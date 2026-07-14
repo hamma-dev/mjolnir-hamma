@@ -2528,41 +2528,90 @@ class TestIncrementalScan:
         d.mkdir(parents=True)
         return d
 
-    def test_second_run_hits_cache_without_rereading(self, hamma_scrub,
-                                                     tmp_path):
+    def _hdr(self, byte50):
+        hdr, rest = _make_trigger()
+        hdr = bytearray(hdr)
+        hdr[50] = byte50
+        return bytes(hdr), rest
+
+    def _two_dirs(self, tmp_path):
+        """Older + newest hourly dir, each with one .bin. Returns (older,newer)."""
+        older = tmp_path / "DATA37" / "2026-04-10T14"
+        newer = tmp_path / "DATA37" / "2026-04-10T15"  # newest -> force-rescanned
+        older.mkdir(parents=True)
+        newer.mkdir(parents=True)
+        ho, rest = self._hdr(1)
+        hn, _ = self._hdr(2)
+        (older / "a.bin").write_bytes(ho + rest)
+        (newer / "a.bin").write_bytes(hn + rest)
+        return older, newer, ho, hn, rest
+
+    def test_unchanged_older_dir_is_cache_hit_newest_rescanned(
+            self, hamma_scrub, tmp_path):
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # build
+        with patch.object(hamma_scrub, "_read_dir_headers",
+                          return_value=(set(), 0, 0)) as mock_read:
+            r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert r2["cache_hits"] == 1                    # older reused
+        assert mock_read.call_count == 1                # only the newest re-read
+        assert mock_read.call_args[0][0].endswith("2026-04-10T15")
+
+    def test_older_dir_mtime_change_invalidates(self, hamma_scrub, tmp_path):
+        """In-place content rewrite (same count) with a bumped dir mtime must
+        invalidate -- catches an mtime-blind signature."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        h2, _ = self._hdr(7)
+        (older / "a.bin").write_bytes(h2 + rest)         # same count, new content
+        os.utime(str(older), (9e9, 9e9))                 # bump older's mtime
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert h2 in res["headers"] and ho not in res["headers"]
+
+    def test_older_dir_count_change_invalidates(self, hamma_scrub, tmp_path):
+        """A new file (count change) invalidates even with mtime pinned --
+        catches a count-blind signature."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        st = os.stat(str(older))
+        h2, _ = self._hdr(8)
+        (older / "b.bin").write_bytes(h2 + rest)         # count 1 -> 2
+        os.utime(str(older), (st.st_atime, st.st_mtime))  # pin mtime
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert h2 in res["headers"]
+
+    def test_newest_dir_inplace_growth_reread(self, hamma_scrub, tmp_path):
+        """A .bin completing IN PLACE (brokkr append-write) in the newest dir --
+        same count, maybe same 2s-vfat mtime -- is still caught, because the
+        newest dir is always re-read."""
+        d = self._dir(tmp_path)  # single dir == newest
+        (d / "a.bin").write_bytes(b"\x00" * 8)  # truncated -> skipped
+        cache = str(tmp_path / "c.json")
+        r1 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert len(r1["headers"]) == 0 and r1["skipped"] == 1
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)   # completes in place, count == 1
+        r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert hdr in r2["headers"]
+
+    def test_save_failure_does_not_raise(self, hamma_scrub, tmp_path):
+        """An unwritable cache location degrades to a full scan, never crashes."""
         d = self._dir(tmp_path)
         hdr, rest = _make_trigger()
         (d / "a.bin").write_bytes(hdr + rest)
-        cache = str(tmp_path / "cache.pkl")
-        r1 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
-        assert r1["cache_hits"] == 0 and hdr in r1["headers"]
-        # Unchanged dir on the 2nd run -> cache hit, files NOT re-read.
-        with patch.object(hamma_scrub, "_read_dir_headers") as mock_read:
-            r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
-        mock_read.assert_not_called()
-        assert r2["cache_hits"] == 1
-        assert r2["headers"] == r1["headers"]
-
-    def test_new_file_invalidates_dir_cache(self, hamma_scrub, tmp_path):
-        d = self._dir(tmp_path)
-        h1, rest = _make_trigger()
-        (d / "a.bin").write_bytes(h1 + rest)
-        cache = str(tmp_path / "c.pkl")
-        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # build
-        h2 = bytearray(h1)
-        h2[50] = 9
-        h2 = bytes(h2)
-        (d / "b.bin").write_bytes(h2 + rest)  # count 1->2 => sig changes
-        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
-        assert h1 in res["headers"] and h2 in res["headers"]
-        assert res["cache_hits"] == 0  # re-read
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file="/proc/nonexistent/cache.json")
+        assert hdr in res["headers"]
 
     def test_corrupt_cache_falls_back(self, hamma_scrub, tmp_path):
         d = self._dir(tmp_path)
         hdr, rest = _make_trigger()
         (d / "a.bin").write_bytes(hdr + rest)
-        cache = tmp_path / "c.pkl"
-        cache.write_bytes(b"not a pickle")
+        cache = tmp_path / "c.json"
+        cache.write_bytes(b"not valid json {{{")
         res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=str(cache))
         assert hdr in res["headers"] and res["cache_hits"] == 0
 
@@ -2570,33 +2619,36 @@ class TestIncrementalScan:
         for i, hour in enumerate(["2026-04-10T14", "2026-04-10T15"]):
             d = tmp_path / "DATA37" / hour
             d.mkdir(parents=True)
-            hdr, rest = _make_trigger()
-            hdr = bytearray(hdr)
-            hdr[50] = i
-            (d / "a.bin").write_bytes(bytes(hdr) + rest)
+            hdr, rest = self._hdr(i)
+            (d / "a.bin").write_bytes(hdr + rest)
         (tmp_path / "DATA37" / "2026-04-10T16").mkdir(parents=True)
         (tmp_path / "DATA37" / "2026-04-10T16" / "trunc.bin").write_bytes(
             b"\x00" * 8)  # truncated -> skipped in both
         full = hamma_scrub.scan_mj_files(str(tmp_path))
         incr = hamma_scrub.scan_mj_files(
-            str(tmp_path), cache_file=str(tmp_path / "c.pkl"))
+            str(tmp_path), cache_file=str(tmp_path / "c.json"))
         assert incr["headers"] == full["headers"]
         assert incr["file_count"] == full["file_count"]
         assert incr["skipped"] == full["skipped"]
+        # No cross-dir duplicate headers here, so the counts agree (they can
+        # legitimately diverge for cross-dir dups -- a log stat, never a control).
+        assert incr["duplicate_count"] == full["duplicate_count"]
 
     def test_cache_self_prunes_removed_dir(self, hamma_scrub, tmp_path):
-        import pickle
         da = tmp_path / "DATA37" / "2026-04-10T14"
         da.mkdir(parents=True)
+        db = tmp_path / "DATA37" / "2026-04-10T15"  # keep a 2nd dir present
+        db.mkdir(parents=True)
         hdr, rest = _make_trigger()
         (da / "a.bin").write_bytes(hdr + rest)
-        cache = str(tmp_path / "c.pkl")
+        (db / "b.bin").write_bytes(hdr + rest)
+        cache = str(tmp_path / "c.json")
         hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
         import shutil as _sh
-        _sh.rmtree(str(tmp_path / "DATA37" / "2026-04-10T14"))
+        _sh.rmtree(str(da))
         hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
-        with open(cache, "rb") as f:
-            saved = pickle.load(f)
+        with open(cache) as f:
+            saved = json.load(f)
         assert all("2026-04-10T14" not in k for k in saved)  # pruned
 
     def test_compressed_dir_skipped(self, hamma_scrub, tmp_path):
@@ -2604,7 +2656,7 @@ class TestIncrementalScan:
         comp.mkdir(parents=True)
         (comp / "x.bin").write_bytes(b"\x00" * 200)  # must be ignored
         res = hamma_scrub.scan_mj_files(
-            str(tmp_path), cache_file=str(tmp_path / "c.pkl"))
+            str(tmp_path), cache_file=str(tmp_path / "c.json"))
         assert res["file_count"] == 0
 
     def test_since_filters_dirs(self, hamma_scrub, tmp_path):
@@ -2616,7 +2668,7 @@ class TestIncrementalScan:
             hdr[50] = ord(hour[9])
             (d / "a.bin").write_bytes(bytes(hdr) + rest)
         res = hamma_scrub.scan_mj_files(
-            str(tmp_path), since="2026-04-11", cache_file=str(tmp_path / "c.pkl"))
+            str(tmp_path), since="2026-04-11", cache_file=str(tmp_path / "c.json"))
         assert res["file_count"] == 1 and res["dirs_skipped"] == 1
 
     def test_empty_cache_file_uses_full_scanner(self, hamma_scrub, tmp_path):
