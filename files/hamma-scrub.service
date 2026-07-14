@@ -1,19 +1,26 @@
 [Unit]
 Description=HAMMA AGS scrub (periodic /ags/data drain, flock-wrapped)
 Documentation=https://github.com/hamma-dev/mjolnir-hamma
-# The scrub needs the deployed repo and a reachable AGS; run after brokkr is up.
+# Order after brokkr (so the deployed repo is present) but do NOT pull it in --
+# a 15-min scrub tick must never resurrect a brokkr an operator deliberately
+# stopped for maintenance (so: After=, not Wants=).
 After=brokkr-hamma-default.service
-Wants=brokkr-hamma-default.service
+# state_monitor (§3.2) recovers a hung scrub by SIGKILLing it, which systemd
+# records as a failed activation. Those kills are ~15 min apart, but a
+# fleet-wide DefaultStartLimitIntervalSec change could let them accumulate and
+# trip the start-limit -- silently disabling this drain/backstop timer under
+# exactly the sustained-hang condition it exists for. Disable start-limiting.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 User=pi
 Group=pi
 ExecStart=/usr/local/bin/hamma-scrub.sh
-# A periodic drain is not urgent: deprioritise CPU and I/O so the scan doesn't
-# contend with brokkr's write pipeline. best-effort/7 (lowest) yields to the
-# writer without starving, unlike the idle class. The incremental scan (design
-# §3.5) is the real contention fix; this is a cheap mitigation.
+# Deprioritise CPU so the scrub's header parse/CRC yields to brokkr on the mj-pi.
+# NO I/O-priority knob: the contended device (/ags/data + the AGS write pipeline)
+# is on the SEPARATE AGS Pi, reached over SSH -- an mj-pi ionice class governs
+# nothing there (and mq-deadline ignores ionice anyway; the AGS writer already
+# holds realtime I/O priority). The real scan-cost fix is the incremental scan
+# (design §3.5).
 Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7

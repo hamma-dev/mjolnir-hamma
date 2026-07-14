@@ -43,8 +43,22 @@ class TestServiceUnit:
         assert "User=pi" in s
         assert "ExecStart=/usr/local/bin/hamma-scrub.sh" in s
 
-    def test_ordered_after_brokkr(self):
-        assert "After=brokkr-hamma-default.service" in _read("hamma-scrub.service")
+    def test_ordered_after_brokkr_but_does_not_want_it(self):
+        s = _read("hamma-scrub.service")
+        assert "After=brokkr-hamma-default.service" in s
+        # Wants= would resurrect a deliberately-stopped brokkr every 15 min.
+        assert "Wants=brokkr" not in s
+
+    def test_start_limiting_disabled(self):
+        # §3.2's periodic SIGKILLs must not be able to trip systemd's start
+        # limit and silently disable the timer backstop.
+        assert "StartLimitIntervalSec=0" in _read("hamma-scrub.service")
+
+    def test_no_misleading_io_priority_knob(self):
+        # ionice on the mj-pi governs nothing on the AGS Pi (separate host, SSH)
+        # and mq-deadline ignores it anyway -- don't imply a mitigation that
+        # does nothing.
+        assert "IOSchedulingClass" not in _read("hamma-scrub.service")
 
 
 class TestTimerUnit:

@@ -222,9 +222,11 @@ configure_brokkr() {
     local systemd_path="/etc/systemd/system"
 
     if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "rm -f $bin_path/hamma-scrub.sh (pre-copy, avoids same-file error)"
         log_dry_run "cp $files_dir/hamma-scrub.sh $bin_path/ (chmod +x)"
         log_dry_run "cp hamma-scrub.{service,timer} to $systemd_path/"
         log_dry_run "systemctl daemon-reload; enable --now hamma-scrub.timer"
+        manifest_add "remove" "path" "$bin_path/hamma-scrub.sh" "sudo" "true"
         manifest_add "copy" "src" "$files_dir/hamma-scrub.sh" "dst" "$bin_path/hamma-scrub.sh" "sudo" "true"
         manifest_add "chmod" "path" "$bin_path/hamma-scrub.sh" "mode" "+x" "sudo" "true"
         manifest_add "copy" "src" "$files_dir/hamma-scrub.service" "dst" "$systemd_path/hamma-scrub.service" "sudo" "true"

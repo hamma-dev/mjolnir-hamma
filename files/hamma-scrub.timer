@@ -9,8 +9,10 @@ Documentation=https://github.com/hamma-dev/mjolnir-hamma
 OnBootSec=10min
 OnUnitActiveSec=15min
 AccuracySec=30s
-# Don't stampede queued runs after downtime; just resume the cadence.
-Persistent=false
+# NOTE: OnUnitActiveSec re-arms from the *last activation*, and a scrub under
+# storm load can run minutes; a tick during an in-progress scrub is skipped by
+# the wrapper's `flock -n`. So the effective drain cadence is ">= 15 min", not
+# a strict 15 min -- fine for a drain (~1.25 GB/tick at observed rates).
 
 [Install]
 WantedBy=timers.target

@@ -169,6 +169,31 @@ effort/7` so the periodic scan yields to brokkr's write pipeline without starvin
 roles:** the steady-state drain, and the reliable **re-spawn backstop** for §3.2 (after a
 hung scrub is killed, the next tick re-runs it — the low-space edge won't re-fire on its own).
 
+**Red-team corrections (3 reviewers) — no CRITICAL ship-blocker; honest scope:**
+- **I/O-priority stanza was on the wrong machine — removed.** The scrub runs on the mj-pi;
+  `/ags/data` + the write pipeline are on the *AGS Pi* (separate host, over SSH), so an mj-pi
+  `ionice` governs nothing on the contended drive (and `mq-deadline` ignores ionice anyway;
+  the AGS java writer already holds *realtime* I/O priority). Kept `Nice=10` (mj-pi CPU only).
+  **Because the scrub does no local block I/O on the AGS drive, the timer does NOT make the
+  fill worse** — it lengthens its own scan, not the writer. So §3.3 is safe to ship *before*
+  §3.5 (incremental scan), which remains the real scan-cost fix.
+- **`Wants=brokkr` → `After=` only:** a 15-min tick must not resurrect a deliberately-stopped
+  brokkr. **`StartLimitIntervalSec=0`:** so repeated §3.2 SIGKILLs (a killed scrub = a systemd
+  *failed* activation) can't trip the start-limit and silently disable the timer under
+  sustained AGS-sick conditions.
+- **Effective cadence is `>= 15 min`, not strict:** under storm load a scrub runs minutes and
+  a tick that lands mid-scrub is skipped by `flock -n`. Fine for a drain; don't advertise 15 min.
+- **`--since auto` kept (not narrowed):** a bounded `--since` would cut scan cost but
+  *under-purge* old confirmed files (they'd fall outside the MJ scan window) → less drain.
+  Completeness wins for a drain; §3.5 is the cost fix.
+- **A §3.2 kill leaves the oneshot in systemd `failed` for ≤15 min** (until the next tick
+  re-activates it) — a sitrep/health check must not misread that as a fault.
+- **M1 (inert recovery) closed for the healthy-disk case:** the kill releases the flock
+  synchronously, so §3.2's immediate `_spawn_scrub` succeeds; the ENOSPC case (where
+  `_spawn_scrub` refuses an `unknown` lock) falls back to the timer, a ≤15-min gap.
+- **Deploy coupling:** ship §3.3 only *with* §3.2 — a bare timer no-ops against a hung lock
+  until §3.1/§3.2 make a held lock visible/recoverable.
+
 A systemd timer (~15 min) that runs the scrub regardless of `bytes_remaining`.
 
 - **What it genuinely buys:** it keeps `/ags/data` drained in steady state so free space
