@@ -2229,7 +2229,9 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             # scan_mj_files called with cutoff derived from AGS data
-            mock_mj.assert_called_once_with("/media/pi", since=expected_cutoff)
+            mock_mj.assert_called_once()
+            assert mock_mj.call_args.args[0] == "/media/pi"
+            assert mock_mj.call_args.kwargs["since"] == expected_cutoff
             assert rc == 0
 
     def test_since_auto_no_valid_gps_scans_all(self, hamma_scrub):
@@ -2261,7 +2263,8 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             # scan_mj_files called without since filter
-            mock_mj.assert_called_once_with("/media/pi", since=None)
+            mock_mj.assert_called_once()
+            assert mock_mj.call_args.kwargs["since"] is None
 
     def test_since_auto_ags_scan_fails(self, hamma_scrub):
         """If AGS scan fails, return EXIT_SSH_ERROR."""
@@ -2515,3 +2518,110 @@ class TestWriteStatus:
         assert mock_replace.call_count == 1
         src, dst = mock_replace.call_args[0]
         assert src == p + ".tmp" and dst == p
+
+
+class TestIncrementalScan:
+    """§3.5: scan_mj_files(cache_file=...) reuses unchanged hourly dirs."""
+
+    def _dir(self, tmp_path, drive="DATA37", hour="2026-04-10T14"):
+        d = tmp_path / drive / hour
+        d.mkdir(parents=True)
+        return d
+
+    def test_second_run_hits_cache_without_rereading(self, hamma_scrub,
+                                                     tmp_path):
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        cache = str(tmp_path / "cache.pkl")
+        r1 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert r1["cache_hits"] == 0 and hdr in r1["headers"]
+        # Unchanged dir on the 2nd run -> cache hit, files NOT re-read.
+        with patch.object(hamma_scrub, "_read_dir_headers") as mock_read:
+            r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        mock_read.assert_not_called()
+        assert r2["cache_hits"] == 1
+        assert r2["headers"] == r1["headers"]
+
+    def test_new_file_invalidates_dir_cache(self, hamma_scrub, tmp_path):
+        d = self._dir(tmp_path)
+        h1, rest = _make_trigger()
+        (d / "a.bin").write_bytes(h1 + rest)
+        cache = str(tmp_path / "c.pkl")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # build
+        h2 = bytearray(h1)
+        h2[50] = 9
+        h2 = bytes(h2)
+        (d / "b.bin").write_bytes(h2 + rest)  # count 1->2 => sig changes
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert h1 in res["headers"] and h2 in res["headers"]
+        assert res["cache_hits"] == 0  # re-read
+
+    def test_corrupt_cache_falls_back(self, hamma_scrub, tmp_path):
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        cache = tmp_path / "c.pkl"
+        cache.write_bytes(b"not a pickle")
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=str(cache))
+        assert hdr in res["headers"] and res["cache_hits"] == 0
+
+    def test_incremental_matches_full_scan(self, hamma_scrub, tmp_path):
+        for i, hour in enumerate(["2026-04-10T14", "2026-04-10T15"]):
+            d = tmp_path / "DATA37" / hour
+            d.mkdir(parents=True)
+            hdr, rest = _make_trigger()
+            hdr = bytearray(hdr)
+            hdr[50] = i
+            (d / "a.bin").write_bytes(bytes(hdr) + rest)
+        (tmp_path / "DATA37" / "2026-04-10T16").mkdir(parents=True)
+        (tmp_path / "DATA37" / "2026-04-10T16" / "trunc.bin").write_bytes(
+            b"\x00" * 8)  # truncated -> skipped in both
+        full = hamma_scrub.scan_mj_files(str(tmp_path))
+        incr = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file=str(tmp_path / "c.pkl"))
+        assert incr["headers"] == full["headers"]
+        assert incr["file_count"] == full["file_count"]
+        assert incr["skipped"] == full["skipped"]
+
+    def test_cache_self_prunes_removed_dir(self, hamma_scrub, tmp_path):
+        import pickle
+        da = tmp_path / "DATA37" / "2026-04-10T14"
+        da.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (da / "a.bin").write_bytes(hdr + rest)
+        cache = str(tmp_path / "c.pkl")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        import shutil as _sh
+        _sh.rmtree(str(tmp_path / "DATA37" / "2026-04-10T14"))
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        with open(cache, "rb") as f:
+            saved = pickle.load(f)
+        assert all("2026-04-10T14" not in k for k in saved)  # pruned
+
+    def test_compressed_dir_skipped(self, hamma_scrub, tmp_path):
+        comp = tmp_path / "DATA37" / "compressed"
+        comp.mkdir(parents=True)
+        (comp / "x.bin").write_bytes(b"\x00" * 200)  # must be ignored
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file=str(tmp_path / "c.pkl"))
+        assert res["file_count"] == 0
+
+    def test_since_filters_dirs(self, hamma_scrub, tmp_path):
+        for hour in ["2026-04-10T14", "2026-04-11T09"]:
+            d = tmp_path / "DATA37" / hour
+            d.mkdir(parents=True)
+            hdr, rest = _make_trigger()
+            hdr = bytearray(hdr)
+            hdr[50] = ord(hour[9])
+            (d / "a.bin").write_bytes(bytes(hdr) + rest)
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), since="2026-04-11", cache_file=str(tmp_path / "c.pkl"))
+        assert res["file_count"] == 1 and res["dirs_skipped"] == 1
+
+    def test_empty_cache_file_uses_full_scanner(self, hamma_scrub, tmp_path):
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file="")
+        assert "cache_hits" not in res  # dispatched to the full scanner

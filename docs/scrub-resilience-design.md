@@ -266,12 +266,17 @@ Split `low_space` into a **purge** and a higher-urgency **alert** threshold, lev
   - **`recover` was never measured on-sensor.** The 16×/round-trip does **not** transfer to
     `recover`'s `dd` of ~20 MB payloads (transfer-bound, not handshake-bound). Recover
     throughput under storm rate is **unvalidated**.
-- **Incremental MJ scan** — cache the confirmed-header set per hourly dir; scan only new
-  hours. **This is the load-bearing scan fix**, because the scan — not purge — is the real
-  wall-clock driver: under active recording the AGS scan hit **99 s** (attribution to USB
-  I/O contention is a **hypothesis**, confounded by a 4× file-count rise; not isolated).
-  Note the shipped `perf(scrub)` commit does **not** speed the scan (it runs before the
-  ControlMaster opens, by design — a single call gets no multiplexing benefit).
+- **Incremental MJ scan (BUILT)** — `scan_mj_files(cache_file=...)` caches each hourly dir's
+  header set keyed by a cheap `(mtime, .bin-count)` signature; an unchanged dir is reused
+  without re-reading a single file, so only the current (being-written) hour and genuinely
+  new dirs pay the per-file cost. **This is the load-bearing scan fix** — the scan, not
+  purge, is the wall-clock driver (the MJ scan is the ~20 s / minutes-under-load cost). Cache
+  lives on **tmpfs** (`/dev/shm/hamma_scrub_mj_cache.pkl`, no SD wear; a reboot costs one full
+  scan); it self-prunes (dirs not seen are dropped) and falls back to a full re-read on any
+  cache anomaly (corrupt file, changed signature). `--mj-cache ""` forces a full scan. The
+  full scanner (`_scan_mj_full`) is unchanged and used when no cache is configured. Tests:
+  `test_hamma_scrub.py::TestIncrementalScan` (10, incl. a patched `_read_dir_headers` proving
+  cache hits don't re-read, parity-vs-full-scan, corrupt-cache fallback, self-prune).
 - **`select_target_drive` once per run**, not per trigger (drops a per-trigger `os.listdir`
   over 904 dirs). Minor for *this* incident (0 triggers recovered during the fill).
 - **`--since auto` for the timer path** needs pinning down — under a storm it pushes the MJ

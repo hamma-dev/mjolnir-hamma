@@ -17,6 +17,7 @@ import contextlib
 import glob
 import json
 import logging
+import pickle
 import math
 import os
 import re
@@ -72,6 +73,12 @@ SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
 # incident (HAM-112/113), and a heartbeat that can't be written would make a
 # healthy scrub look hung. tmpfs stays writable when the SD is full.
 DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
+
+# Incremental-scan cache: per-hourly-dir MJ header sets keyed by a cheap
+# (mtime, .bin-count) signature, so unchanged dirs are reused instead of
+# re-reading every file's header (the ~99s-under-load MJ scan). On tmpfs so it
+# adds no SD wear; a reboot just costs one full scan.
+DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.pkl"
 
 # Exit codes
 EXIT_OK = 0
@@ -339,7 +346,138 @@ def _parse_since(since_str):
     )
 
 
-def scan_mj_files(base_path, since=None):
+def _load_scan_cache(path):
+    """Load the incremental MJ-scan cache; {} on any problem (safe fallback)."""
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, EOFError, ValueError, pickle.UnpicklingError,
+            AttributeError):
+        return {}
+
+
+def _save_scan_cache(path, cache):
+    """Atomically persist the MJ-scan cache (best-effort; never raises)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except (OSError, pickle.PicklingError) as e:
+        logger.debug("Could not write MJ-scan cache %s: %s", path, e)
+
+
+def _read_dir_headers(subdir, bin_names):
+    """Read the 128-byte header of each .bin in one hourly dir.
+
+    Returns (headers set, file_count, skipped). Isolated so both the full and
+    incremental scanners share identical per-file semantics.
+    """
+    headers = set()
+    skipped = 0
+    for name in bin_names:
+        fp = os.path.join(subdir, name)
+        try:
+            if os.path.getsize(fp) < HEADER_SIZE:
+                skipped += 1
+                continue
+            with open(fp, "rb") as f:
+                header = f.read(HEADER_SIZE)
+            if len(header) < HEADER_SIZE:
+                skipped += 1
+            else:
+                headers.add(header)
+        except OSError as e:
+            logger.warning("Error reading %s: %s", fp, e)
+            skipped += 1
+    return headers, len(bin_names), skipped
+
+
+def scan_mj_files(base_path, since=None, cache_file=None):
+    """Scan local mjolnir .bin files and collect headers.
+
+    Dispatches to the incremental scanner when ``cache_file`` is given (reuses
+    per-hourly-dir header sets whose ``(mtime, .bin-count)`` signature is
+    unchanged -- the fix for the O(all-files) MJ scan), else the full scanner.
+    """
+    if cache_file:
+        return _scan_mj_incremental(base_path, since, cache_file)
+    return _scan_mj_full(base_path, since)
+
+
+def _scan_mj_incremental(base_path, since, cache_file):
+    """MJ scan that re-reads only new/changed hourly dirs; reuses the rest.
+
+    A written HAMMA .bin file never changes, so a directory whose
+    ``(mtime, .bin-count)`` signature matches the cache has the same headers --
+    reuse them without touching the files. Only the current (being-written)
+    hour and any genuinely new dirs pay the per-file read cost. The cache lives
+    on tmpfs (no SD wear) and self-prunes (dirs not seen this run are dropped);
+    any anomaly falls back to a full re-read of that dir.
+    """
+    t0 = time.time()
+    old_cache = _load_scan_cache(cache_file)
+    new_cache = {}
+    headers = set()
+    file_count = skipped = dirs_skipped = cache_hits = 0
+
+    drives = sorted(glob.glob(os.path.join(base_path, DRIVE_PATTERN)))
+    if not drives:
+        logger.info("No DATA drives found at %s", base_path)
+    for drive in drives:
+        try:
+            names = sorted(os.listdir(drive))
+        except OSError as e:
+            logger.warning("Error scanning %s: %s, skipping", drive, e)
+            continue
+        for name in names:
+            subdir = os.path.join(drive, name)
+            if name == "compressed" or not os.path.isdir(subdir):
+                continue
+            if since and name < since:
+                dirs_skipped += 1
+                continue
+            try:
+                bin_names = sorted(
+                    e for e in os.listdir(subdir) if e.endswith(".bin"))
+                sig = (os.stat(subdir).st_mtime, len(bin_names))
+            except OSError:
+                continue
+            cached = old_cache.get(subdir)
+            if cached is not None and cached.get("sig") == sig:
+                dir_headers = cached["headers"]
+                dir_files = cached["file_count"]
+                dir_skipped = cached["skipped"]
+                cache_hits += 1
+            else:
+                dir_headers, dir_files, dir_skipped = _read_dir_headers(
+                    subdir, bin_names)
+            new_cache[subdir] = {"sig": sig, "headers": dir_headers,
+                                 "file_count": dir_files, "skipped": dir_skipped}
+            headers |= dir_headers
+            file_count += dir_files
+            skipped += dir_skipped
+
+    _save_scan_cache(cache_file, new_cache)
+    elapsed = time.time() - t0
+    duplicate_count = max(0, file_count - skipped - len(headers))
+    logger.info("MJ scan (incremental): %d unique from %d files, "
+                "%d/%d dirs cached (%.1fs)", len(headers), file_count,
+                cache_hits, len(new_cache), elapsed)
+    return {
+        "headers": headers,
+        "file_count": file_count,
+        "duplicate_count": duplicate_count,
+        "skipped": skipped,
+        "dirs_skipped": dirs_skipped,
+        "elapsed": elapsed,
+        "cache_hits": cache_hits,
+    }
+
+
+def _scan_mj_full(base_path, since=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Parameters
@@ -1679,12 +1817,19 @@ def _build_parser():
         help="Heartbeat/status JSON the scrub updates as it advances "
              "(default: %(default)s; empty string disables)",
     )
+    parser.add_argument(
+        "--mj-cache", default=DEFAULT_MJ_CACHE,
+        help="Incremental MJ-scan cache file: reuse unchanged hourly dirs' "
+             "headers instead of re-reading every file (default: %(default)s; "
+             "empty string forces a full scan every run)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
-        purge=False, status_file=DEFAULT_STATUS_FILE):
+        purge=False, status_file=DEFAULT_STATUS_FILE,
+        mj_cache=DEFAULT_MJ_CACHE):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1708,6 +1853,8 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         If True, delete AGS files fully confirmed on MJ after recovery.
     status_file : str or None
         Heartbeat/status file to update as the scrub advances (None disables).
+    mj_cache : str or None
+        Incremental MJ-scan cache file (None forces a full scan every run).
 
     Returns
     -------
@@ -1757,7 +1904,7 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                 "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
     write_status(status_file, "scan_mj")
-    mj = scan_mj_files(mj_path, since=since_cutoff)
+    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache)
 
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
@@ -1915,6 +2062,7 @@ def main():
         dry_run=args.dry_run,
         purge=args.purge,
         status_file=args.status_file or None,
+        mj_cache=args.mj_cache or None,
     )
     sys.exit(rc)
 
