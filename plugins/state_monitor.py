@@ -3,6 +3,8 @@ Plugin to monitor state variables from the charge controller.
 """
 
 from math import nan
+import fcntl
+import os
 import shlex
 import shutil
 import subprocess
@@ -14,6 +16,10 @@ from notifiers import Notifier
 import brokkr.pipeline.base
 import brokkr.pipeline.decode
 import brokkr.utils.output
+
+# Lock file shared with the spawned `flock -n` scrub, so the monitor can probe
+# whether a prior scrub is still running (and detect a hung one).
+SCRUB_LOCK_FILE = "/tmp/hamma_scrub.lock"
 
 
 def sensor_prefix():
@@ -40,6 +46,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         low_pi_space=5,
         enable_drive_checks=True,
         scrub_command="",
+        stuck_scrub_cycles=10,
         **output_step_kwargs,
         ):
         """
@@ -73,6 +80,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_command : str, optional
             Shell command to run hamma_scrub.py when drive space is low.
             If empty (default), no scrub is spawned. Protected by flock.
+        stuck_scrub_cycles : int, optional
+            Alert if a prior scrub holds the lock for this many consecutive
+            monitor cycles (a hung scrub silently stalls the safety net).
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -92,6 +102,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
         self.scrub_command = scrub_command
+        # Stuck-scrub detection: alert if a prior scrub holds the lock for this
+        # many consecutive monitor cycles (a healthy scrub finishes in
+        # seconds-to-minutes; a hung one silently stalls the safety net).
+        self.stuck_scrub_cycles = stuck_scrub_cycles
+        self._scrub_lock_held_cycles = 0
+        self._stuck_scrub_alerted = False
 
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -206,6 +222,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if self.enable_drive_checks:
             checks.insert(0, self.check_drive)
             checks.append(self.check_sensor_drive)
+            checks.append(self.check_scrub_health)
 
         for check_fn in checks:
             try:
@@ -352,22 +369,94 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             return f"Remaining GB on drive is {space_now:.1f}"
         return None
 
+    def _scrub_lock_is_held(self):
+        """Return True if a scrub currently holds the flock (non-blocking).
+
+        Uses the same flock(2) advisory lock the spawned ``flock -n`` uses, so
+        the two interoperate. Fails safe to False (assume free) if the lock
+        file cannot be opened. Note the tiny benign TOCTOU window: the lock may
+        be grabbed between this probe and a subsequent spawn -- exclusion is
+        still guaranteed by the spawned ``flock -n`` itself; this probe only
+        makes "a prior scrub is running" *visible*.
+        """
+        try:
+            fd = os.open(SCRUB_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True  # someone else holds it
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
     def _spawn_scrub(self):
-        """Spawn detached scrub process if scrub_command is configured."""
+        """Spawn a detached scrub, but only if no prior scrub is running.
+
+        The old code wrapped the command in ``flock -n`` and logged "Spawned
+        scrub" whether or not the lock was acquired -- so a hung prior scrub
+        made the spawn a silent no-op *and the log lied* (the mj05 failure).
+        Here we probe the lock first and log the truth. Exclusion is still
+        enforced by the spawned ``flock -n``; the probe is for honesty +
+        feeds the stuck-lock detector (`check_scrub_health`).
+        """
         if not self.scrub_command or not self.scrub_command.strip():
             return
-        lock_file = "/tmp/hamma_scrub.lock"
+        if self._scrub_lock_is_held():
+            self.logger.warning(
+                "Scrub NOT spawned: a prior scrub still holds %s "
+                "(possibly hung -- see check_scrub_health)", SCRUB_LOCK_FILE)
+            return
         try:
-            cmd = ["flock", "-n", lock_file] + shlex.split(self.scrub_command)
+            cmd = ["flock", "-n", SCRUB_LOCK_FILE] + shlex.split(
+                self.scrub_command)
             subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            self.logger.info("Spawned scrub: %s", " ".join(cmd))
+            self.logger.info("Scrub spawned (lock was free): %s",
+                             " ".join(cmd))
         except (OSError, ValueError) as e:
             self.logger.error("Failed to spawn scrub: %s", e)
+
+    def check_scrub_health(self, input_data):
+        """Detect a hung scrub: the lock held across many monitor cycles.
+
+        A healthy scrub finishes in seconds-to-minutes. If the lock stays held
+        for `stuck_scrub_cycles` consecutive cycles, a prior scrub is hung --
+        the failure mode a timer cannot fix (more spawns just no-op against the
+        held lock). Alert once; re-arm when the lock frees.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute` (unused; kept for check uniformity).
+
+        Returns
+        -------
+        str | None
+            Alert message when the stuck threshold is first crossed, else None.
+        """
+        if not self.scrub_command or not self.scrub_command.strip():
+            return None
+        if self._scrub_lock_is_held():
+            self._scrub_lock_held_cycles += 1
+            if (self._scrub_lock_held_cycles >= self.stuck_scrub_cycles
+                    and not self._stuck_scrub_alerted):
+                self._stuck_scrub_alerted = True
+                return ("Auto-scrub lock held for {} consecutive cycles -- a "
+                        "prior scrub is likely hung; manual intervention "
+                        "needed".format(self._scrub_lock_held_cycles))
+            return None
+        # Lock free -> reset the counter and re-arm the alert
+        self._scrub_lock_held_cycles = 0
+        self._stuck_scrub_alerted = False
+        return None
 
     def check_battery_voltage(self, input_data):
         """

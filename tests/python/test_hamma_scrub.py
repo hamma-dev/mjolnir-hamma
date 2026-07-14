@@ -370,6 +370,24 @@ class TestStriderProtocol:
 class TestScanAgsFiles:
     """Test SSH-based AGS scanning."""
 
+    def test_scan_uses_bounded_timeout(self, hamma_scrub):
+        """AGS scan timeout is bounded to minutes (SCAN_TIMEOUT), not the old
+        3600s cap: a hung scan holds the scrub lock for its whole timeout, so
+        an hour-long cap lets one hung scan stall the safety net for an hour."""
+        assert hamma_scrub.SCAN_TIMEOUT <= 900
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b''
+        mock_result.stderr = b''
+        with patch("subprocess.run", return_value=mock_result) as mock_run, \
+             patch("tempfile.mkstemp",
+                   return_value=(99, "/tmp/local_strider.py")), \
+             patch("os.write"), patch("os.close"), \
+             patch("os.path.exists", return_value=True), patch("os.unlink"):
+            hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+        run_call = mock_run.call_args_list[1]
+        assert run_call.kwargs["timeout"] == hamma_scrub.SCAN_TIMEOUT
+
     def test_deploys_strider_via_scp_then_runs(self, hamma_scrub):
         """scan_ags_files deploys strider via SCP, then runs via SSH."""
         mock_result = MagicMock()

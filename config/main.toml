@@ -58,6 +58,7 @@ config_version = 1
         channel = "status"
         key_file = "/home/pi/.googlechat"
         scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
+        stuck_scrub_cycles = 10  # alert if a prior scrub holds the lock this many consecutive monitor cycles (~10 min; likely hung)
 
     # Step to create HAMMA plot
     [steps.hamma_plot]
