@@ -382,7 +382,8 @@ Corrections applied after review (all three were CRITICAL false-kill or fail-ope
 
 **Deployment gate:** `scrub_auto_recover=true` is defensible now that the false-kill vectors
 are closed, but it kills processes — validate on a bench/idle unit (inject a real hung scrub)
-before enabling fleet-wide. The durable `scrub_log` on the SD still self-disables (→DEVNULL)
+before enabling fleet-wide. **Ships off; enabling is tracked in
+[hamma-dev/mjolnir-hamma#81](https://github.com/hamma-dev/mjolnir-hamma/issues/81).** The durable `scrub_log` on the SD still self-disables (→DEVNULL)
 under a full SD; accepted (degrades to old behavior; the tmpfs heartbeat is the load-bearing
 signal).
 
