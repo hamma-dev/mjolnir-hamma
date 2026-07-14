@@ -406,11 +406,25 @@ When it does roll out, two things do **not** happen automatically and must be in
 3. **`scrub_auto_recover` ships `false`.** The SIGKILL self-heal stays off until it is validated
    on a bench/idle unit by injecting a genuinely hung scrub (§3.2 deployment gate). Flip to
    `true` per-unit only after that.
+4. **`scrub_metrics.csv` is self-capped, not logrotate-managed.** The per-run cache-metrics CSV
+   (`~/brokkr/hamma/log/scrub_metrics.csv`) has no external rotation, so `write_scan_metrics`
+   size-caps it in place (rolls to `.1` past `SCAN_METRICS_MAX_BYTES=1MB`, one generation). It
+   is on the SD but bounded — no HAM-112/113 fill vector. No install/config change needed;
+   both spawn paths run as `pi` so `~` resolves to `/home/pi`.
 
 ---
 
 ## Changelog
 
+- **v4.1 (red-team pass on the v4 follow-ups):** A 3-agent adversarial review caught that
+  `_refresh_cache_dirs` was fed `recover_triggers`' **relative** `target_path` while the cache
+  is keyed by **absolute** dirs — so the refresh silently no-op'd (feature did nothing), and the
+  original tests missed it by passing absolute paths. Fixed (rejoin `mj_path`) + added a run()-
+  level regression test driving the real relative output. Also: the metrics CSV claimed to be
+  "rotated by log tooling" but nothing rotates it — added an in-place size cap
+  (`SCAN_METRICS_MAX_BYTES`, roll to `.1`) and a test; added a test asserting `run()` actually
+  calls `write_scan_metrics` (the fixtures mocked it without asserting, hiding wiring regressions).
+  Root-vs-pi home-dir concern cleared (both spawn paths run as `pi`).
 - **v4 (mj05 hardware validation + cache hardening):** Ran the scrubber on mj05
   against real `/ags/data` (AGS stopped): recovered to `DATA56`, purged 78 files,
   freed ~72GB, retained the 1 corrupt + active file (recover-before-delete held).

@@ -2495,6 +2495,61 @@ class TestRunControlMasterWiring:
         assert mock_purge.call_args.kwargs.get("control_path") == sentinel
         mock_close.assert_called_once_with("hamma", sentinel)
 
+    def test_refreshes_recovered_dirs_with_ABSOLUTE_paths(self, hamma_scrub):
+        """recover_triggers records target_path RELATIVE to mj_path, but the scan
+        cache is keyed by ABSOLUTE dirs. run() must convert before refreshing, or
+        the refresh silently no-ops (relative dir != cache key)."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": set(), "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 1.0, "cache_hits": 0, "dirs_total": 5}
+        # target_path exactly as recover_triggers emits it: relpath to mj_path
+        rec = [{"status": "recovered", "header": hdr,
+                "target_path": "DATA01/2026-07-14T12/mj05_x_recovered.bin",
+                "source_file": "f.bin", "source_offset": 0}]
+        captured = {}
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"), \
+             patch.object(hamma_scrub, "open_control_master", return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "recover_triggers", return_value=rec), \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": [], "retained": []}), \
+             patch.object(hamma_scrub, "purge_ags_files", return_value=[]), \
+             patch.object(hamma_scrub, "_refresh_cache_dirs",
+                          side_effect=lambda cf, d: captured.setdefault(
+                              "dirs", sorted(d))):
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            recover=True, mj_cache="/tmp/c.json",
+                            metrics_file=None)
+        assert captured["dirs"] == ["/media/pi/DATA01/2026-07-14T12"]
+
+    def test_run_calls_write_scan_metrics_at_completion(self, hamma_scrub):
+        """The metrics call must be wired into run() -- guards against the call
+        site being deleted (the run-test fixtures otherwise mock it silently)."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": {hdr}, "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 2.5, "cache_hits": 4, "dirs_total": 5}
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "open_control_master", return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_scan_metrics") as mock_metrics:
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            metrics_file="/tmp/m.csv")
+        mock_metrics.assert_called_once()
+        args = mock_metrics.call_args.args
+        assert args[0] == "/tmp/m.csv" and args[1] is mj   # (path, mj, ...)
+        assert args[2] == 0 and args[3] == 0               # recovered, purged
+
 
 class TestWriteStatus:
     """Scrub writes an atomic heartbeat/status file for the monitor to read."""
@@ -2763,3 +2818,16 @@ class TestScanMetrics:
         hamma_scrub.write_scan_metrics(
             None, {"cache_hits": 1, "dirs_total": 1, "elapsed": 1.0}, 0, 0)
         assert not (tmp_path / "m.csv").exists()
+
+    def test_size_capped_rotation_bounds_the_file(
+            self, hamma_scrub, tmp_path, monkeypatch):
+        """Nothing external rotates this file; past the cap it must roll to .1
+        and restart so the SD can't fill (HAM-112/113 stance)."""
+        path = str(tmp_path / "m.csv")
+        monkeypatch.setattr(hamma_scrub, "SCAN_METRICS_MAX_BYTES", 200)
+        mj = {"cache_hits": 1, "dirs_total": 2, "elapsed": 1.0}
+        for _ in range(30):
+            hamma_scrub.write_scan_metrics(path, mj, 0, 0)
+        assert os.path.exists(path + ".1")               # old generation kept
+        assert os.path.getsize(path) < 400               # live file bounded
+        assert open(path).read().splitlines()[0] == self.HEADER  # header restored

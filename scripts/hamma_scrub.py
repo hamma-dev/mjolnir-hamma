@@ -80,10 +80,14 @@ DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.json"
 
 # Durable per-run CSV of MJ-scan cache performance (hit-rate over time). Unlike
-# the /dev/shm status/cache, this lives on disk so a cold scan (cache lost
-# between runs) leaves a reviewable trail. Rotated by the same log tooling.
+# the /dev/shm status/cache, this lives on the SD so a cold scan (cache lost
+# between runs) leaves a reviewable trail. Size-capped in-place (one .1
+# generation) rather than relying on external logrotate -- keeps it bounded on
+# the SD in line with the HAM-112/113 SD-fill stance, since nothing else rotates
+# it (the sibling scrub_log is hand-rotated by state_monitor, not this file).
 DEFAULT_METRICS_FILE = os.path.expanduser(
     "~/brokkr/hamma/log/scrub_metrics.csv")
+SCAN_METRICS_MAX_BYTES = 1_000_000  # ~20k rows; rotate to .1 past this
 
 # Exit codes
 EXIT_OK = 0
@@ -478,10 +482,17 @@ def write_scan_metrics(path, mj, recovered, purged):
         row = "{},{},{},{},{},{},{}\n".format(
             utc, hits_s, total_s, cold_s,
             round(mj.get("elapsed", 0), 1), recovered, purged)
-        new_file = not os.path.exists(path)
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        # Bound the file: nothing external rotates it. Past the cap, move it to
+        # .1 (one generation) and start fresh -- so the SD can't fill from it.
+        try:
+            if os.path.getsize(path) >= SCAN_METRICS_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        new_file = not os.path.exists(path)
         with open(path, "a") as f:
             if new_file:
                 f.write(SCAN_METRICS_HEADER + "\n")
@@ -2099,7 +2110,11 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
                     mj["headers"].add(r["header"])
                     recovered_headers.add(r["header"])
                     if r.get("target_path"):
-                        recovered_dirs.add(os.path.dirname(r["target_path"]))
+                        # target_path is RELATIVE to mj_path (recover_triggers
+                        # stores os.path.relpath); the scan cache is keyed by
+                        # ABSOLUTE dirs, so rejoin mj_path before refreshing.
+                        recovered_dirs.add(os.path.dirname(
+                            os.path.join(mj_path, r["target_path"])))
             # Recovery wrote new .bin into these dirs AFTER the scan saved the
             # cache (pre-recovery), leaving them stale. Refresh so the next
             # scan cache-hits them instead of re-reading.
