@@ -2691,3 +2691,32 @@ class TestIncrementalScan:
         (d / "a.bin").write_bytes(hdr + rest)
         res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file="")
         assert "cache_hits" not in res  # dispatched to the full scanner
+
+    def test_refresh_cache_dirs_lets_next_scan_hit_recovered_dir(
+            self, hamma_scrub, tmp_path):
+        """The cache is saved DURING the scan, before recovery writes new .bin
+        files. Refreshing a recovered dir's cache entry lets the NEXT scan
+        cache-hit it (with the new header) instead of re-reading it stale."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # older cached
+        # simulate recovery writing a recovered trigger into the OLDER dir
+        h2, _ = self._hdr(9)
+        (older / "r_recovered.bin").write_bytes(h2 + rest)
+        hamma_scrub._refresh_cache_dirs(cache, [str(older)])
+        # next scan: older is a cache HIT (refreshed sig matches); only newest re-read
+        with patch.object(hamma_scrub, "_read_dir_headers",
+                          return_value=(set(), 0, 0)) as mock_read:
+            r = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert r["cache_hits"] == 1
+        assert mock_read.call_count == 1
+        assert mock_read.call_args[0][0].endswith("2026-04-10T15")  # newest only
+        assert h2 in r["headers"]  # refresh captured the recovered header
+
+    def test_refresh_cache_dirs_is_safe_noop(self, hamma_scrub, tmp_path):
+        """No cache file, empty dir list, or a missing dir must never raise."""
+        missing = str(tmp_path / "nope.json")
+        hamma_scrub._refresh_cache_dirs(missing, [str(tmp_path / "gone")])
+        assert not os.path.exists(missing)          # nothing created from nothing
+        hamma_scrub._refresh_cache_dirs(None, [str(tmp_path)])   # None cache
+        hamma_scrub._refresh_cache_dirs(str(tmp_path / "c.json"), [])  # no dirs

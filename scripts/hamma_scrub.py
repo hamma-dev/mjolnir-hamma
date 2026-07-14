@@ -412,6 +412,38 @@ def _read_dir_headers(subdir, bin_names):
     return headers, len(bin_names), skipped
 
 
+def _refresh_cache_dirs(cache_file, dirs):
+    """Re-read the given hourly dirs and update their entries in the scan cache.
+
+    The incremental cache is saved *during* the MJ scan, before the recover
+    phase writes recovered .bin files. Those dirs are therefore stale in the
+    cache (old sig + missing the new headers), so the next scan would re-read
+    them. Refreshing them here -- after recovery -- lets the next scan cache-hit
+    them instead. Best-effort: a missing cache, empty ``dirs``, or an unreadable
+    dir is a silent no-op (the only cost of skipping is a re-read next run).
+    """
+    if not cache_file or not dirs:
+        return
+    cache = _load_scan_cache(cache_file)
+    if not cache:
+        return
+    updated = False
+    for subdir in dirs:
+        try:
+            bin_names = sorted(
+                e for e in os.listdir(subdir) if e.endswith(".bin"))
+            sig = (os.stat(subdir).st_mtime, len(bin_names))
+        except OSError:
+            continue
+        dir_headers, dir_files, dir_skipped = _read_dir_headers(
+            subdir, bin_names)
+        cache[subdir] = {"sig": sig, "headers": dir_headers,
+                         "file_count": dir_files, "skipped": dir_skipped}
+        updated = True
+    if updated:
+        _save_scan_cache(cache_file, cache)
+
+
 def scan_mj_files(base_path, since=None, cache_file=None):
     """Scan local mjolnir .bin files and collect headers.
 
@@ -2007,10 +2039,17 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         # Update mj_headers and missing list with recovered triggers
         if recovery_results:
             recovered_headers = set()
+            recovered_dirs = set()
             for r in recovery_results:
                 if r["status"] == "recovered":
                     mj["headers"].add(r["header"])
                     recovered_headers.add(r["header"])
+                    if r.get("target_path"):
+                        recovered_dirs.add(os.path.dirname(r["target_path"]))
+            # Recovery wrote new .bin into these dirs AFTER the scan saved the
+            # cache (pre-recovery), leaving them stale. Refresh so the next
+            # scan cache-hits them instead of re-reading.
+            _refresh_cache_dirs(mj_cache, recovered_dirs)
             if recovered_headers:
                 comparison["missing_on_mj"] = [
                     e for e in comparison["missing_on_mj"]
