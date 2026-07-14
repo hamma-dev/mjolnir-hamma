@@ -160,6 +160,15 @@ rotation-safe file as it advances. Everything §3.1 couldn't do safely follows f
 
 ### 3.3 Timer-driven periodic scrub — steady-state drain, NOT the cure for a hang
 
+**Built:** `files/hamma-scrub.{sh,service,timer}` + install wiring in
+`unified_install/lib/brokkr.sh`. Oneshot service runs the wrapper (`flock -n -E 0`
+over the same `/tmp/hamma_scrub.lock` + `--recover --purge --since auto`, kept in sync
+with `state_monitor`'s `scrub_command` and validated by `test_scrub_timer.py`); timer =
+`OnBootSec=10min` / `OnUnitActiveSec=15min`. Service is `Nice=10` + `IOSchedulingClass=best-
+effort/7` so the periodic scan yields to brokkr's write pipeline without starving. **Two
+roles:** the steady-state drain, and the reliable **re-spawn backstop** for §3.2 (after a
+hung scrub is killed, the next tick re-runs it — the low-space edge won't re-fire on its own).
+
 A systemd timer (~15 min) that runs the scrub regardless of `bytes_remaining`.
 
 - **What it genuinely buys:** it keeps `/ags/data` drained in steady state so free space

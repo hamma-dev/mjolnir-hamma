@@ -1,0 +1,19 @@
+[Unit]
+Description=HAMMA AGS scrub (periodic /ags/data drain, flock-wrapped)
+Documentation=https://github.com/hamma-dev/mjolnir-hamma
+# The scrub needs the deployed repo and a reachable AGS; run after brokkr is up.
+After=brokkr-hamma-default.service
+Wants=brokkr-hamma-default.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+ExecStart=/usr/local/bin/hamma-scrub.sh
+# A periodic drain is not urgent: deprioritise CPU and I/O so the scan doesn't
+# contend with brokkr's write pipeline. best-effort/7 (lowest) yields to the
+# writer without starving, unlike the idle class. The incremental scan (design
+# §3.5) is the real contention fix; this is a cheap mitigation.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
