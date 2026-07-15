@@ -1496,6 +1496,13 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
         else:
             _record(chunk, "deleted", None)
 
+    # Final heartbeat: the per-chunk beat fires BEFORE its chunk's rm, so the
+    # last chunk's deletions aren't reflected until here. Write the completed
+    # count so the durable status is accurate before the 'done' phase.
+    write_status(status_file, "purge",
+                 purged=sum(1 for r in results if r["status"] == "deleted"),
+                 total=len(filenames))
+
     return results
 
 

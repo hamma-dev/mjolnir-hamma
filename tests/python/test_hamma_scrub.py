@@ -2333,8 +2333,24 @@ class TestPurgeBatching:
                 status_file="/tmp/s.json")
         purge_beats = [c for c in mock_ws.call_args_list
                        if len(c.args) >= 2 and c.args[1] == "purge"]
-        assert len(purge_beats) == 3
+        # 3 pre-chunk beats + 1 final beat (reflects the last chunk's deletions)
+        assert len(purge_beats) == 4
         assert all(c.args[0] == "/tmp/s.json" for c in purge_beats)
+
+    def test_final_heartbeat_reflects_last_chunk(self, hamma_scrub):
+        """A final heartbeat after the loop must report the FULL deleted count.
+        The per-chunk beat fires BEFORE its chunk's rm, so without a trailing
+        write the last chunk's deletions never reach the heartbeat before the
+        'done' phase. Jeff review #2."""
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]  # 3 chunks
+        with patch.object(hamma_scrub, "write_status") as mock_ws, \
+             patch("subprocess.run", return_value=self._ok()):
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False,
+                status_file="/tmp/s.json")
+        purge_beats = [c for c in mock_ws.call_args_list
+                       if len(c.args) >= 2 and c.args[1] == "purge"]
+        assert purge_beats[-1].kwargs.get("purged") == 250  # all, not 200
 
     def test_chunk_command_deletes_multiple_files(self, hamma_scrub):
         with patch("subprocess.run", return_value=self._ok()) as mock_run:

@@ -269,6 +269,24 @@ class TestCheckScrubHealth:
         mock_spawn.assert_called_once()          # freed lock is re-used
         assert msg is not None and "hung" in msg.lower()
 
+    def test_post_kill_respawn_is_cooldown_gated(self):
+        """After killing a hung scrub, the respawn must go through the cooldown
+        gate -- a rapid re-hang must not drive an unbounded kill/respawn cycle
+        (bounded only by scrub_hang_timeout_s). Jeff review #1."""
+        mon = self._mon(scrub_auto_recover=True)
+        mon._last_scrub_spawn = time.monotonic()  # a scrub launched just now
+        s = {"pid": 22, "timestamp": 1, "phase": "recover", "recovered": 2}
+        self._idle_streak(mon, StateMonitor._progress_token(s))
+        with patch.object(StateMonitor, "_scrub_lock_state",
+                          return_value="held"), \
+             patch.object(StateMonitor, "_read_scrub_status", return_value=s), \
+             patch.object(StateMonitor, "_recover_stuck_scrub",
+                          return_value=True), \
+             patch.object(StateMonitor, "_spawn_scrub") as mock_spawn:
+            msg = mon.check_scrub_health(make_input_data(50))
+        mock_spawn.assert_not_called()  # cooldown gate blocks the immediate respawn
+        assert msg is not None and "hung" in msg.lower()
+
     def test_clock_skew_immune_future_timestamp_still_hangs(self):
         """A heartbeat timestamp in the FUTURE (NTP skew) must not disable
         detection: detection is by token-change, not absolute time."""

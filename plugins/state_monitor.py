@@ -724,7 +724,11 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             recovered = self._recover_stuck_scrub(status)
             if recovered:
                 self._scrub_first_held = None  # streak ends; re-measure next hold
-                self._spawn_scrub()  # use the freed lock (a timer is the backstop)
+                # Route the respawn through the cooldown gate so a scrub that
+                # re-hangs on the same root cause can't drive an unbounded
+                # kill/respawn cycle (bounded only by scrub_hang_timeout_s).
+                # The gate also arms _last_scrub_spawn; the timer is the backstop.
+                self._maybe_spawn_scrub()  # use the freed lock, cooldown-gated
         if self._stuck_scrub_alerted:
             return None
         self._stuck_scrub_alerted = True
