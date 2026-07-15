@@ -58,6 +58,16 @@ SSH_CONNECT_TIMEOUT = 10  # seconds to establish an SSH connection (fail fast)
 CONTROL_PERSIST = 60      # seconds the shared ControlMaster lingers after last use
 PURGE_CHUNK_SIZE = 100    # AGS files deleted per batched `rm` (one SSH round-trip)
 PURGE_TIMEOUT = 30        # seconds per batched delete chunk
+# CPU-nice the scrub's heavy AGS-side commands (header scan, recover reads,
+# purge) so they cannot preempt the DAS writer on the AGS Pi. Verified on the
+# fleet: the DAS runs at CPU nice 19 (the floor) while an unniced remote command
+# runs at nice 0 -- i.e. the scrub would OUTRANK the writer on CPU. `nice -n 19`
+# demotes it to the writer's floor. No ionice: the AGS's active I/O scheduler is
+# mq-deadline, which ignores ionice classes entirely (the DAS's "realtime" I/O
+# prio is set but inert), so ionice here would be theatre. `nice` is coreutils,
+# always present. The mj-pi side is deprioritised separately via the service
+# unit's Nice= (files/hamma-scrub.service).
+AGS_NICE = "nice -n 19 "
 # Bounds the SCAN phase's contribution to lock-hold time -- NOT the whole scrub:
 # recover is per-trigger (RECOVER_TIMEOUT) and purge per-chunk (PURGE_TIMEOUT),
 # so the aggregate scan+recover+purge lock-hold is NOT bounded by this alone.
@@ -868,7 +878,7 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
 
     run_cmd = ssh_cmd(
         ags_host,
-        "python3 {script} {path}; rm -f {script}".format(
+        AGS_NICE + "python3 {script} {path}; rm -f {script}".format(
             script=remote_script, path=ags_path),
         control_path=control_path)
     logger.debug("Running: %s", " ".join(run_cmd))
@@ -1179,7 +1189,7 @@ def extract_trigger(ags_host, ags_path, filename, offset, size,
         Extracted data, or None on failure.
     """
     filepath = "{}/{}".format(ags_path, filename)
-    dd_cmd = (
+    dd_cmd = AGS_NICE + (
         "dd if={} iflag=skip_bytes,count_bytes bs=4096"
         " skip={} count={} status=none"
     ).format(filepath, offset, size)
@@ -1447,7 +1457,7 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
         remote_paths = [
             shlex.quote("{}/{}".format(ags_path, fname)) for fname in chunk
         ]
-        rm_command = "rm -f " + " ".join(remote_paths)
+        rm_command = AGS_NICE + "rm -f " + " ".join(remote_paths)
         cmd = ssh_cmd(ags_host, rm_command, control_path=control_path)
         logger.info("Deleting %d AGS file(s) on %s", len(chunk), ags_host)
         try:
@@ -1474,7 +1484,7 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
                            "retrying per-file to attribute status",
                            ags_host, stderr)
             for fname, quoted in zip(chunk, remote_paths):
-                one_cmd = ssh_cmd(ags_host, "rm -f " + quoted,
+                one_cmd = ssh_cmd(ags_host, AGS_NICE + "rm -f " + quoted,
                                   control_path=control_path)
                 try:
                     one = subprocess.run(

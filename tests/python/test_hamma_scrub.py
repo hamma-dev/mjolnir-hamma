@@ -84,6 +84,12 @@ class TestConstants:
     def test_max_datasize(self, hamma_scrub):
         assert hamma_scrub.MAX_DATASIZE == 20000000
 
+    def test_ags_nice_prefix(self, hamma_scrub):
+        """AGS-side commands are CPU-niced to 19 (the DAS writer's floor) so the
+        scrub cannot preempt the writer. No ionice: the AGS runs mq-deadline,
+        which ignores I/O priority classes."""
+        assert hamma_scrub.AGS_NICE == "nice -n 19 "
+
 
 class TestExtractHeaders:
     """Test extract_headers_from_file with synthetic data."""
@@ -422,8 +428,9 @@ class TestScanAgsFiles:
         assert run_argv[0] == "ssh"
         assert "BatchMode=yes" in run_argv
         assert run_argv[-2] == "10.10.10.1"
+        # CPU-niced to the DAS writer's floor so the scan can't preempt it.
         assert run_argv[-1] == (
-            "python3 /tmp/hamma_strider.py /ags/data; "
+            "nice -n 19 python3 /tmp/hamma_strider.py /ags/data; "
             "rm -f /tmp/hamma_strider.py")
 
         # Local temp file written and cleaned up
@@ -825,7 +832,7 @@ class TestExtractTrigger:
 
         assert data == mock_result.stdout
         cmd = mock_run.call_args[0][0]
-        assert "dd" in cmd[-1]
+        assert cmd[-1].startswith("nice -n 19 dd ")  # niced below the DAS writer
         assert "skip=1000" in cmd[-1]
         assert "count=104" in cmd[-1]
         assert "iflag=skip_bytes,count_bytes" in cmd[-1]
@@ -1493,7 +1500,7 @@ class TestPurgeAgsFiles:
         assert "hamma" in cmd
         # remote rm command is the last argv element; path is shlex-quoted
         assert "'/ags/data/ags file.bin'" in cmd[-1]
-        assert cmd[-1].startswith("rm -f ")
+        assert cmd[-1].startswith("nice -n 19 rm -f ")  # niced below the DAS writer
 
 
 class TestRecoveryReport:
@@ -2357,8 +2364,22 @@ class TestPurgeBatching:
             hamma_scrub.purge_ags_files(
                 "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
         remote = mock_run.call_args[0][0][-1]
+        assert remote.startswith("nice -n 19 rm -f ")  # niced below the DAS writer
         assert "/ags/data/a.bin" in remote
         assert "/ags/data/b.bin" in remote
+
+    def test_per_file_retry_rm_is_niced(self, hamma_scrub):
+        """The per-file retry after a partial-chunk failure is niced too."""
+        batch_fail = MagicMock()
+        batch_fail.returncode = 1
+        batch_fail.stderr = b'rm: cannot remove one'
+        with patch("subprocess.run",
+                   side_effect=[batch_fail, self._ok(), self._ok()]) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        # calls[1] and [2] are the per-file retries
+        retry = mock_run.call_args_list[1][0][0][-1]
+        assert retry.startswith("nice -n 19 rm -f ")
 
     def test_chunk_failure_marks_all_in_chunk_failed(self, hamma_scrub):
         m = MagicMock()

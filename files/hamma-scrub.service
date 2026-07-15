@@ -18,9 +18,10 @@ User=pi
 Group=pi
 ExecStart=/usr/local/bin/hamma-scrub.sh
 # Deprioritise CPU so the scrub's header parse/CRC yields to brokkr on the mj-pi.
-# NO I/O-priority knob: the contended device (/ags/data + the AGS write pipeline)
-# is on the SEPARATE AGS Pi, reached over SSH -- an mj-pi ionice class governs
-# nothing there (and mq-deadline ignores ionice anyway; the AGS writer already
-# holds realtime I/O priority). The real scan-cost fix is the incremental scan
-# (design §3.5).
+# NO I/O-priority knob here: the contended device (/ags/data + the AGS write
+# pipeline) is on the SEPARATE AGS Pi, reached over SSH -- an mj-pi ionice class
+# governs nothing there, and mq-deadline ignores ionice anyway. The scrub's
+# AGS-side work is deprioritised on the AGS itself: the heavy remote commands
+# (header scan, recover reads, purge) are wrapped in `nice -n 19` so they run at
+# the DAS writer's CPU floor instead of outranking it (hamma_scrub.py AGS_NICE).
 Nice=10

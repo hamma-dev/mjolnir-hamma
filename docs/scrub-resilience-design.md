@@ -172,11 +172,20 @@ hung scrub is killed, the next tick re-runs it — the low-space edge won't re-f
 **Red-team corrections (3 reviewers) — no CRITICAL ship-blocker; honest scope:**
 - **I/O-priority stanza was on the wrong machine — removed.** The scrub runs on the mj-pi;
   `/ags/data` + the write pipeline are on the *AGS Pi* (separate host, over SSH), so an mj-pi
-  `ionice` governs nothing on the contended drive (and `mq-deadline` ignores ionice anyway;
-  the AGS java writer already holds *realtime* I/O priority). Kept `Nice=10` (mj-pi CPU only).
+  `ionice` governs nothing on the contended drive (and `mq-deadline` ignores ionice anyway).
+  Kept `Nice=10` (mj-pi CPU only).
   **Because the scrub does no local block I/O on the AGS drive, the timer does NOT make the
   fill worse** — it lengthens its own scan, not the writer. So §3.3 is safe to ship *before*
   §3.5 (incremental scan), which remains the real scan-cost fix.
+- **AGS-side commands are CPU-niced to the DAS floor (`AGS_NICE = "nice -n 19 "`).** Fleet
+  check (mj05 AGS) settled the priority question with data: active I/O scheduler is
+  `mq-deadline` (ignores ionice — the DAS's *realtime* ioprio is **set but inert**), and the
+  DAS java runs at CPU `nice 19` while an unniced remote command runs at `nice 0` — i.e. the
+  scrub would **outrank** the writer on CPU. Fix: wrap the heavy AGS-side commands (header
+  scan, recover `dd` reads, purge `rm` incl. the per-file retry) in `nice -n 19` so they sit
+  at the writer's floor instead of preempting it. `ionice` deliberately **not** used (theatre
+  under mq-deadline). The real CRC/fifo-overflow contention has a separate fix; this is just
+  the scrub being a good citizen so it can't steal CPU from the writer.
 - **`Wants=brokkr` → `After=` only:** a 15-min tick must not resurrect a deliberately-stopped
   brokkr. **`StartLimitIntervalSec=0`:** so repeated §3.2 SIGKILLs (a killed scrub = a systemd
   *failed* activation) can't trip the start-limit and silently disable the timer under
@@ -416,6 +425,15 @@ When it does roll out, two things do **not** happen automatically and must be in
 
 ## Changelog
 
+- **v4.2 (PR #82 review round + AGS-side priority):** Addressed jcburchfield's two review
+  gaps — (1) the post-kill auto-recover respawn now routes through the cooldown gate
+  (`_maybe_spawn_scrub`) so a re-hang can't drive an unbounded kill/respawn cycle; (2) added a
+  final purge heartbeat so the last chunk's deletions reach the durable status before `done`.
+  Then, per Phillip: made the scrub a **lower CPU priority than the DAS on the AGS itself**.
+  Fleet check (mj05 AGS) found `mq-deadline` (ionice inert) with the DAS at CPU `nice 19` and
+  unniced remote commands at `nice 0` — so the scrub was *outranking* the writer. Wrapped the
+  heavy AGS-side commands in `nice -n 19` (`AGS_NICE`); verified `nice -n 19` runs over the
+  scrub's SSH path on real hardware. ionice deliberately not used (no effect under mq-deadline).
 - **v4.1 (red-team pass on the v4 follow-ups):** A 3-agent adversarial review caught that
   `_refresh_cache_dirs` was fed `recover_triggers`' **relative** `target_path` while the cache
   is keyed by **absolute** dirs — so the refresh silently no-op'd (feature did nothing), and the
