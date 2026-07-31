@@ -130,3 +130,78 @@ setup_automount() {
     echo ""
     log_info "Users in 'pi' group can now mount/unmount drives using udisksctl"
 }
+
+# --- Configure Log-Size Bounds (HAM-113) ---
+# Bounds /var/log so a runaway log source (brokkr science_ingest spamming when
+# the AGS is down, HAM-112) cannot fill the SD card. Three defenses:
+#   1. journald SystemMaxUse cap (drop-in)
+#   2. maxsize on the rsyslog logrotate stanzas
+#   3. hourly logrotate run so maxsize is enforced within the hour
+#
+# The operations themselves live in lib/log_bounds.sh, shared with
+# scripts/apply_log_bounds.sh so there is exactly one implementation. This
+# function contributes only the installer concerns: step logging, --dry-run,
+# and manifest entries for rollback.
+configure_log_bounds() {
+    log_step "Configuring log-size bounds (HAM-113)..."
+
+    # shellcheck source=./log_bounds.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/log_bounds.sh"
+
+    local result
+
+    # --- Step 1: Cap systemd-journald disk use ---
+    log_step "[Log bounds 1/3] Capping systemd-journald..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "mkdir -p $LOG_BOUNDS_JOURNALD_DIR"
+        log_dry_run "cp $LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_JOURNALD_SRC $LOG_BOUNDS_JOURNALD_DST"
+        log_dry_run "systemctl restart systemd-journald"
+        manifest_add "mkdir" "path" "$LOG_BOUNDS_JOURNALD_DIR" "sudo" "true"
+        manifest_add "copy" "src" "$LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_JOURNALD_SRC" "dst" "$LOG_BOUNDS_JOURNALD_DST" "sudo" "true"
+        manifest_add "service" "action" "restart" "unit" "systemd-journald" "sudo" "true"
+    else
+        result="$(log_bounds_apply_journald || true)"
+        case "$result" in
+            APPLIED)     log_success "journald disk use capped ($LOG_BOUNDS_JOURNALD_DST)" ;;
+            MISSING_SRC) log_warn "journald bounds file not found at $LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_JOURNALD_SRC" ;;
+            *)           log_warn "unexpected journald result: $result" ;;
+        esac
+    fi
+
+    # --- Step 2: Add maxsize cap to the rsyslog logrotate stanzas ---
+    log_step "[Log bounds 2/3] Adding maxsize cap to $LOG_BOUNDS_RSYSLOG_LR..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "inject 'maxsize $LOG_BOUNDS_MAXSIZE' into $LOG_BOUNDS_RSYSLOG_LR (idempotent; backup at $LOG_BOUNDS_RSYSLOG_BAK)"
+        manifest_add "modify" "path" "$LOG_BOUNDS_RSYSLOG_LR" "change" "add maxsize $LOG_BOUNDS_MAXSIZE" "sudo" "true"
+    else
+        result="$(log_bounds_apply_rsyslog || true)"
+        case "$result" in
+            APPLIED)        log_success "Added 'maxsize $LOG_BOUNDS_MAXSIZE' to $LOG_BOUNDS_RSYSLOG_LR (backup at $LOG_BOUNDS_RSYSLOG_BAK)" ;;
+            ALREADY)        log_info "rsyslog logrotate already has a maxsize cap; leaving as-is" ;;
+            MISSING_TARGET) log_warn "rsyslog logrotate config not found at $LOG_BOUNDS_RSYSLOG_LR" ;;
+            *)              log_warn "unexpected rsyslog result: $result" ;;
+        esac
+    fi
+
+    # --- Step 3: Run logrotate hourly so maxsize is enforced within the hour ---
+    log_step "[Log bounds 3/3] Installing hourly logrotate job..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "cp $LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_CRON_SRC $LOG_BOUNDS_CRON_DST"
+        log_dry_run "chmod 0755 $LOG_BOUNDS_CRON_DST"
+        manifest_add "copy" "src" "$LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_CRON_SRC" "dst" "$LOG_BOUNDS_CRON_DST" "sudo" "true"
+        manifest_add "chmod" "path" "$LOG_BOUNDS_CRON_DST" "mode" "0755" "sudo" "true"
+    else
+        result="$(log_bounds_apply_cron || true)"
+        case "$result" in
+            APPLIED)     log_success "Hourly logrotate job installed at $LOG_BOUNDS_CRON_DST" ;;
+            MISSING_SRC) log_warn "Hourly logrotate file not found at $LOG_BOUNDS_FILES_DIR/$LOG_BOUNDS_CRON_SRC" ;;
+            *)           log_warn "unexpected cron result: $result" ;;
+        esac
+    fi
+
+    log_success "Log-size bounds configured!"
+    echo ""
+    log_info "  - journald: SystemMaxUse capped via $LOG_BOUNDS_JOURNALD_DST"
+    log_info "  - rsyslog:  maxsize $LOG_BOUNDS_MAXSIZE per log, rotated hourly"
+    log_info "  - Keeps /var/log well under 2 GB even under sustained log spam"
+}
