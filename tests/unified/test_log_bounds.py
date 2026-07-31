@@ -16,6 +16,7 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.parent
 FILES_DIR = REPO_ROOT / "files"
 UNIFIED_DIR = REPO_ROOT / "unified_install"
+LIB_DIR = UNIFIED_DIR / "lib"
 
 
 class TestLogBoundsArtifacts:
@@ -117,6 +118,7 @@ class TestRsyslogBackupLocation:
 
     def _sources(self):
         return [
+            (LIB_DIR / "log_bounds.sh").read_text(),
             (UNIFIED_DIR / "lib" / "hardware.sh").read_text(),
             (REPO_ROOT / "scripts" / "apply_log_bounds.sh").read_text(),
         ]
@@ -129,5 +131,63 @@ class TestRsyslogBackupLocation:
             assert "/etc/logrotate.d/rsyslog.mjolnir-orig" not in text
 
     def test_backup_uses_var_backups(self):
-        for text in self._sources():
-            assert "/var/backups/logrotate-rsyslog.mjolnir-orig" in text
+        # The path is defined once, in the shared lib.
+        lib = (LIB_DIR / "log_bounds.sh").read_text()
+        assert "/var/backups/logrotate-rsyslog.mjolnir-orig" in lib
+
+
+class TestSingleImplementation:
+    """The apply logic must exist in exactly ONE place (lib/log_bounds.sh).
+
+    Before this refactor, configure_log_bounds() in hardware.sh and
+    scripts/apply_log_bounds.sh were parallel implementations of the same three
+    operations -- same paths, same sed, same backup logic, duplicated comments.
+    These tests fail if the duplication is reintroduced.
+    """
+
+    def _lib(self):
+        return (LIB_DIR / "log_bounds.sh").read_text()
+
+    def _callers(self):
+        return {
+            "hardware.sh": (UNIFIED_DIR / "lib" / "hardware.sh").read_text(),
+            "apply_log_bounds.sh": (REPO_ROOT / "scripts" / "apply_log_bounds.sh").read_text(),
+        }
+
+    def test_shared_lib_exists_and_defines_the_operations(self):
+        lib = self._lib()
+        for fn in ("log_bounds_apply_journald",
+                   "log_bounds_apply_rsyslog",
+                   "log_bounds_apply_cron"):
+            assert f"{fn}()" in lib, f"{fn} must be defined in lib/log_bounds.sh"
+
+    def test_both_callers_source_the_shared_lib(self):
+        for name, text in self._callers().items():
+            assert "log_bounds.sh" in text, f"{name} must source lib/log_bounds.sh"
+
+    def test_callers_do_not_reimplement_the_sed(self):
+        """The maxsize injection is the sharpest duplication marker."""
+        for name, text in self._callers().items():
+            assert "sed -i" not in text or "maxsize" not in text, (
+                f"{name} appears to reimplement the maxsize sed; "
+                "it must call log_bounds_apply_rsyslog instead")
+
+    def test_callers_do_not_hardcode_the_managed_paths(self):
+        """Paths are defined once in the lib and referenced by variable."""
+        managed = [
+            "/etc/systemd/journald.conf.d/00-sensor-bounds.conf",
+            "/etc/cron.hourly/mjolnir-logrotate",
+        ]
+        for name, text in self._callers().items():
+            for path in managed:
+                assert path not in text, (
+                    f"{name} hardcodes {path}; use the LOG_BOUNDS_* variable")
+
+    def test_status_helpers_available_for_verify_deployment(self):
+        """verify_deployment.sh needs a read-only check it can call."""
+        lib = self._lib()
+        assert "log_bounds_all_present()" in lib
+        for fn in ("log_bounds_status_journald",
+                   "log_bounds_status_rsyslog",
+                   "log_bounds_status_cron"):
+            assert f"{fn}()" in lib
