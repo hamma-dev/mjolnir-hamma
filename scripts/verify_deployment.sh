@@ -284,6 +284,20 @@ check_brokkr_status() {
         fail "Brokkr status command failed"
         info "Output: $status_output"
     fi
+
+    # gpiozero must import in ltgenv — gpiozero 2.0 on Python 3.7 raises
+    # ModuleNotFoundError, which breaks relay.py and therefore sensor power
+    # control via mjol_array --up/--down (HAM-84).
+    local ltgenv_py="/home/pi/dev/ltgenv/bin/python"
+    if [[ -x "$ltgenv_py" ]]; then
+        if "$ltgenv_py" -c "import gpiozero" 2>/dev/null; then
+            pass "gpiozero imports in ltgenv"
+        else
+            fail "gpiozero fails to import in ltgenv (pin gpiozero<2.0 on Python 3.7 — HAM-84)"
+        fi
+    else
+        skip "ltgenv python not found — cannot check gpiozero"
+    fi
 }
 
 check_server_connection() {
