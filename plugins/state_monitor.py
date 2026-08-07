@@ -31,6 +31,13 @@ DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 # this was DEVNULL'd). Rotated at SCRUB_LOG_MAX_BYTES so it can't fill the disk.
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
 SCRUB_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate the scrub log past this size
+# Mountpoint base for the mj-side DATA drives. Deliberately the same template
+# brokkr's own get_output_drive uses (utils/output.py), rather than a hardcoded
+# /media/pi, so this cannot drift from where brokkr actually writes.
+# check_drive discovers drives by *label* under /dev/disk/by-label, but free
+# space is a property of the mounted filesystem, so this check must work from
+# mountpoints instead.
+RECOVERY_MOUNT_BASE = "/media/{current_user}"
 
 
 def sensor_prefix():
@@ -64,6 +71,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_status_file=DEFAULT_SCRUB_STATUS_FILE,
         scrub_auto_recover=False,
         scrub_log=DEFAULT_SCRUB_LOG,
+        recovery_low_gb=25,
         low_space=None,   # DEPRECATED: replaced by purge_space/alert_space
         **output_step_kwargs,
         ):
@@ -125,6 +133,14 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         scrub_log : str, optional
             Durable file capturing the scrub's stdout/stderr (rotated); empty
             string disables (falls back to DEVNULL).
+        recovery_low_gb : numeric, optional
+            GB free on the roomiest mj-side DATA drive below which to alert.
+            These drives are both brokkr's science-data write target and where
+            the scrubber lands recovered AGS triggers -- if they all fill,
+            writes stop and recovery has nowhere to go. A single drive at 100%
+            is normal rotation, so only the *roomiest* drive is judged.
+            Alert-only: a full DATA drive is not fixed by scrubbing the AGS.
+            Default 25.
         low_space : numeric, optional
             **Deprecated.** The old single edge-triggered threshold, replaced by
             purge_space/alert_space (§3.4). Accepted only so a stale per-unit
@@ -185,6 +201,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self._scrub_last_progress = None   # monotonic; last heartbeat advance
         self._scrub_progress_token = None  # last-seen heartbeat identity
         self._stuck_scrub_alerted = False
+        # mj-side recovery-target drives (where brokkr writes science data and
+        # where the scrubber lands recovered AGS triggers).
+        self.recovery_low_gb = recovery_low_gb
+        self._recovery_low_active = False  # latch: alert once per descent
 
         self.notifier = Notifier(
             method=method, key_file=key_file, channel=channel, logger=self.logger)
@@ -298,6 +318,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         ]
         if self.enable_drive_checks:
             checks.insert(0, self.check_drive)
+            checks.append(self.check_recovery_drives)
             checks.append(self.check_sensor_drive)
             checks.append(self.check_scrub_health)
 
@@ -353,6 +374,78 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             return "No drives available."
         else:
             return None
+
+    def check_recovery_drives(self, input_data):
+        """
+        Check free space on the mj-side recovery-target DATA drives.
+
+        These are both brokkr's science-data write target and where the
+        scrubber lands recovered AGS triggers. If they all fill, writes stop
+        and recovery has nowhere to go. A single drive at 100% is normal
+        rotation, so only the *roomiest* drive is judged. Local and
+        telemetry-independent -- no AGS dependency, so this still reports when
+        the AGS is dark. Alert-only: a full DATA drive is not fixed by
+        scrubbing the AGS.
+
+        Drives are resolved with `brokkr.utils.output.find_drives`, which drops
+        any match that is a directory but not a mountpoint. That filter is
+        load-bearing here: when udisks hits a stale `/media/pi/DATA07` dir it
+        mounts the real drive at `DATA071`, and `shutil.disk_usage()` on the
+        leftover directory returns the *SD root's* free space. Because this
+        check takes `max()`, a roomy root would then mask genuinely full DATA
+        drives. The trailing `*` on the glob catches the suffixed mountpoint
+        that a bare `DATA??` would miss.
+
+        Returns
+        -------
+        str | None
+            Message if the roomiest drive is below `recovery_low_gb`, else None.
+
+        """
+        # `from ... import name` rather than `import brokkr.utils.misc`: the
+        # latter would bind a local `brokkr`, shadowing the module-global one
+        # that brokkr.utils.output is resolved through below.
+        from brokkr.config.main import CONFIG
+        from brokkr.utils.misc import get_actual_username
+        drive_glob = (CONFIG['steps']['science_binary_output']
+                      ['drive_kwargs']['drive_glob'])
+
+        # Trailing "*" tolerates udisks-suffixed mountpoints (DATA07 -> DATA071).
+        # Both parts matter: the "*" finds the suffixed mount, and find_drives'
+        # ismount filter drops the stale directory that caused the suffix.
+        # Either alone is wrong -- see test_both_fixes_are_required.
+        paths = brokkr.utils.output.find_drives(
+            drive_glob + "*", RECOVERY_MOUNT_BASE,
+            filename_kwargs={"current_user": get_actual_username()})
+        if not paths:
+            # Nothing mounted -- leave the "no drives" alert to check_drive.
+            return None
+
+        frees = []
+        for path in paths:
+            try:
+                frees.append(shutil.disk_usage(str(path)).free)
+            except OSError:
+                # Drive unmounted mid-check; skip it rather than aborting.
+                continue
+        if not frees:
+            # Paths resolved but every one errored -- avoid max([]) ValueError.
+            return None
+
+        threshold = self.recovery_low_gb * (2 ** 30)
+        best_free = max(frees)
+        if best_free >= threshold:
+            self._recovery_low_active = False   # re-arm for the next descent
+            return None
+        if self._recovery_low_active:
+            return None                          # already alerted this descent
+        self._recovery_low_active = True
+        below = sum(1 for free in frees if free < threshold)
+        return ("Recovery drives low: roomiest {} has {:.1f} GB free "
+                "({}/{} below {} GB) -- brokkr writes and AGS recovery both "
+                "land here".format(
+                    drive_glob, best_free / (2 ** 30), below, len(frees),
+                    self.recovery_low_gb))
 
     def check_power(self, input_data):
         """

@@ -64,6 +64,7 @@ config_version = 1
         scrub_hang_timeout_s = 900  # judge a scrub hung if the lock is held with no heartbeat progress this long (>SCAN_TIMEOUT=600s)
         scrub_auto_recover = false  # kill a genuinely-hung scrub to free the lock (self-healing). DEFAULT OFF: validate on a bench unit (inject a hung scrub) before enabling fleet-wide; false = alert only. Enable tracked in hamma-dev/mjolnir-hamma#81
         scrub_log = "/home/pi/brokkr/hamma/log/hamma_scrub.log"  # durable capture of scrub stdout/stderr (rotated); mj05 ran blind on DEVNULL
+        recovery_low_gb = 25  # GB free on the roomiest mj-side DATA drive below which to alert; these are brokkr's write target AND where scrub recovery lands, so if they all fill both stop. Alert-only -- scrubbing the AGS does not free them
 
     # Step to create HAMMA plot
     [steps.hamma_plot]
