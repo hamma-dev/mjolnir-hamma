@@ -52,12 +52,18 @@ config_version = 1
     [steps.state_monitor]
         _preset = "state_monitor.outputs.plugin"
         power_delim = 15  # delimiter between normal power and low power
-        low_space = 100  # if # of GB is less than this, generate a notification
+        purge_space = 200  # GB free on the AGS drive below which to drain proactively (level-triggered, no alert)
+        alert_space = 75   # GB free below which to alert: falling despite the auto-scrub (purge losing)
+        scrub_cooldown_s = 300  # min seconds between level-triggered scrub launches while below purge_space (more responsive than the 15-min timer)
+        hs_stale_cycles = 15  # alert if bytes_remaining is NA this many consecutive cycles (~15 min) -- the AGS is dark and /ags/data can fill unseen
         ping_max = 3  # after this many pings, send chat message
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"
         key_file = "/home/pi/.googlechat"
         scrub_command = "python3 /home/pi/dev/mjolnir-hamma/scripts/hamma_scrub.py --recover --purge --since auto"
+        scrub_hang_timeout_s = 900  # judge a scrub hung if the lock is held with no heartbeat progress this long (>SCAN_TIMEOUT=600s)
+        scrub_auto_recover = false  # kill a genuinely-hung scrub to free the lock (self-healing). DEFAULT OFF: validate on a bench unit (inject a hung scrub) before enabling fleet-wide; false = alert only. Enable tracked in hamma-dev/mjolnir-hamma#81
+        scrub_log = "/home/pi/brokkr/hamma/log/hamma_scrub.log"  # durable capture of scrub stdout/stderr (rotated); mj05 ran blind on DEVNULL
 
     # Step to create HAMMA plot
     [steps.hamma_plot]

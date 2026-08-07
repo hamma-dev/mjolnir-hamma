@@ -84,6 +84,12 @@ class TestConstants:
     def test_max_datasize(self, hamma_scrub):
         assert hamma_scrub.MAX_DATASIZE == 20000000
 
+    def test_ags_nice_prefix(self, hamma_scrub):
+        """AGS-side commands are CPU-niced to 19 (the DAS writer's floor) so the
+        scrub cannot preempt the writer. No ionice: the AGS runs mq-deadline,
+        which ignores I/O priority classes."""
+        assert hamma_scrub.AGS_NICE == "nice -n 19 "
+
 
 class TestExtractHeaders:
     """Test extract_headers_from_file with synthetic data."""
@@ -370,6 +376,24 @@ class TestStriderProtocol:
 class TestScanAgsFiles:
     """Test SSH-based AGS scanning."""
 
+    def test_scan_uses_bounded_timeout(self, hamma_scrub):
+        """AGS scan timeout is bounded to minutes (SCAN_TIMEOUT), not the old
+        3600s cap: a hung scan holds the scrub lock for its whole timeout, so
+        an hour-long cap lets one hung scan stall the safety net for an hour."""
+        assert hamma_scrub.SCAN_TIMEOUT == 600
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b''
+        mock_result.stderr = b''
+        with patch("subprocess.run", return_value=mock_result) as mock_run, \
+             patch("tempfile.mkstemp",
+                   return_value=(99, "/tmp/local_strider.py")), \
+             patch("os.write"), patch("os.close"), \
+             patch("os.path.exists", return_value=True), patch("os.unlink"):
+            hamma_scrub.scan_ags_files("10.10.10.1", "/ags/data")
+        run_call = mock_run.call_args_list[1]
+        assert run_call.kwargs["timeout"] == hamma_scrub.SCAN_TIMEOUT
+
     def test_deploys_strider_via_scp_then_runs(self, hamma_scrub):
         """scan_ags_files deploys strider via SCP, then runs via SSH."""
         mock_result = MagicMock()
@@ -397,12 +421,17 @@ class TestScanAgsFiles:
             "10.10.10.1:/tmp/hamma_strider.py",
         ]
 
-        # SSH runs the deployed script (no stdin piping)
-        assert run_call[0][0] == [
-            "ssh", "10.10.10.1",
-            "python3 /tmp/hamma_strider.py /ags/data; "
-            "rm -f /tmp/hamma_strider.py",
-        ]
+        # SSH runs the deployed script (no stdin piping). Command is built via
+        # ssh_cmd(), so it carries BatchMode/ConnectTimeout opts; host and the
+        # remote command are the last two argv elements.
+        run_argv = run_call[0][0]
+        assert run_argv[0] == "ssh"
+        assert "BatchMode=yes" in run_argv
+        assert run_argv[-2] == "10.10.10.1"
+        # CPU-niced to the DAS writer's floor so the scan can't preempt it.
+        assert run_argv[-1] == (
+            "nice -n 19 python3 /tmp/hamma_strider.py /ags/data; "
+            "rm -f /tmp/hamma_strider.py")
 
         # Local temp file written and cleaned up
         mock_write.assert_called_once_with(
@@ -803,7 +832,7 @@ class TestExtractTrigger:
 
         assert data == mock_result.stdout
         cmd = mock_run.call_args[0][0]
-        assert "dd" in cmd[-1]
+        assert cmd[-1].startswith("nice -n 19 dd ")  # niced below the DAS writer
         assert "skip=1000" in cmd[-1]
         assert "count=104" in cmd[-1]
         assert "iflag=skip_bytes,count_bytes" in cmd[-1]
@@ -1468,9 +1497,10 @@ class TestPurgeAgsFiles:
 
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "ssh"
-        assert cmd[1] == "hamma"
-        # shlex.quote wraps paths with spaces in single quotes
-        assert "'/ags/data/ags file.bin'" in cmd[2]
+        assert "hamma" in cmd
+        # remote rm command is the last argv element; path is shlex-quoted
+        assert "'/ags/data/ags file.bin'" in cmd[-1]
+        assert cmd[-1].startswith("nice -n 19 rm -f ")  # niced below the DAS writer
 
 
 class TestRecoveryReport:
@@ -1829,6 +1859,17 @@ class TestCLI:
 class TestMain:
     """Test main() integration."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_control_master(self, hamma_scrub):
+        """run() opens a real SSH ControlMaster + writes a status/metrics file
+        to the real home; stub them out in unit tests."""
+        with patch.object(hamma_scrub, "open_control_master",
+                          return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"):
+            yield
+
     def test_exit_code_0_all_match(self, hamma_scrub):
         """All matched -> exit code 0."""
         hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
@@ -2157,6 +2198,17 @@ class TestMain:
 class TestRunSinceAuto:
     """Test --since auto integration in run()."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_control_master(self, hamma_scrub):
+        """run() opens a real SSH ControlMaster + writes a status/metrics file
+        to the real home; stub them out in unit tests."""
+        with patch.object(hamma_scrub, "open_control_master",
+                          return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"):
+            yield
+
     def test_since_auto_derives_cutoff_from_ags(self, hamma_scrub):
         """run() with since='auto' derives cutoff from AGS entries."""
         hdr = _make_gps_header()
@@ -2186,7 +2238,9 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             # scan_mj_files called with cutoff derived from AGS data
-            mock_mj.assert_called_once_with("/media/pi", since=expected_cutoff)
+            mock_mj.assert_called_once()
+            assert mock_mj.call_args.args[0] == "/media/pi"
+            assert mock_mj.call_args.kwargs["since"] == expected_cutoff
             assert rc == 0
 
     def test_since_auto_no_valid_gps_scans_all(self, hamma_scrub):
@@ -2218,7 +2272,8 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             # scan_mj_files called without since filter
-            mock_mj.assert_called_once_with("/media/pi", since=None)
+            mock_mj.assert_called_once()
+            assert mock_mj.call_args.kwargs["since"] is None
 
     def test_since_auto_ags_scan_fails(self, hamma_scrub):
         """If AGS scan fails, return EXIT_SSH_ERROR."""
@@ -2229,3 +2284,587 @@ class TestRunSinceAuto:
                 mj_path="/media/pi", since="auto",
             )
             assert rc == hamma_scrub.EXIT_SSH_ERROR
+
+
+class TestSshCmd:
+    """Test the ssh command builder (BatchMode/ConnectTimeout + optional ControlMaster)."""
+
+    def test_basic_command_has_host_and_remote(self, hamma_scrub):
+        cmd = hamma_scrub.ssh_cmd("hamma", "rm -f /x")
+        assert cmd[0] == "ssh"
+        assert "hamma" in cmd
+        assert cmd[-1] == "rm -f /x"
+
+    def test_includes_batchmode_and_connecttimeout(self, hamma_scrub):
+        joined = " ".join(hamma_scrub.ssh_cmd("hamma", "true"))
+        assert "BatchMode=yes" in joined
+        assert "ConnectTimeout=" in joined
+
+    def test_no_control_path_by_default(self, hamma_scrub):
+        joined = " ".join(hamma_scrub.ssh_cmd("hamma", "true"))
+        assert "ControlPath" not in joined
+
+    def test_control_path_added_when_given(self, hamma_scrub):
+        joined = " ".join(
+            hamma_scrub.ssh_cmd("hamma", "true", control_path="/tmp/cm.sock"))
+        assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestPurgeBatching:
+    """Purge deletes in chunks over one connection, not one SSH per file."""
+
+    def _ok(self):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b''
+        return m
+
+    def test_one_ssh_call_per_chunk_not_per_file(self, hamma_scrub):
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False)
+        # 250 files, chunk size 100 -> 3 calls, not 250
+        assert mock_run.call_count == 3
+        assert len(results) == 250
+        assert all(r["status"] == "deleted" for r in results)
+
+    def test_writes_per_chunk_heartbeat(self, hamma_scrub):
+        """A long purge advances the heartbeat per chunk so the monitor can't
+        mistake a working purge for a hung one (GAP: purge was heartbeat-blind)."""
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]  # 3 chunks
+        with patch.object(hamma_scrub, "write_status") as mock_ws, \
+             patch("subprocess.run", return_value=self._ok()):
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False,
+                status_file="/tmp/s.json")
+        purge_beats = [c for c in mock_ws.call_args_list
+                       if len(c.args) >= 2 and c.args[1] == "purge"]
+        # 3 pre-chunk beats + 1 final beat (reflects the last chunk's deletions)
+        assert len(purge_beats) == 4
+        assert all(c.args[0] == "/tmp/s.json" for c in purge_beats)
+
+    def test_final_heartbeat_reflects_last_chunk(self, hamma_scrub):
+        """A final heartbeat after the loop must report the FULL deleted count.
+        The per-chunk beat fires BEFORE its chunk's rm, so without a trailing
+        write the last chunk's deletions never reach the heartbeat before the
+        'done' phase. Jeff review #2."""
+        files = ["ags{:03d}.bin".format(i) for i in range(250)]  # 3 chunks
+        with patch.object(hamma_scrub, "write_status") as mock_ws, \
+             patch("subprocess.run", return_value=self._ok()):
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False,
+                status_file="/tmp/s.json")
+        purge_beats = [c for c in mock_ws.call_args_list
+                       if len(c.args) >= 2 and c.args[1] == "purge"]
+        assert purge_beats[-1].kwargs.get("purged") == 250  # all, not 200
+
+    def test_chunk_command_deletes_multiple_files(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        remote = mock_run.call_args[0][0][-1]
+        assert remote.startswith("nice -n 19 rm -f ")  # niced below the DAS writer
+        assert "/ags/data/a.bin" in remote
+        assert "/ags/data/b.bin" in remote
+
+    def test_per_file_retry_rm_is_niced(self, hamma_scrub):
+        """The per-file retry after a partial-chunk failure is niced too."""
+        batch_fail = MagicMock()
+        batch_fail.returncode = 1
+        batch_fail.stderr = b'rm: cannot remove one'
+        with patch("subprocess.run",
+                   side_effect=[batch_fail, self._ok(), self._ok()]) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        # calls[1] and [2] are the per-file retries
+        retry = mock_run.call_args_list[1][0][0][-1]
+        assert retry.startswith("nice -n 19 rm -f ")
+
+    def test_chunk_failure_marks_all_in_chunk_failed(self, hamma_scrub):
+        m = MagicMock()
+        m.returncode = 255
+        m.stderr = b'Connection closed by remote host'
+        with patch("subprocess.run", return_value=m):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin"], dry_run=False)
+        assert all(r["status"] == "failed" for r in results)
+        assert "Connection closed" in results[0]["error"]
+
+    def test_partial_chunk_failure_attributes_per_file(self, hamma_scrub):
+        """A batched delete that returns non-zero retries per-file, so files
+        that WERE deleted are not mis-reported as failed. `rm -f a b c` can
+        delete a and c while erroring on b yet exit non-zero -- the report
+        must not claim all three failed (it would lie during a disk-fill)."""
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            calls["n"] += 1
+            remote = cmd[-1]
+            m = MagicMock()
+            if calls["n"] == 1:
+                # the batched `rm -f a b c` -- one file errored -> non-zero
+                m.returncode = 1
+                m.stderr = b"rm: /ags/data/b.bin: Permission denied"
+            else:
+                # per-file retries: only b.bin fails
+                fails = "b.bin" in remote
+                m.returncode = 1 if fails else 0
+                m.stderr = b"rm: Permission denied" if fails else b""
+            return m
+
+        with patch("subprocess.run", side_effect=fake_run):
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin", "b.bin", "c.bin"],
+                dry_run=False)
+        by = {r["filename"]: r["status"] for r in results}
+        assert by == {"a.bin": "deleted", "b.bin": "failed", "c.bin": "deleted"}
+
+    @pytest.mark.parametrize("nfiles,expected_calls", [
+        (0, 0), (1, 1), (99, 1), (100, 1), (101, 2), (200, 2), (250, 3)])
+    def test_chunk_boundaries(self, hamma_scrub, nfiles, expected_calls):
+        """Exact-multiple boundaries: no spurious empty trailing chunk."""
+        files = ["f{}.bin".format(i) for i in range(nfiles)]
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            results = hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", files, dry_run=False)
+        assert mock_run.call_count == expected_calls
+        assert len(results) == nfiles
+        assert all(r["status"] == "deleted" for r in results)
+
+    def test_passes_control_path_through(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            hamma_scrub.purge_ags_files(
+                "hamma", "/ags/data", ["a.bin"], dry_run=False,
+                control_path="/tmp/cm.sock")
+        joined = " ".join(mock_run.call_args[0][0])
+        assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestSshControlMaster:
+    """Test the shared-connection context manager."""
+
+    def _ok(self):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = b''
+        return m
+
+    def test_yields_socket_path_on_success(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is not None
+                assert isinstance(cp, str)
+
+    def test_yields_none_when_master_fails(self, hamma_scrub):
+        bad = MagicMock()
+        bad.returncode = 255
+        bad.stderr = b'connect failed'
+        with patch("subprocess.run", return_value=bad):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is None
+
+    def test_yields_none_on_setup_timeout(self, hamma_scrub):
+        with patch("subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=15)):
+            with hamma_scrub.ssh_control_master("hamma") as cp:
+                assert cp is None
+
+    def test_tears_down_master_on_exit(self, hamma_scrub):
+        with patch("subprocess.run", return_value=self._ok()) as mock_run:
+            with hamma_scrub.ssh_control_master("hamma"):
+                pass
+        last_cmd = mock_run.call_args_list[-1][0][0]
+        assert "-O" in last_cmd
+        assert "exit" in last_cmd
+
+
+class TestExtractTriggerControlPath:
+    """extract_trigger routes through ssh_cmd and honors control_path."""
+
+    def test_control_path_in_ssh_command(self, hamma_scrub):
+        header, body = _make_trigger()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = header + body
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            hamma_scrub.extract_trigger(
+                "hamma", "/ags/data", "ags001.bin", 1000, len(header + body),
+                control_path="/tmp/cm.sock")
+        joined = " ".join(mock_run.call_args[0][0])
+        assert "ControlPath=/tmp/cm.sock" in joined
+
+
+class TestRunControlMasterWiring:
+    """run() must open ONE ControlMaster, thread its socket to BOTH recover
+    and purge, and close it. This is the integration seam the leaf tests miss;
+    without it, dropping control_path (or the open/close) passes silently.
+    Deliberately NO autouse control-master stub here."""
+
+    def test_control_path_threaded_to_recover_and_purge_and_closed(
+            self, hamma_scrub):
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": set(), "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 1.0}
+        sentinel = "/tmp/sentinel_cm.sock"
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"), \
+             patch.object(hamma_scrub, "open_control_master",
+                          return_value=sentinel) as mock_open, \
+             patch.object(hamma_scrub, "close_control_master") as mock_close, \
+             patch.object(hamma_scrub, "recover_triggers",
+                          return_value=[]) as mock_recover, \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": ["f.bin"],
+                                        "retained": []}), \
+             patch.object(hamma_scrub, "purge_ags_files",
+                          return_value=[]) as mock_purge:
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            recover=True, purge=True)
+
+        mock_open.assert_called_once_with("hamma")
+        assert mock_recover.call_args.kwargs.get("control_path") == sentinel
+        assert mock_purge.call_args.kwargs.get("control_path") == sentinel
+        mock_close.assert_called_once_with("hamma", sentinel)
+
+    def test_refreshes_recovered_dirs_with_ABSOLUTE_paths(self, hamma_scrub):
+        """recover_triggers records target_path RELATIVE to mj_path, but the scan
+        cache is keyed by ABSOLUTE dirs. run() must convert before refreshing, or
+        the refresh silently no-ops (relative dir != cache key)."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": set(), "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 1.0, "cache_hits": 0, "dirs_total": 5}
+        # target_path exactly as recover_triggers emits it: relpath to mj_path
+        rec = [{"status": "recovered", "header": hdr,
+                "target_path": "DATA01/2026-07-14T12/mj05_x_recovered.bin",
+                "source_file": "f.bin", "source_offset": 0}]
+        captured = {}
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "write_scan_metrics"), \
+             patch.object(hamma_scrub, "open_control_master", return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "recover_triggers", return_value=rec), \
+             patch.object(hamma_scrub, "identify_purgeable_files",
+                          return_value={"purgeable": [], "retained": []}), \
+             patch.object(hamma_scrub, "purge_ags_files", return_value=[]), \
+             patch.object(hamma_scrub, "_refresh_cache_dirs",
+                          side_effect=lambda cf, d: captured.setdefault(
+                              "dirs", sorted(d))):
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            recover=True, mj_cache="/tmp/c.json",
+                            metrics_file=None)
+        assert captured["dirs"] == ["/media/pi/DATA01/2026-07-14T12"]
+
+    def test_run_calls_write_scan_metrics_at_completion(self, hamma_scrub):
+        """The metrics call must be wired into run() -- guards against the call
+        site being deleted (the run-test fixtures otherwise mock it silently)."""
+        hdr = b'\xf5\xff\x50\x5d' + b'\x01' + b'\x00' * 123
+        ags = {"entries": [{"header": hdr, "filename": "f.bin",
+                            "offset": 0, "index": 0}],
+               "headers": {hdr}, "duplicate_count": 0, "elapsed": 1.0}
+        mj = {"headers": {hdr}, "file_count": 5, "duplicate_count": 0,
+              "skipped": 0, "elapsed": 2.5, "cache_hits": 4, "dirs_total": 5}
+        with patch.object(hamma_scrub, "scan_ags_files", return_value=ags), \
+             patch.object(hamma_scrub, "scan_mj_files", return_value=mj), \
+             patch.object(hamma_scrub, "write_status"), \
+             patch.object(hamma_scrub, "open_control_master", return_value=None), \
+             patch.object(hamma_scrub, "close_control_master"), \
+             patch.object(hamma_scrub, "write_scan_metrics") as mock_metrics:
+            hamma_scrub.run("hamma", "/ags/data", "/media/pi",
+                            metrics_file="/tmp/m.csv")
+        mock_metrics.assert_called_once()
+        args = mock_metrics.call_args.args
+        assert args[0] == "/tmp/m.csv" and args[1] is mj   # (path, mj, ...)
+        assert args[2] == 0 and args[3] == 0               # recovered, purged
+
+
+class TestWriteStatus:
+    """Scrub writes an atomic heartbeat/status file for the monitor to read."""
+
+    def test_writes_json_with_timestamp_phase_pid_counts(self, hamma_scrub,
+                                                         tmp_path):
+        p = str(tmp_path / "sub" / "status.json")  # dir does not exist yet
+        hamma_scrub.write_status(p, "purge", recovered=2, purged=10)
+        data = json.loads(pathlib.Path(p).read_text())
+        assert data["phase"] == "purge"
+        assert data["recovered"] == 2 and data["purged"] == 10
+        assert data["pid"] == os.getpid()
+        assert isinstance(data["timestamp"], (int, float))
+
+    def test_none_path_is_noop(self, hamma_scrub):
+        hamma_scrub.write_status(None, "scan")  # must not raise
+
+    def test_write_failure_is_swallowed(self, hamma_scrub):
+        # Unwritable location -> logged at debug, never raised (status is
+        # best-effort; a failed heartbeat must not crash the scrub).
+        hamma_scrub.write_status("/proc/cannot/write/status.json", "scan")
+
+    def test_atomic_replace_used(self, hamma_scrub, tmp_path):
+        # Overwriting an existing status file must not leave a partial file.
+        p = str(tmp_path / "status.json")
+        hamma_scrub.write_status(p, "scan", purged=0)
+        hamma_scrub.write_status(p, "done", purged=5)
+        data = json.loads(pathlib.Path(p).read_text())
+        assert data["phase"] == "done" and data["purged"] == 5
+
+    def test_writes_via_temp_then_os_replace(self, hamma_scrub, tmp_path):
+        # Atomicity MECHANISM: writes go to a temp path then os.replace onto the
+        # target (a reader never sees a torn file). A non-atomic direct write
+        # would fail this.
+        p = str(tmp_path / "status.json")
+        with patch("os.replace", wraps=os.replace) as mock_replace:
+            hamma_scrub.write_status(p, "scan", purged=0)
+        assert mock_replace.call_count == 1
+        src, dst = mock_replace.call_args[0]
+        assert src == p + ".tmp" and dst == p
+
+
+class TestIncrementalScan:
+    """§3.5: scan_mj_files(cache_file=...) reuses unchanged hourly dirs."""
+
+    def _dir(self, tmp_path, drive="DATA37", hour="2026-04-10T14"):
+        d = tmp_path / drive / hour
+        d.mkdir(parents=True)
+        return d
+
+    def _hdr(self, byte50):
+        hdr, rest = _make_trigger()
+        hdr = bytearray(hdr)
+        hdr[50] = byte50
+        return bytes(hdr), rest
+
+    def _two_dirs(self, tmp_path):
+        """Older + newest hourly dir, each with one .bin. Returns (older,newer)."""
+        older = tmp_path / "DATA37" / "2026-04-10T14"
+        newer = tmp_path / "DATA37" / "2026-04-10T15"  # newest -> force-rescanned
+        older.mkdir(parents=True)
+        newer.mkdir(parents=True)
+        ho, rest = self._hdr(1)
+        hn, _ = self._hdr(2)
+        (older / "a.bin").write_bytes(ho + rest)
+        (newer / "a.bin").write_bytes(hn + rest)
+        return older, newer, ho, hn, rest
+
+    def test_unchanged_older_dir_is_cache_hit_newest_rescanned(
+            self, hamma_scrub, tmp_path):
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # build
+        with patch.object(hamma_scrub, "_read_dir_headers",
+                          return_value=(set(), 0, 0)) as mock_read:
+            r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert r2["cache_hits"] == 1                    # older reused
+        assert mock_read.call_count == 1                # only the newest re-read
+        assert mock_read.call_args[0][0].endswith("2026-04-10T15")
+
+    def test_older_dir_mtime_change_invalidates(self, hamma_scrub, tmp_path):
+        """In-place content rewrite (same count) with a bumped dir mtime must
+        invalidate -- catches an mtime-blind signature."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        h2, _ = self._hdr(7)
+        (older / "a.bin").write_bytes(h2 + rest)         # same count, new content
+        os.utime(str(older), (9e9, 9e9))                 # bump older's mtime
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert h2 in res["headers"] and ho not in res["headers"]
+
+    def test_older_dir_count_change_invalidates(self, hamma_scrub, tmp_path):
+        """A new file (count change) invalidates even with mtime pinned --
+        catches a count-blind signature."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        st = os.stat(str(older))
+        h2, _ = self._hdr(8)
+        (older / "b.bin").write_bytes(h2 + rest)         # count 1 -> 2
+        os.utime(str(older), (st.st_atime, st.st_mtime))  # pin mtime
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert h2 in res["headers"]
+
+    def test_newest_dir_inplace_growth_reread(self, hamma_scrub, tmp_path):
+        """A .bin completing IN PLACE (brokkr append-write) in the newest dir --
+        same count, maybe same 2s-vfat mtime -- is still caught, because the
+        newest dir is always re-read."""
+        d = self._dir(tmp_path)  # single dir == newest
+        (d / "a.bin").write_bytes(b"\x00" * 8)  # truncated -> skipped
+        cache = str(tmp_path / "c.json")
+        r1 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert len(r1["headers"]) == 0 and r1["skipped"] == 1
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)   # completes in place, count == 1
+        r2 = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert hdr in r2["headers"]
+
+    def test_save_failure_does_not_raise(self, hamma_scrub, tmp_path):
+        """An unwritable cache location degrades to a full scan, never crashes."""
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file="/proc/nonexistent/cache.json")
+        assert hdr in res["headers"]
+
+    def test_corrupt_cache_falls_back(self, hamma_scrub, tmp_path):
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        cache = tmp_path / "c.json"
+        cache.write_bytes(b"not valid json {{{")
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=str(cache))
+        assert hdr in res["headers"] and res["cache_hits"] == 0
+
+    def test_incremental_matches_full_scan(self, hamma_scrub, tmp_path):
+        for i, hour in enumerate(["2026-04-10T14", "2026-04-10T15"]):
+            d = tmp_path / "DATA37" / hour
+            d.mkdir(parents=True)
+            hdr, rest = self._hdr(i)
+            (d / "a.bin").write_bytes(hdr + rest)
+        (tmp_path / "DATA37" / "2026-04-10T16").mkdir(parents=True)
+        (tmp_path / "DATA37" / "2026-04-10T16" / "trunc.bin").write_bytes(
+            b"\x00" * 8)  # truncated -> skipped in both
+        full = hamma_scrub.scan_mj_files(str(tmp_path))
+        incr = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file=str(tmp_path / "c.json"))
+        assert incr["headers"] == full["headers"]
+        assert incr["file_count"] == full["file_count"]
+        assert incr["skipped"] == full["skipped"]
+        # No cross-dir duplicate headers here, so the counts agree (they can
+        # legitimately diverge for cross-dir dups -- a log stat, never a control).
+        assert incr["duplicate_count"] == full["duplicate_count"]
+
+    def test_cache_self_prunes_removed_dir(self, hamma_scrub, tmp_path):
+        da = tmp_path / "DATA37" / "2026-04-10T14"
+        da.mkdir(parents=True)
+        db = tmp_path / "DATA37" / "2026-04-10T15"  # keep a 2nd dir present
+        db.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (da / "a.bin").write_bytes(hdr + rest)
+        (db / "b.bin").write_bytes(hdr + rest)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        import shutil as _sh
+        _sh.rmtree(str(da))
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        with open(cache) as f:
+            saved = json.load(f)
+        assert all("2026-04-10T14" not in k for k in saved)  # pruned
+
+    def test_compressed_dir_skipped(self, hamma_scrub, tmp_path):
+        comp = tmp_path / "DATA37" / "compressed"
+        comp.mkdir(parents=True)
+        (comp / "x.bin").write_bytes(b"\x00" * 200)  # must be ignored
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file=str(tmp_path / "c.json"))
+        assert res["file_count"] == 0
+
+    def test_since_filters_dirs(self, hamma_scrub, tmp_path):
+        for hour in ["2026-04-10T14", "2026-04-11T09"]:
+            d = tmp_path / "DATA37" / hour
+            d.mkdir(parents=True)
+            hdr, rest = _make_trigger()
+            hdr = bytearray(hdr)
+            hdr[50] = ord(hour[9])
+            (d / "a.bin").write_bytes(bytes(hdr) + rest)
+        res = hamma_scrub.scan_mj_files(
+            str(tmp_path), since="2026-04-11", cache_file=str(tmp_path / "c.json"))
+        assert res["file_count"] == 1 and res["dirs_skipped"] == 1
+
+    def test_empty_cache_file_uses_full_scanner(self, hamma_scrub, tmp_path):
+        d = self._dir(tmp_path)
+        hdr, rest = _make_trigger()
+        (d / "a.bin").write_bytes(hdr + rest)
+        res = hamma_scrub.scan_mj_files(str(tmp_path), cache_file="")
+        assert "cache_hits" not in res  # dispatched to the full scanner
+
+    def test_refresh_cache_dirs_lets_next_scan_hit_recovered_dir(
+            self, hamma_scrub, tmp_path):
+        """The cache is saved DURING the scan, before recovery writes new .bin
+        files. Refreshing a recovered dir's cache entry lets the NEXT scan
+        cache-hit it (with the new header) instead of re-reading it stale."""
+        older, newer, ho, hn, rest = self._two_dirs(tmp_path)
+        cache = str(tmp_path / "c.json")
+        hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)  # older cached
+        # simulate recovery writing a recovered trigger into the OLDER dir
+        h2, _ = self._hdr(9)
+        (older / "r_recovered.bin").write_bytes(h2 + rest)
+        hamma_scrub._refresh_cache_dirs(cache, [str(older)])
+        # next scan: older is a cache HIT (refreshed sig matches); only newest re-read
+        with patch.object(hamma_scrub, "_read_dir_headers",
+                          return_value=(set(), 0, 0)) as mock_read:
+            r = hamma_scrub.scan_mj_files(str(tmp_path), cache_file=cache)
+        assert r["cache_hits"] == 1
+        assert mock_read.call_count == 1
+        assert mock_read.call_args[0][0].endswith("2026-04-10T15")  # newest only
+        assert h2 in r["headers"]  # refresh captured the recovered header
+
+    def test_refresh_cache_dirs_is_safe_noop(self, hamma_scrub, tmp_path):
+        """No cache file, empty dir list, or a missing dir must never raise."""
+        missing = str(tmp_path / "nope.json")
+        hamma_scrub._refresh_cache_dirs(missing, [str(tmp_path / "gone")])
+        assert not os.path.exists(missing)          # nothing created from nothing
+        hamma_scrub._refresh_cache_dirs(None, [str(tmp_path)])   # None cache
+        hamma_scrub._refresh_cache_dirs(str(tmp_path / "c.json"), [])  # no dirs
+
+
+class TestScanMetrics:
+    """A durable per-run CSV of MJ-scan cache performance (hit-rate over time)."""
+
+    HEADER = "utc,dirs_cached,dirs_total,cold,scan_seconds,recovered,purged"
+
+    def test_writes_header_then_row(self, hamma_scrub, tmp_path):
+        path = str(tmp_path / "m.csv")
+        mj = {"cache_hits": 1191, "dirs_total": 1193, "elapsed": 9.14}
+        hamma_scrub.write_scan_metrics(path, mj, recovered=4, purged=78)
+        lines = open(path).read().splitlines()
+        assert lines[0] == self.HEADER
+        # utc is field 0; the rest are the recorded values (warm scan -> cold=0)
+        assert lines[1].split(",")[1:] == ["1191", "1193", "0", "9.1", "4", "78"]
+
+    def test_appends_without_duplicating_header_and_flags_cold(
+            self, hamma_scrub, tmp_path):
+        path = str(tmp_path / "m.csv")
+        cold = {"cache_hits": 0, "dirs_total": 1193, "elapsed": 500.0}
+        hamma_scrub.write_scan_metrics(path, cold, recovered=0, purged=0)
+        hamma_scrub.write_scan_metrics(path, cold, recovered=0, purged=0)
+        lines = open(path).read().splitlines()
+        assert lines.count(self.HEADER) == 1        # header written once
+        assert len(lines) == 3                       # header + 2 rows
+        assert lines[1].split(",")[3] == "1"         # 0/1193 -> cold flagged
+
+    def test_full_scanner_has_blank_cache_fields(self, hamma_scrub, tmp_path):
+        """When the cache is disabled (full scanner), there are no cache stats;
+        the row records blanks rather than a bogus cold flag."""
+        path = str(tmp_path / "m.csv")
+        hamma_scrub.write_scan_metrics(
+            path, {"elapsed": 3.0}, recovered=1, purged=2)
+        row = open(path).read().splitlines()[1].split(",")
+        assert row[1] == "" and row[2] == "" and row[3] == ""   # no cache stats
+
+    def test_none_path_is_noop(self, hamma_scrub, tmp_path):
+        hamma_scrub.write_scan_metrics(
+            None, {"cache_hits": 1, "dirs_total": 1, "elapsed": 1.0}, 0, 0)
+        assert not (tmp_path / "m.csv").exists()
+
+    def test_size_capped_rotation_bounds_the_file(
+            self, hamma_scrub, tmp_path, monkeypatch):
+        """Nothing external rotates this file; past the cap it must roll to .1
+        and restart so the SD can't fill (HAM-112/113 stance)."""
+        path = str(tmp_path / "m.csv")
+        monkeypatch.setattr(hamma_scrub, "SCAN_METRICS_MAX_BYTES", 200)
+        mj = {"cache_hits": 1, "dirs_total": 2, "elapsed": 1.0}
+        for _ in range(30):
+            hamma_scrub.write_scan_metrics(path, mj, 0, 0)
+        assert os.path.exists(path + ".1")               # old generation kept
+        assert os.path.getsize(path) < 400               # live file bounded
+        assert open(path).read().splitlines()[0] == self.HEADER  # header restored

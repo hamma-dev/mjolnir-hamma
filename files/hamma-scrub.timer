@@ -1,0 +1,18 @@
+[Unit]
+Description=Periodic HAMMA AGS scrub (steady-state drain of /ags/data)
+Documentation=https://github.com/hamma-dev/mjolnir-hamma
+
+[Timer]
+# Settle after boot, then run every 15 min. This is the steady-state drain AND
+# the reliable re-spawn path after check_scrub_health kills a hung scrub -- the
+# low-space edge trigger will not re-fire on its own once space is below it.
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=30s
+# NOTE: OnUnitActiveSec re-arms from the *last activation*, and a scrub under
+# storm load can run minutes; a tick during an in-progress scrub is skipped by
+# the wrapper's `flock -n`. So the effective drain cadence is ">= 15 min", not
+# a strict 15 min -- fine for a drain (~1.25 GB/tick at observed rates).
+
+[Install]
+WantedBy=timers.target

@@ -229,6 +229,39 @@ configure_brokkr() {
         log_success "Brokkr services installed"
     fi
 
+    # --- Step 5: Install the periodic AGS scrub timer ---
+    # Steady-state drain of /ags/data, independent of the low-space telemetry
+    # trigger, and the re-spawn path after check_scrub_health kills a hung scrub.
+    log_step "[Brokkr Config 5/5] Installing AGS scrub timer..."
+
+    local files_dir="${FILES_DIR:-$INSTALL_PATH/mjolnir-hamma/files}"
+    local bin_path="/usr/local/bin"
+    local systemd_path="/etc/systemd/system"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "rm -f $bin_path/hamma-scrub.sh (pre-copy, avoids same-file error)"
+        log_dry_run "cp $files_dir/hamma-scrub.sh $bin_path/ (chmod +x)"
+        log_dry_run "cp hamma-scrub.{service,timer} to $systemd_path/"
+        log_dry_run "systemctl daemon-reload; enable --now hamma-scrub.timer"
+        manifest_add "remove" "path" "$bin_path/hamma-scrub.sh" "sudo" "true"
+        manifest_add "copy" "src" "$files_dir/hamma-scrub.sh" "dst" "$bin_path/hamma-scrub.sh" "sudo" "true"
+        manifest_add "chmod" "path" "$bin_path/hamma-scrub.sh" "mode" "+x" "sudo" "true"
+        manifest_add "copy" "src" "$files_dir/hamma-scrub.service" "dst" "$systemd_path/hamma-scrub.service" "sudo" "true"
+        manifest_add "copy" "src" "$files_dir/hamma-scrub.timer" "dst" "$systemd_path/hamma-scrub.timer" "sudo" "true"
+        manifest_add "command" "cmd" "systemctl daemon-reload" "sudo" "true"
+        manifest_add "systemctl" "action" "enable" "service" "hamma-scrub.timer"
+        manifest_add "systemctl" "action" "start" "service" "hamma-scrub.timer"
+    else
+        sudo rm -f "$bin_path/hamma-scrub.sh"
+        sudo cp "$files_dir/hamma-scrub.sh" "$bin_path/"
+        sudo chmod +x "$bin_path/hamma-scrub.sh"
+        sudo cp "$files_dir/hamma-scrub.service" "$systemd_path/"
+        sudo cp "$files_dir/hamma-scrub.timer" "$systemd_path/"
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now hamma-scrub.timer
+        log_success "hamma-scrub.timer enabled (drain every 15 min)"
+    fi
+
     log_success "Brokkr configuration complete!"
     echo ""
     log_info "To verify:"

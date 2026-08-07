@@ -357,6 +357,7 @@ if [[ "$SKIP_HARDWARE" != "true" ]]; then
     source "$SCRIPT_DIR/lib/hardware.sh"
     setup_sensor_connection
     setup_automount
+    configure_log_bounds
 else
     log_info "Skipping hardware setup (--skip-hardware)"
 fi

@@ -13,6 +13,7 @@ Usage:
 
 # Standard library imports
 import argparse
+import contextlib
 import glob
 import json
 import logging
@@ -52,6 +53,52 @@ MIN_FREE_SPACE = 104857600  # 100MB minimum free space on target drive
 RECOVER_TIMEOUT = 60  # seconds per dd extraction
 ORPHAN_MAX_AGE = 3600  # seconds (1 hour) before orphaned temps are deleted
 
+# SSH / throughput constants
+SSH_CONNECT_TIMEOUT = 10  # seconds to establish an SSH connection (fail fast)
+CONTROL_PERSIST = 60      # seconds the shared ControlMaster lingers after last use
+PURGE_CHUNK_SIZE = 100    # AGS files deleted per batched `rm` (one SSH round-trip)
+PURGE_TIMEOUT = 30        # seconds per batched delete chunk
+# CPU-nice the scrub's heavy AGS-side commands (header scan, recover reads,
+# purge) so they cannot preempt the DAS writer on the AGS Pi. Verified on the
+# fleet: the DAS runs at CPU nice 19 (the floor) while an unniced remote command
+# runs at nice 0 -- i.e. the scrub would OUTRANK the writer on CPU. `nice -n 19`
+# demotes it to the writer's floor. No ionice: the AGS's active I/O scheduler is
+# mq-deadline, which ignores ionice classes entirely (the DAS's "realtime" I/O
+# prio is set but inert), so ionice here would be theatre. `nice` is coreutils,
+# always present. The mj-pi side is deprioritised separately via the service
+# unit's Nice= (files/hamma-scrub.service).
+AGS_NICE = "nice -n 19 "
+# Bounds the SCAN phase's contribution to lock-hold time -- NOT the whole scrub:
+# recover is per-trigger (RECOVER_TIMEOUT) and purge per-chunk (PURGE_TIMEOUT),
+# so the aggregate scan+recover+purge lock-hold is NOT bounded by this alone.
+# An auto-scrub runs under `flock -n`; the old 3600s scan cap let one hung scan
+# stall the safety net for an hour. 600s is ~6x the observed worst case (~99s).
+SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
+
+# Heartbeat/status file the scrub updates as it advances, so the monitor
+# (state_monitor.check_scrub_health) can tell a working scrub from a hung one
+# (progress, not just lock age) and safely recover only genuine hangs.
+# On tmpfs (/dev/shm), NOT the SD root: the SD fills from logs during the exact
+# incident (HAM-112/113), and a heartbeat that can't be written would make a
+# healthy scrub look hung. tmpfs stays writable when the SD is full.
+DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
+
+# Incremental-scan cache: per-hourly-dir MJ header sets keyed by a cheap
+# (mtime, .bin-count) signature, so unchanged dirs are reused instead of
+# re-reading every file's header (the ~99s-under-load MJ scan). On tmpfs so it
+# adds no SD wear; a reboot just costs one full scan.
+DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.json"
+
+# Durable per-run CSV of MJ-scan cache performance (hit-rate over time). Unlike
+# the /dev/shm status/cache, this lives on the SD so a cold scan (cache lost
+# between runs) leaves a reviewable trail. Size-capped in-place (one .1
+# generation) rather than relying on external logrotate -- keeps it bounded on
+# the SD in line with the HAM-112/113 SD-fill stance, since nothing else rotates
+# it (the sibling scrub_log is hand-rotated by state_monitor, not this file).
+DEFAULT_METRICS_FILE = os.path.expanduser(
+    "~/brokkr/hamma/log/scrub_metrics.csv")
+SCAN_METRICS_MAX_BYTES = 1_000_000  # ~20k rows; rotate to .1 past this
+
 # Exit codes
 EXIT_OK = 0
 EXIT_MISSING = 1
@@ -65,6 +112,138 @@ GPS_UTC_OFFSET_OFFSET = 86  # float32
 GPS_SUBSECOND_OFFSET = 94   # uint32
 GPS_ECC_OFFSET = 98         # uint32
 GPS_EPOCH = 315964800        # UTC epoch for GPS week 0
+
+
+def ssh_cmd(host, remote_command, control_path=None):
+    """Build an ssh command list for a remote command on the AGS.
+
+    Adds ``BatchMode`` (never prompt) and ``ConnectTimeout`` (fail fast on a
+    sick/unreachable AGS). When ``control_path`` is given, routes over an
+    existing ControlMaster socket so many calls reuse one connection.
+
+    Parameters
+    ----------
+    host : str
+        SSH host (e.g. ``hamma``).
+    remote_command : str
+        The command to run on the remote host.
+    control_path : str or None
+        Path to a ControlMaster socket to reuse, or None for a fresh connection.
+
+    Returns
+    -------
+    list of str
+        The argv for ``subprocess.run``/``Popen``.
+    """
+    cmd = ["ssh", "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT)]
+    if control_path:
+        cmd += ["-o", "ControlPath={}".format(control_path)]
+    cmd += [host, remote_command]
+    return cmd
+
+
+def open_control_master(host):
+    """Start a shared SSH ControlMaster to ``host``; return its socket path.
+
+    Reusing the socket lets many ``ssh_cmd`` calls skip the per-connection
+    handshake (~16x faster per round-trip, measured). The master lingers
+    ``CONTROL_PERSIST`` seconds after the last use, so it self-closes even
+    without an explicit teardown.
+
+    Parameters
+    ----------
+    host : str
+        SSH host (e.g. ``hamma``).
+
+    Returns
+    -------
+    str or None
+        ControlMaster socket path, or None if setup failed (callers then fall
+        back to per-call connections transparently).
+    """
+    control_path = "/tmp/hamma_scrub_cm_{}.sock".format(os.getpid())
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+             "-o", "ControlMaster=yes",
+             "-o", "ControlPersist={}".format(CONTROL_PERSIST),
+             "-o", "ControlPath={}".format(control_path),
+             host, "true"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=SSH_CONNECT_TIMEOUT + 5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning("ControlMaster setup error (%s); using per-call SSH", e)
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            "ControlMaster setup failed (%s); using per-call SSH",
+            result.stderr.decode('utf-8', errors='replace').strip())
+        return None
+    return control_path
+
+
+def close_control_master(host, control_path):
+    """Tear down a ControlMaster socket opened by ``open_control_master``."""
+    if not control_path:
+        return
+    try:
+        subprocess.run(
+            ["ssh", "-o", "ControlPath={}".format(control_path),
+             "-O", "exit", host],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+@contextlib.contextmanager
+def ssh_control_master(host):
+    """Context-manager form of :func:`open_control_master` with teardown.
+
+    Yields the socket path (or None if setup failed) and always closes the
+    master on exit.
+    """
+    control_path = open_control_master(host)
+    try:
+        yield control_path
+    finally:
+        close_control_master(host, control_path)
+
+
+def write_status(path, phase, **counts):
+    """Atomically write the scrub heartbeat/status file (best-effort).
+
+    Records ``pid``, ``phase``, a wall-clock ``timestamp`` (the heartbeat), and
+    any running ``counts`` (e.g. recovered=, purged=). Written via temp-file +
+    ``os.replace`` so a reader never sees a partial file. Failures are logged at
+    debug and swallowed -- a heartbeat that can't be written must never crash
+    or block the scrub. ``path`` of None is a no-op.
+
+    Parameters
+    ----------
+    path : str or None
+        Destination status file, or None to disable.
+    phase : str
+        Current phase: 'start', 'scan', 'recover', 'purge', 'done', 'error'.
+    **counts
+        Extra fields to record (e.g. recovered, purged, missing).
+    """
+    if not path:
+        return
+    payload = {"pid": os.getpid(), "phase": phase, "timestamp": time.time()}
+    payload.update(counts)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.debug("Could not write status file %s: %s", path, e)
 
 
 def extract_headers(fileobj, file_size, filename):
@@ -186,7 +365,250 @@ def _parse_since(since_str):
     )
 
 
-def scan_mj_files(base_path, since=None):
+def _load_scan_cache(path):
+    """Load the incremental MJ-scan cache; {} on any problem (safe fallback).
+
+    JSON, NOT pickle: the cache lives on world-writable tmpfs (`/dev/shm` is
+    mode 1777), so unpickling it would be a local code-execution vector as the
+    scrub's user. JSON stores headers as hex and can never execute code on load.
+    """
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            k: {"sig": tuple(v["sig"]),
+                "headers": {bytes.fromhex(h) for h in v["headers"]},
+                "file_count": v["file_count"],
+                "skipped": v["skipped"]}
+            for k, v in raw.items()
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _save_scan_cache(path, cache):
+    """Atomically persist the MJ-scan cache as JSON (best-effort; never raises)."""
+    try:
+        raw = {k: {"sig": list(v["sig"]),
+                   "headers": sorted(h.hex() for h in v["headers"]),
+                   "file_count": v["file_count"],
+                   "skipped": v["skipped"]}
+               for k, v in cache.items()}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(raw, f)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError) as e:
+        logger.debug("Could not write MJ-scan cache %s: %s", path, e)
+
+
+def _read_dir_headers(subdir, bin_names):
+    """Read the 128-byte header of each .bin in one hourly dir.
+
+    Returns (headers set, file_count, skipped). Used by the incremental scanner
+    for the dirs it must (re)read; the full scanner has its own inline read with
+    identical per-file semantics (the parity test keeps them in lockstep).
+    """
+    headers = set()
+    skipped = 0
+    for name in bin_names:
+        fp = os.path.join(subdir, name)
+        try:
+            if os.path.getsize(fp) < HEADER_SIZE:
+                skipped += 1
+                continue
+            with open(fp, "rb") as f:
+                header = f.read(HEADER_SIZE)
+            if len(header) < HEADER_SIZE:
+                skipped += 1
+            else:
+                headers.add(header)
+        except OSError as e:
+            logger.warning("Error reading %s: %s", fp, e)
+            skipped += 1
+    return headers, len(bin_names), skipped
+
+
+def _refresh_cache_dirs(cache_file, dirs):
+    """Re-read the given hourly dirs and update their entries in the scan cache.
+
+    The incremental cache is saved *during* the MJ scan, before the recover
+    phase writes recovered .bin files. Those dirs are therefore stale in the
+    cache (old sig + missing the new headers), so the next scan would re-read
+    them. Refreshing them here -- after recovery -- lets the next scan cache-hit
+    them instead. Best-effort: a missing cache, empty ``dirs``, or an unreadable
+    dir is a silent no-op (the only cost of skipping is a re-read next run).
+    """
+    if not cache_file or not dirs:
+        return
+    cache = _load_scan_cache(cache_file)
+    if not cache:
+        return
+    updated = False
+    for subdir in dirs:
+        try:
+            bin_names = sorted(
+                e for e in os.listdir(subdir) if e.endswith(".bin"))
+            sig = (os.stat(subdir).st_mtime, len(bin_names))
+        except OSError:
+            continue
+        dir_headers, dir_files, dir_skipped = _read_dir_headers(
+            subdir, bin_names)
+        cache[subdir] = {"sig": sig, "headers": dir_headers,
+                         "file_count": dir_files, "skipped": dir_skipped}
+        updated = True
+    if updated:
+        _save_scan_cache(cache_file, cache)
+
+
+SCAN_METRICS_HEADER = (
+    "utc,dirs_cached,dirs_total,cold,scan_seconds,recovered,purged")
+
+
+def write_scan_metrics(path, mj, recovered, purged):
+    """Append one CSV row summarizing this run's MJ-scan cache performance.
+
+    Durable (unlike the /dev/shm status file), so cache hit-rate can be reviewed
+    over time. A ``cold`` row (0 dirs cached over a large total) flags that the
+    cache was lost between runs -- the signal to catch a real-world cache miss.
+    When the cache is disabled (full scanner, no ``cache_hits``) the cache
+    columns are left blank rather than reporting a bogus cold flag. ``path`` of
+    None disables it; best-effort, never raises.
+    """
+    if not path:
+        return
+    try:
+        hits = mj.get("cache_hits")
+        total = mj.get("dirs_total")
+        if hits is None or total is None:
+            hits_s = total_s = cold_s = ""      # full scanner: no cache stats
+        else:
+            hits_s, total_s = str(hits), str(total)
+            cold_s = "1" if (total > 0 and hits == 0) else "0"
+        utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        row = "{},{},{},{},{},{},{}\n".format(
+            utc, hits_s, total_s, cold_s,
+            round(mj.get("elapsed", 0), 1), recovered, purged)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Bound the file: nothing external rotates it. Past the cap, move it to
+        # .1 (one generation) and start fresh -- so the SD can't fill from it.
+        try:
+            if os.path.getsize(path) >= SCAN_METRICS_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        new_file = not os.path.exists(path)
+        with open(path, "a") as f:
+            if new_file:
+                f.write(SCAN_METRICS_HEADER + "\n")
+            f.write(row)
+    except OSError as e:
+        logger.debug("Could not write scan metrics %s: %s", path, e)
+
+
+def scan_mj_files(base_path, since=None, cache_file=None):
+    """Scan local mjolnir .bin files and collect headers.
+
+    Dispatches to the incremental scanner when ``cache_file`` is given (reuses
+    per-hourly-dir header sets whose ``(mtime, .bin-count)`` signature is
+    unchanged -- the fix for the O(all-files) MJ scan), else the full scanner.
+    """
+    if cache_file:
+        return _scan_mj_incremental(base_path, since, cache_file)
+    return _scan_mj_full(base_path, since)
+
+
+def _scan_mj_incremental(base_path, since, cache_file):
+    """MJ scan that re-reads only new/changed hourly dirs; reuses the rest.
+
+    A directory whose ``(mtime, .bin-count)`` signature matches the cache is
+    reused without touching its files. TWO safety rules make this sound despite
+    brokkr append-writing .bin in place on 2 s-granularity vfat (so an in-place
+    completion may leave the signature unchanged):
+      1. the newest hourly dir per drive -- the one brokkr is actively
+         appending to -- is ALWAYS re-read (never cache-hit);
+      2. once an hour rolls over, brokkr writes the next hour's dir, so past
+         dirs are immutable and safe to cache.
+    The cache lives on tmpfs (no SD wear), self-prunes (dirs not seen are
+    dropped), and falls back to a full re-read on any anomaly.
+    """
+    t0 = time.time()
+    old_cache = _load_scan_cache(cache_file)
+    new_cache = {}
+    headers = set()
+    file_count = skipped = dirs_skipped = cache_hits = 0
+
+    drives = sorted(glob.glob(os.path.join(base_path, DRIVE_PATTERN)))
+    if not drives:
+        logger.info("No DATA drives found at %s", base_path)
+    for drive in drives:
+        try:
+            names = sorted(os.listdir(drive))
+        except OSError as e:
+            logger.warning("Error scanning %s: %s, skipping", drive, e)
+            continue
+        # First pass: the qualifying hourly dirs (cheap; per-dir, not per-file).
+        subdirs = []
+        for name in names:
+            subdir = os.path.join(drive, name)
+            if name == "compressed" or not os.path.isdir(subdir):
+                continue
+            if since and name < since:
+                dirs_skipped += 1
+                continue
+            subdirs.append((name, subdir))
+        newest = subdirs[-1][0] if subdirs else None  # names are sorted
+        for name, subdir in subdirs:
+            try:
+                bin_names = sorted(
+                    e for e in os.listdir(subdir) if e.endswith(".bin"))
+                sig = (os.stat(subdir).st_mtime, len(bin_names))
+            except OSError:
+                continue
+            cached = old_cache.get(subdir)
+            # Force-read the actively-written newest dir (rule 1).
+            if (name != newest and cached is not None
+                    and cached.get("sig") == sig):
+                dir_headers = cached["headers"]
+                dir_files = cached["file_count"]
+                dir_skipped = cached["skipped"]
+                cache_hits += 1
+            else:
+                dir_headers, dir_files, dir_skipped = _read_dir_headers(
+                    subdir, bin_names)
+            new_cache[subdir] = {"sig": sig, "headers": dir_headers,
+                                 "file_count": dir_files, "skipped": dir_skipped}
+            headers |= dir_headers
+            file_count += dir_files
+            skipped += dir_skipped
+
+    _save_scan_cache(cache_file, new_cache)
+    elapsed = time.time() - t0
+    # NOTE: this differs from _scan_mj_full's per-file dup count for headers
+    # duplicated ACROSS hourly dirs; it is a log stat only, never a control input
+    # (compare_headers/identify_purgeable_files use the `headers` set alone).
+    duplicate_count = max(0, file_count - skipped - len(headers))
+    logger.info("MJ scan (incremental): %d unique from %d files, "
+                "%d/%d dirs cached (%.1fs)", len(headers), file_count,
+                cache_hits, len(new_cache), elapsed)
+    return {
+        "headers": headers,
+        "file_count": file_count,
+        "duplicate_count": duplicate_count,
+        "skipped": skipped,
+        "dirs_skipped": dirs_skipped,
+        "elapsed": elapsed,
+        "cache_hits": cache_hits,
+        "dirs_total": len(new_cache),
+    }
+
+
+def _scan_mj_full(base_path, since=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Parameters
@@ -399,7 +821,7 @@ def decode_strider_output(data):
     return entries
 
 
-def scan_ags_files(ags_host, ags_path):
+def scan_ags_files(ags_host, ags_path, control_path=None):
     """Run remote strider on AGS sensor and collect headers.
 
     Parameters
@@ -454,16 +876,18 @@ def scan_ags_files(ags_host, ags_path):
         if local_tmp is not None and os.path.exists(local_tmp):
             os.unlink(local_tmp)
 
-    run_cmd = ["ssh", ags_host,
-               "python3 {script} {path}; rm -f {script}".format(
-                   script=remote_script, path=ags_path)]
+    run_cmd = ssh_cmd(
+        ags_host,
+        AGS_NICE + "python3 {script} {path}; rm -f {script}".format(
+            script=remote_script, path=ags_path),
+        control_path=control_path)
     logger.debug("Running: %s", " ".join(run_cmd))
 
     result = subprocess.run(
         run_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=3600,
+        timeout=SCAN_TIMEOUT,
     )
 
     if result.returncode != 0:
@@ -740,7 +1164,8 @@ def select_target_drive(mj_path, min_free=MIN_FREE_SPACE):
     return None
 
 
-def extract_trigger(ags_host, ags_path, filename, offset, size):
+def extract_trigger(ags_host, ags_path, filename, offset, size,
+                    control_path=None):
     """Extract a single trigger from AGS via SSH dd.
 
     Parameters
@@ -755,6 +1180,8 @@ def extract_trigger(ags_host, ags_path, filename, offset, size):
         Byte offset in file.
     size : int
         Total bytes to extract (header + payload + padding).
+    control_path : str or None
+        ControlMaster socket to reuse for the SSH call.
 
     Returns
     -------
@@ -762,11 +1189,11 @@ def extract_trigger(ags_host, ags_path, filename, offset, size):
         Extracted data, or None on failure.
     """
     filepath = "{}/{}".format(ags_path, filename)
-    dd_cmd = (
+    dd_cmd = AGS_NICE + (
         "dd if={} iflag=skip_bytes,count_bytes bs=4096"
         " skip={} count={} status=none"
     ).format(filepath, offset, size)
-    cmd = ["ssh", ags_host, dd_cmd]
+    cmd = ssh_cmd(ags_host, dd_cmd, control_path=control_path)
     logger.debug("Extracting: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -972,8 +1399,15 @@ def identify_purgeable_files(ags_entries, mj_headers, recovery_results=None):
     return {"purgeable": purgeable, "retained": retained}
 
 
-def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
-    """Delete AGS files via SSH.
+def purge_ags_files(ags_host, ags_path, filenames, dry_run=False,
+                    control_path=None, status_file=None):
+    """Delete AGS files via SSH, batched over one connection.
+
+    Files are deleted in chunks of ``PURGE_CHUNK_SIZE`` — a single
+    ``rm -f f1 f2 ...`` per chunk (one SSH round-trip) rather than one SSH per
+    file. Reusing a ControlMaster socket (``control_path``) collapses the
+    per-file cost by ~16x; batching collapses the round-trip count. Chunk
+    status maps to every file in the chunk (delete succeeds/fails as a unit).
 
     Parameters
     ----------
@@ -985,6 +1419,12 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
         Filenames to delete.
     dry_run : bool
         If True, log what would be deleted but take no action.
+    control_path : str or None
+        ControlMaster socket to reuse for the SSH calls.
+    status_file : str or None
+        If given, write a ``purge``-phase heartbeat (``purged``/``total``) to
+        this status file after each chunk, so a long purge advances the progress
+        token and the monitor's hung-scrub detector does not misjudge it as stuck.
 
     Returns
     -------
@@ -993,50 +1433,85 @@ def purge_ags_files(ags_host, ags_path, filenames, dry_run=False):
         and optional error.
     """
     results = []
-    for fname in filenames:
-        remote_path = "{}/{}".format(ags_path, fname)
+
+    def _record(chunk, status, error):
+        for fname in chunk:
+            results.append({"filename": fname, "status": status, "error": error})
+
+    for start in range(0, len(filenames), PURGE_CHUNK_SIZE):
+        chunk = filenames[start:start + PURGE_CHUNK_SIZE]
+        # Per-chunk heartbeat: purge over a wedging SSH pipe can take a while;
+        # advancing the heartbeat here lets the monitor's hung-scrub detector
+        # tell a working purge from a stalled one (else a long purge could look
+        # hung and be killed).
+        write_status(status_file, "purge",
+                     purged=sum(1 for r in results if r["status"] == "deleted"),
+                     total=len(filenames))
 
         if dry_run:
-            logger.info("Would delete: %s:%s", ags_host, remote_path)
-            results.append({
-                "filename": fname,
-                "status": "dry_run",
-                "error": None,
-            })
+            for fname in chunk:
+                logger.info("Would delete: %s:%s/%s", ags_host, ags_path, fname)
+            _record(chunk, "dry_run", None)
             continue
 
-        cmd = ["ssh", ags_host, "rm " + shlex.quote(remote_path)]
-        logger.info("Deleting: %s:%s", ags_host, remote_path)
+        remote_paths = [
+            shlex.quote("{}/{}".format(ags_path, fname)) for fname in chunk
+        ]
+        rm_command = AGS_NICE + "rm -f " + " ".join(remote_paths)
+        cmd = ssh_cmd(ags_host, rm_command, control_path=control_path)
+        logger.info("Deleting %d AGS file(s) on %s", len(chunk), ags_host)
         try:
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=15,
+                timeout=PURGE_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            logger.warning("Timeout deleting %s on %s", fname, ags_host)
-            results.append({
-                "filename": fname,
-                "status": "failed",
-                "error": "SSH timeout (15s)",
-            })
+            logger.warning("Timeout deleting %d file(s) on %s",
+                           len(chunk), ags_host)
+            _record(chunk, "failed", "SSH timeout ({}s)".format(PURGE_TIMEOUT))
             continue
 
         if result.returncode != 0:
+            # `rm -f f1..fN` exits non-zero if ANY file errored, but it still
+            # deleted the others. Marking the whole chunk "failed" would lie
+            # (the report would under-count deletions during a disk-fill).
+            # Retry per-file to attribute status correctly -- only failing
+            # chunks pay the per-file cost; healthy chunks stay batched-fast.
             stderr = result.stderr.decode('utf-8', errors='replace').strip()
-            logger.warning("Failed to delete %s: %s", fname, stderr)
-            results.append({
-                "filename": fname,
-                "status": "failed",
-                "error": stderr,
-            })
+            logger.warning("Batched delete on %s returned non-zero (%s); "
+                           "retrying per-file to attribute status",
+                           ags_host, stderr)
+            for fname, quoted in zip(chunk, remote_paths):
+                one_cmd = ssh_cmd(ags_host, AGS_NICE + "rm -f " + quoted,
+                                  control_path=control_path)
+                try:
+                    one = subprocess.run(
+                        one_cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, timeout=PURGE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    results.append({"filename": fname, "status": "failed",
+                                    "error": "SSH timeout ({}s)".format(
+                                        PURGE_TIMEOUT)})
+                    continue
+                if one.returncode == 0:
+                    results.append({"filename": fname, "status": "deleted",
+                                    "error": None})
+                else:
+                    results.append({
+                        "filename": fname, "status": "failed",
+                        "error": one.stderr.decode(
+                            'utf-8', errors='replace').strip()})
         else:
-            results.append({
-                "filename": fname,
-                "status": "deleted",
-                "error": None,
-            })
+            _record(chunk, "deleted", None)
+
+    # Final heartbeat: the per-chunk beat fires BEFORE its chunk's rm, so the
+    # last chunk's deletions aren't reflected until here. Write the completed
+    # count so the durable status is accurate before the 'done' phase.
+    write_status(status_file, "purge",
+                 purged=sum(1 for r in results if r["status"] == "deleted"),
+                 total=len(filenames))
 
     return results
 
@@ -1071,7 +1546,8 @@ def cleanup_orphaned_temps(mj_path, max_age=ORPHAN_MAX_AGE):
     return count
 
 
-def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
+def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False,
+                     control_path=None, status_file=None):
     """Recover missing triggers from AGS to MJ DATA drives.
 
     Parameters
@@ -1098,6 +1574,11 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
     results = []
 
     for candidate in candidates:
+        # Heartbeat per trigger: recover is the long phase, so this is the
+        # granularity the monitor needs to tell "grinding" from "hung".
+        write_status(status_file, "recover", recovered=len(
+            [r for r in results if r["status"] == "recovered"]),
+            total=len(candidates))
         src_file = candidate["filename"]
         src_offset = candidate["offset"]
         trig_idx = candidate["index"]
@@ -1174,7 +1655,8 @@ def recover_triggers(candidates, ags_host, ags_path, mj_path, dry_run=False):
             continue
 
         # Extract trigger via SSH dd
-        data = extract_trigger(ags_host, ags_path, src_file, src_offset, size)
+        data = extract_trigger(ags_host, ags_path, src_file, src_offset, size,
+                               control_path=control_path)
         if data is None:
             results.append({
                 "source_file": src_file,
@@ -1479,12 +1961,29 @@ def _build_parser():
         "--purge", action="store_true",
         help="After recovery, delete AGS files fully confirmed on MJ (requires --recover)",
     )
+    parser.add_argument(
+        "--status-file", default=DEFAULT_STATUS_FILE,
+        help="Heartbeat/status JSON the scrub updates as it advances "
+             "(default: %(default)s; empty string disables)",
+    )
+    parser.add_argument(
+        "--mj-cache", default=DEFAULT_MJ_CACHE,
+        help="Incremental MJ-scan cache file: reuse unchanged hourly dirs' "
+             "headers instead of re-reading every file (default: %(default)s; "
+             "empty string forces a full scan every run)",
+    )
+    parser.add_argument(
+        "--metrics-file", default=DEFAULT_METRICS_FILE,
+        help="Durable CSV appended one row per run with MJ-scan cache "
+             "hit-rate/timing (default: %(default)s; empty string disables)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
-        purge=False):
+        purge=False, status_file=DEFAULT_STATUS_FILE,
+        mj_cache=DEFAULT_MJ_CACHE, metrics_file=DEFAULT_METRICS_FILE):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -1506,12 +2005,17 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         If True, show what would be recovered without transferring.
     purge : bool
         If True, delete AGS files fully confirmed on MJ after recovery.
+    status_file : str or None
+        Heartbeat/status file to update as the scrub advances (None disables).
+    mj_cache : str or None
+        Incremental MJ-scan cache file (None forces a full scan every run).
 
     Returns
     -------
     int
         Exit code.
     """
+    write_status(status_file, "start")
     if dry_run and not recover:
         logger.warning("--dry-run has no effect without --recover")
 
@@ -1536,10 +2040,12 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info("Filtering MJ directories to >= %s", since_cutoff)
 
     # AGS scan runs first (needed for auto-detect and comparison)
+    write_status(status_file, "scan")
     try:
         ags = scan_ags_files(ags_host, ags_path)
     except RuntimeError as e:
         logger.error("AGS scan failed: %s", e)
+        write_status(status_file, "error", error="ags scan failed")
         return EXIT_SSH_ERROR
 
     # Auto-detect: derive cutoff from the scanned AGS entries
@@ -1551,14 +2057,19 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info(
                 "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
-    mj = scan_mj_files(mj_path, since=since_cutoff)
+    write_status(status_file, "scan_mj")
+    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache)
 
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
+        write_status(status_file, "done", recovered=0, purged=0)
+        write_scan_metrics(metrics_file, mj, 0, 0)
         return EXIT_OK
 
     if mj["file_count"] == 0 and mj["skipped"] == 0:
         logger.error("No DATA drives or .bin files found at %s", mj_path)
+        write_status(status_file, "error", error="no MJ drives/files")
+        write_scan_metrics(metrics_file, mj, 0, 0)
         return EXIT_NO_DATA
 
     comparison = compare_headers(ags["entries"], mj["headers"])
@@ -1579,74 +2090,100 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         "warnings": [],
     }
 
-    # Recovery flow
+    # Recovery + purge reuse one SSH connection (per-op cost ~16x lower).
+    # The context manager guarantees teardown even if recover/purge raise
+    # (the bare open/close pair leaked the socket on exceptions).
     recovery_results = None
-    if recover and comparison["missing_on_mj"]:
-        cleanup_orphaned_temps(mj_path)
-        candidates = filter_recovery_candidates(
-            comparison["missing_on_mj"], ags["entries"],
-            since_cutoff=since_cutoff,
-        )
-        recovery_results = recover_triggers(
-            candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
-        )
-        recovered_count = len([r for r in recovery_results
-                               if r["status"] == "recovered"])
-        failed_count = len([r for r in recovery_results
-                            if r["status"] == "failed"])
-        if recovered_count:
-            logger.info("Recovery: %d succeeded", recovered_count)
-        if failed_count:
-            logger.warning("Recovery: %d failed", failed_count)
-
-    # Update mj_headers and missing list with recovered triggers
-    if recovery_results:
-        recovered_headers = set()
-        for r in recovery_results:
-            if r["status"] == "recovered":
-                mj["headers"].add(r["header"])
-                recovered_headers.add(r["header"])
-        if recovered_headers:
-            comparison["missing_on_mj"] = [
-                e for e in comparison["missing_on_mj"]
-                if e["header"] not in recovered_headers
-            ]
-            results["missing_on_mj"] = comparison["missing_on_mj"]
-            results["matched"] += len(recovered_headers)
-
-    # Purge flow
     purge_results = None
-    if purge:
-        eligibility = identify_purgeable_files(
-            ags["entries"], mj["headers"], recovery_results,
-        )
-        if eligibility["purgeable"]:
-            purge_deletions = purge_ags_files(
-                ags_host, ags_path, eligibility["purgeable"],
-                dry_run=dry_run,
+    with ssh_control_master(ags_host) as control_path:
+        # Recovery flow
+        if recover and comparison["missing_on_mj"]:
+            write_status(status_file, "recover", recovered=0,
+                         missing=len(comparison["missing_on_mj"]))
+            cleanup_orphaned_temps(mj_path)
+            candidates = filter_recovery_candidates(
+                comparison["missing_on_mj"], ags["entries"],
+                since_cutoff=since_cutoff,
             )
-        else:
-            purge_deletions = []
+            recovery_results = recover_triggers(
+                candidates, ags_host, ags_path, mj_path, dry_run=dry_run,
+                control_path=control_path, status_file=status_file,
+            )
+            recovered_count = len([r for r in recovery_results
+                                   if r["status"] == "recovered"])
+            failed_count = len([r for r in recovery_results
+                                if r["status"] == "failed"])
+            if recovered_count:
+                logger.info("Recovery: %d succeeded", recovered_count)
+            if failed_count:
+                logger.warning("Recovery: %d failed", failed_count)
 
-        deleted_names = [d["filename"] for d in purge_deletions
-                         if d["status"] == "deleted"]
-        failed_purge = [d for d in purge_deletions
-                        if d["status"] == "failed"]
+        # Update mj_headers and missing list with recovered triggers
+        if recovery_results:
+            recovered_headers = set()
+            recovered_dirs = set()
+            for r in recovery_results:
+                if r["status"] == "recovered":
+                    mj["headers"].add(r["header"])
+                    recovered_headers.add(r["header"])
+                    if r.get("target_path"):
+                        # target_path is RELATIVE to mj_path (recover_triggers
+                        # stores os.path.relpath); the scan cache is keyed by
+                        # ABSOLUTE dirs, so rejoin mj_path before refreshing.
+                        recovered_dirs.add(os.path.dirname(
+                            os.path.join(mj_path, r["target_path"])))
+            # Recovery wrote new .bin into these dirs AFTER the scan saved the
+            # cache (pre-recovery), leaving them stale. Refresh so the next
+            # scan cache-hits them instead of re-reading.
+            _refresh_cache_dirs(mj_cache, recovered_dirs)
+            if recovered_headers:
+                comparison["missing_on_mj"] = [
+                    e for e in comparison["missing_on_mj"]
+                    if e["header"] not in recovered_headers
+                ]
+                results["missing_on_mj"] = comparison["missing_on_mj"]
+                results["matched"] += len(recovered_headers)
 
-        if deleted_names:
-            logger.info("Purge: deleted %d AGS files", len(deleted_names))
-        if failed_purge:
-            logger.warning("Purge: %d deletions failed", len(failed_purge))
+        # Purge flow
+        if purge:
+            write_status(status_file, "purge")
+            eligibility = identify_purgeable_files(
+                ags["entries"], mj["headers"], recovery_results,
+            )
+            if eligibility["purgeable"]:
+                purge_deletions = purge_ags_files(
+                    ags_host, ags_path, eligibility["purgeable"],
+                    dry_run=dry_run, control_path=control_path,
+                    status_file=status_file,
+                )
+            else:
+                purge_deletions = []
 
-        # Normalize to flat filename lists for reports (matching spec JSON shape)
-        purge_results = {
-            "deleted": [d["filename"] for d in purge_deletions
-                        if d["status"] in ("deleted", "dry_run")],
-            "failed": [{"filename": d["filename"], "error": d["error"]}
-                       for d in purge_deletions if d["status"] == "failed"],
-            "retained": eligibility["retained"],
-            "dry_run": dry_run,
-        }
+            deleted_names = [d["filename"] for d in purge_deletions
+                             if d["status"] == "deleted"]
+            failed_purge = [d for d in purge_deletions
+                            if d["status"] == "failed"]
+
+            if deleted_names:
+                logger.info("Purge: deleted %d AGS files", len(deleted_names))
+            if failed_purge:
+                logger.warning("Purge: %d deletions failed", len(failed_purge))
+
+            # Flatten to filename lists for reports (matching spec JSON shape)
+            purge_results = {
+                "deleted": [d["filename"] for d in purge_deletions
+                            if d["status"] in ("deleted", "dry_run")],
+                "failed": [{"filename": d["filename"], "error": d["error"]}
+                           for d in purge_deletions if d["status"] == "failed"],
+                "retained": eligibility["retained"],
+                "dry_run": dry_run,
+            }
+
+    recovered_n = len([r for r in (recovery_results or [])
+                       if r["status"] == "recovered"])
+    purged_n = len((purge_results or {}).get("deleted", []))
+    write_status(status_file, "done", recovered=recovered_n, purged=purged_n)
+    write_scan_metrics(metrics_file, mj, recovered_n, purged_n)
 
     if json_output:
         print(format_json_report(results, ags_host,
@@ -1692,6 +2229,9 @@ def main():
         recover=args.recover,
         dry_run=args.dry_run,
         purge=args.purge,
+        status_file=args.status_file or None,
+        mj_cache=args.mj_cache or None,
+        metrics_file=args.metrics_file or None,
     )
     sys.exit(rc)
 
