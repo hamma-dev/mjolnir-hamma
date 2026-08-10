@@ -23,8 +23,12 @@ Test-harness notes:
   it has no `**kwargs` -- so a kwarg that would be a TypeError at pipeline
   build on a sensor is a TypeError here too.
 * `Tree.drive_kwargs()` READS the shipped `config/main.toml` and redirects
-  only `base_path`/`mount_base_path` at the temp tree. Deleting `drive_glob`
-  from the shipped config must fail this suite, not pass it.
+  exactly two values, `base_path` and `mount_base_path`, at the temp tree.
+  Everything else is the shipped value; deleting `drive_glob` from the config
+  must fail this suite, not pass it. In particular `fallback_path` keeps its
+  shipped `~/brokkr/{system_name}/science` form and `sensor()` redirects HOME,
+  because substituting a pre-expanded absolute path there once hid a
+  production bug that made the acceptance case silent.
 * `brokkr.utils.output` is the real module, loaded by `_real_brokkr`; the
   stand-in is used only where brokkr cannot be found at all.
 * The tuning knobs are module constants, so tests exercise them with
@@ -132,6 +136,18 @@ def make_output_module():
     return module
 
 
+def real_convert_path():
+    """brokkr's own convert_path, which is what expands `~` in its paths.
+
+    Must be the real function: the plugin routes every path it resolves by
+    hand through it, and a MagicMock here would make the resolution untested
+    exactly where the bug was.
+    """
+    if REAL_BROKKR_OUTPUT is not None:
+        return _real_brokkr.modules()["brokkr.utils.misc"].convert_path
+    return _convert_path
+
+
 # --- Module loading ----------------------------------------------------------
 
 class MockOutputStep:
@@ -170,7 +186,10 @@ def load_state_monitor_module():
     # The plugin reaches brokkr.utils.output through attribute access, so the
     # real module has to be reachable that way, not just via sys.modules.
     mock_brokkr.utils.output = OUTPUT_MODULE
+    # get_actual_username is stubbed because the test machine is not "pi";
+    # convert_path is REAL, because path resolution is under test.
     mock_brokkr.utils.misc.get_actual_username.return_value = USER
+    mock_brokkr.utils.misc.convert_path = real_convert_path()
 
     with patch.dict("sys.modules", {
         "brokkr": mock_brokkr,
@@ -268,9 +287,15 @@ class Tree:
         self.media_base = tmp_path / "media"
         self.media = self.media_base / USER
         self.by_label = tmp_path / "dev" / "disk" / "by-label"
-        self.fallback = tmp_path / "sdcard" / "brokkr" / "hamma" / "science"
+        # The SD-card fallback is NOT redirected by rewriting the config
+        # value. `sensor()` points HOME here instead, so the shipped
+        # `~/brokkr/{system_name}/science` template is the one under test --
+        # including the `~` expansion, which is where the real bug was.
+        self.home = tmp_path / "home" / USER
+        self.fallback = self.home / "brokkr" / "hamma" / "science"
         self.media.mkdir(parents=True)
         self.by_label.mkdir(parents=True)
+        self.home.mkdir(parents=True)
         self.mounts = set()      # paths os.path.ismount() will answer True for
         self.stats = {}          # path -> FakeStatVFS or OSError to raise
 
@@ -350,18 +375,42 @@ class Tree:
     def wrote_to(self, name, age_s=0, hour="2026-08-09T12"):
         self.science_write(self.media / name, age_s=age_s, hour=hour)
 
+    def go_quiet(self, age_s=None):
+        """Age every science write out of the evidence window.
+
+        What a lull between storms looks like: the fault is untouched, but
+        nothing has been written recently enough to prove brokkr tried.
+        """
+        if age_s is None:
+            age_s = 2 * MODULE.DRIVE_TARGET_EVIDENCE_S
+        roots = [self.fallback] + list(self.media.iterdir())
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for child in root.iterdir():
+                self._backdate(child, age_s)
+            self._backdate(root, age_s)
+
     # -- brokkr's settings for this tree -------------------------------------
     def drive_kwargs(self, **overrides):
-        """The SHIPPED drive_kwargs, redirected at the temp tree.
+        """The SHIPPED drive_kwargs, with exactly two path roots redirected.
 
-        Only the two path roots are redirected. `drive_glob`, `mount_glob` and
-        `min_free_gb` are whatever config/main.toml actually ships, so
-        deleting or changing them there is visible here.
+        `base_path` and `mount_base_path` are rewritten to point at the temp
+        tree, keeping `{current_user}` so the substitution stays exercised.
+        Everything else -- `drive_glob`, `mount_glob`, `min_free_gb` and
+        crucially `fallback_path` -- is whatever config/main.toml actually
+        ships, so changing or deleting it there is visible here.
+
+        `fallback_path` is deliberately NOT rewritten. An earlier version of
+        this fixture substituted an absolute, pre-expanded path for the
+        shipped `~/brokkr/{system_name}/science`, which quietly fixed the
+        production bug inside the test: the plugin resolved the template with
+        `.format()` alone, leaving a literal `~` that matched nothing, and the
+        mj51 acceptance test passed anyway. Redirect HOME, never the value.
         """
         kwargs = config_drive_kwargs()
         kwargs["base_path"] = str(self.media_base) + "/{current_user}"
         kwargs["mount_base_path"] = str(self.by_label)
-        kwargs["fallback_path"] = str(self.fallback)
         kwargs.update(overrides)
         return kwargs
 
@@ -396,8 +445,13 @@ def sensor(tree, drive_kwargs=None):
             UNIT_CONFIG={"number": 31, "site_description": "test"}),
         }
     with patch.dict("sys.modules", modules), \
+            patch.dict(os.environ, {"HOME": str(tree.home)}), \
             patch("os.path.ismount", side_effect=fake_ismount), \
             patch("os.statvfs", side_effect=fake_statvfs):
+        # brokkr's convert_path rewrites "~" to "~$SUDO_USER" before
+        # expanding, which would resolve to the invoking user's real home
+        # rather than HOME. patch.dict restores the whole environment on exit.
+        os.environ.pop("SUDO_USER", None)
         yield
 
 
@@ -574,10 +628,68 @@ class TestBrokkrContract:
         with sensor(tree):
             alert = monitor.check_drive_target(None)
         assert alert is not None
-        assert "nowhere left to go" in alert
+        assert "min_free_gb" in alert and "ENOSPC" in alert
         assert named(alert) == {"DATA31"}, (
             "the check must measure only what brokkr's own glob resolves")
         assert "DATA311" not in alert
+
+    def test_fallback_path_is_expanded_the_way_brokkr_expands_it(
+            self, tmp_path):
+        """The shipped fallback is `~`-relative; `.format()` alone leaves it.
+
+        brokkr resolves it with `.format()` AND `convert_path`
+        (render_output_filename, output.py:203). Resolving only the first half
+        leaves a literal tilde that matches nothing on disk -- and since this
+        path is the check's evidence that brokkr wrote to the SD card, and the
+        only evidence source in the mj51 topology, that made the total-loss
+        case silent while the partial case still alerted.
+        """
+        assert config_drive_kwargs()["fallback_path"].startswith("~"), (
+            "this test is meaningless unless the shipped value is ~-relative")
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            view = monitor._brokkr_drive_view()
+        resolved = str(view.fallback_path)
+        assert "~" not in resolved
+        assert resolved == str(tree.fallback)
+        assert os.path.isabs(resolved)
+
+    def test_base_path_is_expanded_the_way_brokkr_expands_it(self, tmp_path):
+        """Same rule for the other path the plugin resolves by hand."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree, tree.drive_kwargs(
+                base_path="~/media/{current_user}")):
+            view = monitor._brokkr_drive_view()
+        assert "~" not in str(view.base_path)
+        assert str(view.base_path) == str(tree.home / "media" / USER)
+
+    def test_only_one_place_in_the_plugin_resolves_a_path_template(self):
+        """A standing red flag, not a one-off bug.
+
+        brokkr renders a path template in two steps and the plugin's rule is
+        "never restate brokkr's resolution, reuse it". `base_path` and
+        `mount_base_path` get both steps for free by going through
+        `find_drives`; `fallback_path` was the one path resolved by hand, and
+        it was the one that was wrong. Every `.format(**kwargs)` on a path must
+        now live in `_resolve_path`, which also applies `convert_path`.
+        """
+        offenders = []
+        for node in ast.walk(ast.parse(PLUGIN_PATH.read_text())):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "format"
+                        and any(keyword.arg is None
+                                for keyword in inner.keywords)):
+                    offenders.append(node.name)
+        assert set(offenders) <= {"_resolve_path"}, (
+            "{} resolve a path template by hand; route it through "
+            "_resolve_path so brokkr's convert_path is applied".format(
+                sorted(set(offenders) - {"_resolve_path"})))
 
     def test_uses_the_configured_glob_unchanged(self, tmp_path):
         tree = Tree(tmp_path)
@@ -1073,6 +1185,83 @@ class TestDampingAndLatch:
                 tree.unmount(name)
             assert monitor.check_drive_target(None) is not None
 
+    def test_quiet_gaps_are_not_recovery(self, tmp_path):
+        """One never-fixed fault, four storms: exactly one page.
+
+        The evidence gate empties `hidden` whenever brokkr goes quiet. If that
+        runs the healthy branch it clears the latch AND `_drive_target_alert_at`
+        -- and the renotify floor is guarded on `alert_at is not None`, so the
+        storm protection is bypassed too. Measured before the fix: 4 pages for
+        4 bursts, one per storm, for a fault that never cleared.
+        """
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        pages = []
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=2):
+            for burst in range(4):
+                tree.wrote_to_sd(age_s=0,
+                                 hour="2026-08-09T{:02d}".format(10 + burst))
+                pages += [m for m in run_cycles(monitor, 5) if m]
+                assert monitor._drive_target_alerted is not None, (
+                    "the latch must survive a storm")
+                tree.go_quiet()
+                pages += [m for m in run_cycles(monitor, 5) if m]
+                assert monitor._drive_target_alerted is not None, (
+                    "a lull is not recovery -- the fault is still there")
+        assert len(pages) == 1, (
+            "one never-fixed fault paged {} times".format(len(pages)))
+
+    def test_a_lull_does_not_reset_the_renotify_floor(self, tmp_path):
+        """A *changed* fault after a lull is still subject to the floor."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
+                                  DRIVE_TARGET_RENOTIFY_CYCLES=30):
+            assert monitor.check_drive_target(None) is not None
+            tree.go_quiet()
+            run_cycles(monitor, 5)
+            # the fault changes shape, and brokkr writes again
+            tree.label("DATA53")
+            tree.wrote_to_sd(age_s=0, hour="2026-08-09T13")
+            assert run_cycles(monitor, 5) == [None] * 5
+
+    def test_real_recovery_during_a_lull_still_clears(self, tmp_path):
+        """The freeze must not outlive the fault."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            assert monitor.check_drive_target(None) is not None
+            tree.go_quiet()
+            for name in ("DATA311", "DATA421"):
+                tree.unmount(name)
+                shutil.rmtree(str(tree.media / name))
+            for name in ("DATA31", "DATA42"):
+                tree.mounts.add(str(tree.media / name))
+                tree.stats[str(tree.media / name)] = FakeStatVFS(500 * GIB)
+            assert monitor.check_drive_target(None) is None
+            assert monitor._drive_target_alerted is None
+            assert monitor._drive_target_alert_at is None
+
+    def test_a_blind_label_cycle_does_not_clear_an_outstanding_fault(
+            self, tmp_path):
+        """Same defect via the other suppression path."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        real_find = OUTPUT_MODULE.find_drives
+
+        def only_labels_fail(drive_glob, base_path, filename_kwargs=None):
+            if str(base_path) == str(tree.by_label):
+                raise OSError(13, "Permission denied")
+            return real_find(drive_glob, base_path,
+                             filename_kwargs=filename_kwargs)
+
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            assert monitor.check_drive_target(None) is not None
+            latched = monitor._drive_target_alerted
+            with patch.object(OUTPUT_MODULE, "find_drives", only_labels_fail):
+                run_cycles(monitor, 3)
+            assert monitor._drive_target_alerted == latched
+
     def test_a_flap_shorter_than_the_window_never_pages(self, tmp_path):
         tree = healthy_tree(tmp_path)
         monitor = make_monitor()
@@ -1127,13 +1316,30 @@ class TestCapacity:
             assert monitor.check_drive_target(None) is not None
 
     def test_all_partitions_full_alerts(self, tmp_path, prompt):
+        """With >1 candidate, brokkr's select_drive really does refuse."""
         tree = healthy_tree(tmp_path, free_gib=0)
         monitor = make_monitor()
         with sensor(tree):
             alert = monitor.check_drive_target(None)
         assert alert is not None
-        assert "nowhere left to go" in alert
+        assert "All drives full!" in alert
+        assert "ENOSPC" not in alert
         assert {"DATA31", "DATA42"} <= named(alert)
+
+    def test_a_single_full_partition_says_enospc_not_refusal(
+            self, tmp_path, prompt):
+        """brokkr applies min_free_gb only inside select_drive, and
+        get_output_drive calls it only when len(canidate_drives) > 1. With one
+        candidate it returns it unchecked and the write fails at ENOSPC."""
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.mount("DATA31", free_gib=0)
+        tree.wrote_to("DATA31")
+        monitor = make_monitor()
+        with sensor(tree):
+            alert = monitor.check_drive_target(None)
+        assert "ENOSPC" in alert
+        assert "All drives full!" not in alert
 
     def test_single_full_partition_alerts(self, tmp_path, prompt):
         tree = Tree(tmp_path)
@@ -1174,7 +1380,7 @@ class TestCapacity:
             alert = monitor.check_drive_target(None)
         assert alert is not None
         assert "tried and failed to mount them" in alert    # the hidden one
-        assert "nowhere left to go" in alert                # the emergency
+        assert "min_free_gb" in alert and "ENOSPC" in alert  # the emergency
 
     def test_last_partition_is_reported_with_a_hidden_third(
             self, tmp_path, prompt):
