@@ -3,7 +3,9 @@ Plugin to monitor state variables from the charge controller.
 """
 
 from math import nan
+import collections
 import fcntl
+import inspect
 import json
 import os
 import shlex
@@ -32,6 +34,30 @@ DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
 SCRUB_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate the scrub log past this size
 
+# statvfs f_flag bit meaning "mounted read-only" (Linux; guarded for portability
+# so the module still imports on a platform that does not define it).
+ST_RDONLY = getattr(os, "ST_RDONLY", 1)
+
+# UNITS (HAM-185 check): every byte quantity computed below is *displayed* in
+# GiB (2**30), and every message that prints one says "GiB". The single
+# threshold applied to a byte count is brokkr's own `min_free_gb` from
+# science_binary_output.drive_kwargs, compared exactly the way brokkr compares
+# it (`min_free_gb * 1e9`, decimal, see brokkr.utils.output.select_drive). We
+# reuse brokkr's comparison rather than restating "full" in our own units; the
+# only new config key added here (`drive_target_cycles`) counts monitor cycles
+# and so carries no unit at all.
+
+# Both views the HAM-185 check compares. Nothing here is a new drive-discovery
+# rule: `candidates` is brokkr's own science-output resolution and `labels` is
+# brokkr's own mount-side resolution, both read out of brokkr's config.
+_DriveView = collections.namedtuple("_DriveView", [
+    "candidates",     # list[Path]: what brokkr's writer would consider, or None
+    "labels",         # list[Path]: labelled DATA devices attached, or None
+    "base_path",      # str: resolved mount base (e.g. /media/pi)
+    "fallback_path",  # str|None: where brokkr writes when it finds no drive
+    "min_free_gb",    # numeric: brokkr's own "this drive is full" threshold
+    ])
+
 
 def sensor_prefix():
     """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
@@ -59,6 +85,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         key_file=None,
         low_pi_space=5,
         enable_drive_checks=True,
+        drive_target_cycles=5,
         scrub_command="",
         scrub_hang_timeout_s=900,
         scrub_status_file=DEFAULT_SCRUB_STATUS_FILE,
@@ -109,6 +136,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         enable_drive_checks : bool, optional
             If True (default), check for archive drives and sensor drive space.
             Set to False for units without HAMMA sensor hardware connected.
+        drive_target_cycles : int, optional
+            Consecutive monitor cycles a science-write-target fault must
+            persist before `check_drive_target` alerts (default 5, ~5 min at
+            the 60 s monitor interval). Damping, in the same idiom as
+            `hs_stale_cycles`/`ping_max`: udisks mount/unmount races, a drive
+            being swapped, and the window between boot and brokkr's first
+            `mount_drives` call all produce a transient mismatch that must not
+            page. The count restarts whenever *which* drives are at fault
+            changes.
         scrub_command : str, optional
             Shell command to run hamma_scrub.py when drive space is low.
             If empty (default), no scrub is spawned. Protected by flock.
@@ -173,6 +209,14 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.bad_ping = 0  # Track the number of bad pings
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
+        # HAM-185 science-write-target check. The latch is keyed on *which*
+        # drives are at fault, not on a bare bool, so a drive swap (a different
+        # offender) re-arms the alert instead of muting it forever; the counter
+        # supplies the damping every sibling check has.
+        self.drive_target_cycles = drive_target_cycles
+        self._drive_target_signature = None   # fault set currently being timed
+        self._drive_target_count = 0          # consecutive cycles seen
+        self._drive_target_alerted = None     # fault set already reported
         self.scrub_command = scrub_command
         # Hung-scrub detection (progress-gated): a scrub is "hung" only if the
         # lock is held AND its heartbeat has been stale this long -- so a long
@@ -298,6 +342,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         ]
         if self.enable_drive_checks:
             checks.insert(0, self.check_drive)
+            checks.insert(1, self.check_drive_target)
             checks.append(self.check_sensor_drive)
             checks.append(self.check_scrub_health)
 
@@ -353,6 +398,378 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             return "No drives available."
         else:
             return None
+
+    # --- HAM-185: is brokkr's science write target actually usable? ---------
+
+    def _output_drive_defaults(self):
+        """Default kwargs of brokkr's ``get_output_drive``, from its signature.
+
+        `drive_kwargs` in main.toml only overrides *some* of brokkr's drive
+        settings; the rest come from `get_output_drive`'s own defaults (e.g.
+        ``base_path="/media/{current_user}"``). Those defaults are read out of
+        brokkr's signature instead of being restated here, so a change on the
+        brokkr side cannot silently desynchronise this monitor from the writer
+        it is supposed to be watching.
+
+        Returns
+        -------
+        dict
+            Parameter name -> default value. Empty if the signature could not
+            be introspected, in which case the caller declines to evaluate
+            rather than substituting a guess.
+        """
+        try:
+            parameters = inspect.signature(
+                brokkr.utils.output.get_output_drive).parameters
+        except (TypeError, ValueError) as e:
+            self.logger.warning(
+                "state_monitor: cannot introspect brokkr's get_output_drive "
+                "(%s); skipping the science-drive-target check", e)
+            return {}
+        return {name: param.default for name, param in parameters.items()
+                if param.default is not inspect.Parameter.empty}
+
+    def _drive_filename_kwargs(self, drive_kwargs):
+        """Build the substitutions brokkr applies to its drive paths.
+
+        brokkr's paths are templates (``/media/{current_user}``,
+        ``~/brokkr/{system_name}/science``); these are the same three sources
+        `brokkr.utils.output.render_output_filename` fills them from.
+        """
+        import brokkr.utils.misc   # local, matching check_drive's style
+
+        filename_kwargs = {
+            "current_user": brokkr.utils.misc.get_actual_username()}
+        try:
+            from brokkr.config.metadata import METADATA
+            from brokkr.config.unit import UNIT_CONFIG
+            filename_kwargs["system_name"] = METADATA["name"]
+            filename_kwargs["unit_number"] = UNIT_CONFIG["number"]
+        except (ImportError, KeyError) as e:
+            self.logger.debug(
+                "state_monitor: no system/unit metadata for drive paths: %s", e)
+        filename_kwargs.update(drive_kwargs.get("filename_kwargs") or {})
+        return filename_kwargs
+
+    def _find_drives_safely(self, drive_glob, base_path, filename_kwargs, what):
+        """Run brokkr's own `find_drives`, returning None (logged) on failure.
+
+        Returning None is deliberately distinct from returning ``[]``: "could
+        not look" must not be mistaken for "looked, found nothing".
+        """
+        try:
+            return brokkr.utils.output.find_drives(
+                drive_glob, base_path, filename_kwargs=filename_kwargs)
+        except (OSError, KeyError, IndexError, ValueError, TypeError,
+                AttributeError) as e:
+            self.logger.warning(
+                "state_monitor: could not enumerate %s (%r under %r): %s",
+                what, drive_glob, base_path, e)
+            return None
+
+    def _brokkr_drive_view(self):
+        """Resolve, from brokkr's own config and code, both views of the drives.
+
+        `candidates` is what brokkr's science writer would consider -- produced
+        by calling `brokkr.utils.output.find_drives` with the settings brokkr
+        itself passes to `get_output_drive`. `labels` is the set of attached,
+        labelled DATA devices, produced by the same function with brokkr's
+        *mount-side* settings (``mount_glob``/``mount_base_path``), i.e. the
+        list brokkr's own `mount_drives` works from.
+
+        No pattern is invented and no glob is widened: both views are brokkr's,
+        and the HAM-185 signal is the divergence between them.
+
+        Read-only. `get_output_drive` is deliberately NOT called, because it
+        has a side effect (`mount_drives` shells out to ``udisksctl mount``);
+        the monitor must never mount, unmount or spawn anything.
+
+        Returns
+        -------
+        _DriveView | None
+            None if brokkr's settings could not be resolved at all (logged at
+            WARNING). Either view is None on its own if that one enumeration
+            failed.
+        """
+        try:
+            from brokkr.config.main import CONFIG
+            drive_kwargs = dict(
+                CONFIG["steps"]["science_binary_output"]["drive_kwargs"])
+        except (ImportError, KeyError, TypeError) as e:
+            self.logger.warning(
+                "state_monitor: cannot read science_binary_output "
+                "drive_kwargs (%s); skipping the drive-target check", e)
+            return None
+
+        defaults = self._output_drive_defaults()
+        drive_glob = drive_kwargs.get("drive_glob")
+        base_path = drive_kwargs.get("base_path", defaults.get("base_path"))
+        if not drive_glob or not base_path:
+            self.logger.warning(
+                "state_monitor: no usable drive_glob/base_path for science "
+                "output (glob=%r, base=%r); skipping the drive-target check",
+                drive_glob, base_path)
+            return None
+
+        # brokkr's own rule: `mount_glob = True` means "reuse drive_glob".
+        mount_glob = drive_kwargs.get("mount_glob", defaults.get("mount_glob"))
+        if mount_glob is True:
+            mount_glob = drive_glob
+        mount_base_path = drive_kwargs.get(
+            "mount_base_path", defaults.get("mount_base_path"))
+        min_free_gb = drive_kwargs.get(
+            "min_free_gb", defaults.get("min_free_gb"))
+        filename_kwargs = self._drive_filename_kwargs(drive_kwargs)
+
+        try:
+            resolved_base = str(base_path).format(**filename_kwargs)
+        except (KeyError, IndexError) as e:
+            self.logger.warning(
+                "state_monitor: cannot resolve brokkr's drive base path %r "
+                "(%s); skipping the drive-target check", base_path, e)
+            return None
+
+        candidates = self._find_drives_safely(
+            drive_glob, base_path, filename_kwargs,
+            "brokkr's science-output drive candidates")
+        labels = None
+        if mount_glob and mount_base_path:
+            labels = self._find_drives_safely(
+                mount_glob, mount_base_path, filename_kwargs,
+                "attached labelled DATA devices")
+
+        fallback_path = drive_kwargs.get(
+            "fallback_path", defaults.get("fallback_path"))
+        if fallback_path:
+            try:
+                fallback_path = str(fallback_path).format(**filename_kwargs)
+            except (KeyError, IndexError):
+                pass  # cosmetic only -- it just names the SD-card path
+
+        return _DriveView(
+            candidates=candidates,
+            labels=labels,
+            base_path=resolved_base,
+            fallback_path=fallback_path,
+            min_free_gb=min_free_gb if min_free_gb is not None else 0,
+            )
+
+    def _mounted_under(self, base_path):
+        """Names of everything actually mounted under `base_path`.
+
+        Diagnostic only -- never used to decide anything, so it is not a drive
+        discovery rule and applies no pattern. It exists so the alert can name
+        the mountpoint the operator has to act on (``DATA071`` in the mj51
+        incident), which no glob-based view can report by construction.
+        """
+        try:
+            entries = sorted(os.listdir(base_path))
+        except OSError as e:
+            self.logger.warning(
+                "state_monitor: cannot list %s (%s)", base_path, e)
+            return []
+        return [entry for entry in entries
+                if os.path.ismount(os.path.join(base_path, entry))]
+
+    def check_drive_target(self, input_data):
+        """Alert when brokkr cannot write science data to an attached DATA drive.
+
+        The gap this closes (HAM-185, sensor-log #52 on mj51): a labelled DATA
+        drive is attached and mounted, but *not where brokkr looks*, so brokkr
+        silently falls back to the SD card. On mj51 a stale empty
+        ``/media/pi/DATA07`` directory made udisks mount the real drive at
+        ``DATA071``; brokkr's ``DATA??`` never matched it and eight days of
+        science data went to the SD card with nothing alerting.
+
+        The signal is the **divergence** between two views that brokkr itself
+        maintains -- the drives its writer would consider, and the labelled
+        devices its mounter knows about -- not the free space or the contents
+        of either view alone. Widening the glob so the check can see the
+        suffixed mount is what PR #84 did, and it reports "healthy, 500 GB
+        free" on exactly this topology, because the filesystem it then measures
+        is not the one brokkr writes to.
+
+        Faults reported, all of them "brokkr cannot write science data here":
+
+        - **hidden**: a labelled DATA device has no matching mountpoint in
+          brokkr's candidate set -> brokkr is on the SD card (the mj51 shape).
+        - **not a directory**: brokkr's `find_drives` filter (``not is_dir()
+          or ismount()``) screens *directories* only, so any non-directory
+          match is kept unconditionally and `statvfs` on it reports the
+          containing filesystem -- a stray file named like a drive would
+          otherwise stand in for a real one. Such a match never satisfies a
+          label here, and is reported.
+        - **unreadable**: a candidate mountpoint that raises on `statvfs`.
+          brokkr's own `select_drive` stats the same path and would raise too;
+          it is a fault, and it is logged rather than skipped in silence.
+        - **read-only**: a candidate mounted ``ro`` (what a dirty unmount
+          leaves behind on a FAT volume) -- brokkr will select it and every
+          write will fail.
+        - **capacity**: see below. Reported only when no drive is hidden,
+          since a hidden drive makes the capacity picture meaningless.
+
+        On capacity: a fixed "low free space" floor is close to useless on
+        these units. The drives are 1.8 TB and mj03 writes 14.75 GiB/day, so a
+        25 GiB floor stays silent for ~226 days and then gives 41 hours of
+        warning, once -- and nothing on the sensor can free these drives
+        (`hamma_scrub` only ever deletes on the AGS). The actionable event is
+        the transition brokkr's name-ordered fill produces months earlier:
+        "the earlier drives are full, the unit is now on its last one". That
+        is what is reported, using brokkr's own `min_free_gb` as the
+        definition of full, so no new threshold is introduced.
+
+        Alert-only, per HAM-185: nothing here unmounts, `rmdir`s, remounts or
+        spawns. HAM-173's boot-time oneshot is where automatic repair belongs.
+
+        Parameters
+        ----------
+        input_data : Mapping[str, DataValue]
+            Same as argument of `execute` (unused; kept for check uniformity).
+
+        Returns
+        -------
+        str | None
+            Alert naming the offending drives and the remedy, or None.
+        """
+        view = self._brokkr_drive_view()
+        if view is None or view.candidates is None:
+            # Could not evaluate this cycle (already logged at WARNING). Leave
+            # BOTH the latch and the damping counter untouched: an error must
+            # neither clear an outstanding alert nor count towards raising one.
+            return None
+
+        candidate_dirs = []   # names brokkr's writer would accept
+        notdir = []
+        unreadable = []       # (name, error text)
+        readonly = []
+        usable = []           # (name, free bytes)
+        for drive in view.candidates:
+            try:
+                is_dir = drive.is_dir()
+            except OSError as e:          # pragma: no cover - is_dir swallows
+                self.logger.warning(
+                    "state_monitor: cannot stat %s: %s", drive, e)
+                unreadable.append((drive.name, str(e)))
+                continue
+            if not is_dir:
+                self.logger.warning(
+                    "state_monitor: %s matches brokkr's drive pattern but is "
+                    "not a directory; brokkr keeps such matches unfiltered",
+                    drive)
+                notdir.append(drive.name)
+                continue
+            candidate_dirs.append(drive.name)
+            try:
+                stat_result = os.statvfs(str(drive))
+            except OSError as e:
+                # Logged, not swallowed: a permanently-erroring mount must not
+                # be indistinguishable from a healthy one.
+                self.logger.warning(
+                    "state_monitor: %s is in brokkr's drive set but its free "
+                    "space cannot be read: %s", drive, e)
+                unreadable.append((drive.name, str(e)))
+                continue
+            if stat_result.f_flag & ST_RDONLY:
+                readonly.append(drive.name)
+            usable.append(
+                (drive.name, stat_result.f_bavail * stat_result.f_frsize))
+
+        hidden = []
+        if view.labels is not None:
+            hidden = sorted(
+                {drive.name for drive in view.labels} - set(candidate_dirs))
+
+        full = sorted(name for name, free in usable
+                      if free < view.min_free_gb * 1e9)
+        remaining = [(name, free) for name, free in usable
+                     if free >= view.min_free_gb * 1e9]
+        all_full = bool(usable) and not remaining and not hidden
+        last_drive = (len(usable) > 1 and len(remaining) == 1 and not hidden)
+
+        # Latch signature: the *set of offending drives*, per fault kind. A
+        # different offender is a different alert.
+        faults = [("hidden", name) for name in hidden]
+        faults += [("notdir", name) for name in notdir]
+        faults += [("unreadable", name) for name, _err in unreadable]
+        faults += [("readonly", name) for name in readonly]
+        if all_full:
+            faults += [("full", name) for name, _free in usable]
+        elif last_drive:
+            faults.append(("lastdrive", remaining[0][0]))
+        signature = frozenset(
+            "{}:{}".format(kind, name) for kind, name in faults)
+
+        if not signature:
+            # Healthy: clear the latch AND the counter on this exit path, so
+            # the next fault is timed and reported from scratch.
+            self._drive_target_signature = None
+            self._drive_target_count = 0
+            self._drive_target_alerted = None
+            return None
+        if signature != self._drive_target_signature:
+            # New or changed fault set (e.g. a drive swap): restart the damping
+            # count. `_drive_target_alerted` still holds the *previous* set, so
+            # the comparison below re-arms rather than muting.
+            self._drive_target_signature = signature
+            self._drive_target_count = 0
+        self._drive_target_count += 1
+        if self._drive_target_count < self.drive_target_cycles:
+            return None   # damping: not yet persistent enough to page
+        if self._drive_target_alerted == signature:
+            return None   # same fault, already reported; stay quiet
+
+        reasons = []
+        if hidden:
+            mounted = self._mounted_under(view.base_path)
+            reasons.append(
+                "labelled DATA drive(s) {} are attached, but brokkr has no "
+                "write target for them: nothing named for them is mounted "
+                "under {}, so science data is going to the SD card ({}). "
+                "Actually mounted under {}: {}. This is the sensor-log #52 "
+                "shape -- a stale empty mountpoint directory forces udisks to "
+                "mount at a suffixed path. Fix by hand: unmount the drive, "
+                "rmdir the leftover empty directory, remount".format(
+                    ", ".join(hidden), view.base_path,
+                    view.fallback_path or "brokkr's fallback path",
+                    view.base_path, ", ".join(mounted) or "nothing"))
+        if notdir:
+            reasons.append(
+                "{} under {} match brokkr's drive pattern but are not "
+                "directories; brokkr keeps such matches and would stat the SD "
+                "card through them. Move or delete them".format(
+                    ", ".join(notdir), view.base_path))
+        if unreadable:
+            reasons.append(
+                "{} are mounted where brokkr expects a drive but cannot be "
+                "read; brokkr's own drive selection stats the same paths and "
+                "will fail".format(", ".join(
+                    "{} ({})".format(name, err) for name, err in unreadable)))
+        if readonly:
+            reasons.append(
+                "{} is mounted READ-ONLY, so every brokkr write to it fails "
+                "(a dirty unmount leaves a FAT volume this way); fsck and "
+                "remount read-write".format(", ".join(readonly)))
+        if all_full:
+            reasons.append(
+                "every DATA drive ({}) is below brokkr's own min_free_gb={:g} "
+                "floor; science writes have nowhere left to go. Swap the "
+                "drives".format(", ".join(name for name, _f in usable),
+                                view.min_free_gb))
+        elif last_drive:
+            name, free = remaining[0]
+            reasons.append(
+                "{} of {} DATA drives are full ({}); brokkr is now writing to "
+                "the last one, {}, with {:.1f} GiB free. Swap the drives "
+                "before it fills".format(
+                    len(full), len(usable), ", ".join(full), name,
+                    free / (2 ** 30)))
+
+        # Latch only once the message is actually built, so a formatting bug
+        # cannot mute the fault permanently by latching without alerting.
+        self._drive_target_alerted = signature
+        return ("Science drive target problem -- " + "; ".join(reasons)
+                + ". Note the auto-scrub cannot help with any of this: it "
+                  "only deletes on the AGS, never on the mj-side DATA drives.")
 
     def check_power(self, input_data):
         """
