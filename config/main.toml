@@ -56,7 +56,6 @@ config_version = 1
         alert_space = 75   # GB free below which to alert: falling despite the auto-scrub (purge losing)
         scrub_cooldown_s = 300  # min seconds between level-triggered scrub launches while below purge_space (more responsive than the 15-min timer)
         hs_stale_cycles = 15  # alert if bytes_remaining is NA this many consecutive cycles (~15 min) -- the AGS is dark and /ags/data can fill unseen
-        drive_target_cycles = 5  # consecutive cycles (~5 min) a science-write-target fault must persist before alerting; damps udisks mount/unmount races and the boot-time window (HAM-185)
         ping_max = 3  # after this many pings, send chat message
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"

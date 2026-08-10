@@ -42,7 +42,6 @@ failure, so this coverage cannot quietly disappear.
 """
 
 import atexit
-import contextlib
 import importlib
 import os
 import shutil
@@ -169,15 +168,35 @@ def _load():
     _state["loaded"] = True
 
 
-def require():
-    """Return the real brokkr module map, or skip/fail if it is unavailable."""
+def unavailable_reason():
+    """Return why real brokkr is unavailable, or None if it loaded.
+
+    Honours ``HAMMA_REQUIRE_REAL_BROKKR=1`` by raising, so a caller that only
+    wants to know whether the real package is present cannot silently degrade
+    to a stand-in under CI. (An earlier version of this module only honoured
+    the variable inside ``require()``, which the one caller never used -- the
+    guard was inert.)
+    """
     _load()
     if _state["loaded"]:
-        return _state["modules"]
+        return None
     message = "real brokkr unavailable: {}".format(_state["reason"])
     if os.environ.get("HAMMA_REQUIRE_REAL_BROKKR") == "1":
         raise RuntimeError(message)
-    pytest.skip(message, allow_module_level=True)
+    return message
+
+
+def modules():
+    """The real brokkr module map, or None if it is unavailable."""
+    return _state["modules"] if _load() or _state["loaded"] else None
+
+
+def require():
+    """Return the real brokkr module map, or skip/fail if it is unavailable."""
+    reason = unavailable_reason()
+    if reason is None:
+        return _state["modules"]
+    pytest.skip(reason, allow_module_level=True)
 
 
 def load_plugin(plugin_name="state_monitor", output_step=None):
@@ -221,72 +240,12 @@ def load_plugin(plugin_name="state_monitor", output_step=None):
     return module
 
 
-@contextlib.contextmanager
-def mountpoints(paths):
-    """Make `paths` report as mountpoints to `os.path.ismount`.
-
-    Creating a real mount needs privileges that a test runner does not
-    reliably have, and `os.path.ismount` is a pure predicate over the
-    filesystem -- `find_drives` does not care *how* the answer is produced.
-    Everything else in the path stays real: real directories, real
-    `Path.glob`, real `Path.is_dir`, real `str.format`.  Those are where the
-    bugs were; the privilege boundary is not.
-
-    (A genuinely real mount is possible on macOS via `hdiutil attach
-    -mountpoint`, and on Linux CI via `sudo mount -t tmpfs`.  See
-    `real_mountpoint` below -- it is opt-in because it is slow and
-    platform-specific.)
-    """
-    wanted = {os.path.realpath(str(path)) for path in paths}
-    real_ismount = os.path.ismount
-
-    def ismount(path):
-        return os.path.realpath(str(path)) in wanted or real_ismount(path)
-
-    saved = os.path.ismount
-    os.path.ismount = ismount
-    try:
-        yield
-    finally:
-        os.path.ismount = saved
-
-
-@contextlib.contextmanager
-def real_mountpoint(path, size_mb=8):
-    """Mount a real (tiny) filesystem at `path`. Opt-in; needs tooling.
-
-    macOS: rootless via `hdiutil`.  Linux: needs passwordless sudo, which
-    GitHub Actions runners provide.  Skips if neither is available.
-    """
-    import subprocess
-
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "darwin":
-        image = Path(tempfile.mkdtemp(prefix="hamma_vol_")) / "vol.dmg"
-        subprocess.run(
-            ["hdiutil", "create", "-size", "{}m".format(size_mb), "-fs", "HFS+",
-             "-volname", path.name, "-quiet", str(image)], check=True)
-        subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-quiet",
-             "-mountpoint", str(path), str(image)], check=True)
-        try:
-            yield path
-        finally:
-            subprocess.run(["hdiutil", "detach", "-quiet", str(path)],
-                           check=False)
-            shutil.rmtree(image.parent, ignore_errors=True)
-    elif sys.platform.startswith("linux"):
-        if shutil.which("sudo") is None:
-            pytest.skip("real mounts on Linux need sudo")
-        rc = subprocess.run(
-            ["sudo", "-n", "mount", "-t", "tmpfs", "-o",
-             "size={}m".format(size_mb), "tmpfs", str(path)]).returncode
-        if rc != 0:
-            pytest.skip("passwordless sudo mount unavailable")
-        try:
-            yield path
-        finally:
-            subprocess.run(["sudo", "-n", "umount", str(path)], check=False)
-    else:                                            # pragma: no cover
-        pytest.skip("no real-mount support on {}".format(sys.platform))
+# NOTE: this module deliberately provides no mount helper. Tests stub
+# `os.path.ismount` themselves, because they need to change which paths are
+# mountpoints *during* a test (a partition dropping out mid-run is one of the
+# behaviours under test) and a context manager that captures the set on entry
+# cannot express that. Stubbing that one predicate is legitimate: creating a
+# real mount needs privileges a test runner does not reliably have, and
+# everything else on the path stays real -- real directories, real
+# `Path.glob`, real `Path.is_dir`, real `str.format`. Those are where the bugs
+# were; the privilege boundary is not.
