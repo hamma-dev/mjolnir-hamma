@@ -91,12 +91,24 @@ def _get_output_drive(
 
 
 def _load_real_brokkr_output():
-    """Return the real brokkr.utils.output, or None if brokkr is unavailable."""
+    """Return the real brokkr.utils.output, or None if brokkr is unavailable.
+
+    A bare ``import brokkr`` cannot work here: brokkr is not installed, and
+    importing it writes default TOMLs into ``~/.config`` and resolves its
+    config relative to the CWD.  ``_real_brokkr`` locates the sibling checkout
+    and imports it inside a sandboxed HOME with the system path pinned.
+    """
     try:
-        import brokkr.utils.output
-    except Exception:      # noqa: BLE001 - brokkr's import needs its config
+        from . import _real_brokkr
+    except ImportError:
+        import _real_brokkr
+    try:
+        _real_brokkr._load()
+        if not _real_brokkr._state["loaded"]:
+            return None
+        return _real_brokkr._state["modules"]["brokkr.utils.output"]
+    except Exception:      # noqa: BLE001 - never let harness trouble fail collection
         return None
-    return brokkr.utils.output
 
 
 REAL_BROKKR_OUTPUT = _load_real_brokkr_output()
