@@ -266,16 +266,21 @@ class FakeStatVFS:
     """os.statvfs result: free space, the read-only flag, realistic geometry.
 
     `f_bsize != f_frsize` and `f_bfree != f_bavail` on purpose -- they differ
-    on a real ext4 volume (I/O block size, and the 5% root reserve), and the
-    implementation must use the same pair `shutil.disk_usage` does.
+    on a real ext4 volume (I/O block size, and the root reserve), and the
+    implementation must use the same pair `shutil.disk_usage` does. The
+    reserve is a realistic ~5% of 1.8 TB, not a token offset: at 512 KB an
+    f_bavail -> f_bfree swap is undetectable, which is the whole point of
+    setting them apart.
     """
+
+    RESERVE_BYTES = int(0.05 * 1.8e12)      # ~90 GB, as ext4 actually reserves
 
     def __init__(self, free_bytes, readonly=False):
         self.f_frsize = 512                 # fragment size: the one that counts
         self.f_bsize = 4096                 # preferred I/O size: NOT the one
         self.f_blocks = int(1.8e12) // 512  # the fleet's 1.8 TB disks
         self.f_bavail = int(free_bytes) // 512
-        self.f_bfree = self.f_bavail + 1000  # root reserve
+        self.f_bfree = self.f_bavail + self.RESERVE_BYTES // 512
         self.f_flag = os.ST_RDONLY if readonly else 0
 
 
@@ -375,14 +380,19 @@ class Tree:
     def wrote_to(self, name, age_s=0, hour="2026-08-09T12"):
         self.science_write(self.media / name, age_s=age_s, hour=hour)
 
+    #: Absolute, NOT derived from any constant in the module under test. An
+    #: earlier version used `2 * MODULE.DRIVE_TARGET_EVIDENCE_S`, so shrinking
+    #: that constant to 1 shrank "quiet" with it and the mutation survived.
+    QUIET_AGE_S = 7 * 86400
+
     def go_quiet(self, age_s=None):
-        """Age every science write out of the evidence window.
+        """Age every science write into the past.
 
         What a lull between storms looks like: the fault is untouched, but
-        nothing has been written recently enough to prove brokkr tried.
+        nothing has been written since to prove brokkr tried.
         """
         if age_s is None:
-            age_s = 2 * MODULE.DRIVE_TARGET_EVIDENCE_S
+            age_s = self.QUIET_AGE_S
         roots = [self.fallback] + list(self.media.iterdir())
         for root in roots:
             if not root.is_dir():
@@ -467,11 +477,12 @@ def named(alert):
 
 # --- Topologies --------------------------------------------------------------
 
-def mj51_tree(tmp_path, sd_write_age_s=0):
+def mj51_tree(tmp_path):
     """sensor-log #52: stale DATA31/DATA42 dirs, real partitions at DATA*1.
 
-    With `sd_write_age_s` seconds since brokkr last wrote to the SD-card
-    fallback -- the evidence that brokkr tried to mount and failed.
+    Structure only. The evidence -- brokkr falling back to the SD card -- has
+    to post-date the topology, so tests add it with `falls_back` after the
+    monitor has observed the tree at least once.
     """
     tree = Tree(tmp_path)
     tree.label("DATA31")
@@ -480,9 +491,21 @@ def mj51_tree(tmp_path, sd_write_age_s=0):
     tree.stale_dir("DATA42")
     tree.mount("DATA311", free_gib=500)   # udisks' suffixed mountpoints
     tree.mount("DATA421", free_gib=500)
-    if sd_write_age_s is not None:
-        tree.wrote_to_sd(age_s=sd_write_age_s)
     return tree
+
+
+def falls_back(monitor, tree, settle_cycles=1):
+    """Observe the topology, then have brokkr write to the SD card.
+
+    Models what actually happens on a sensor: brokkr starts (or the
+    mountpoints are rearranged), the monitor sees that arrangement, and only
+    the NEXT lightning trigger produces evidence attributable to it. A fault
+    that predates the monitor is confirmed by the next trigger, not by writes
+    left over from before.
+    """
+    messages = run_cycles(monitor, settle_cycles)
+    tree.wrote_to_sd(age_s=0)
+    return messages
 
 
 def healthy_tree(tmp_path, free_gib=500):
@@ -496,6 +519,58 @@ def healthy_tree(tmp_path, free_gib=500):
 
 
 # --- The config/constructor contract ----------------------------------------
+
+#: The ONLY keys `Tree.drive_kwargs()` is allowed to change. Everything else
+#: must reach the plugin exactly as config/main.toml ships it.
+#:
+#: This is the rule that kept getting broken in a new place each round: first a
+#: test-local `find_drives`, then `fallback_path` rewritten to a pre-expanded
+#: absolute path (which hid a production bug the suite was named after), then
+#: constants read back out of the module under test. Stating it in a docstring
+#: did not stop it, so it is enforced here instead.
+FIXTURE_MAY_OVERRIDE = frozenset(["base_path", "mount_base_path"])
+
+
+class TestFixtureIntegrity:
+    """The fixture must not substitute the values under test."""
+
+    def test_fixture_overrides_only_the_path_roots(self, tmp_path):
+        tree = Tree(tmp_path)
+        shipped = config_drive_kwargs()
+        fixture = tree.drive_kwargs()
+        added = set(fixture) - set(shipped)
+        assert added <= FIXTURE_MAY_OVERRIDE, (
+            "the fixture added {}".format(sorted(added - FIXTURE_MAY_OVERRIDE)))
+        assert not set(shipped) - set(fixture), "the fixture dropped keys"
+        changed = {key for key in shipped if fixture[key] != shipped[key]}
+        assert changed <= FIXTURE_MAY_OVERRIDE, (
+            "{} differ from the shipped config; redirect HOME or the base "
+            "paths, never the value under test".format(sorted(
+                changed - FIXTURE_MAY_OVERRIDE)))
+
+    def test_fallback_path_reaches_the_plugin_unmodified(self, tmp_path):
+        """The specific substitution that hid the convert_path bug."""
+        tree = Tree(tmp_path)
+        assert (tree.drive_kwargs()["fallback_path"]
+                == config_drive_kwargs()["fallback_path"])
+        assert tree.drive_kwargs()["fallback_path"].startswith("~")
+
+    def test_tuning_constants_hold_their_shipped_values(self):
+        """Pin the values, not just the types.
+
+        Mutating a constant downward otherwise survives, because fixtures that
+        derive their own magnitudes from the module scale with the mutation.
+        """
+        assert MODULE.DRIVE_TARGET_CYCLES == 5
+        assert MODULE.DRIVE_TARGET_RENOTIFY_CYCLES == 60
+        assert MODULE.DRIVE_TARGET_BLIND_CYCLES == 60
+        assert MODULE.DRIVE_TARGET_CLOCK_SLACK_S == 60
+
+    def test_quiet_age_is_not_derived_from_the_module(self):
+        source = Path(__file__).read_text()
+        quiet = source.split("QUIET_AGE_S = ", 1)[1].split("\n", 1)[0]
+        assert "MODULE" not in quiet
+
 
 class TestConfigContract:
     """A config key with no constructor parameter is a fleet-wide outage.
@@ -545,7 +620,8 @@ class TestConfigContract:
         keys = set(config_state_monitor_kwargs())
         assert not [key for key in keys if key.startswith("drive_target")]
         for name in ("DRIVE_TARGET_CYCLES", "DRIVE_TARGET_RENOTIFY_CYCLES",
-                     "DRIVE_TARGET_BLIND_CYCLES", "DRIVE_TARGET_EVIDENCE_S"):
+                     "DRIVE_TARGET_BLIND_CYCLES",
+                     "DRIVE_TARGET_CLOCK_SLACK_S"):
             assert isinstance(getattr(MODULE, name), (int, float))
 
     def test_real_init_sets_up_the_latch_state(self):
@@ -592,6 +668,62 @@ class TestBrokkrContract:
         assert defaults == expected
         assert defaults["base_path"] == "/media/{current_user}"
         assert defaults["mount_base_path"] == "/dev/disk/by-label"
+
+    @pytest.mark.skipif(REAL_BROKKR_OUTPUT is None,
+                        reason="needs real brokkr to resolve the real paths")
+    def test_production_config_shape_resolves_end_to_end(self, tmp_path):
+        """The shipped config sets NEITHER base_path NOR mount_base_path.
+
+        Production therefore gets both from `_output_drive_defaults()`. Every
+        other behavioural test overrides them at the temp tree, so the method
+        with the longest justification in the file had no end-to-end coverage
+        -- `defaults = {}` was green. Here the shipped drive_kwargs is passed
+        through untouched and the temp tree is reached by pointing
+        `{current_user}` and `/dev/disk/by-label` at it instead.
+        """
+        shipped = config_drive_kwargs()
+        assert "base_path" not in shipped and "mount_base_path" not in shipped
+
+        # /media/<user> and /dev/disk/by-label, relocated under tmp_path by
+        # patching only what brokkr itself would consult.
+        media = tmp_path / "media"
+        user_dir = media / USER
+        by_label = tmp_path / "dev" / "disk" / "by-label"
+        user_dir.mkdir(parents=True)
+        by_label.mkdir(parents=True)
+        tree = Tree(tmp_path / "unused")
+        tree.media_base, tree.media, tree.by_label = media, user_dir, by_label
+        tree.label("DATA31")
+        tree.stale_dir("DATA31")
+        tree.mount("DATA311", free_gib=500)
+        tree.wrote_to_sd(age_s=0)
+
+        real_convert = real_convert_path()
+
+        def relocate(path):
+            """Resolve as brokkr does, then re-root the two absolute prefixes."""
+            resolved = str(real_convert(path))
+            for original, replacement in (("/media", str(media)),
+                                          ("/dev/disk/by-label",
+                                           str(by_label))):
+                if resolved.startswith(original):
+                    return Path(replacement + resolved[len(original):])
+            return Path(resolved)
+
+        # brokkr's find_drives resolves paths through its OWN reference to
+        # convert_path, so the real module has to be patched too -- patching
+        # only the plugin's view would leave brokkr globbing the real /media.
+        misc = _real_brokkr.modules()["brokkr.utils.misc"]
+        monitor = make_monitor()
+        with sensor(tree, shipped):
+            with patch.object(misc, "convert_path", relocate), \
+                    patch.object(MOCK_BROKKR.utils.misc, "convert_path",
+                                 relocate):
+                with tuning(DRIVE_TARGET_CYCLES=1):
+                    falls_back(monitor, tree)
+                    alert = monitor.check_drive_target(None)
+        assert alert is not None
+        assert "DATA31" in named(alert)
 
     def test_no_glob_literal_in_the_plugin(self):
         source = PLUGIN_PATH.read_text()
@@ -640,13 +772,16 @@ class TestBrokkrContract:
         brokkr resolves it with `.format()` AND `convert_path`
         (render_output_filename, output.py:203). Resolving only the first half
         leaves a literal tilde that matches nothing on disk -- and since this
-        path is the check's evidence that brokkr wrote to the SD card, and the
-        only evidence source in the mj51 topology, that made the total-loss
-        case silent while the partial case still alerted.
+        path is the check's only evidence source, that made the mj51 case
+        silent.
         """
-        assert config_drive_kwargs()["fallback_path"].startswith("~"), (
-            "this test is meaningless unless the shipped value is ~-relative")
         tree = mj51_tree(tmp_path)
+        # Guard on the value actually handed to the plugin. Reading the
+        # shipped config here instead let a fixture that overrode
+        # fallback_path defeat this test while the guard still passed.
+        assert tree.drive_kwargs()["fallback_path"].startswith("~"), (
+            "this test is meaningless unless the plugin receives the "
+            "~-relative template")
         monitor = make_monitor()
         with sensor(tree):
             view = monitor._brokkr_drive_view()
@@ -712,7 +847,26 @@ class TestBrokkrContract:
         monitor = make_monitor()
         with sensor(tree):
             with patch.object(OUTPUT_MODULE, "get_output_drive", tripwire):
+                falls_back(monitor, tree)
                 assert monitor.check_drive_target(None) is not None
+
+    def test_require_real_brokkr_guard_raises(self, monkeypatch):
+        """The CI guard was inert once and shipped that way (S06).
+
+        Without this, re-breaking it is green and a CI run with no brokkr
+        source is byte-identical to one with it.
+        """
+        monkeypatch.setitem(_real_brokkr._state, "loaded", False)
+        monkeypatch.setitem(_real_brokkr._state, "reason", "simulated absence")
+        monkeypatch.setenv("HAMMA_REQUIRE_REAL_BROKKR", "1")
+        with pytest.raises(RuntimeError, match="simulated absence"):
+            _real_brokkr.unavailable_reason()
+
+    def test_require_real_brokkr_guard_is_opt_in(self, monkeypatch):
+        monkeypatch.setitem(_real_brokkr._state, "loaded", False)
+        monkeypatch.setitem(_real_brokkr._state, "reason", "simulated absence")
+        monkeypatch.delenv("HAMMA_REQUIRE_REAL_BROKKR", raising=False)
+        assert "simulated absence" in _real_brokkr.unavailable_reason()
 
     @pytest.mark.skipif(REAL_BROKKR_OUTPUT is None,
                         reason="no brokkr source available")
@@ -786,32 +940,102 @@ class TestPreTriggerState:
             tree.wrote_to_sd(age_s=0, hour="2026-08-09T12")
             assert monitor.check_drive_target(None) is not None
 
-    def test_a_write_to_a_working_partition_is_also_evidence(
-            self, tmp_path, prompt):
-        """One partition mounted, one hidden: brokkr's mounter demonstrably ran."""
-        tree = Tree(tmp_path)
-        tree.label("DATA31")
-        tree.label("DATA42")
-        tree.mount("DATA31", free_gib=500)
-        tree.stale_dir("DATA42")
-        tree.mount("DATA421", free_gib=500)
-        monitor = make_monitor()
-        with sensor(tree):
-            assert monitor.check_drive_target(None) is None   # no writes yet
-            tree.wrote_to("DATA31")
-            alert = monitor.check_drive_target(None)
-        assert alert is not None
-        assert named(alert) == {"DATA42", "DATA421", "DATA31"}
+    def test_reboot_within_the_old_window_is_silent(self, tmp_path, prompt):
+        """Operator reboots to clear a stale mountpoint (N1a).
 
-    def test_the_evidence_window_is_the_module_constant(self, tmp_path, prompt):
+        udisks removed the mountpoints; brokkr has not run at all yet. But the
+        pre-reboot fallback writes are only 18 minutes old, so a bare
+        "within the last hour" window opened the gate and the check announced
+        that brokkr had tried and failed. Every clause of that was false.
+        Evidence must post-date the CURRENT topology, and a restart makes the
+        first observed topology current.
+        """
         tree = self.freshly_booted(tmp_path)
-        tree.wrote_to_sd(age_s=1800)          # 30 min
+        tree.wrote_to_sd(age_s=18 * 60)
         monitor = make_monitor()
         with sensor(tree):
-            with tuning(DRIVE_TARGET_EVIDENCE_S=600):
-                assert monitor.check_drive_target(None) is None
-            with tuning(DRIVE_TARGET_EVIDENCE_S=7200):
-                assert monitor.check_drive_target(None) is not None
+            assert run_cycles(monitor, 10) == [None] * 10
+
+    def test_half_finished_manual_remedy_is_silent(self, tmp_path, prompt):
+        """Operator has unmounted and rmdir'd, and is waiting for a trigger (N1b).
+
+        The alert's own prescribed remedy, mid-flight. Unmounting changes the
+        topology, so the writes from before it stop counting.
+        """
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+            # the remedy: unmount the suffixed mounts, rmdir the stale dirs
+            for suffixed, stale in (("DATA311", "DATA31"),
+                                    ("DATA421", "DATA42")):
+                tree.unmount(suffixed)
+                shutil.rmtree(str(tree.media / suffixed))
+                shutil.rmtree(str(tree.media / stale))
+            # Clear ALL the latch state, so the only thing that can keep the
+            # check quiet is the evidence gate itself. Leaving
+            # `_drive_target_alert_at` set let the renotify floor do the
+            # silencing and the test passed without the gate working.
+            before = monitor._drive_topology_since
+            monitor._drive_target_alerted = None
+            monitor._drive_target_count = 0
+            monitor._drive_target_alert_at = None
+            assert run_cycles(monitor, 10) == [None] * 10
+            assert monitor._drive_topology_since > before, (
+                "unmounting is a topology change and must restart the clock")
+
+    def test_scrub_activity_is_not_evidence(self, tmp_path, prompt):
+        """hamma_scrub --recover writes into the DATA partitions (N1c).
+
+        It reproduces brokkr's own directory and filename convention there and
+        mkstemps in the partition root, and THIS class spawns it every
+        scrub_cooldown_s while the AGS drive is low -- so a check that accepted
+        writes under /media/<user>/DATA* as evidence would manufacture, every
+        five minutes, the proof it then consumed. Only the SD-card fallback
+        counts, which the scrub never touches.
+        """
+        # The mj51 shape, where the scrub's unfiltered glob lands in the STALE
+        # directory on the SD card -- and brokkr's writer has not run at all.
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            run_cycles(monitor, 1)              # establish the topology
+            tree.wrote_to("DATA31")             # scrub recovers into the orphan
+            tree.wrote_to("DATA42")
+            assert run_cycles(monitor, 5) == [None] * 5
+
+        # And the partial shape: brokkr still has a partition, the scrub keeps
+        # touching it, and that must not become evidence about the other one.
+        other = Tree(tmp_path / "partial")
+        other.label("DATA31")
+        other.label("DATA42")
+        other.mount("DATA31", free_gib=500)
+        other.stale_dir("DATA42")
+        other.mount("DATA421", free_gib=500)
+        monitor = make_monitor()
+        with sensor(other):
+            assert monitor.check_drive_target(None) is None
+            other.wrote_to("DATA31")            # indistinguishable from scrub
+            assert run_cycles(monitor, 5) == [None] * 5
+
+    def test_a_future_timestamp_is_not_evidence(self, tmp_path, prompt):
+        """A clock we cannot trust proves nothing (N4).
+
+        fake-hwclock steps this fleet's clocks backwards across a reboot, and
+        FAT32 stores local time with a mount-time offset. Treating a negative
+        age as "recent" turned a clock step on a quiet, freshly-booted unit
+        into a full false alert.
+        """
+        tree = self.freshly_booted(tmp_path)
+        tree.wrote_to_sd(age_s=-6 * 3600)       # six hours in the future
+        monitor = make_monitor()
+        with sensor(tree):
+            with tuning(DRIVE_TARGET_BLIND_CYCLES=3):
+                messages = run_cycles(monitor, 4)
+        assert all("drive target problem" not in (m or "") for m in messages)
+        assert messages[2] is not None
+        assert "clock cannot be trusted" in messages[2]
 
 
 # --- The acceptance test -----------------------------------------------------
@@ -841,6 +1065,7 @@ class TestMj51Topology:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()          # DRIVE_TARGET_CYCLES = 5, as shipped
         with sensor(tree):
+            falls_back(monitor, tree)
             messages = run_cycles(monitor, 5)
         assert messages[:4] == [None] * 4          # damping
         alert = messages[4]
@@ -854,6 +1079,7 @@ class TestMj51Topology:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             alert = monitor.check_drive_target(None)
         assert {"DATA31", "DATA42"} <= named(alert)
 
@@ -861,6 +1087,7 @@ class TestMj51Topology:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             alert = monitor.check_drive_target(None)
         assert config_drive_kwargs()["drive_glob"] not in alert
         assert "rmdir the leftover empty directory" in alert
@@ -887,9 +1114,15 @@ class TestMj51Topology:
 class TestDiagnosis:
     """The alert must not assert things that are not true of this topology."""
 
-    def test_sd_card_claim_only_when_brokkr_has_no_candidate(
-            self, tmp_path, prompt):
-        """brokkr falls back only on `not canidate_drives`."""
+    def test_a_partial_loss_is_logged_but_not_paged(self, tmp_path, prompt):
+        """One partition hidden while another still works.
+
+        Deliberately not paged: brokkr is not falling back, so the only
+        available evidence would be writes under /media/<user>/DATA*, which
+        the scrub also produces (see test_scrub_activity_is_not_evidence).
+        Data is still landing; if the survivor fills, the capacity half
+        reports it. Recorded at INFO so the state is visible in the log.
+        """
         tree = Tree(tmp_path)
         tree.label("DATA31")
         tree.label("DATA42")
@@ -899,18 +1132,29 @@ class TestDiagnosis:
         tree.wrote_to("DATA31")
         monitor = make_monitor()
         with sensor(tree):
+            assert run_cycles(monitor, 5) == [None] * 5
+        logged = " ".join(str(call) for call in monitor.logger.info.call_args_list)
+        assert "capacity is reduced" in logged
+
+    def test_the_sd_card_claim_is_only_made_when_it_is_true(
+            self, tmp_path, prompt):
+        """`hidden` implies brokkr had no candidate, so the claim always holds."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            falls_back(monitor, tree)
             alert = monitor.check_drive_target(None)
-        assert "SD card" not in alert
-        assert "data is not being lost yet" in alert
+        assert "going to the SD card" in alert
+        assert str(tree.fallback) in alert
 
     def test_rmdir_remedy_only_when_a_stray_mount_exists(
             self, tmp_path, prompt):
         """No suffixed mount -> a different fault and a different remedy."""
         tree = Tree(tmp_path)
         tree.label("DATA31")
-        tree.wrote_to_sd()
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             alert = monitor.check_drive_target(None)
         assert alert is not None
         # (substring, not "rmdir" -- pytest's tmp_path is named after the test)
@@ -940,15 +1184,24 @@ class TestNonDirectoryMatches:
         assert "are not directories" in alert
 
     def test_stray_file_cannot_stand_in_for_its_label(self, tmp_path, prompt):
-        """A file named DATA55 must not satisfy the DATA55 label."""
-        tree = healthy_tree(tmp_path)
+        """A file named DATA55 must not satisfy the DATA55 label.
+
+        Total-loss shape, so the hidden clause is in play: if the stray file
+        counted as a mounted partition, DATA55 would look satisfied and the
+        unit would read as healthy while brokkr wrote to the SD card.
+        """
+        tree = Tree(tmp_path)
         tree.label("DATA55")
         tree.stray_file("DATA55")
         monitor = make_monitor()
-        with sensor(tree):
+        # Two cycles, so the settle cycle (which already sees the stray file)
+        # does not consume the page before the hidden clause appears.
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=2):
+            falls_back(monitor, tree)
             alert = monitor.check_drive_target(None)
         assert alert is not None
         assert "tried and failed to mount them" in alert
+        assert "are not directories" in alert
 
 
 class TestUnusableMounts:
@@ -982,6 +1235,7 @@ class TestUnusableMounts:
         monitor = make_monitor()
         with sensor(tree):
             with tuning(DRIVE_TARGET_CYCLES=99):
+                falls_back(monitor, tree)
                 run_cycles(monitor, 3)
                 assert monitor._drive_target_count == 3
                 with patch.object(OUTPUT_MODULE, "find_drives",
@@ -991,11 +1245,19 @@ class TestUnusableMounts:
         assert monitor.logger.warning.called
 
     def test_incomplete_settings_are_logged_not_raised(self, tmp_path, prompt):
-        tree = mj51_tree(tmp_path)
+        """Every key the check depends on must be guarded, not just the first.
+
+        Uses a tree with real mounted candidates on purpose: with none, the
+        capacity arithmetic never runs, so an unguarded `min_free_gb=None`
+        never gets multiplied and the test passes without the guard existing.
+        """
+        tree = healthy_tree(tmp_path)
         monitor = make_monitor()
-        for broken in ("drive_glob", "min_free_gb"):
+        for broken in ("drive_glob", "base_path", "min_free_gb"):
             with sensor(tree, tree.drive_kwargs(**{broken: None})):
-                assert monitor.check_drive_target(None) is None
+                assert monitor.check_drive_target(None) is None, (
+                    "{}=None should disable the check, not evaluate".format(
+                        broken))
         assert monitor.logger.warning.called
 
 
@@ -1041,6 +1303,55 @@ class TestBlindWatchdog:
         assert [m is not None for m in messages] == [
             False, False, True, False, False, False]
 
+    def test_missing_mount_glob_is_blind_not_silent(self, tmp_path):
+        """A per-unit drive_kwargs without mount_glob (N5).
+
+        There is then no second view to compare against, so the check cannot
+        do its job -- but it used to take the healthy path and report nothing
+        for 70 cycles on a live mj51 fault, with blind_count at 0.
+        """
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree, tree.drive_kwargs(mount_glob=False)):
+            with tuning(DRIVE_TARGET_BLIND_CYCLES=3):
+                tree.wrote_to_sd(age_s=0)
+                messages = run_cycles(monitor, 4)
+        assert messages[2] is not None
+        assert "not configured to mount by label" in messages[2]
+
+    def test_missing_fallback_path_is_blind_not_silent(self, tmp_path):
+        """Same for fallback_path: no evidence source means blind (N5)."""
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree, tree.drive_kwargs(fallback_path=None)):
+            with tuning(DRIVE_TARGET_BLIND_CYCLES=3):
+                tree.wrote_to_sd(age_s=0)
+                messages = run_cycles(monitor, 4)
+        assert messages[2] is not None
+        assert "no fallback_path configured" in messages[2]
+
+    def test_unreadable_by_label_directory_is_blind_not_empty(self, tmp_path):
+        """Path.glob returns [] for chmod 000 as well as for missing (N6).
+
+        So an unreadable /dev/disk/by-label read as "no labelled partitions"
+        -- observation, not blindness -- which is the None-vs-[] contract this
+        file claims to keep.
+        """
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        mode = tree.by_label.stat().st_mode
+        os.chmod(str(tree.by_label), 0o000)
+        try:
+            if os.access(str(tree.by_label), os.R_OK):
+                pytest.skip("running as root; permissions are not enforced")
+            with sensor(tree):
+                with tuning(DRIVE_TARGET_BLIND_CYCLES=3):
+                    messages = run_cycles(monitor, 4)
+        finally:
+            os.chmod(str(tree.by_label), mode)
+        assert messages[2] is not None
+        assert "cannot be read" in messages[2]
+
     def test_recovery_rearms_the_blind_watchdog(self, tmp_path, prompt):
         tree = healthy_tree(tmp_path)
         monitor = make_monitor()
@@ -1057,6 +1368,7 @@ class TestBlindWatchdog:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             latched = monitor._drive_target_alerted
             with patch.object(OUTPUT_MODULE, "find_drives",
@@ -1076,6 +1388,7 @@ class TestDampingAndLatch:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=cycles):
+            falls_back(monitor, tree)
             messages = run_cycles(monitor, cycles + 1)
         assert messages[:cycles - 1] == [None] * (cycles - 1)
         assert messages[cycles - 1] is not None
@@ -1088,46 +1401,52 @@ class TestDampingAndLatch:
         0 alerts over 40 consecutive faulty cycles, because every cycle reset
         the damping count.
         """
-        tree = Tree(tmp_path)
-        tree.label("DATA31")
-        tree.label("DATA42")
-        tree.mount("DATA31", free_gib=500)
-        tree.mount("DATA42", free_gib=500)
-        tree.wrote_to("DATA31")
+        tree = self.flaky_enclosure(tmp_path)
         monitor = make_monitor()
         messages = []
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=5):
             for cycle in range(40):
-                # a flaky enclosure: exactly one partition visible, alternating
-                visible = "DATA42" if cycle % 2 else "DATA31"
-                tree.unmount("DATA31" if cycle % 2 else "DATA42")
-                tree.mounts.add(str(tree.media / visible))
-                # brokkr keeps writing throughout -- that is how we know the
-                # missing partition is a fault and not a quiet unit.
-                tree.wrote_to(visible)
+                self.flap(tree, cycle)
                 messages.append(monitor.check_drive_target(None))
         assert any(message is not None for message in messages), (
             "40 consecutive faulty cycles produced no alert")
 
-    def test_a_flapping_fault_does_not_storm(self, tmp_path):
-        """Re-arming on a changed fault set must not page every cycle."""
+    @staticmethod
+    def flaky_enclosure(tmp_path):
+        """Two labelled partitions, neither mounted, brokkr on the SD card."""
         tree = Tree(tmp_path)
         tree.label("DATA31")
         tree.label("DATA42")
-        tree.mount("DATA31", free_gib=500)
-        tree.mount("DATA42", free_gib=500)
-        tree.wrote_to("DATA31")
+        return tree
+
+    @staticmethod
+    def flap(tree, cycle):
+        """One label drops off the bus on odd cycles; brokkr keeps writing.
+
+        Both states are genuinely faulty -- brokkr has no partition either way
+        -- but the fault SET alternates, which is what the damping counter and
+        the renotify floor have to cope with together.
+        """
+        link = tree.by_label / "DATA42"
+        if cycle % 6 == 0 and link.is_symlink():
+            link.unlink()
+        elif cycle % 6 == 3 and not link.is_symlink():
+            link.symlink_to(tree.root / "dev" / "sdDATA42")
+        # brokkr keeps falling back to the SD card throughout. On the cycle a
+        # label moves, that write pre-dates the new topology and cannot
+        # confirm anything -- which must freeze the machine, not reset it.
+        tree.wrote_to_sd(age_s=0,
+                         hour="2026-08-09T{:02d}".format(cycle % 24))
+
+    def test_a_flapping_fault_does_not_storm(self, tmp_path):
+        """Re-arming on a changed fault set must not page every cycle."""
+        tree = self.flaky_enclosure(tmp_path)
         monitor = make_monitor()
         messages = []
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=2,
                                   DRIVE_TARGET_RENOTIFY_CYCLES=30):
             for cycle in range(60):
-                visible = "DATA42" if cycle % 2 else "DATA31"
-                tree.unmount("DATA31" if cycle % 2 else "DATA42")
-                tree.mounts.add(str(tree.media / visible))
-                # brokkr keeps writing throughout -- that is how we know the
-                # missing partition is a fault and not a quiet unit.
-                tree.wrote_to(visible)
+                self.flap(tree, cycle)
                 messages.append(monitor.check_drive_target(None))
         pages = sum(message is not None for message in messages)
         assert 1 <= pages <= 3, "60 flapping cycles produced {} pages".format(
@@ -1137,6 +1456,7 @@ class TestDampingAndLatch:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             messages = run_cycles(monitor, 30)
         assert sum(message is not None for message in messages) == 1
 
@@ -1147,10 +1467,10 @@ class TestDampingAndLatch:
         tree.label("DATA31")
         tree.stale_dir("DATA31")
         tree.mount("DATA311", free_gib=500)
-        tree.wrote_to_sd()
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
                                   DRIVE_TARGET_RENOTIFY_CYCLES=3):
+            falls_back(monitor, tree)
             first = monitor.check_drive_target(None)
             assert first is not None and named(first) == {"DATA31", "DATA311"}
             shutil.rmtree(str(tree.media / "DATA31"))
@@ -1159,7 +1479,7 @@ class TestDampingAndLatch:
             tree.label("DATA42")
             tree.stale_dir("DATA42")
             tree.mount("DATA421", free_gib=500)
-            tree.wrote_to_sd()
+            falls_back(monitor, tree)
             messages = run_cycles(monitor, 4)
         assert messages[:2] == [None, None]      # inside the renotify floor
         assert messages[2] is not None
@@ -1169,6 +1489,7 @@ class TestDampingAndLatch:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             # operator fixes it: rmdir the orphans, remount properly
             for name in ("DATA311", "DATA421"):
@@ -1180,9 +1501,11 @@ class TestDampingAndLatch:
             assert monitor.check_drive_target(None) is None
             assert monitor._drive_target_alerted is None
             assert monitor._drive_target_alert_at is None
-            # and it breaks again
+            # and it breaks again -- a new topology, so a fresh fallback
+            # write is needed before it can be confirmed
             for name in ("DATA31", "DATA42"):
                 tree.unmount(name)
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
 
     def test_quiet_gaps_are_not_recovery(self, tmp_path):
@@ -1198,6 +1521,7 @@ class TestDampingAndLatch:
         monitor = make_monitor()
         pages = []
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=2):
+            run_cycles(monitor, 1)      # establish the topology
             for burst in range(4):
                 tree.wrote_to_sd(age_s=0,
                                  hour="2026-08-09T{:02d}".format(10 + burst))
@@ -1217,6 +1541,7 @@ class TestDampingAndLatch:
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
                                   DRIVE_TARGET_RENOTIFY_CYCLES=30):
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             tree.go_quiet()
             run_cycles(monitor, 5)
@@ -1230,6 +1555,7 @@ class TestDampingAndLatch:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             tree.go_quiet()
             for name in ("DATA311", "DATA421"):
@@ -1256,11 +1582,49 @@ class TestDampingAndLatch:
                              filename_kwargs=filename_kwargs)
 
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             latched = monitor._drive_target_alerted
             with patch.object(OUTPUT_MODULE, "find_drives", only_labels_fail):
                 run_cycles(monitor, 3)
             assert monitor._drive_target_alerted == latched
+
+    def test_label_flapping_does_not_storm(self, tmp_path):
+        """THE INVARIANT, on the branch that was still missing it.
+
+        A flaky USB enclosure resetting on the bus makes the by-label symlink
+        disappear for a cycle. `missing` then empties, the fault set empties,
+        and a state machine that reads that as health resets the latch AND the
+        floor. Measured before the invariant restructure: 11 pages in 66
+        cycles against a floor that intends <=1/hour. A vanished label has not
+        been proven fixed -- it has stopped being observable.
+        """
+        tree = mj51_tree(tmp_path)
+        monitor = make_monitor()
+        # EVERY label drops, so the fault genuinely stops being observable --
+        # `missing` empties and the fault set with it. Dropping only one of
+        # two leaves the fault visible and does not exercise the invariant.
+        links = {name: (tree.by_label / name, tree.root / "dev" / ("sd" + name))
+                 for name in ("DATA31", "DATA42")}
+        pages = []
+        # Three, not five: the runs of confirmable cycles between drops are
+        # four long, so a five-cycle damping window would never page at all
+        # and `<= 1` would pass without the invariant doing anything.
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=3):
+            for cycle in range(66):
+                for link, target in links.values():
+                    if cycle % 6 == 5:
+                        if link.is_symlink():
+                            link.unlink()               # enclosure resets
+                    elif not link.is_symlink():
+                        link.symlink_to(target)         # and comes back
+                tree.wrote_to_sd(age_s=0,
+                                 hour="2026-08-09T{:02d}".format(cycle % 24))
+                message = monitor.check_drive_target(None)
+                if message:
+                    pages.append(message)
+        assert len(pages) == 1, (
+            "label flapping produced {} pages".format(len(pages)))
 
     def test_a_flap_shorter_than_the_window_never_pages(self, tmp_path):
         tree = healthy_tree(tmp_path)
@@ -1365,31 +1729,63 @@ class TestCapacity:
         with sensor(tree):
             assert monitor.check_drive_target(None) is None
 
-    def test_capacity_is_reported_alongside_a_hidden_partition(
+    def test_a_readonly_partition_is_not_offered_as_capacity(
             self, tmp_path, prompt):
-        """Both are true and the capacity one is the emergency."""
+        """The live mj54 shape, verified in the field 2026-08-09.
+
+            DATA80  1465.1 GiB free, mounted ro, FAT-fs cluster-chain errors
+            DATA81  writable, and the only partition brokkr can actually use
+
+        Counting DATA80's free space made it `remaining`, so when DATA81 fills
+        the alert offered DATA80 as "the last one, with 1465.1 GiB free" and
+        ~100 days of runway -- for a partition brokkr cannot write one byte
+        to, contradicting the readonly clause in the same message.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA80")
+        tree.label("DATA81")
+        tree.mount("DATA80", free_gib=1465, readonly=True)
+        tree.mount("DATA81", free_gib=0)
+        tree.wrote_to("DATA81")
+        monitor = make_monitor()
+        with sensor(tree):
+            alert = monitor.check_drive_target(None)
+        assert alert is not None
+        assert "READ-ONLY" in alert and "DATA80" in alert
+        assert "1465" not in alert, "must not quote a read-only partition's free space"
+        assert "last one" not in alert, "must not offer it as somewhere to write"
+        assert "min_free_gb" in alert, "the true state is: nothing writable left"
+        assert named(alert) == {"DATA80", "DATA81"}
+
+    def test_capacity_is_reported_alongside_another_fault(
+            self, tmp_path, prompt):
+        """Never suppressed by a co-occurring fault: it is the emergency.
+
+        (The co-occurring fault here is a non-directory match rather than a
+        hidden partition, because `hidden` is by construction only reported
+        when brokkr has no candidate at all, and then there is no capacity to
+        report. The rule under test -- report both -- is the same.)
+        """
         tree = Tree(tmp_path)
         tree.label("DATA31")
-        tree.label("DATA42")
         tree.mount("DATA31", free_gib=0)       # the only one brokkr can use
-        tree.stale_dir("DATA42")
-        tree.mount("DATA421", free_gib=900)
+        tree.stray_file("DATA55")
         tree.wrote_to("DATA31")
         monitor = make_monitor()
         with sensor(tree):
             alert = monitor.check_drive_target(None)
         assert alert is not None
-        assert "tried and failed to mount them" in alert    # the hidden one
-        assert "min_free_gb" in alert and "ENOSPC" in alert  # the emergency
+        assert "are not directories" in alert                # the other fault
+        assert "min_free_gb" in alert and "ENOSPC" in alert   # the emergency
 
-    def test_last_partition_is_reported_with_a_hidden_third(
+    def test_last_partition_is_reported_with_another_fault(
             self, tmp_path, prompt):
         tree = Tree(tmp_path)
-        for name in ("DATA31", "DATA42", "DATA53"):
-            tree.label(name)
+        tree.label("DATA31")
+        tree.label("DATA42")
         tree.mount("DATA31", free_gib=0)
         tree.mount("DATA42", free_gib=900)
-        tree.stale_dir("DATA53")
+        tree.stray_file("DATA53")
         tree.wrote_to("DATA42")
         monitor = make_monitor()
         with sensor(tree):
@@ -1413,6 +1809,7 @@ class TestAlertOnly:
                     patch("os.remove") as remove, \
                     patch("os.unlink") as unlink, \
                     patch("shutil.rmtree") as rmtree:
+                falls_back(monitor, tree)
                 assert monitor.check_drive_target(None) is not None
         for mock in (popen, run, rmdir, remove, unlink, rmtree):
             assert not mock.called
@@ -1422,5 +1819,6 @@ class TestAlertOnly:
         before = sorted(path.name for path in tree.media.iterdir())
         monitor = make_monitor()
         with sensor(tree):
+            falls_back(monitor, tree)
             run_cycles(monitor, 3)
         assert sorted(path.name for path in tree.media.iterdir()) == before

@@ -99,16 +99,33 @@ def _find_brokkr_src():
     # Walk up rather than assuming a fixed depth: feature work in this repo
     # happens in git worktrees (.claude/worktrees/<agent>/, .worktrees/<name>/),
     # where REPO_ROOT.parent is NOT the directory holding the sibling checkouts.
+    #
+    # But collect ALL the hits and refuse to guess between them. Walking to the
+    # filesystem root means an unrelated leftover checkout several levels up can
+    # silently become the brokkr under test, which makes the result depend on
+    # the developer's directory layout. Ambiguity is a hard error with a named
+    # remedy, not a coin toss.
+    candidates = []
     for ancestor in [REPO_ROOT] + list(REPO_ROOT.parents):
         sibling = ancestor.parent / "brokkr" / "src"
         if (sibling / "brokkr" / "__init__.py").is_file():
-            return sibling
+            resolved = sibling.resolve()
+            if resolved not in candidates:
+                candidates.append(resolved)
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "several brokkr checkouts are visible from {} ({}); set "
+            "BROKKR_SRC to choose one".format(
+                REPO_ROOT, ", ".join(str(path) for path in candidates)))
+    if candidates:
+        return candidates[0]
 
     if importlib.util.find_spec("brokkr") is not None:
         return None   # installed; nothing to add to sys.path
     raise RuntimeError(
-        "no brokkr source found (looked at $BROKKR_SRC, {}, and the "
-        "installed packages)".format(sibling))
+        "no brokkr source found (looked at $BROKKR_SRC, every "
+        "<ancestor>/../brokkr/src above {}, and the installed "
+        "packages)".format(REPO_ROOT))
 
 
 def _load():

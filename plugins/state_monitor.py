@@ -74,21 +74,67 @@ DRIVE_TARGET_RENOTIFY_CYCLES = 60
 # Several paths here can silently self-disable, and a check that reports its
 # own failures only to the log is a check nobody hears.
 DRIVE_TARGET_BLIND_CYCLES = 60
-# How recently brokkr's science writer must have run for a labelled-but-absent
-# partition to count as a fault (1 h).
-#
-# THIS IS THE PREMISE OF THE WHOLE CHECK. There is no automounter on these
-# units -- `setup_automount` installs a polkit *authorization* only, no fstab
-# entry, no udev rule, no .mount unit. brokkr is the only thing that ever
-# mounts /media/<user>/DATA*, and it does it from FileOutputStep.execute ->
+# Seconds a file mtime may exceed the current clock before it is treated as
+# untrustworthy rather than as evidence. fake-hwclock steps this fleet's
+# clocks non-monotonically across reboots, and FAT32 stores local time with a
+# mount-time offset, so future mtimes are a real occurrence here -- and a
+# timestamp we cannot trust is not proof of anything.
+DRIVE_TARGET_CLOCK_SLACK_S = 60
+
+# THE PREMISE OF THE WHOLE CHECK. There is no automounter on these units --
+# `setup_automount` installs a polkit *authorization* only, no fstab entry, no
+# udev rule, no .mount unit. brokkr is the only thing that ever mounts
+# /media/<user>/DATA*, and it does it from FileOutputStep.execute ->
 # render_output_filename -> get_output_drive -> mount_drives: once per science
 # packet, i.e. only when lightning triggers the sensor. udisks removes the
 # mountpoint directories at boot. So "labelled but not mounted" is the
-# ORDINARY state of a quiet or freshly-booted unit, and it lasts until the
-# next lightning trigger -- an unbounded, weather-dependent wait. No cycle
-# count can separate the fault from that state; only evidence that brokkr's
-# writer actually ran, and the drive still is not there, can.
-DRIVE_TARGET_EVIDENCE_S = 3600
+# ORDINARY state of a quiet or freshly-booted unit, and it lasts until the next
+# lightning trigger -- an unbounded, weather-dependent wait.
+#
+# The only thing that separates the fault from that state is evidence that
+# brokkr's writer ran and the partition still is not there. That evidence has
+# to prove two things, and earlier versions of this check proved neither:
+#
+#   ATTRIBUTABLE -- written by brokkr's science writer and nothing else. Writes
+#     to /media/<user>/DATA* do NOT qualify: `hamma_scrub.py --recover`
+#     reproduces brokkr's own directory and filename convention there (see
+#     `compute_target_path`) and mkstemps in the partition root, and it is
+#     spawned by THIS class every scrub_cooldown_s while the AGS drive is low.
+#     The check would have been manufacturing the evidence it consumed. Only
+#     the SD-card fallback path qualifies: `hamma_scrub.select_target_drive`
+#     globs the DATA partitions and returns None when it finds none -- it never
+#     writes to ~/brokkr/<system>/science.
+#
+#   NEWER THAN THE CURRENT TOPOLOGY -- a write from before the mountpoints were
+#     last rearranged says nothing about whether brokkr has tried since. A
+#     reboot to clear a stale mountpoint, or an operator halfway through the
+#     unmount/rmdir/remount remedy, both leave recent writes lying around; a
+#     bare "within the last hour" window reported both as confirmed faults.
+#     `_drive_topology_since` timestamps the last observed change in (labels,
+#     brokkr's candidates, what is mounted under the base) and the evidence
+#     must post-date it. This is also why no window constant is needed: on a
+#     stable topology a single write is evidence indefinitely, which is exactly
+#     right for a fault nobody has touched.
+
+# THE INVARIANT, for anything that touches the state machine below:
+#
+#     The latch and its floor may be cleared only by positive evidence that
+#     the fault is gone -- never by the fault becoming unobservable.
+#
+# Every cycle resolves to exactly one of three verdicts. CLEAR is reachable
+# only from an affirmative "we looked, we could see, and there is no fault";
+# everything else is UNKNOWN, which freezes the latch, the floor and the
+# counter. Bugs in three separate rounds of review were all the same mistake:
+# a path where the fault stopped being visible took the healthy branch.
+_VERDICT_FAULTY = "faulty"     # a fault is present right now
+_VERDICT_CLEAR = "clear"       # we could see everything, and it is fine
+_VERDICT_UNKNOWN = "unknown"   # we could not establish either -- freeze
+
+# Fault kinds whose offender simply being gone IS the repair. For every other
+# kind the offender must be observed HEALTHY before the latch clears: a
+# partition that vanished has not been proven fixed, it has stopped being
+# observable.
+_RESOLVED_BY_ABSENCE = frozenset(["notdir"])
 
 # Both views the HAM-185 check compares. Nothing here is a new drive-discovery
 # rule: `candidates` is brokkr's own science-output resolution and `labels` is
@@ -98,6 +144,7 @@ _DriveView = collections.namedtuple("_DriveView", [
     "labels",         # list[Path]: labelled DATA devices attached, or None
     "mount_configured",  # bool: brokkr is configured to mount by label at all
     "base_path",      # Path: mount base, resolved as brokkr resolves it
+    "mount_base_path",   # str|None: where the labelled devices are looked up
     "fallback_path",  # Path|None: where brokkr writes when it finds no drive
     "min_free_gb",    # numeric: brokkr's own "this partition is full" floor
     ])
@@ -257,6 +304,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self._drive_target_count = 0          # consecutive faulty cycles
         self._drive_target_alerted = None     # fault set already reported
         self._drive_target_alert_at = None    # count when that page went out
+        # Fingerprint of (labels, brokkr's candidates, what is mounted under
+        # the base) and when it last changed. Evidence older than the current
+        # topology is not evidence -- see the PREMISE block. Starting at None
+        # means the first observed cycle sets the clock to now, so a restart
+        # correctly requires a fresh write before anything can be confirmed.
+        self._drive_topology = None
+        self._drive_topology_since = None
         # Self-report when the check cannot evaluate, instead of going quiet.
         self._drive_target_blind_count = 0
         self._drive_target_blind_alerted = False
@@ -644,27 +698,55 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             candidates=candidates,
             labels=labels,
             mount_configured=bool(mount_glob),
+            mount_base_path=mount_base_path,
             base_path=resolved_base,
             fallback_path=fallback_path,
             min_free_gb=min_free_gb,
             )
 
-    def _mounted_under(self, base_path):
-        """Names of everything actually mounted under `base_path`.
+    @staticmethod
+    def _readable_dir(path):
+        """'yes', 'absent' or 'unreadable' for a directory we need to see.
 
-        Diagnostic only -- never used to decide anything, so it is not a drive
-        discovery rule and applies no pattern. It exists so the alert can name
-        the mountpoint the operator has to act on (``DATA071`` in the mj51
-        incident), which no glob-based view can report by construction.
+        `Path.glob` and `os.listdir` do not agree about failure: glob returns
+        [] for a missing directory AND for one we lack permission on, so an
+        unreadable /dev/disk/by-label would otherwise read as "no labelled
+        partitions" rather than as "we cannot see". 'absent' is an observation
+        (nothing has ever been mounted there); 'unreadable' is blindness.
         """
+        if path is None:
+            return "absent"
+        if not os.path.isdir(str(path)):
+            return "absent"
+        return "yes" if os.access(str(path), os.R_OK | os.X_OK) else "unreadable"
+
+    def _mounted_under(self, base_path):
+        """Names of everything actually mounted under `base_path`, or None.
+
+        Applies no pattern, so it is not a drive-discovery rule. Two uses: it
+        lets the alert name the mountpoint the operator has to act on
+        (``DATA311`` in the mj51 incident), which no glob-based view can report
+        by construction, and it is part of the topology fingerprint, so an
+        operator unmounting something mid-remedy invalidates stale evidence.
+
+        Returns None if the directory exists but cannot be read -- blindness,
+        not emptiness.
+        """
+        state = self._readable_dir(base_path)
+        if state == "absent":
+            return []      # nothing has ever been mounted here
+        if state == "unreadable":
+            self.logger.warning(
+                "state_monitor: %s exists but cannot be read", base_path)
+            return None
         try:
-            entries = sorted(os.listdir(base_path))
+            entries = sorted(os.listdir(str(base_path)))
         except OSError as e:
             self.logger.warning(
                 "state_monitor: cannot list %s (%s)", base_path, e)
-            return []
+            return None
         return [entry for entry in entries
-                if os.path.ismount(os.path.join(base_path, entry))]
+                if os.path.ismount(os.path.join(str(base_path), entry))]
 
     def _newest_write(self, path):
         """Newest mtime at or one level under `path`, or None.
@@ -691,39 +773,37 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "state_monitor: no write history at %s (%s)", path, e)
         return newest
 
-    def _writer_ran_recently(self, view, candidate_paths):
-        """Has brokkr's science writer actually run in the recent past?
+    def _fell_back_to_sd_since(self, view, since):
+        """Did brokkr's writer write to the SD-card fallback after `since`?
 
-        This is the positive evidence that separates "brokkr tried to mount
-        this partition and still cannot write to it" from "brokkr has not been
-        asked to write anything yet". brokkr resolves (and mounts) drives once
-        per science packet, so a write -- to a DATA partition or to the SD-card
-        fallback -- proves `mount_drives` ran. Absent such a write, a missing
-        mountpoint is the ordinary state of a quiet unit and means nothing.
+        The one piece of evidence this check trusts. See the PREMISE block at
+        the top of the file for why it has to be attributable and why it has to
+        post-date the current topology; in short, writes under
+        /media/<user>/DATA* are not attributable (the scrub makes them, and
+        this class spawns the scrub) and a write from before the mountpoints
+        were rearranged proves nothing about now.
 
         Returns
         -------
-        (bool, float | None)
-            Whether a write happened within DRIVE_TARGET_EVIDENCE_S, and the
-            age in seconds of the newest write found (None if none was found).
+        (bool, str | None)
+            Whether brokkr fell back to the SD card after `since`, and a
+            blindness reason if the answer could not be trusted.
         """
-        # The candidate paths come straight from brokkr's `find_drives`, so
-        # they are already resolved by brokkr; never rebuild them from names.
-        paths = list(candidate_paths)
-        if view.fallback_path:
-            paths.append(view.fallback_path)
-        newest = None
-        for path in paths:
-            mtime = self._newest_write(path)
-            if mtime is not None and (newest is None or mtime > newest):
-                newest = mtime
+        if not view.fallback_path:
+            return False, ("brokkr has no fallback_path configured, so a "
+                           "write to the SD card cannot be detected")
+        newest = self._newest_write(view.fallback_path)
         if newest is None:
-            return False, None
-        age = time.time() - newest
-        # A negative age means the clock stepped (fake-hwclock on these units
-        # does that across a reboot). Count it as recent: going quiet on a
-        # clock oddity is the failure mode this check exists to remove.
-        return age <= DRIVE_TARGET_EVIDENCE_S, age
+            return False, None      # brokkr has never fallen back here
+        if newest > time.time() + DRIVE_TARGET_CLOCK_SLACK_S:
+            # NOT evidence. fake-hwclock steps these clocks backwards across a
+            # reboot and FAT32 stores local time, so future mtimes happen --
+            # and a timestamp from an untrustworthy clock proves nothing. The
+            # caller turns this into UNKNOWN, never into a fault or a clear.
+            return False, ("a science-write timestamp at {} is in the future; "
+                           "the clock cannot be trusted, so write recency "
+                           "cannot be established".format(view.fallback_path))
+        return newest > since, None
 
     def _note_blind(self, reason):
         """Count a cycle the check could not evaluate; page once if chronic.
@@ -778,23 +858,30 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         it then measures is not the one brokkr writes to.
 
         Divergence alone is NOT sufficient, and treating it as sufficient was
-        this check's own first mistake. brokkr is the only thing on these units
-        that mounts /media/<user>/DATA* (there is no automounter; see
-        DRIVE_TARGET_EVIDENCE_S), and it does so only when writing a science
-        packet -- i.e. only when lightning triggers the sensor. udisks deletes
-        the mountpoint directories at boot, so a quiet or freshly-booted unit
+        this check's own first mistake. See the PREMISE block at the top of the
+        file: there is no automounter, so a quiet or freshly-booted unit
         legitimately shows every partition labelled and none mounted, for an
-        unbounded time. A hidden partition is therefore reported only when
-        `_writer_ran_recently` confirms brokkr's writer has run since -- proof
-        that `mount_drives` was given its chance and the partition still is not
-        there. That gate cannot fire on a quiet unit and needs no tuning.
+        unbounded time. A hidden partition is reported only when
+        `_fell_back_to_sd_since` confirms brokkr wrote to the SD-card fallback
+        after the current topology was established -- the one signal that is
+        both attributable to brokkr's writer and newer than the arrangement it
+        is being used to judge. That gate cannot fire on a quiet unit, on a
+        unit rebooted to clear a stale mountpoint, on a half-finished manual
+        remedy, or on scrub activity, and it needs no window constant.
+
+        Everything else in the state machine obeys THE INVARIANT stated at the
+        top of the file: only an affirmative observation of health clears the
+        latch. Anything that makes the fault unobservable freezes it instead.
 
         Faults reported, all of them "brokkr cannot write science data here":
 
-        - **hidden** (evidence-gated, above): a labelled DATA partition has no
-          matching mountpoint in brokkr's candidate set. If brokkr has no
-          candidates at all it is writing to the SD card (the mj51 shape); if
-          it has others, data is still landing but capacity is halved.
+        - **hidden** (evidence-gated, above): every labelled DATA partition is
+          missing from brokkr's candidate set and brokkr is falling back to the
+          SD card -- the mj51 shape, and total loss of science data.
+          Deliberately NOT reported when brokkr still has another partition
+          mounted: data is still landing, and there is no evidence source for
+          that case that the scrub cannot also produce. It is logged at INFO
+          and, if the survivor fills, the capacity half reports it.
         - **not a directory**: brokkr's `find_drives` filter (``not is_dir()
           or ismount()``) screens *directories* only, so any non-directory
           match is kept unconditionally and `statvfs` on it reports the
@@ -853,7 +940,6 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "could not be read"))
 
         candidate_dirs = []   # names brokkr's writer would accept
-        candidate_paths = []  # the same, as brokkr's own resolved Paths
         notdir = []
         unreadable = []       # (name, error text)
         readonly = []
@@ -874,7 +960,6 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 notdir.append(drive.name)
                 continue
             candidate_dirs.append(drive.name)
-            candidate_paths.append(drive)
             try:
                 stat_result = os.statvfs(str(drive))
             except OSError as e:
@@ -886,47 +971,101 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 unreadable.append((drive.name, str(e)))
                 continue
             if stat_result.f_flag & ST_RDONLY:
+                # A read-only partition is NOT usable capacity, so it must not
+                # enter `usable` -- exactly like an unreadable one above.
+                # Measured on mj54: DATA80 is mounted ro with 1465 GiB free
+                # while DATA81 is the only writable partition. Counting DATA80
+                # made it the "last one" with months of runway, in the same
+                # alert whose readonly clause said writes to it fail.
                 readonly.append(drive.name)
+                continue
             usable.append(
                 (drive.name, stat_result.f_bavail * stat_result.f_frsize))
 
-        hidden = []
-        # True when this cycle produced no *confirmed* hidden partition but
-        # also could not establish that there is none. An empty fault set then
-        # means "not proven", not "recovered", and must not clear the latch --
-        # see the `if not signature` branch below.
-        unproven = False
-        if view.labels is None and view.mount_configured:
-            # "Could not look" is not "looked and found nothing". Letting a
-            # failed label enumeration fall through to `hidden = []` would
-            # report a unit in the mj51 state as healthy, which is exactly the
-            # silence this check exists to remove.
-            unproven = True
-            blind = self._note_blind(
+        # --- observability -------------------------------------------------
+        # Everything that stops us seeing the truth goes in one list. It is
+        # what makes CLEAR unreachable except from an affirmative observation.
+        blind_reasons = []
+
+        mounted = self._mounted_under(view.base_path)
+        if mounted is None:
+            blind_reasons.append(
+                "{} cannot be listed, so what is mounted there is "
+                "unknown".format(view.base_path))
+            mounted = []
+        if not view.mount_configured:
+            blind_reasons.append(
+                "brokkr is not configured to mount by label (no mount_glob), "
+                "so there is no second view to compare its drives against")
+        elif view.labels is None:
+            blind_reasons.append(
                 "the labelled DATA partitions could not be enumerated")
+        elif not view.labels and self._readable_dir(
+                view.mount_base_path) == "unreadable":
+            blind_reasons.append(
+                "{} exists but cannot be read, so an attached partition would "
+                "look identical to none".format(view.mount_base_path))
+
+        # --- topology fingerprint -------------------------------------------
+        # Evidence older than the current arrangement of mountpoints is not
+        # evidence. Any change here restarts the clock, which is what makes a
+        # reboot, a hot-replug and a half-finished manual remedy all wait for
+        # a fresh write instead of reusing a stale one.
+        fingerprint = (
+            frozenset(drive.name for drive in (view.labels or ())),
+            frozenset(candidate_dirs),
+            frozenset(mounted),
+            )
+        if fingerprint != self._drive_topology:
+            self._drive_topology = fingerprint
+            self._drive_topology_since = time.time()
+
+        hidden = []
+        # A visible-but-unattributable fault: every partition is labelled and
+        # none is mounted, but no fallback write proves brokkr has tried since.
+        # That is NOT health -- it is the fault being unconfirmable -- so it
+        # freezes the machine rather than clearing it. On a unit that has never
+        # had a fault this is indistinguishable from CLEAR; on one that is
+        # flapping it is what stops the damping counter being reset to zero on
+        # every unconfirmable cycle, which would hold it below the threshold
+        # forever.
+        unconfirmed = False
+        if view.labels:
+            missing = sorted({drive.name for drive in view.labels}
+                             - set(candidate_dirs))
+            if missing and candidate_dirs:
+                # brokkr still has somewhere to write, so it is not falling
+                # back and there is no attributable evidence available (see
+                # `_fell_back_to_sd_since`). Reduced capacity, no data loss;
+                # if the survivor fills, the capacity half reports it.
+                self.logger.info(
+                    "state_monitor: %s labelled but not mounted while %s is; "
+                    "capacity is reduced. Not paged: with no fallback write "
+                    "there is no evidence attributable to brokkr's writer",
+                    ", ".join(missing), ", ".join(sorted(candidate_dirs)))
+            elif missing:
+                fell_back, reason = self._fell_back_to_sd_since(
+                    view, self._drive_topology_since)
+                if reason:
+                    blind_reasons.append(reason)
+                elif fell_back:
+                    hidden = missing
+                else:
+                    unconfirmed = True
+                    # The ordinary state of a quiet or freshly-booted unit:
+                    # brokkr has not been asked to write since the mountpoints
+                    # were last arranged, so it has not had its chance yet.
+                    self.logger.debug(
+                        "state_monitor: %s labelled but not mounted; brokkr "
+                        "has not fallen back to the SD card since the current "
+                        "topology was established, so this is the pre-trigger "
+                        "state, not a fault", ", ".join(missing))
+
+        if blind_reasons:
+            blind = self._note_blind("; ".join(blind_reasons))
         else:
             blind = None
             self._clear_blind()
-            if view.labels is not None:
-                missing = sorted({drive.name for drive in view.labels}
-                                 - set(candidate_dirs))
-                if missing:
-                    ran, age = self._writer_ran_recently(view, candidate_paths)
-                    if ran:
-                        hidden = missing
-                    else:
-                        # The partitions are still missing; we just cannot
-                        # prove brokkr has tried since. Suppressed, not fixed.
-                        unproven = True
-                        # The ordinary state of a quiet or freshly-booted
-                        # unit, not a fault. See DRIVE_TARGET_EVIDENCE_S.
-                        self.logger.debug(
-                            "state_monitor: %s labelled but not mounted; "
-                            "brokkr's science writer has not run recently "
-                            "(%s), so this is the pre-trigger state, not a "
-                            "fault", ", ".join(missing),
-                            "no writes found" if age is None
-                            else "{:.0f}s ago".format(age))
 
         # Capacity is NOT suppressed by a hidden partition: "DATA08 is hidden"
         # and "the DATA07 that is left is full" are both true, and the second
@@ -943,7 +1082,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # floor below). An unchanged fault pages once and then stays quiet
         # until it GENUINELY clears -- matching _low_space_alerted /
         # _stuck_scrub_alerted in this file. "Genuinely" is load-bearing: see
-        # the `unproven` handling below. It does NOT nag; to make a persistent
+        # THE INVARIANT block below. It does NOT nag; to make a persistent
         # data-loss condition re-page every DRIVE_TARGET_RENOTIFY_CYCLES,
         # delete the `== signature` early return below (the floor now holds
         # across lulls, so that change is bounded at one page per hour).
@@ -958,19 +1097,35 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         signature = frozenset(
             "{}:{}".format(kind, name) for kind, name in faults)
 
-        if not signature:
-            if unproven:
-                # NOT recovery: the partitions are still missing, or we could
-                # not enumerate them. Freeze the latch and the counter.
-                # Clearing here would re-arm the alert for the next burst of
-                # triggers -- and because the renotify floor below is guarded
-                # on `_drive_target_alert_at is not None`, clearing that too
-                # would bypass the storm floor entirely. Measured on the
-                # version that did clear: one never-fixed mj51 fault paged
-                # once per storm, four times over four bursts.
-                return self._deliver_blind(blind)
-            # Genuinely healthy: clear the latch AND the counter on this exit
-            # path, so the next fault is timed and reported from scratch.
+        # --- THE INVARIANT ---------------------------------------------------
+        # Exactly one verdict per cycle, and CLEAR is reachable only from an
+        # affirmative observation. Two conditions have to hold for it: nothing
+        # blinded us this cycle, AND every partition we previously latched a
+        # fault against is now observed HEALTHY -- mounted where brokkr looks,
+        # readable, writable and not full. A partition whose label merely
+        # vanished has not been proven fixed; it has stopped being observable,
+        # and clearing on that is how a flaky enclosure turned one fault into
+        # 11 pages in 66 cycles.
+        healthy_names = {name for name, _free in remaining}
+        latched_names = set()
+        for entry in (self._drive_target_alerted or ()):
+            kind, _, name = entry.partition(":")
+            if kind not in _RESOLVED_BY_ABSENCE:
+                latched_names.add(name)
+        if signature:
+            verdict = _VERDICT_FAULTY
+        elif (blind_reasons or unconfirmed
+                or (latched_names - healthy_names)):
+            verdict = _VERDICT_UNKNOWN
+        else:
+            verdict = _VERDICT_CLEAR
+
+        if verdict is _VERDICT_UNKNOWN:
+            # Freeze everything. Not recovery: the fault stopped being visible.
+            return self._deliver_blind(blind)
+        if verdict is _VERDICT_CLEAR:
+            # Positive evidence that the fault is gone -- the only thing
+            # allowed to clear the latch, the floor and the counter.
             self._drive_target_count = 0
             self._drive_target_alerted = None
             self._drive_target_alert_at = None
@@ -996,22 +1151,15 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         reasons = []
         if hidden:
-            # Only claim the SD-card fallback when brokkr would actually take
-            # it -- brokkr falls back on `not canidate_drives`, so with any
-            # candidate left the data is still landing on a real partition.
-            if not candidate_dirs:
-                consequence = ("science data is going to the SD card ({})"
-                               .format(view.fallback_path
-                                       or "brokkr's fallback path"))
-            else:
-                consequence = ("brokkr is still writing to {}, so data is not "
-                               "being lost yet, but the unit is down to part "
-                               "of its storage".format(", ".join(
-                                   sorted(candidate_dirs))))
+            # `hidden` is only ever set when brokkr has no candidate at all
+            # and has been observed falling back, so the SD-card claim is
+            # unconditional here by construction.
+            consequence = ("science data is going to the SD card ({})"
+                           .format(view.fallback_path
+                                   or "brokkr's fallback path"))
             # Only prescribe the sensor-log #52 remedy when there really is a
             # mount sitting where brokkr does not look.
-            stray = [name for name in self._mounted_under(view.base_path)
-                     if name not in candidate_dirs]
+            stray = [name for name in mounted if name not in candidate_dirs]
             if stray:
                 remedy = ("something IS mounted under {} where brokkr does not "
                           "look ({}): the sensor-log #52 shape, where a stale "
@@ -1025,10 +1173,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                           "enclosure or an unreadable partition".format(
                               view.base_path))
             reasons.append(
-                "labelled DATA partition(s) {} are attached and brokkr's "
-                "science writer has run since, so it has tried and failed to "
-                "mount them -- {}. {}".format(
-                    ", ".join(hidden), consequence, remedy))
+                "labelled DATA partition(s) {} are attached but not mounted "
+                "where brokkr looks, and brokkr has fallen back to the SD card "
+                "since -- so it has tried and failed to mount them. {}. "
+                "{}".format(", ".join(hidden), consequence, remedy))
         if notdir:
             reasons.append(
                 "{} under {} match brokkr's drive pattern but are not "
