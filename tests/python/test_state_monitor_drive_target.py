@@ -38,6 +38,7 @@ Test-harness notes:
 import ast
 import importlib.util
 import inspect
+import json
 import os
 import re
 import shutil
@@ -298,9 +299,13 @@ class Tree:
         # including the `~` expansion, which is where the real bug was.
         self.home = tmp_path / "home" / USER
         self.fallback = self.home / "brokkr" / "hamma" / "science"
+        # Stands in for /dev/shm. Redirected by `sensor()` so the suite never
+        # reads or writes the real one, and so each test starts with no latch.
+        self.state_file = tmp_path / "shm" / "drive_state.json"
         self.media.mkdir(parents=True)
         self.by_label.mkdir(parents=True)
         self.home.mkdir(parents=True)
+        self.state_file.parent.mkdir(parents=True)
         self.mounts = set()      # paths os.path.ismount() will answer True for
         self.stats = {}          # path -> FakeStatVFS or OSError to raise
 
@@ -456,6 +461,8 @@ def sensor(tree, drive_kwargs=None):
         }
     with patch.dict("sys.modules", modules), \
             patch.dict(os.environ, {"HOME": str(tree.home)}), \
+            patch.object(MODULE, "DEFAULT_DRIVE_STATE_FILE",
+                         str(tree.state_file)), \
             patch("os.path.ismount", side_effect=fake_ismount), \
             patch("os.statvfs", side_effect=fake_statvfs):
         # brokkr's convert_path rewrites "~" to "~$SUDO_USER" before
@@ -562,9 +569,13 @@ class TestFixtureIntegrity:
         derive their own magnitudes from the module scale with the mutation.
         """
         assert MODULE.DRIVE_TARGET_CYCLES == 5
-        assert MODULE.DRIVE_TARGET_RENOTIFY_CYCLES == 60
+        assert MODULE.DRIVE_TARGET_RENOTIFY_S == 3600
         assert MODULE.DRIVE_TARGET_BLIND_CYCLES == 60
         assert MODULE.DRIVE_TARGET_CLOCK_SLACK_S == 60
+        assert MODULE.DRIVE_TARGET_STATE_MAX_AGE_S == 3600
+        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/dev/shm/"), (
+            "the latch must live on tmpfs; see the docstring for why the SD "
+            "card is the wrong place")
 
     def test_quiet_age_is_not_derived_from_the_module(self):
         source = Path(__file__).read_text()
@@ -619,16 +630,17 @@ class TestConfigContract:
         """No new config key: it would be a reverse-path TypeError hazard."""
         keys = set(config_state_monitor_kwargs())
         assert not [key for key in keys if key.startswith("drive_target")]
-        for name in ("DRIVE_TARGET_CYCLES", "DRIVE_TARGET_RENOTIFY_CYCLES",
+        for name in ("DRIVE_TARGET_CYCLES", "DRIVE_TARGET_RENOTIFY_S",
                      "DRIVE_TARGET_BLIND_CYCLES",
-                     "DRIVE_TARGET_CLOCK_SLACK_S"):
+                     "DRIVE_TARGET_CLOCK_SLACK_S",
+                     "DRIVE_TARGET_STATE_MAX_AGE_S"):
             assert isinstance(getattr(MODULE, name), (int, float))
 
     def test_real_init_sets_up_the_latch_state(self):
         monitor = make_monitor()
         assert monitor._drive_target_count == 0
         assert monitor._drive_target_alerted is None
-        assert monitor._drive_target_alert_at is None
+        assert monitor._drive_target_alerted_at is None
         assert monitor._drive_target_blind_count == 0
 
     def test_check_runs_under_the_shipped_config(self):
@@ -1005,19 +1017,9 @@ class TestPreTriggerState:
             tree.wrote_to("DATA42")
             assert run_cycles(monitor, 5) == [None] * 5
 
-        # And the partial shape: brokkr still has a partition, the scrub keeps
-        # touching it, and that must not become evidence about the other one.
-        other = Tree(tmp_path / "partial")
-        other.label("DATA31")
-        other.label("DATA42")
-        other.mount("DATA31", free_gib=500)
-        other.stale_dir("DATA42")
-        other.mount("DATA421", free_gib=500)
-        monitor = make_monitor()
-        with sensor(other):
-            assert monitor.check_drive_target(None) is None
-            other.wrote_to("DATA31")            # indistinguishable from scrub
-            assert run_cycles(monitor, 5) == [None] * 5
+        # (The partial shape -- one partition working, one missing -- DOES
+        # page, but on structural evidence the scrub cannot produce. See
+        # TestDiagnosis::test_partial_loss_never_consults_the_mtime_gate.)
 
     def test_a_future_timestamp_is_not_evidence(self, tmp_path, prompt):
         """A clock we cannot trust proves nothing (N4).
@@ -1114,14 +1116,13 @@ class TestMj51Topology:
 class TestDiagnosis:
     """The alert must not assert things that are not true of this topology."""
 
-    def test_a_partial_loss_is_logged_but_not_paged(self, tmp_path, prompt):
+    def test_a_partial_loss_pages(self, tmp_path, prompt):
         """One partition hidden while another still works.
 
-        Deliberately not paged: brokkr is not falling back, so the only
-        available evidence would be writes under /media/<user>/DATA*, which
-        the scrub also produces (see test_scrub_activity_is_not_evidence).
-        Data is still landing; if the survivor fills, the capacity half
-        reports it. Recorded at INFO so the state is visible in the log.
+        Without this the unit runs on half its storage for ~120 days at the
+        measured 14.75 GiB/day and the operator finds out when the survivor
+        fills -- by which point they have an emergency AND the original fault.
+        Caught here the fix is still remount + rmdir the stale directory.
         """
         tree = Tree(tmp_path)
         tree.label("DATA31")
@@ -1129,12 +1130,71 @@ class TestDiagnosis:
         tree.mount("DATA31", free_gib=500)      # brokkr still has somewhere
         tree.stale_dir("DATA42")
         tree.mount("DATA421", free_gib=500)
-        tree.wrote_to("DATA31")
         monitor = make_monitor()
         with sensor(tree):
-            assert run_cycles(monitor, 5) == [None] * 5
-        logged = " ".join(str(call) for call in monitor.logger.info.call_args_list)
-        assert "capacity is reduced" in logged
+            alert = monitor.check_drive_target(None)
+        assert alert is not None
+        assert "DATA42" in named(alert)
+        assert "brokkr is not using them" in alert
+        # It must not read as an emergency: data is still landing.
+        assert "NO DATA IS BEING LOST" in alert
+        assert "going to the SD card" not in alert
+        assert "rmdir the leftover empty directory" in alert
+
+    def test_partial_loss_never_consults_the_mtime_gate(self, tmp_path, prompt):
+        """Its evidence is structural: a mounted candidate proves the mounter ran.
+
+        `mount_drives` mounts EVERY labelled drive it does not already see
+        mounted, and nothing else on these units mounts them, so no timestamp
+        is needed -- and none may be consulted, or the scrub could suppress
+        this the way it could have faked the total-loss case.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.label("DATA42")
+        tree.mount("DATA31", free_gib=500)
+        tree.stale_dir("DATA42")
+        tree.mount("DATA421", free_gib=500)
+        monitor = make_monitor()
+        tripwire = MagicMock(side_effect=AssertionError(
+            "the partial branch consulted the mtime evidence gate"))
+        with sensor(tree):
+            with patch.object(StateMonitor, "_fell_back_to_sd_since", tripwire):
+                alert = monitor.check_drive_target(None)
+        assert alert is not None and "DATA42" in named(alert)
+        assert not tripwire.called
+
+    def test_partial_loss_pages_with_no_write_history_at_all(
+            self, tmp_path, prompt):
+        """A unit that has never written anything still reports this."""
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.label("DATA42")
+        tree.mount("DATA31", free_gib=500)
+        tree.stale_dir("DATA42")
+        monitor = make_monitor()
+        with sensor(tree):
+            assert monitor.check_drive_target(None) is not None
+
+    def test_total_and_partial_read_differently(self, tmp_path, prompt):
+        """Total loss is an emergency; partial loss explicitly is not."""
+        total = mj51_tree(tmp_path / "total")
+        monitor = make_monitor()
+        with sensor(total):
+            falls_back(monitor, total)
+            total_alert = monitor.check_drive_target(None)
+        partial = Tree(tmp_path / "partial")
+        partial.label("DATA31")
+        partial.label("DATA42")
+        partial.mount("DATA31", free_gib=500)
+        partial.stale_dir("DATA42")
+        monitor = make_monitor()
+        with sensor(partial):
+            partial_alert = monitor.check_drive_target(None)
+        assert "going to the SD card" in total_alert
+        assert "NO DATA IS BEING LOST" not in total_alert
+        assert "NO DATA IS BEING LOST" in partial_alert
+        assert "going to the SD card" not in partial_alert
 
     def test_the_sd_card_claim_is_only_made_when_it_is_true(
             self, tmp_path, prompt):
@@ -1444,13 +1504,12 @@ class TestDampingAndLatch:
         monitor = make_monitor()
         messages = []
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=2,
-                                  DRIVE_TARGET_RENOTIFY_CYCLES=30):
+                                  DRIVE_TARGET_RENOTIFY_S=3600):
             for cycle in range(60):
                 self.flap(tree, cycle)
                 messages.append(monitor.check_drive_target(None))
         pages = sum(message is not None for message in messages)
-        assert 1 <= pages <= 3, "60 flapping cycles produced {} pages".format(
-            pages)
+        assert pages == 1, "60 flapping cycles produced {} pages".format(pages)
 
     def test_a_persistent_fault_pages_once(self, tmp_path, prompt):
         tree = mj51_tree(tmp_path)
@@ -1469,7 +1528,7 @@ class TestDampingAndLatch:
         tree.mount("DATA311", free_gib=500)
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
-                                  DRIVE_TARGET_RENOTIFY_CYCLES=3):
+                                  DRIVE_TARGET_RENOTIFY_S=3600):
             falls_back(monitor, tree)
             first = monitor.check_drive_target(None)
             assert first is not None and named(first) == {"DATA31", "DATA311"}
@@ -1480,10 +1539,13 @@ class TestDampingAndLatch:
             tree.stale_dir("DATA42")
             tree.mount("DATA421", free_gib=500)
             falls_back(monitor, tree)
-            messages = run_cycles(monitor, 4)
-        assert messages[:2] == [None, None]      # inside the renotify floor
-        assert messages[2] is not None
-        assert "DATA42" in named(messages[2])
+            assert run_cycles(monitor, 4) == [None] * 4, (
+                "a different fault inside the floor must stay quiet")
+            # the floor expires (wall clock, so age the recorded page)
+            monitor._drive_target_alerted_at -= 3601
+            late = monitor.check_drive_target(None)
+        assert late is not None
+        assert "DATA42" in named(late)
 
     def test_latch_clears_and_rearms_after_recovery(self, tmp_path, prompt):
         tree = mj51_tree(tmp_path)
@@ -1500,7 +1562,7 @@ class TestDampingAndLatch:
                 tree.stats[str(tree.media / name)] = FakeStatVFS(500 * GIB)
             assert monitor.check_drive_target(None) is None
             assert monitor._drive_target_alerted is None
-            assert monitor._drive_target_alert_at is None
+            assert monitor._drive_target_alerted_at is None
             # and it breaks again -- a new topology, so a fresh fallback
             # write is needed before it can be confirmed
             for name in ("DATA31", "DATA42"):
@@ -1540,7 +1602,7 @@ class TestDampingAndLatch:
         tree = mj51_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
-                                  DRIVE_TARGET_RENOTIFY_CYCLES=30):
+                                  DRIVE_TARGET_RENOTIFY_S=3600):
             falls_back(monitor, tree)
             assert monitor.check_drive_target(None) is not None
             tree.go_quiet()
@@ -1566,7 +1628,7 @@ class TestDampingAndLatch:
                 tree.stats[str(tree.media / name)] = FakeStatVFS(500 * GIB)
             assert monitor.check_drive_target(None) is None
             assert monitor._drive_target_alerted is None
-            assert monitor._drive_target_alert_at is None
+            assert monitor._drive_target_alerted_at is None
 
     def test_a_blind_label_cycle_does_not_clear_an_outstanding_fault(
             self, tmp_path):
@@ -1794,13 +1856,295 @@ class TestCapacity:
         assert "DATA53" in named(alert)
 
 
+# --- Surviving a brokkr restart ----------------------------------------------
+
+class TestLatchPersistence:
+    """The latch outlives a brokkr restart -- and fails OPEN whenever it cannot.
+
+    A missing latch repeats a page; a wrong latch suppresses one. This check
+    exists because a suppressed page cost eight days of science data, so every
+    doubt about the stored note resolves to "page".
+    """
+
+    def restarted(self, tree, first=None):
+        """Page a fault, then hand the tree to a brand-new StateMonitor."""
+        monitor = first if first is not None else make_monitor()
+        with sensor(tree):
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+        return make_monitor()
+
+    def latched_tree(self, tmp_path):
+        return mj51_tree(tmp_path)
+
+    def test_the_latch_survives_a_restart(self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            reborn = self.restarted(tree)
+            falls_back(reborn, tree)
+            assert run_cycles(reborn, 5) == [None] * 5, (
+                "a restart must not re-page a fault already reported")
+            assert reborn._drive_target_alerted is not None
+
+    def test_a_restart_still_pages_a_different_fault(self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
+                                  DRIVE_TARGET_RENOTIFY_S=0):
+            reborn = self.restarted(tree)
+            tree.label("DATA53")           # the fault set changes
+            falls_back(reborn, tree)
+            assert reborn.check_drive_target(None) is not None
+
+    def test_a_restart_pages_again_once_the_fault_clears_and_returns(
+            self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            reborn = self.restarted(tree)
+            for name in ("DATA311", "DATA421"):
+                tree.unmount(name)
+                shutil.rmtree(str(tree.media / name))
+            for name in ("DATA31", "DATA42"):
+                tree.mounts.add(str(tree.media / name))
+                tree.stats[str(tree.media / name)] = FakeStatVFS(500 * GIB)
+            assert reborn.check_drive_target(None) is None      # CLEAR
+            assert not tree.state_file.exists(), (
+                "a cleared fault must not leave a note behind")
+
+    # --- fail-open paths, one test each ----------------------------------
+
+    def assert_pages_after_restart(self, tree, corrupt):
+        """Page a fault, damage the stored note, and require a fresh page."""
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            reborn = self.restarted(tree)
+            corrupt(tree.state_file)
+            falls_back(reborn, tree)
+            assert reborn.check_drive_target(None) is not None, (
+                "a latch that cannot be trusted must fail OPEN")
+
+    def test_absent_state_pages(self, tmp_path):
+        self.assert_pages_after_restart(
+            self.latched_tree(tmp_path), lambda path: path.unlink())
+
+    def test_malformed_json_pages(self, tmp_path):
+        self.assert_pages_after_restart(
+            self.latched_tree(tmp_path),
+            lambda path: path.write_text("{not json"))
+
+    def test_non_object_state_pages(self, tmp_path):
+        self.assert_pages_after_restart(
+            self.latched_tree(tmp_path), lambda path: path.write_text("[1,2]"))
+
+    def test_unreadable_state_pages_and_says_why(self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            reborn = self.restarted(tree)
+            os.chmod(str(tree.state_file), 0o000)
+            if os.access(str(tree.state_file), os.R_OK):
+                pytest.skip("running as root; permissions are not enforced")
+            falls_back(reborn, tree)
+            assert reborn.check_drive_target(None) is not None
+        logged = " ".join(str(c) for c in reborn.logger.info.call_args_list)
+        assert "not restoring the drive-target latch" in logged, (
+            "failing open silently is how a broken store stays broken")
+
+    def test_wrong_schema_version_pages(self, tmp_path):
+        def bump(path):
+            stored = json.loads(path.read_text())
+            stored["version"] = MODULE.DRIVE_TARGET_STATE_VERSION + 1
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), bump)
+
+    def test_another_units_state_pages(self, tmp_path):
+        def reassign(path):
+            stored = json.loads(path.read_text())
+            stored["identity"] = ["hamma", 99]
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), reassign)
+
+    def test_malformed_signature_pages(self, tmp_path):
+        def mangle(path):
+            stored = json.loads(path.read_text())
+            stored["signature"] = [{"not": "a string"}]
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), mangle)
+
+    def test_malformed_timestamps_page(self, tmp_path):
+        def mangle(path):
+            stored = json.loads(path.read_text())
+            stored["alerted_at"] = "yesterday"
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), mangle)
+
+    def test_stale_state_pages(self, tmp_path):
+        """Bounded staleness -- do not lean on the tmpfs wipe as the expiry."""
+        def age(path):
+            stored = json.loads(path.read_text())
+            stored["last_seen"] -= MODULE.DRIVE_TARGET_STATE_MAX_AGE_S + 60
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), age)
+
+    def test_state_from_the_future_pages(self, tmp_path):
+        """fake-hwclock steps these clocks; a future note is not trustworthy."""
+        def skew(path):
+            stored = json.loads(path.read_text())
+            # Inside the staleness bound on purpose: a larger offset would be
+            # rejected as stale and the sign check would go untested.
+            stored["last_seen"] += MODULE.DRIVE_TARGET_STATE_MAX_AGE_S / 6
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), skew)
+
+    def test_alerted_in_the_future_pages(self, tmp_path):
+        def skew(path):
+            stored = json.loads(path.read_text())
+            stored["alerted_at"] += 6 * 3600
+            path.write_text(json.dumps(stored))
+        self.assert_pages_after_restart(self.latched_tree(tmp_path), skew)
+
+    # --- the store must not become a failure mode -------------------------
+
+    def test_an_unwritable_store_costs_only_the_suppression(
+            self, tmp_path, prompt):
+        """A full or read-only /dev/shm must not break the check."""
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            with patch("builtins.open", side_effect=OSError(28, "No space")):
+                falls_back(monitor, tree)
+                assert monitor.check_drive_target(None) is not None
+        assert monitor.logger.warning.called
+
+    def test_a_broken_store_never_raises_into_the_loop(self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            with patch.object(MODULE.os, "replace",
+                              side_effect=OSError(30, "Read-only")):
+                falls_back(monitor, tree)
+                assert monitor.check_drive_target(None) is not None
+                assert run_cycles(monitor, 3) == [None] * 3
+
+    def test_the_note_is_one_small_file_that_cannot_grow(
+            self, tmp_path, prompt):
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree):
+            falls_back(monitor, tree)
+            monitor.check_drive_target(None)
+            first = tree.state_file.stat().st_size
+            run_cycles(monitor, 20)
+            # Bounded, not byte-identical: `last_seen` is refreshed each cycle
+            # and its float repr varies by a couple of characters. What
+            # matters is that 20 cycles do not accumulate anything.
+            assert abs(tree.state_file.stat().st_size - first) < 16
+            assert first < 2048
+            assert sorted(path.name for path in tree.state_file.parent.iterdir()
+                          ) == [tree.state_file.name], "no leftover temp files"
+
+    def test_a_vanished_partition_does_not_clear_a_partial_latch(
+            self, tmp_path, prompt):
+        """THE INVARIANT applies to the partial fault too.
+
+        If the missing partition's label drops off the bus, the fault has
+        stopped being observable, not been repaired.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.label("DATA42")
+        tree.mount("DATA31", free_gib=500)
+        tree.stale_dir("DATA42")
+        monitor = make_monitor()
+        with sensor(tree):
+            assert monitor.check_drive_target(None) is not None
+            latched = monitor._drive_target_alerted
+            (tree.by_label / "DATA42").unlink()          # enclosure resets
+            assert run_cycles(monitor, 3) == [None] * 3
+            assert monitor._drive_target_alerted == latched
+
+    def test_an_unverifiable_identity_pages(self, tmp_path, prompt):
+        """Cannot check whose note it is => cannot trust it => page."""
+        tree = self.latched_tree(tmp_path)
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            reborn = self.restarted(tree)
+            with patch.object(StateMonitor, "_drive_state_identity",
+                              staticmethod(lambda: None)):
+                falls_back(reborn, tree)
+                assert reborn.check_drive_target(None) is not None
+
+    def test_a_failed_write_leaves_the_previous_note_intact(
+            self, tmp_path, prompt):
+        """Atomicity: a note is never half-written.
+
+        A direct write would truncate the good note on the way to failing;
+        the temp-file-and-replace keeps it, so a crash mid-save costs nothing.
+        """
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+            good = tree.state_file.read_text()
+            with patch.object(MODULE.json, "dump",
+                              side_effect=OSError(28, "No space")):
+                run_cycles(monitor, 3)
+            assert tree.state_file.read_text() == good
+
+    def test_a_long_lived_fault_keeps_its_note_fresh(self, tmp_path, prompt):
+        """`last_seen` is refreshed every cycle, not frozen at the alert.
+
+        Otherwise a fault paged hours ago has a note older than the staleness
+        bound, and the restart it exists to cover re-pages anyway.
+        """
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1):
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+            # the fault was first reported well beyond the staleness bound
+            monitor._drive_target_alerted_at -= (
+                2 * MODULE.DRIVE_TARGET_STATE_MAX_AGE_S)
+            monitor.check_drive_target(None)
+            reborn = make_monitor()
+            falls_back(reborn, tree)
+            assert run_cycles(reborn, 3) == [None] * 3, (
+                "the note should still be fresh enough to trust")
+
+    def test_a_backwards_clock_step_does_not_suppress(self, tmp_path, prompt):
+        """The floor must fail open when elapsed time is negative."""
+        tree = self.latched_tree(tmp_path)
+        monitor = make_monitor()
+        with sensor(tree), tuning(DRIVE_TARGET_CYCLES=1,
+                                  DRIVE_TARGET_RENOTIFY_S=3600):
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+            # fake-hwclock steps the clock back: the page now reads as future
+            monitor._drive_target_alerted_at += 600
+            tree.label("DATA53")               # a different fault set
+            falls_back(monitor, tree)
+            assert monitor.check_drive_target(None) is not None
+
+    def test_the_shipped_location_is_tmpfs(self):
+        """Moving this to the SD card trades a repeat for a suppression."""
+        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/dev/shm/")
+        assert MODULE.DEFAULT_SCRUB_STATUS_FILE.startswith("/dev/shm/"), (
+            "one storage idiom, not two")
+
+
 # --- Alert-only --------------------------------------------------------------
 
 class TestAlertOnly:
     """HAM-185: repair belongs in HAM-173's boot-time oneshot, not here."""
 
     def test_nothing_is_mounted_removed_or_spawned(self, tmp_path, prompt):
+        """Alert-only, judged against the SENSOR's paths.
+
+        Not "os.remove is never called": the check removes its own latch note
+        on tmpfs when a fault clears, which is neither a mount nor sensor data.
+        The rule is that nothing under /media, /dev/disk/by-label or the
+        science output is touched, and that nothing is spawned at all.
+        """
         tree = mj51_tree(tmp_path)
+        protected = (str(tree.media_base), str(tree.by_label),
+                     str(tree.fallback))
         monitor = make_monitor()
         with sensor(tree):
             with patch("subprocess.Popen") as popen, \
@@ -1811,8 +2155,20 @@ class TestAlertOnly:
                     patch("shutil.rmtree") as rmtree:
                 falls_back(monitor, tree)
                 assert monitor.check_drive_target(None) is not None
-        for mock in (popen, run, rmdir, remove, unlink, rmtree):
-            assert not mock.called
+                # clearing the fault is what exercises the removal path
+                for name in ("DATA311", "DATA421"):
+                    tree.unmount(name)
+                for name in ("DATA31", "DATA42"):
+                    tree.mounts.add(str(tree.media / name))
+                    tree.stats[str(tree.media / name)] = FakeStatVFS(500 * GIB)
+                assert monitor.check_drive_target(None) is None
+        for mock in (popen, run):
+            assert not mock.called, "the check must never spawn anything"
+        for mock in (rmdir, remove, unlink, rmtree):
+            for call in mock.call_args_list:
+                target = str(call[0][0]) if call[0] else ""
+                assert not any(target.startswith(path) for path in protected), (
+                    "the check touched {}".format(target))
 
     def test_the_tree_is_unchanged(self, tmp_path, prompt):
         tree = mj51_tree(tmp_path)

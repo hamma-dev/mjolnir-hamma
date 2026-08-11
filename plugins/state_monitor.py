@@ -65,11 +65,40 @@ ST_RDONLY = getattr(os, "ST_RDONLY", 1)
 # the 60 s monitor interval).
 DRIVE_TARGET_CYCLES = 5
 # While a fault persists but its *shape* keeps changing -- a flaky USB
-# enclosure alternating which partition is visible -- page at most this often
-# (~1 h). Without this floor, re-arming on a changed fault set turns a flap
-# into an alert storm; with it, the damping counter can keep running instead
-# of restarting, so a flapping fault can no longer mute itself forever.
-DRIVE_TARGET_RENOTIFY_CYCLES = 60
+# enclosure alternating which partition is visible -- page at most this often.
+# Without this floor, re-arming on a changed fault set turns a flap into an
+# alert storm; with it, the damping counter can keep running instead of
+# restarting, so a flapping fault can no longer mute itself forever.
+#
+# WALL CLOCK, not cycles. It used to be counted in this process's own monitor
+# cycles, which is meaningless the moment the process restarts -- and is also
+# not what "one hour" means when the counter is frozen during lulls.
+DRIVE_TARGET_RENOTIFY_S = 3600
+
+# --- Surviving a brokkr restart -------------------------------------------
+# The latch lives in memory, so every brokkr restart re-pages every latched
+# fault. On units whose fault needs a site visit (a drive swap in Australia,
+# fsck on two others) that is pure noise: mj03's retained journal shows >=4
+# brokkr starts in a month.
+#
+# ON TMPFS, DELIBERATELY. /dev/shm survives a service restart -- the case that
+# produces the bursts, including the notifiers ImportError crash-loop -- and is
+# wiped by a reboot, so a rebooted unit always re-evaluates from scratch and
+# pages. That makes the dangerous failure mode structurally impossible rather
+# than merely guarded: there is no stale note to suppress a genuine page. The
+# SD card would also cover reboots, but it is the filesystem whose filling is a
+# documented recurring incident (HAM-112/113), it is unwritable during exactly
+# the disk-full event this check must survive, and it would reintroduce that
+# suppression path. DEFAULT_SCRUB_STATUS_FILE is on /dev/shm for the same
+# reason, so this is one storage idiom rather than two.
+DEFAULT_DRIVE_STATE_FILE = "/dev/shm/hamma_drive_target_state.json"
+DRIVE_TARGET_STATE_VERSION = 1
+# A stored latch older than this is not trusted, independently of the tmpfs
+# wipe. On tmpfs the only gap the note has to bridge is a service restart,
+# which takes seconds; an hour is two orders of magnitude of headroom while
+# still guaranteeing that a monitor absent for any substantial period
+# re-evaluates and pages from scratch.
+DRIVE_TARGET_STATE_MAX_AGE_S = 3600
 # Cycles the check may fail to evaluate before it says so out loud (~1 h).
 # Several paths here can silently self-disable, and a check that reports its
 # own failures only to the log is a check nobody hears.
@@ -303,7 +332,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # pages so re-arming cannot become a storm.
         self._drive_target_count = 0          # consecutive faulty cycles
         self._drive_target_alerted = None     # fault set already reported
-        self._drive_target_alert_at = None    # count when that page went out
+        self._drive_target_alerted_at = None  # wall clock when it went out
+        # Loaded lazily on the first check, not here: it needs brokkr's unit
+        # config, and a unit with enable_drive_checks=False never needs it.
+        self._drive_state_loaded = False
         # Fingerprint of (labels, brokkr's candidates, what is mounted under
         # the base) and when it last changed. Evidence older than the current
         # topology is not evidence -- see the PREMISE block. Starting at None
@@ -805,6 +837,126 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                            "cannot be established".format(view.fallback_path))
         return newest > since, None
 
+    @staticmethod
+    def _drive_state_identity():
+        """(system, unit) for this sensor, or None if it cannot be determined.
+
+        Used to refuse a stored latch that did not come from this unit. None
+        is a refusal, not a pass: an identity we cannot check is one we cannot
+        trust, and the safe direction is to page.
+        """
+        try:
+            from brokkr.config.metadata import METADATA
+            from brokkr.config.unit import UNIT_CONFIG
+            return [METADATA["name"], UNIT_CONFIG["number"]]
+        except Exception:      # noqa: BLE001 - any failure is "unknown"
+            return None
+
+    def _load_drive_state(self):
+        """Restore the latch from the previous process, or fail open.
+
+        FAIL OPEN IS THE WHOLE CONTRACT. A latch that is absent, unreadable,
+        malformed, from another schema version, from another unit, or simply
+        too old is discarded, and the check then behaves exactly as it did
+        before persistence existed: it pages. The asymmetry is deliberate --
+        a missing latch repeats a page, a wrong latch suppresses one, and this
+        check exists because a suppressed page cost eight days of science data.
+        """
+        def give_up(reason, *args):
+            self.logger.info(
+                "state_monitor: not restoring the drive-target latch (" +
+                reason + "); the next fault will page", *args)
+            self._drive_target_alerted = None
+            self._drive_target_alerted_at = None
+
+        try:
+            with open(DEFAULT_DRIVE_STATE_FILE) as state_file:
+                stored = json.load(state_file)
+        except FileNotFoundError:
+            return          # nothing stored: the normal first-run case
+        except (OSError, ValueError) as e:
+            give_up("it could not be read: %s", e)
+            return
+
+        try:
+            if not isinstance(stored, dict):
+                give_up("it is not an object")
+                return
+            if stored.get("version") != DRIVE_TARGET_STATE_VERSION:
+                give_up("it is schema version %r, not %r",
+                        stored.get("version"), DRIVE_TARGET_STATE_VERSION)
+                return
+            identity = self._drive_state_identity()
+            if identity is None or stored.get("identity") != identity:
+                give_up("it belongs to %r, not %r",
+                        stored.get("identity"), identity)
+                return
+            signature = stored.get("signature")
+            if (not isinstance(signature, list)
+                    or not all(isinstance(item, str) for item in signature)):
+                give_up("its fault set is malformed: %r", signature)
+                return
+            alerted_at = stored.get("alerted_at")
+            last_seen = stored.get("last_seen")
+            if not all(isinstance(value, (int, float))
+                       for value in (alerted_at, last_seen)):
+                give_up("its timestamps are malformed: %r, %r",
+                        alerted_at, last_seen)
+                return
+            age = time.time() - last_seen
+            if not 0 <= age <= DRIVE_TARGET_STATE_MAX_AGE_S:
+                # Negative means the clock stepped (fake-hwclock does this);
+                # too old means the monitor was away long enough that the
+                # world could have changed under it. Neither is trustworthy.
+                give_up("it was last confirmed %.0f s ago", age)
+                return
+            if not 0 <= time.time() - alerted_at:
+                give_up("it was raised in the future")
+                return
+        except Exception as e:                      # pragma: no cover
+            give_up("it could not be validated: %s", e)
+            return
+
+        self._drive_target_alerted = frozenset(signature)
+        self._drive_target_alerted_at = alerted_at
+        self.logger.info(
+            "state_monitor: restored the drive-target latch for %s (raised "
+            "%.0f s ago); it will not be re-paged unless it changes or clears",
+            ", ".join(sorted(signature)), time.time() - alerted_at)
+
+    def _save_drive_state(self):
+        """Persist the latch, or give up quietly. NEVER raises, never blocks.
+
+        Written on tmpfs, at most one small fixed-size object, replaced
+        atomically, and removed entirely when there is no latch -- so it
+        cannot grow, cannot be half-written, and cannot outlive the fault. A
+        filesystem that is full or read-only costs the suppression, not the
+        check.
+        """
+        try:
+            if self._drive_target_alerted is None:
+                try:
+                    os.remove(DEFAULT_DRIVE_STATE_FILE)
+                except FileNotFoundError:
+                    pass
+                return
+            payload = {
+                "version": DRIVE_TARGET_STATE_VERSION,
+                "identity": self._drive_state_identity(),
+                "signature": sorted(self._drive_target_alerted),
+                "alerted_at": self._drive_target_alerted_at,
+                "last_seen": time.time(),
+                }
+            temp_path = DEFAULT_DRIVE_STATE_FILE + ".tmp"
+            with open(temp_path, "w") as state_file:
+                json.dump(payload, state_file)
+            os.replace(temp_path, DEFAULT_DRIVE_STATE_FILE)
+        except Exception as e:     # noqa: BLE001 - must not reach the loop
+            self.logger.warning(
+                "state_monitor: could not persist the drive-target latch to "
+                "%s (%s); it will not survive a brokkr restart",
+                DEFAULT_DRIVE_STATE_FILE, e)
+
     def _note_blind(self, reason):
         """Count a cycle the check could not evaluate; page once if chronic.
 
@@ -875,13 +1027,24 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         Faults reported, all of them "brokkr cannot write science data here":
 
-        - **hidden** (evidence-gated, above): every labelled DATA partition is
-          missing from brokkr's candidate set and brokkr is falling back to the
-          SD card -- the mj51 shape, and total loss of science data.
-          Deliberately NOT reported when brokkr still has another partition
-          mounted: data is still landing, and there is no evidence source for
-          that case that the scrub cannot also produce. It is logged at INFO
-          and, if the survivor fills, the capacity half reports it.
+        - **hidden** (mtime-gated, above): EVERY labelled DATA partition is
+          missing from brokkr's candidate set and brokkr is falling back to
+          the SD card -- the mj51 shape, and total loss of science data.
+        - **unused**: some labelled partition is missing while another is
+          mounted and working. Data is still landing, so this is not an
+          emergency, but the unit is on part of its storage and will look
+          healthy until the survivor fills -- about 120 days at the measured
+          14.75 GiB/day, at which point the operator has both an emergency and
+          the original fault. Caught here it is still just remount + rmdir.
+
+          This branch does NOT use the mtime gate, and does not need it. Its
+          evidence is structural and strictly stronger: `mount_drives`
+          iterates and mounts EVERY labelled drive it does not already see
+          mounted, and after a reboot nothing is mounted until brokkr does it
+          (udisks removes the mountpoint directories). So a mounted candidate
+          proves the mounter ran, and therefore that it ran on the missing
+          ones and failed. The scrub cannot fake it, because the scrub mounts
+          nothing.
         - **not a directory**: brokkr's `find_drives` filter (``not is_dir()
           or ismount()``) screens *directories* only, so any non-directory
           match is kept unconditionally and `statvfs` on it reports the
@@ -915,6 +1078,20 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         it is not fixed here -- fixing it needs a capacity policy, not another
         threshold in this function.
 
+        On restarts: the latch is persisted to `DEFAULT_DRIVE_STATE_FILE` so
+        a brokkr restart does not re-page every latched fault -- on units whose
+        fault needs a site visit that was ~16 pages a month of pure noise.
+
+        THE FILE IS ON TMPFS ON PURPOSE, AND A REBOOT WILL RE-PAGE. That is
+        the accepted cost, not an oversight: moving it to the SD card to "fix"
+        the reboot case buys reboot coverage at the price of a
+        stale-suppression path, on the one filesystem whose filling is a
+        recurring incident (HAM-112/113) and which is unwritable during exactly
+        the disk-full event this check must survive. A reboot losing the note
+        means the check falls back to alerting, which is the correct direction
+        for a check that exists because silence cost eight days. Every way of
+        failing to read the note fails the same way: it pages.
+
         Alert-only, per HAM-185: nothing here unmounts, `rmdir`s, remounts or
         spawns. HAM-173's boot-time oneshot is where automatic repair belongs.
 
@@ -928,6 +1105,18 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         str | None
             Alert naming the offending drives and the remedy, or None.
         """
+        if not self._drive_state_loaded:
+            self._drive_state_loaded = True
+            self._load_drive_state()
+        try:
+            return self._evaluate_drive_target()
+        finally:
+            # One save point, on every exit path including exceptions, so the
+            # stored latch cannot drift out of step with the in-memory one.
+            self._save_drive_state()
+
+    def _evaluate_drive_target(self):
+        """The body of `check_drive_target`; see its docstring."""
         view = self._brokkr_drive_view()
         if view is None or view.candidates is None:
             # Nothing was evaluated (already logged at WARNING). Leave BOTH
@@ -1030,19 +1219,22 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # every unconfirmable cycle, which would hold it below the threshold
         # forever.
         unconfirmed = False
+        unused = []
         if view.labels:
             missing = sorted({drive.name for drive in view.labels}
                              - set(candidate_dirs))
             if missing and candidate_dirs:
-                # brokkr still has somewhere to write, so it is not falling
-                # back and there is no attributable evidence available (see
-                # `_fell_back_to_sd_since`). Reduced capacity, no data loss;
-                # if the survivor fills, the capacity half reports it.
-                self.logger.info(
-                    "state_monitor: %s labelled but not mounted while %s is; "
-                    "capacity is reduced. Not paged: with no fallback write "
-                    "there is no evidence attributable to brokkr's writer",
-                    ", ".join(missing), ", ".join(sorted(candidate_dirs)))
+                # STRUCTURAL evidence, and it is stronger than the mtime kind.
+                # `mount_drives` iterates and mounts EVERY labelled drive it
+                # does not already see mounted -- it is not "mount one and
+                # stop" -- and after a reboot nothing is mounted until brokkr
+                # does it, because udisks removes the mountpoint directories.
+                # So a mounted candidate is itself proof that the mounter ran,
+                # and therefore that it ran on these and failed (or that they
+                # mounted where brokkr cannot see them). The scrub cannot
+                # manufacture this: the scrub mounts nothing. No timestamp is
+                # consulted on this path, and none is needed.
+                unused = missing
             elif missing:
                 fell_back, reason = self._fell_back_to_sd_since(
                     view, self._drive_topology_since)
@@ -1087,6 +1279,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # delete the `== signature` early return below (the floor now holds
         # across lulls, so that change is bounded at one page per hour).
         faults = [("hidden", name) for name in hidden]
+        faults += [("unused", name) for name in unused]
         faults += [("notdir", name) for name in notdir]
         faults += [("unreadable", name) for name, _err in unreadable]
         faults += [("readonly", name) for name in readonly]
@@ -1128,7 +1321,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             # allowed to clear the latch, the floor and the counter.
             self._drive_target_count = 0
             self._drive_target_alerted = None
-            self._drive_target_alert_at = None
+            self._drive_target_alerted_at = None
             return self._deliver_blind(blind)
         # A fault is present. Count it -- WITHOUT regard to which fault it is.
         # Restarting the count when the fault set changes lets a fault that
@@ -1141,12 +1334,14 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if self._drive_target_alerted == signature:
             # same fault, already reported; stay quiet
             return self._deliver_blind(blind)
-        if (self._drive_target_alert_at is not None
-                and (self._drive_target_count - self._drive_target_alert_at
-                     < DRIVE_TARGET_RENOTIFY_CYCLES)):
+        if (self._drive_target_alerted_at is not None
+                and 0 <= (time.time() - self._drive_target_alerted_at)
+                < DRIVE_TARGET_RENOTIFY_S):
             # A *different* fault set, but we paged recently. Re-arming on any
             # change is what keeps a drive swap from being muted; this floor is
-            # what keeps a flapping enclosure from paging every cycle.
+            # what keeps a flapping enclosure from paging every cycle. A
+            # negative elapsed time means the clock stepped, and falls through
+            # to paging rather than to suppression.
             return self._deliver_blind(blind)
 
         reasons = []
@@ -1177,6 +1372,28 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "where brokkr looks, and brokkr has fallen back to the SD card "
                 "since -- so it has tried and failed to mount them. {}. "
                 "{}".format(", ".join(hidden), consequence, remedy))
+        if unused:
+            stray = [name for name in mounted if name not in candidate_dirs]
+            if stray:
+                remedy = ("something IS mounted under {} where brokkr does not "
+                          "look ({}): the sensor-log #52 shape, where a stale "
+                          "empty mountpoint directory forces udisks to mount "
+                          "at a suffixed path. Unmount it, rmdir the leftover "
+                          "empty directory, remount".format(
+                              view.base_path, ", ".join(stray)))
+            else:
+                remedy = ("nothing is mounted for them under {}; check dmesg "
+                          "and `udisksctl status` for a failing enclosure or "
+                          "an unreadable partition".format(view.base_path))
+            reasons.append(
+                "labelled DATA partition(s) {} are attached but brokkr is not "
+                "using them, while {} is mounted -- so brokkr's mounter has "
+                "run and failed on them. NO DATA IS BEING LOST: science data "
+                "is still landing on {}. But the unit is running on part of "
+                "its storage and will look healthy until that fills, so fix "
+                "it now while the fix is still cheap -- {}".format(
+                    ", ".join(unused), ", ".join(sorted(candidate_dirs)),
+                    ", ".join(sorted(candidate_dirs)), remedy))
         if notdir:
             reasons.append(
                 "{} under {} match brokkr's drive pattern but are not "
@@ -1223,7 +1440,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # Latch only once the message is actually built, so a formatting bug
         # cannot mute the fault permanently by latching without alerting.
         self._drive_target_alerted = signature
-        self._drive_target_alert_at = self._drive_target_count
+        self._drive_target_alerted_at = time.time()
         return ("Science drive target problem -- " + "; ".join(reasons)
                 + ". Note the auto-scrub cannot help with any of this: it "
                   "only deletes on the AGS, never on the mj-side DATA "
