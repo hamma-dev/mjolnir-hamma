@@ -6,6 +6,7 @@ from math import nan
 import fcntl
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -31,6 +32,13 @@ DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 # this was DEVNULL'd). Rotated at SCRUB_LOG_MAX_BYTES so it can't fill the disk.
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
 SCRUB_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate the scrub log past this size
+
+# How often to compare the relay against brokkr's mode (HAM-182). Gated on elapsed
+# time, NOT a cycle count: config/mode.toml overrides monitor_interval_s to 1 s
+# under `realtime`, so counting cycles would silently mean "every minute" there.
+# (`test` also shortens the interval but disables state_monitor outright, so it
+# never reaches this code.)
+POWER_CHECK_INTERVAL_S = 3600
 
 
 def sensor_prefix():
@@ -156,6 +164,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.hs_stale_cycles = hs_stale_cycles
         self._hs_stale_count = 0
         self._hs_stale_alerted = False
+        # Relay-vs-mode check (HAM-182). None means "never run", so the first
+        # monitor cycle after brokkr starts checks immediately -- that is when a
+        # cold-loss divergence is most likely to be sitting there unnoticed.
+        self._last_power_check = None
         # Legacy config compatibility: a deployed per-unit override may still set
         # `low_space` (removed in favour of purge_space/alert_space). Accept and
         # ignore it -- brokkr's Executable.__init__ has no **kwargs, so an
@@ -295,6 +307,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 self.check_ping,
                 self.check_power,
                 self.check_battery_voltage,
+                self.check_power_state_divergence,
         ]
         if self.enable_drive_checks:
             checks.insert(0, self.check_drive)
@@ -767,6 +780,145 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if (batt_now <= CRITICAL_VOLTAGE) and (batt_pre >= CRITICAL_VOLTAGE):
             return f"Battery voltage critically low ({batt_now:.3f} V)"
         return None
+
+    def check_power_state_divergence(self, input_data):
+        """
+        Alert when the relay and brokkr's mode disagree (HAM-182).
+
+        There are two independent representations of "is this sensor on": the relay
+        (physical truth) and brokkr's mode. They are coupled at exactly one moment
+        -- when sensors.py runs -- and nothing re-checks afterwards.
+
+        The dangerous divergence is powered-but-declared-off. A cold power loss
+        resets the GPIO pads to INPUT; undriven, the relay board pulls the line LOW,
+        which on an active_high unit is energised. The front end comes back ON while
+        brokkr is still in nosensor, so the AGS records to its own stick but brokkr
+        ingests nothing and it never reaches the DATA drives or the server. Pi up,
+        tunnel up, brokkr running, disk fine -- every check passes and no data
+        arrives.
+
+        This DETECTS and REPORTS. It deliberately does not remediate. "Was off, now
+        on" is an anomaly that wants a human, not something to paper over, and every
+        remediation path examined had failure modes worse than the mismatch itself.
+
+        WHAT THIS DOES NOT COVER -- read before extending the claim.
+        It compares the relay against brokkr's mode and nothing else. It cannot see
+        the two drifting into agreement on the WRONG state, which is exactly the
+        HAM-182 incident: mj43 was re-powered on 2026-07-02 by a deliberate
+        `sensors.py --on` sweep that moved the relay AND the mode together, so it
+        reads self-consistent (powered + `default`) and this check is silent on it
+        today -- while sensor-log #69 and #103 still record the unit as off. The
+        stale representation there is the FIELD LOG, a third thing not modelled
+        here. That gap is HAM-189. Do not describe this check as protecting units
+        that are deliberately held off; it does not.
+
+        Level-triggered on purpose -- it re-fires every interval for as long as the
+        mismatch persists. That is what makes it loud, and it also means an alert
+        raised while the link is down simply lands on the next cycle after the link
+        returns, with no store-and-forward machinery.
+        """
+        now = time.monotonic()
+        if (self._last_power_check is not None
+                and now - self._last_power_check < POWER_CHECK_INTERVAL_S):
+            return None
+        self._last_power_check = now
+
+        from brokkr.config.unit import UNIT_CONFIG
+        from brokkr.config.mode import MODE_CONFIG
+
+        relay = UNIT_CONFIG.get("relay")
+        if not relay:
+            # No relay board / no config: mj05, mj06, mj50, mj54 today.
+            return None
+
+        # Validate the same fields sensors.load_relay_config validates. This reads
+        # the same file but is not the same parser, and hand-editing unit.toml is
+        # normal practice here -- a quoted `active_high = "false"` is valid TOML and
+        # would pass through bool() as True, silently inverting the comparison. That
+        # would either invent an hourly false alert or, worse, mask a real
+        # divergence. Alert rather than raise: an exception here would be caught by
+        # run_checks and logged only, so the check would sit dead and silent.
+        pin = relay.get("pin")
+        active_high = relay.get("active_high")
+        if isinstance(pin, bool) or not isinstance(pin, int) \
+                or not isinstance(active_high, bool):
+            return (
+                "POWER-STATE CHECK DISABLED: the [relay] section of unit.toml is "
+                "malformed -- pin={pin!r} (want a plain integer), active_high={ah!r} "
+                "(want a bare true/false, not a quoted string). The relay-vs-mode "
+                "comparison cannot run on this unit until that is fixed, so a "
+                "powered-but-declared-off sensor would go unnoticed. "
+                "ACTION: correct ~/.config/brokkr/hamma/unit.toml on this unit."
+                .format(pin=pin, ah=active_high))
+
+        level, func = self._read_gpio(pin)
+        if level is None:
+            self.logger.warning(
+                "Could not read GPIO %s; skipping power-state check", pin)
+            return None
+
+        # Two different things, easy to conflate: the relay COIL and the front end.
+        # relay.py always energises the COIL by driving the pad LOW (it hardcodes
+        # gpiozero active_high=False), whichever unit it is. Whether an energised
+        # coil means the FRONT END is on is what this unit's active_high says --
+        # mj42 is wired inverted, so for it an energised coil means the front end
+        # is OFF. This is the inverse of compute_relay_flag(sensor_on, active_high).
+        sensor_powered = ((level == 0) == active_high)
+
+        # brokkr's OWN resolved mode, not an inference from the drop-in file. Per
+        # HAM-184 the mode has three possible placements (drop-in Environment=,
+        # drop-in ExecStart=, the unit's own ExecStart=); MODE_CONFIG reflects
+        # whichever actually took effect for this running process.
+        mode = MODE_CONFIG["mode"]
+        # Matches both `nosensor` and `nosensor_nochargecontroller`.
+        declared_on = "nosensor" not in mode
+
+        if sensor_powered == declared_on:
+            return None
+
+        detail = ("GPIO {pin} level={level} func={func}, active_high={ah}; "
+                  "brokkr mode '{mode}'".format(
+                      pin=pin, level=level, func=func,
+                      ah=active_high, mode=mode))
+        number = UNIT_CONFIG["number"]
+
+        if sensor_powered:
+            return (
+                "POWER-STATE MISMATCH: the front end is POWERED but brokkr is in "
+                "'{mode}' mode, so nothing is being ingested -- the AGS is "
+                "recording to its own stick and none of it reaches the DATA drives "
+                "or the server. This is what a cold power loss looks like: the "
+                "relay re-energises but brokkr's mode does not follow. "
+                "ACTION: decide whether this unit should be capturing. To resume, "
+                "run `mjol_array.py -p {n} --up` on the VPS; to keep it off, run "
+                "`--down` to cut the front end. Then update the field log. "
+                "({detail})".format(mode=mode, n=number, detail=detail))
+
+        return (
+            "POWER-STATE MISMATCH: brokkr is in '{mode}' mode but the front end is "
+            "NOT powered. brokkr will retry the dead front end continuously, which "
+            "fills the SD card, and with no AGS power its space telemetry reads NA "
+            "so proactive space management cannot run either. "
+            "ACTION: run `mjol_array.py -p {n} --up` on the VPS to power the front "
+            "end, or `--down` to put brokkr in nosensor. Then update the field log. "
+            "({detail})".format(mode=mode, n=number, detail=detail))
+
+    @staticmethod
+    def _read_gpio(pin):
+        """Return (level, func) for a BCM pin, or (None, None) if unreadable."""
+        try:
+            result = subprocess.run(
+                ["raspi-gpio", "get", str(pin)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None, None
+        if result.returncode != 0:
+            return None, None
+        level = re.search(r"level=(\d)", result.stdout)
+        func = re.search(r"func=(\w+)", result.stdout)
+        return (int(level.group(1)) if level else None,
+                func.group(1) if func else None)
 
     def send_message(self, msg):
         """Prefix with the sensor identity and send via the notifier."""

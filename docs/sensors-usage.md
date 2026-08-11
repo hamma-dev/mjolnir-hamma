@@ -142,9 +142,106 @@ Each step prints `[OK]` or `[FAIL]` as it runs. If a critical step fails, the sc
 [OK] Started sindri service
 ```
 
-## Reboot Behavior
+## Reboot and Power-Loss Behavior
 
-On reboot, GPIO pins reset to input (floating), which de-energizes the relay. The systemd drop-in persists, so brokkr restarts in the correct mode. But for `active_high=false` sensors, a reboot after `--off` will re-power the sensor (de-energized = on) while brokkr stays in nosensor mode. This is a known limitation.
+> **Corrected 2026-08-07 by controlled experiment on mj03 (HAM-182).** The previous
+> version of this section said a *reboot* releases the pin and that `active_high=false`
+> sensors are the ones that re-power. **Both statements were wrong.**
+
+**A warm reboot is safe.** `reboot` does not power-cycle the SoC, so the GPIO pads keep
+their configuration and the relay holds its state. Verified: mj41 went through at least
+8 warm reboots while declared OFF and `adc_il_f` stayed at the OFF level (0.37–0.63 A)
+every time.
+
+**A COLD power loss is what re-powers the sensor.** If the charge controller itself
+loses power — an outage, an LVD trip, a disconnected load terminal — the SoC is
+power-cycled and GPIO 4 reverts to `func=INPUT`. Undriven, the relay board pulls the
+line **LOW**, overriding the SoC's internal pull-up. On `active_high=true` units LOW is
+energised, so **the front end comes back ON while the brokkr drop-in still says
+`nosensor`**, and nothing detects the divergence.
+
+Measured on mj03, 2026-08-07, after a ~30 s interruption at the CC load terminal:
+
+```
+BEFORE:  GPIO 4: level=1 fsel=1 func=OUTPUT pull=NONE   adc_il_f = 0.29 A   (off)
+AFTER:   GPIO 4: level=0 fsel=0 func=INPUT  pull=UP     adc_il_f = 1.39 A   (ON)
+         BROKKR_MODE=nosensor unchanged; mode.conf still present
+```
+
+Charge-controller `hourmeter` regressed 47006 → 46991, confirming a genuine cold loss
+(the counter cannot decrease while powered).
+
+### Which units are exposed
+
+| Units | Why |
+|---|---|
+| mj02, mj03, mj04, mj08, mj41, mj43 | `active_high=true`; undriven pin reads LOW = energised = **ON** |
+| **mj42** | `active_high=false`, but it is the only unit with `gpio=4=op,dh` in `/boot/firmware/config.txt` (line 67, added 2025-09-19). That forces the pin output-**high** at boot, and for `active_high=false` high = ON. **mj42 boots with the front end ON unconditionally.** |
+| mj05, mj50, mj54 | No `[relay]` section, and GPIO 4 reads HIGH on the SoC pull-up. |
+| **mj06** | No `[relay]` section either, but GPIO 4 reads **level=0 `func=INPUT pull=UP`** — something external overcomes the internal pull-up, so "no `[relay]` section" does **not** prove "no relay board". If a `[relay]` section is ever added, the check would immediately compute powered=True against its `nosensor_nochargecontroller` mode and alert. mj06 runs `NullInput`, so `adc_il_f` is NA and there is no way to cross-check. |
+
+Confirmed occurrences: mj08 ran ON for 4 d 2 h while declared OFF after a cold loss on
+2026-06-25 (sensor-log #77); mj03 probably did the same after an 11.6-day outage ending
+2026-06-22; and mj03 again under the controlled test above.
+
+**Practical consequence.** After any power interruption, do not trust the drop-in to tell
+you whether a sensor is powered. Check `adc_il_f` (telemetry **field 7** — field 6 is
+`adc_ic_f` solar charge current and is blind to the relay). Roughly: ~1.4 A front end on,
+~0.4 A off, though the absolute level varies per unit and over time, so compare against
+that unit's own recent history rather than a fixed threshold.
+
+
+## Power-State Mismatch Alert
+
+`state_monitor` compares the relay against brokkr's own running mode once an hour and
+**alerts if they disagree**. It does not change anything.
+
+This exists because of the cold-loss behaviour above: the front end comes back ON while
+brokkr is still in `nosensor`, so the AGS records to its own stick while brokkr ingests
+nothing — and every other check passes. Pi up, tunnel up, brokkr running, disk fine, no
+data arriving.
+
+**It deliberately does not fix anything.** "Was off, now on" is an anomaly that wants a
+human, and every auto-remediation approach tried had failure modes worse than the
+mismatch itself.
+
+**What it does NOT cover.** It compares the relay against brokkr's mode and nothing else.
+It cannot see the two drifting into agreement on the *wrong* state — which is exactly the
+HAM-182 incident. mj43 was re-powered on 2026-07-02 by a deliberate `sensors.py --on`
+sweep that moved the relay **and** the mode together, so it reads self-consistent
+(powered + `default`) and this check is **silent on mj43 today**, while sensor-log #69 and
+#103 still record it as off. The stale representation there is the **field log**, a third
+thing not modelled here — that gap is HAM-189. Do not describe this check as protecting
+units that are deliberately held off.
+
+| What it sees | Alert |
+|---|---|
+| Relay and mode agree | Nothing |
+| Front end POWERED, mode is `nosensor*` | Nothing is being ingested. Decide whether it should be capturing |
+| Front end NOT powered, mode is not `nosensor*` | brokkr retries a dead front end ~58/s, filling the SD card; the AGS auto-scrub is also off in this state |
+| No `[relay]` section (mj05, mj06, mj50, mj54) | Nothing — 4 of 10 reachable units are silent by construction |
+
+Both messages carry an `ACTION:` line naming the `mjol_array.py` command to run.
+
+**The alert repeats every hour while the mismatch persists.** That is deliberate: it makes
+the alert loud, and it means an alert raised while the link is down simply lands on the
+next cycle once the link returns — no queuing or replay needed. The flip side is that a
+unit left mismatched will keep alerting, so resolve it or power the front end down.
+
+Two details worth knowing:
+
+- The mode comes from brokkr's own resolved `MODE_CONFIG`, not from the presence of
+  `mode.conf`. There are **four** placements — drop-in `Environment=`, drop-in
+  `ExecStart=`, the unit's own `ExecStart=`, and a `mode` key in the unit's local
+  `~/.config/brokkr/hamma/mode.toml` (mj05 uses that one) — and only the running
+  process knows which took effect.
+- The interval is wall-clock, not a cycle count, because `config/mode.toml` overrides
+  `monitor_interval_s` to 1 s under `realtime` and 5 s under `test`.
+
+**Deploying it takes two steps, not one.** `git pull` brings the file, but a running
+brokkr has the old module already imported — units routinely stay up for weeks — so
+the check does not activate until `brokkr-hamma-default.service` is restarted. There
+is no new unit file, config or state directory beyond that.
 
 ## File Locations
 
@@ -152,7 +249,7 @@ On reboot, GPIO pins reset to input (floating), which de-energizes the relay. Th
 |------|---------|
 | `/home/pi/dev/mjolnir-hamma/scripts/sensors.py` | The script |
 | `~/.config/brokkr/hamma/unit.toml` | Per-unit relay config (`[relay]` section) |
-| `/etc/systemd/system/brokkr-hamma-default.service.d/mode.conf` | Systemd drop-in for nosensor mode |
+| `/etc/systemd/system/brokkr-hamma-default.service.d/mode.conf` | Systemd drop-in for nosensor mode. **Shared filename for every mode override** — may hold an `ExecStart=` override for `nosensor_nochargecontroller` etc., not just `Environment=BROKKR_MODE=nosensor` |
 | `~/brokkr/hamma/telemetry/` | Telemetry CSVs and `.bak` archives |
 
 ## Prerequisites

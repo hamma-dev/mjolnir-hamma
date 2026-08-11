@@ -354,3 +354,141 @@ def test_send_message_prefixes_and_delegates():
     with patch.object(MODULE, "sensor_prefix", return_value="mj02: "):
         sm.send_message("hi")
     sm.notifier.send.assert_called_once_with("mj02: hi")
+
+
+# --- check_power_state_divergence (HAM-182) ---------------------------------
+
+class TestCheckPowerStateDivergence:
+    """Relay-vs-mode comparison. Alert-only: it must never mutate anything.
+
+    The polarity is the load-bearing part. relay.py always energises the COIL by
+    driving the pad LOW; whether that means the FRONT END is on depends on the
+    unit's `active_high`. mj42 is wired inverted, so it is covered explicitly.
+    """
+
+    def _monitor(self, relay, mode, level, func="OUTPUT"):
+        m = _make_monitor()
+        m._last_power_check = None
+        m._read_gpio = lambda pin: (level, func)
+        unit_config = {"number": 3, "site_description": "Test"}
+        if relay is not None:
+            unit_config["relay"] = relay
+        mods = {
+            "brokkr.config": MagicMock(),
+            "brokkr.config.unit": SimpleNamespace(UNIT_CONFIG=unit_config),
+            "brokkr.config.mode": SimpleNamespace(MODE_CONFIG={"mode": mode}),
+        }
+        return m, mods
+
+    def _run(self, relay, mode, level, func="OUTPUT"):
+        m, mods = self._monitor(relay, mode, level, func)
+        with patch.dict("sys.modules", mods):
+            return m.check_power_state_divergence({})
+
+    AH_TRUE = {"pin": 4, "active_high": True}
+    AH_FALSE = {"pin": 4, "active_high": False}
+
+    # --- agreeing states must be silent ---
+
+    def test_powered_and_default_is_silent(self):
+        """mj04/mj08: pad LOW on active_high=true is ON, mode default."""
+        assert self._run(self.AH_TRUE, "default", 0) is None
+
+    def test_off_and_nosensor_is_silent(self):
+        """mj03 as left by `sensors.py --off`."""
+        assert self._run(self.AH_TRUE, "nosensor", 1) is None
+
+    def test_no_relay_section_is_silent(self):
+        """mj05/mj06/mj50/mj54 have no [relay] -- nothing to compare."""
+        assert self._run(None, "default", 1) is None
+
+    def test_mj42_inverted_powered_and_default_is_silent(self):
+        """mj42 is active_high=false: pad HIGH is ON."""
+        assert self._run(self.AH_FALSE, "default", 1) is None
+
+    # --- the divergence this exists for ---
+
+    def test_cold_loss_powered_but_nosensor_alerts(self):
+        msg = self._run(self.AH_TRUE, "nosensor", 0, func="INPUT")
+        assert msg is not None
+        assert "POWERED" in msg
+        assert "ACTION:" in msg
+
+    def test_mj42_inverted_powered_but_nosensor_alerts(self):
+        msg = self._run(self.AH_FALSE, "nosensor", 1)
+        assert msg is not None
+        assert "POWERED" in msg
+
+    def test_not_powered_but_declared_on_alerts(self):
+        msg = self._run(self.AH_TRUE, "default", 1)
+        assert msg is not None
+        assert "NOT powered" in msg
+        assert "ACTION:" in msg
+
+    # --- mode semantics ---
+
+    def test_combined_nosensor_mode_counts_as_declared_off(self):
+        """`nosensor_nochargecontroller` must match the nosensor test."""
+        assert self._run(self.AH_TRUE, "nosensor_nochargecontroller", 1) is None
+
+    def test_nochargecontroller_alone_counts_as_declared_on(self):
+        """It does NOT disable ingestion, so a dark front end is a mismatch."""
+        msg = self._run(self.AH_TRUE, "nochargecontroller", 1)
+        assert msg is not None
+        assert "NOT powered" in msg
+
+    def test_every_mode_in_mode_toml_classifies_correctly(self):
+        """Pin the naming convention the substring test relies on.
+
+        `declared_on` is derived from the string "nosensor" appearing in the mode
+        name. That is only correct while mode names track whether the science
+        pipeline is enabled. If a future preset disables ingest without saying
+        "nosensor", this fails and tells whoever added it to fix the check.
+        """
+        import re as _re
+        mode_toml = (REPO_ROOT / "config" / "mode.toml").read_text()
+        presets = set(_re.findall(r"^\[([a-z0-9_]+)\]", mode_toml, _re.M))
+        assert "nosensor" in presets, "mode.toml no longer defines [nosensor]"
+        for preset in presets:
+            section = mode_toml.split("[" + preset + "]", 1)[1]
+            section = section.split("\n[", 1)[0]
+            disables_ingest = "science_ingest" in section
+            if disables_ingest:
+                assert "nosensor" in preset, (
+                    "mode '{}' disables science_ingest but its name lacks "
+                    "'nosensor', so check_power_state_divergence would treat it "
+                    "as capturing".format(preset))
+
+    # --- robustness ---
+
+    def test_unreadable_gpio_is_silent_and_warns(self):
+        m, mods = self._monitor(self.AH_TRUE, "nosensor", 0)
+        m._read_gpio = lambda pin: (None, None)
+        with patch.dict("sys.modules", mods):
+            assert m.check_power_state_divergence({}) is None
+        assert m.logger.warning.called
+
+    def test_string_active_high_is_reported_not_silently_inverted(self):
+        """`active_high = "false"` is valid TOML and bool("false") is True.
+
+        Without validation that inverts the comparison silently, which could mask
+        a real divergence. It must alert instead.
+        """
+        msg = self._run({"pin": 4, "active_high": "false"}, "default", 1)
+        assert msg is not None
+        assert "malformed" in msg
+
+    def test_missing_relay_key_is_reported(self):
+        msg = self._run({"pin": 4}, "default", 1)
+        assert msg is not None
+        assert "malformed" in msg
+
+    # --- rate limiting ---
+
+    def test_rate_limited_then_refires_level_triggered(self):
+        m, mods = self._monitor(self.AH_TRUE, "nosensor", 0)
+        with patch.dict("sys.modules", mods):
+            assert m.check_power_state_divergence({}) is not None
+            assert m.check_power_state_divergence({}) is None
+            m._last_power_check -= MODULE.POWER_CHECK_INTERVAL_S + 1
+            assert m.check_power_state_divergence({}) is not None
