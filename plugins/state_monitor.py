@@ -580,7 +580,13 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             from brokkr.config.unit import UNIT_CONFIG
             filename_kwargs["system_name"] = METADATA["name"]
             filename_kwargs["unit_number"] = UNIT_CONFIG["number"]
-        except (ImportError, KeyError) as e:
+        except Exception as e:     # noqa: BLE001 - matches _drive_state_identity
+            # Deliberately as broad as the identical lookup in
+            # `_drive_state_identity`. `check_drive_target` has try/finally and
+            # no `except`, so anything escaping here (an AttributeError from a
+            # config proxy touched pre-init, say) would bypass this file's
+            # WARNING-and-degrade path and surface as a generic run_checks
+            # traceback instead.
             self.logger.debug(
                 "state_monitor: no system/unit metadata for drive paths: %s", e)
         filename_kwargs.update(drive_kwargs.get("filename_kwargs") or {})
@@ -691,7 +697,16 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                     ("min_free_gb", min_free_gb)]
         if mount_glob:
             required.append(("mount_base_path", mount_base_path))
-        absent = [name for name, value in required if not value]
+        # `min_free_gb` is tested for PRESENCE, not truthiness: it is the one
+        # numeric setting here, and 0 is a legitimate value meaning "no
+        # capacity floor" -- brokkr's `select_drive` has no reserved sentinel
+        # for "disabled". A falsy test read 0 as "config missing" and silently
+        # skipped the entire check, leaving only the ~1-hour blind watchdog.
+        # Every other key is a path or glob, where empty is as broken as
+        # missing.
+        absent = [name for name, value in required
+                  if value is None
+                  or (name != "min_free_gb" and not value)]
         if absent:
             self.logger.warning(
                 "state_monitor: brokkr's science-output drive settings are "
@@ -1385,15 +1400,35 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 remedy = ("nothing is mounted for them under {}; check dmesg "
                           "and `udisksctl status` for a failing enclosure or "
                           "an unreadable partition".format(view.base_path))
+            # The reassurance may name ONLY partitions brokkr can actually
+            # write to. `candidate_dirs` is appended before the ST_RDONLY and
+            # statvfs tests, so it still holds read-only and unreadable
+            # mounts; `remaining` is what survives them AND has room. Using
+            # the former here printed "science data is still landing on
+            # DATA80" about the very partition whose read-only clause in this
+            # same alert says writes to it fail -- mj54's topology, where the
+            # claim is not merely imprecise but false: brokkr selects on free
+            # space alone, so it picks that partition, fails, and falls back
+            # to the SD card.
+            receiving = sorted(name for name, _free in remaining)
+            if receiving:
+                consequence = (
+                    "NO DATA IS BEING LOST: science data is still landing on "
+                    "{}. But the unit is running on part of its storage and "
+                    "will look healthy until that fills, so fix it now while "
+                    "the fix is still cheap".format(", ".join(receiving)))
+            else:
+                consequence = (
+                    "AND NOTHING WRITABLE IS LEFT: science data is going to "
+                    "the SD card ({}). See this alert's other reasons for why "
+                    "each mounted partition is unusable".format(
+                        view.fallback_path or "brokkr's fallback path"))
             reasons.append(
                 "labelled DATA partition(s) {} are attached but brokkr is not "
                 "using them, while {} is mounted -- so brokkr's mounter has "
-                "run and failed on them. NO DATA IS BEING LOST: science data "
-                "is still landing on {}. But the unit is running on part of "
-                "its storage and will look healthy until that fills, so fix "
-                "it now while the fix is still cheap -- {}".format(
+                "run and failed on them. {} -- {}".format(
                     ", ".join(unused), ", ".join(sorted(candidate_dirs)),
-                    ", ".join(sorted(candidate_dirs)), remedy))
+                    consequence, remedy))
         if notdir:
             reasons.append(
                 "{} under {} match brokkr's drive pattern but are not "

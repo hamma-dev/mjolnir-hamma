@@ -1276,6 +1276,70 @@ class TestUnusableMounts:
         assert alert is not None
         assert "READ-ONLY" in alert and "DATA31" in alert
 
+    def test_a_readonly_candidate_is_not_named_as_where_data_lands(
+            self, tmp_path, prompt):
+        """The reassurance must name only partitions brokkr can WRITE to.
+
+        `candidate_dirs` is appended before the ST_RDONLY test, so it holds
+        read-only mounts; `usable` does not. Naming the former would print
+        "science data is still landing on DATA80" in the same alert whose
+        read-only clause says writes to DATA80 fail.
+        """
+        tree = Tree(tmp_path)
+        for name in ("DATA80", "DATA81", "DATA82"):
+            tree.label(name)
+        tree.mount("DATA80", free_gib=1465, readonly=True)
+        tree.mount("DATA81", free_gib=500)
+        monitor = make_monitor()
+        with sensor(tree):
+            alert = monitor.check_drive_target(None)
+        assert alert is not None
+        assert "NO DATA IS BEING LOST" in alert
+        landing = alert.split("still landing on ")[1]
+        assert "DATA81" in landing
+        assert "DATA80" not in landing.split(".")[0], (
+            "named a read-only partition as a place data is landing")
+
+    def test_no_writable_candidate_retracts_the_reassurance(
+            self, tmp_path, prompt):
+        """mj54's topology with the writable partition gone.
+
+        One labelled partition is unmounted (so the mounter demonstrably ran
+        and failed) and the only mounted candidate is read-only. brokkr
+        selects on free space alone, so it picks the read-only one, fails the
+        write and falls back to the SD card. Data IS being lost, and the
+        alert must not say otherwise.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA80")
+        tree.label("DATA82")
+        tree.mount("DATA80", free_gib=1465, readonly=True)
+        monitor = make_monitor()
+        with sensor(tree):
+            alert = monitor.check_drive_target(None)
+        assert alert is not None
+        assert "DATA82" in alert, "the unused partition is still reported"
+        assert "NO DATA IS BEING LOST" not in alert, (
+            "claimed no loss while nothing writable remained")
+        assert "SD card" in alert
+
+    def test_min_free_gb_zero_is_a_setting_not_an_absence(
+            self, tmp_path, prompt):
+        """0 means "no capacity floor", not "unset".
+
+        brokkr's `select_drive` has no reserved sentinel for "disabled", so 0
+        is a legitimate value distinct from a missing key. A falsy test read
+        it as absent and silently skipped the whole check.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.mount("DATA31", free_gib=500, readonly=True)
+        monitor = make_monitor()
+        with sensor(tree, tree.drive_kwargs(min_free_gb=0)):
+            alert = monitor.check_drive_target(None)
+        assert alert is not None, "min_free_gb=0 disabled the entire check"
+        assert "READ-ONLY" in alert and "DATA31" in alert
+
     def test_unreadable_mount_alerts_and_logs(self, tmp_path, prompt):
         """PR #84's `except OSError: continue` had no logger call at all."""
         tree = Tree(tmp_path)
