@@ -354,3 +354,157 @@ def test_send_message_prefixes_and_delegates():
     with patch.object(MODULE, "sensor_prefix", return_value="mj02: "):
         sm.send_message("hi")
     sm.notifier.send.assert_called_once_with("mj02: hi")
+
+
+# --- check_power_state_divergence (HAM-182) ---------------------------------
+
+class TestCheckPowerStateDivergence:
+    """Relay-vs-mode comparison. Alert-only: it must never mutate anything.
+
+    Two things carry the weight. Polarity: relay.py always energises the COIL by
+    driving the pad LOW, and whether that means the FRONT END is on depends on the
+    unit's `active_high` -- mj42 is wired inverted, so it is covered explicitly.
+    And `declared_on`, which must come from whether the science-ingest pipeline is
+    actually enabled, NOT from the mode's name.
+    """
+
+    AH_TRUE = {"pin": 4, "active_high": True}
+    AH_FALSE = {"pin": 4, "active_high": False}
+
+    def _monitor(self, relay, science_enabled, level, func="OUTPUT", mode="default"):
+        m = _make_monitor()
+        m._next_power_check = None
+        m._read_gpio = lambda pin: (level, func)
+        unit_config = {"number": 3, "site_description": "Test"}
+        if relay is not None:
+            unit_config["relay"] = relay
+        science = {} if science_enabled is None else {"_enabled": science_enabled}
+        mods = {
+            "brokkr.config": MagicMock(),
+            "brokkr.config.unit": SimpleNamespace(UNIT_CONFIG=unit_config),
+            "brokkr.config.main": SimpleNamespace(
+                CONFIG={"pipelines": {"science_ingest": science}}),
+            "brokkr.config.mode": SimpleNamespace(MODE_CONFIG={"mode": mode}),
+        }
+        return m, mods
+
+    def _run(self, relay, science_enabled, level, func="OUTPUT", mode="default"):
+        m, mods = self._monitor(relay, science_enabled, level, func, mode)
+        with patch.dict("sys.modules", mods):
+            return m.check_power_state_divergence({})
+
+    # --- agreeing states must be silent ---
+
+    def test_powered_and_ingesting_is_silent(self):
+        """mj04/mj08: pad LOW on active_high=true is ON, ingest enabled."""
+        assert self._run(self.AH_TRUE, None, 0) is None
+
+    def test_off_and_not_ingesting_is_silent(self):
+        """mj03 as left by `sensors.py --off`."""
+        assert self._run(self.AH_TRUE, False, 1) is None
+
+    def test_no_relay_section_is_silent(self):
+        """mj05/mj06/mj50/mj54 have no [relay] -- nothing to compare."""
+        assert self._run(None, None, 1) is None
+
+    def test_mj42_inverted_powered_and_ingesting_is_silent(self):
+        """mj42 is active_high=false: pad HIGH is ON."""
+        assert self._run(self.AH_FALSE, None, 1) is None
+
+    # --- the divergence this exists for ---
+
+    def test_cold_loss_powered_but_not_ingesting_alerts(self):
+        msg = self._run(self.AH_TRUE, False, 0, func="INPUT", mode="nosensor")
+        assert msg is not None
+        assert "POWERED" in msg
+        assert "ACTION:" in msg
+
+    def test_mj42_inverted_powered_but_not_ingesting_alerts(self):
+        msg = self._run(self.AH_FALSE, False, 1, mode="nosensor")
+        assert msg is not None
+        assert "POWERED" in msg
+
+    def test_not_powered_but_ingesting_alerts(self):
+        msg = self._run(self.AH_TRUE, None, 1)
+        assert msg is not None
+        assert "NOT powered" in msg
+        assert "ACTION:" in msg
+
+    # --- declared_on must be structural, not name-based ---
+
+    def test_absent_enabled_key_means_ingesting(self):
+        """`_enabled` is simply absent unless a mode overrides it."""
+        assert self._run(self.AH_TRUE, None, 0) is None
+
+    def test_decision_ignores_the_mode_name(self):
+        """A mode named 'nosensor' whose pipeline is enabled must count as ON.
+
+        This is the regression guard: if anyone reverts to matching on the mode
+        string, this fails. The name is display-only.
+        """
+        assert self._run(self.AH_TRUE, True, 0, mode="nosensor") is None
+        msg = self._run(self.AH_TRUE, True, 1, mode="nosensor")
+        assert msg is not None
+        assert "NOT powered" in msg
+
+    def test_mode_name_appears_in_the_message_only(self):
+        msg = self._run(self.AH_TRUE, False, 0, mode="nosensor_nochargecontroller")
+        assert "nosensor_nochargecontroller" in msg
+
+    def test_mode_toml_nosensor_presets_still_disable_science_ingest(self):
+        """Guard the config side of the contract.
+
+        The check reads `science_ingest._enabled`. If a future edit stopped the
+        nosensor presets from setting it, the check would go quietly blind on
+        exactly the units it matters for.
+        """
+        mode_toml = (REPO_ROOT / "config" / "mode.toml").read_text()
+        for preset in ("nosensor", "nosensor_nochargecontroller"):
+            section = mode_toml.split("[" + preset + "]", 1)[1]
+            assert "science_ingest" in section, (
+                "[{}] no longer disables science_ingest".format(preset))
+
+    # --- robustness ---
+
+    def test_unreadable_gpio_is_silent_and_retries_sooner(self):
+        m, mods = self._monitor(self.AH_TRUE, False, 0)
+        m._read_gpio = lambda pin: (None, None)
+        with patch.dict("sys.modules", mods):
+            assert m.check_power_state_divergence({}) is None
+        assert m.logger.warning.called
+        # must not have consumed the full interval
+        remaining = m._next_power_check - MODULE.time.monotonic()
+        assert remaining <= m.power_check_retry_s + 1
+        assert remaining < m.power_check_interval_s
+
+    def test_non_dict_relay_is_reported_not_raised(self):
+        """`relay = true` instead of a [relay] table passes a falsy-only guard."""
+        msg = self._run(True, None, 1)
+        assert msg is not None
+        assert "not a" in msg and "table" in msg
+
+    def test_string_active_high_is_reported_not_silently_inverted(self):
+        """`active_high = "false"` is valid TOML and bool("false") is True."""
+        msg = self._run({"pin": 4, "active_high": "false"}, None, 1)
+        assert msg is not None
+        assert "malformed" in msg
+
+    def test_missing_relay_key_is_reported(self):
+        msg = self._run({"pin": 4}, None, 1)
+        assert msg is not None
+        assert "malformed" in msg
+
+    # --- rate limiting ---
+
+    def test_rate_limited_then_refires_level_triggered(self):
+        m, mods = self._monitor(self.AH_TRUE, False, 0)
+        with patch.dict("sys.modules", mods):
+            assert m.check_power_state_divergence({}) is not None
+            assert m.check_power_state_divergence({}) is None
+            m._next_power_check -= m.power_check_interval_s + 1
+            assert m.check_power_state_divergence({}) is not None
+
+    def test_interval_is_configurable(self):
+        m = _make_monitor(power_check_interval_s=7, power_check_retry_s=2)
+        assert m.power_check_interval_s == 7
+        assert m.power_check_retry_s == 2
