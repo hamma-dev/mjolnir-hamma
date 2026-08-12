@@ -33,14 +33,6 @@ DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
 SCRUB_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate the scrub log past this size
 
-# How often to compare the relay against brokkr's mode (HAM-182). Gated on elapsed
-# time, NOT a cycle count: config/mode.toml overrides monitor_interval_s to 1 s
-# under `realtime`, so counting cycles would silently mean "every minute" there.
-# (`test` also shortens the interval but disables state_monitor outright, so it
-# never reaches this code.)
-POWER_CHECK_INTERVAL_S = 3600
-
-
 def sensor_prefix():
     """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
     from brokkr.config.unit import UNIT_CONFIG
@@ -62,6 +54,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         alert_space=75,
         scrub_cooldown_s=300,
         hs_stale_cycles=15,
+        power_check_interval_s=3600,
+        power_check_retry_s=300,
         ping_max=3,
         channel=None,
         key_file=None,
@@ -104,6 +98,14 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             dark, so every space-based decision is blind and `/ags/data` can fill
             unseen -- this watchdog is the only thing that speaks up in that state.
             Reset (and re-armed) by any numeric reading.
+        power_check_interval_s : numeric, optional
+            Seconds between relay-vs-mode comparisons (HAM-182). Default 3600.
+            Elapsed wall-clock, not a cycle count: `config/mode.toml` overrides
+            `monitor_interval_s` to 1 s under `realtime`, so counting cycles would
+            silently mean "every minute" there.
+        power_check_retry_s : numeric, optional
+            Shorter retry used when the GPIO read itself fails (default 300), so a
+            transient failure costs minutes of blindness rather than a full hour.
         ping_max : int, optional
             The maximum number of consecutive ping errors before we send an error message
             via `method`. Any ping errors are still logged locally.
@@ -164,10 +166,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self.hs_stale_cycles = hs_stale_cycles
         self._hs_stale_count = 0
         self._hs_stale_alerted = False
-        # Relay-vs-mode check (HAM-182). None means "never run", so the first
-        # monitor cycle after brokkr starts checks immediately -- that is when a
-        # cold-loss divergence is most likely to be sitting there unnoticed.
-        self._last_power_check = None
+        # Relay-vs-mode check (HAM-182). None means "due now", so the first monitor
+        # cycle after brokkr starts checks immediately -- that is when a cold-loss
+        # divergence is most likely to be sitting there unnoticed.
+        self.power_check_interval_s = power_check_interval_s
+        self.power_check_retry_s = power_check_retry_s
+        self._next_power_check = None
         # Legacy config compatibility: a deployed per-unit override may still set
         # `low_space` (removed in favour of purge_space/alert_space). Accept and
         # ignore it -- brokkr's Executable.__init__ has no **kwargs, so an
@@ -818,18 +822,32 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         returns, with no store-and-forward machinery.
         """
         now = time.monotonic()
-        if (self._last_power_check is not None
-                and now - self._last_power_check < POWER_CHECK_INTERVAL_S):
+        if self._next_power_check is not None and now < self._next_power_check:
             return None
-        self._last_power_check = now
+        # Claim the full interval up front, so an unexpected exception below cannot
+        # turn this into a once-per-cycle retry storm. The GPIO-read path shortens
+        # it again on failure -- a transient read must not cost a whole hour of
+        # blindness.
+        self._next_power_check = now + self.power_check_interval_s
 
         from brokkr.config.unit import UNIT_CONFIG
-        from brokkr.config.mode import MODE_CONFIG
+        from brokkr.config.main import CONFIG
 
         relay = UNIT_CONFIG.get("relay")
-        if not relay:
+        if relay is None or relay == {}:
             # No relay board / no config: mj05, mj06, mj50, mj54 today.
             return None
+        if not isinstance(relay, dict):
+            # e.g. `relay = true` instead of a `[relay]` table. Falsy-only guards
+            # miss this and the .get() below would raise -- which run_checks logs
+            # but never sends, i.e. the silent death this check exists to avoid.
+            return (
+                "POWER-STATE CHECK DISABLED: `relay` in unit.toml is {t}, not a "
+                "[relay] table. The relay-vs-mode comparison cannot run on this "
+                "unit, so a powered-but-declared-off sensor would go unnoticed. "
+                "ACTION: fix the [relay] section of "
+                "~/.config/brokkr/hamma/unit.toml on this unit."
+                .format(t=type(relay).__name__))
 
         # Validate the same fields sensors.load_relay_config validates. This reads
         # the same file but is not the same parser, and hand-editing unit.toml is
@@ -853,8 +871,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         level, func = self._read_gpio(pin)
         if level is None:
+            # Retry sooner than the full interval: this is usually transient, and
+            # burning an hour of blindness on it is worse than one extra read.
+            self._next_power_check = now + self.power_check_retry_s
             self.logger.warning(
-                "Could not read GPIO %s; skipping power-state check", pin)
+                "Could not read GPIO %s; retrying the power-state check in %s s",
+                pin, self.power_check_retry_s)
             return None
 
         # Two different things, easy to conflate: the relay COIL and the front end.
@@ -865,13 +887,17 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # is OFF. This is the inverse of compute_relay_flag(sensor_on, active_high).
         sensor_powered = ((level == 0) == active_high)
 
-        # brokkr's OWN resolved mode, not an inference from the drop-in file. Per
-        # HAM-184 the mode has three possible placements (drop-in Environment=,
-        # drop-in ExecStart=, the unit's own ExecStart=); MODE_CONFIG reflects
-        # whichever actually took effect for this running process.
-        mode = MODE_CONFIG["mode"]
-        # Matches both `nosensor` and `nosensor_nochargecontroller`.
-        declared_on = "nosensor" not in mode
+        # Ask the RENDERED config whether the science-ingest pipeline is actually
+        # enabled, rather than matching on the mode's name. `_enabled` is absent
+        # when not overridden (= enabled) and False under the nosensor* presets --
+        # verified on mj03 across default/nosensor/nosensor_nochargecontroller/
+        # nochargecontroller. This is the real semantic; a substring test on the
+        # mode name only tracked it by convention and would break silently the day
+        # a preset disabled ingest without saying "nosensor".
+        science = CONFIG.get("pipelines", {}).get("science_ingest", {})
+        declared_on = bool(science.get("_enabled", True))
+        # Name is for the operator-facing message only, never for the decision.
+        mode = self._brokkr_mode()
 
         if sensor_powered == declared_on:
             return None
@@ -904,13 +930,28 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             "({detail})".format(mode=mode, n=number, detail=detail))
 
     @staticmethod
+    def _brokkr_mode():
+        """Mode name for display only -- never for the enabled/disabled decision.
+
+        There are four placements (drop-in Environment=, drop-in ExecStart=, the
+        unit's own ExecStart=, and a `mode` key in the unit's local mode.toml), and
+        only the running process resolves across all of them. Guarded because a
+        cosmetic lookup must not be able to kill the check.
+        """
+        try:
+            from brokkr.config.mode import MODE_CONFIG
+            return MODE_CONFIG.get("mode", "unknown")
+        except Exception:      # noqa: BLE001 - cosmetic only
+            return "unknown"
+
+    @staticmethod
     def _read_gpio(pin):
         """Return (level, func) for a BCM pin, or (None, None) if unreadable."""
         try:
             result = subprocess.run(
                 ["raspi-gpio", "get", str(pin)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                universal_newlines=True, timeout=10)
+                universal_newlines=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
             return None, None
         if result.returncode != 0:
