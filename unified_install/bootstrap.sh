@@ -124,6 +124,16 @@ echo ""
 USB_MOUNT="/mnt/usb"
 INSTALL_PATH="/home/pi/dev"
 REPO_NAME="mjolnir-hamma"
+
+# These two are composed into a path that is later passed to `rm -rf` and to
+# `find -delete`. This script runs `set -e` but NOT `set -u`, so an unset or
+# emptied variable expands to nothing silently: "$INSTALL_PATH/$REPO_NAME" would
+# become "/", and the update path would delete the root filesystem. Neither is
+# overridable today (no CLI flag, no env read), so this is not currently
+# reachable -- it is here so that it stays unreachable if either ever becomes
+# configurable, or if a refactor moves these assignments.
+: "${INSTALL_PATH:?INSTALL_PATH must be set and non-empty}"
+: "${REPO_NAME:?REPO_NAME must be set and non-empty}"
 FILES_PATH="$SCRIPT_DIR/../files"
 CONFIG_FILE="/boot/config.txt"
 # On newer Raspberry Pi OS, it might be /boot/firmware/config.txt
@@ -369,14 +379,19 @@ else
 
     if [[ -d "$INSTALL_PATH/$REPO_NAME" ]]; then
         log_warn "$REPO_NAME already exists at $INSTALL_PATH - updating..."
-        # Remove old copy and recopy fresh to avoid stale/corrupted files
-        rm -rf "$INSTALL_PATH/$REPO_NAME"
+        # Remove old copy and recopy fresh to avoid stale/corrupted files.
+        # ${VAR:?} rather than "$VAR": if either is ever empty this aborts instead
+        # of expanding to "rm -rf /". Belt and braces with the assertions above --
+        # this is the line that would do the damage, so it carries its own guard.
+        rm -rf "${INSTALL_PATH:?}/${REPO_NAME:?}"
     fi
 
     cp -r "$REPO_SOURCE" "$INSTALL_PATH/"
-    # Remove macOS metadata files (AppleDouble) that cause issues with brokkr
-    find "$INSTALL_PATH/$REPO_NAME" -name '._*' -delete 2>/dev/null || true
-    find "$INSTALL_PATH/$REPO_NAME" -name '.DS_Store' -delete 2>/dev/null || true
+    # Remove macOS metadata files (AppleDouble) that cause issues with brokkr.
+    # Same guard: an empty expansion here would be `find / -name '._*' -delete`,
+    # which is destructive across the whole filesystem, not just wrong.
+    find "${INSTALL_PATH:?}/${REPO_NAME:?}" -name '._*' -delete 2>/dev/null || true
+    find "${INSTALL_PATH:?}/${REPO_NAME:?}" -name '.DS_Store' -delete 2>/dev/null || true
     log_success "Copied $REPO_NAME to $INSTALL_PATH"
 fi
 
