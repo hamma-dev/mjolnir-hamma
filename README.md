@@ -146,7 +146,12 @@ I seriously considered ext4, NTFS, UFS and exFAT and looking into probably a doz
 For now I've settled on FAT32 w/larger cluster sizes (which will need to either be done on non-Windows platforms or with a third party tool), and just doing the mounting in the Python code initialization.
 We’ll need to name the drives consistently so the software can reliably find them and not dump data into any arbitrary mass storage device that may be inserted; to match the current ones they can be named DATANN, where NN 00-99.
 
-Important note: Given drive selection only occurs on initialization (to avoid unacceptable overhead) and to avoid hardcoding udev rules, as well as for write safety anyway, the Brokkr client service should be cleanly stopped before swapping drives (or the Pi safety powered off).
+Important note: to avoid hardcoding udev rules, and for write safety anyway, the Brokkr client service should be cleanly stopped before swapping drives (or the Pi safely powered off).
+
+Drive selection does **not** only occur on initialization, despite what this note used to say. `FileOutputStep.execute` calls `render_output_filename` -> `get_output_drive` -> `mount_drives` for **every science packet written**, so the drives are re-resolved (and mounted, via the polkit rule in `files/mount-udisks.pkla`) on each lightning trigger. There is no automounter: `setup_automount` installs that polkit authorization and nothing else — no fstab entry, no udev rule, no `.mount` unit. Two consequences worth knowing:
+
+- After a reboot, the `/media/pi/DATANN` mountpoints do not exist and no drive is mounted until the sensor's **first trigger**. On a quiet unit that can be days. This is normal, not a fault.
+- Because mounting happens per packet, a drive re-plugged while brokkr is running is not picked up until the next trigger either.
 
 
 
