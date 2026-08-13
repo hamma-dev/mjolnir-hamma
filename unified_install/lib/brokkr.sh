@@ -226,14 +226,31 @@ configure_brokkr() {
         log_success "Brokkr services installed"
     fi
 
-    # --- Step 5: Install the periodic AGS scrub timer ---
+    # --- Step 5: Install the runtime dir and the periodic AGS scrub timer ---
     # Steady-state drain of /ags/data, independent of the low-space telemetry
     # trigger, and the re-spawn path after check_scrub_health kills a hung scrub.
-    log_step "[Brokkr Config 5/5] Installing AGS scrub timer..."
+    log_step "[Brokkr Config 5/5] Installing runtime dir and AGS scrub timer..."
 
     local files_dir="${FILES_DIR:-$INSTALL_PATH/mjolnir-hamma/files}"
     local bin_path="/usr/local/bin"
     local systemd_path="/etc/systemd/system"
+    local tmpfiles_path="/etc/tmpfiles.d"
+
+    # /run/hamma holds the scrub heartbeat, the MJ-scan cache and the
+    # drive-target latch. Without it those writes fail (pi cannot mkdir under
+    # /run) and the scrub runs cold and heartbeat-less every time, which
+    # check_scrub_health reports as a hung scrub. Must land before the timer is
+    # started below. --create applies it now; boot is covered by tmpfiles-setup.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "cp $files_dir/tmpfiles-hamma.conf $tmpfiles_path/hamma.conf"
+        log_dry_run "systemd-tmpfiles --create $tmpfiles_path/hamma.conf"
+        manifest_add "copy" "src" "$files_dir/tmpfiles-hamma.conf" "dst" "$tmpfiles_path/hamma.conf" "sudo" "true"
+        manifest_add "command" "cmd" "systemd-tmpfiles --create $tmpfiles_path/hamma.conf" "sudo" "true"
+    else
+        sudo cp "$files_dir/tmpfiles-hamma.conf" "$tmpfiles_path/hamma.conf"
+        sudo systemd-tmpfiles --create "$tmpfiles_path/hamma.conf"
+        log_success "/run/hamma runtime dir installed"
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "rm -f $bin_path/hamma-scrub.sh (pre-copy, avoids same-file error)"

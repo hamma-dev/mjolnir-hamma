@@ -2588,6 +2588,38 @@ class TestRunControlMasterWiring:
         assert args[2] == 0 and args[3] == 0               # recovered, purged
 
 
+class TestRuntimeDir:
+    """Where the tmpfs state lives is load-bearing, not a detail."""
+
+    def test_state_is_on_tmpfs_under_the_runtime_dir(self, hamma_scrub):
+        assert hamma_scrub.RUNTIME_DIR == "/run/hamma"
+        for name in ("DEFAULT_STATUS_FILE", "DEFAULT_MJ_CACHE"):
+            assert getattr(hamma_scrub, name).startswith(
+                hamma_scrub.RUNTIME_DIR + "/"), (
+                    "%s must sit in RUNTIME_DIR so one tmpfiles.d entry "
+                    "provisions all of it" % name)
+
+    def test_state_is_not_on_dev_shm(self, hamma_scrub):
+        """/dev/shm is tmpfs but does not survive an ordinary pi logout.
+
+        systemd-logind's RemoveIPC=yes -- the compiled-in default, left
+        commented out in logind.conf -- deletes every object in /dev/shm owned
+        by a user when that user's last login session ends. The scrub runs as
+        pi, so `ssh pi@sensor; exit` deleted both the heartbeat and the scan
+        cache. The next scrub then ran cold: on mj05, a >1000 s re-read of
+        101k files (vs 4 s warm) with no heartbeat to show progress, which
+        state_monitor.check_scrub_health paged as a hung scrub.
+        """
+        for name in ("DEFAULT_STATUS_FILE", "DEFAULT_MJ_CACHE"):
+            assert not getattr(hamma_scrub, name).startswith("/dev/shm"), (
+                "%s is wiped by RemoveIPC on pi logout; /run is tmpfs too and "
+                "logind does not touch it" % name)
+
+    def test_the_metrics_csv_stays_durable(self, hamma_scrub):
+        """The cold-scan trail must outlive the tmpfs it reports on."""
+        assert not hamma_scrub.DEFAULT_METRICS_FILE.startswith("/run")
+
+
 class TestWriteStatus:
     """Scrub writes an atomic heartbeat/status file for the monitor to read."""
 

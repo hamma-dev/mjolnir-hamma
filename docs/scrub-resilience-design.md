@@ -375,9 +375,19 @@ that needs a reachable AGS. Re-using the freed lock relies on the re-spawn below
 §3.3 timer** as the real backstop (the space trigger is edge-based and won't re-fire).
 
 Corrections applied after review (all three were CRITICAL false-kill or fail-open vectors):
-- **Heartbeat on tmpfs (`/dev/shm`), not the SD root.** The SD fills from logs during the
+- **Heartbeat on tmpfs, not the SD root.** The SD fills from logs during the
   incident (HAM-112/113); a heartbeat that can't be written would make a healthy scrub look
   hung. tmpfs stays writable when the SD is full.
+
+  > **Superseded 2026-08-13 — the tmpfs must be `/run/hamma`, not `/dev/shm`.**
+  > systemd-logind's `RemoveIPC=yes` (the compiled-in default, left commented in
+  > `logind.conf`) deletes every object in `/dev/shm` owned by a user when that user's
+  > last login session ends. The heartbeat, the MJ-scan cache and the drive-target latch
+  > are all written by `pi`, so a routine `ssh pi@sensor` logout wiped all three. On mj05
+  > this made every post-logout scrub run cold — a >1000 s re-read of 101k files against
+  > 4 s warm — *and* left it with no heartbeat, so `check_scrub_health` paged the working
+  > scrub as hung. `/run` is tmpfs, still cleared on reboot, and logind does not touch it.
+  > Provisioned pi-owned by `files/tmpfiles-hamma.conf`.
 - **Detection by heartbeat *advancement* in the monitor's own `monotonic` clock**, never the
   scrub's wall-clock `timestamp`. Immune to (a) sensor clock skew / NTP steps (a future
   timestamp no longer disables detection; a backward step no longer false-kills) and (b) a

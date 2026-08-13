@@ -75,22 +75,35 @@ AGS_NICE = "nice -n 19 "
 # stall the safety net for an hour. 600s is ~6x the observed worst case (~99s).
 SCAN_TIMEOUT = 600        # seconds for the remote AGS strider scan
 
+# Runtime dir for this script's tmpfs state. Both files below must live on
+# tmpfs, NOT the SD root: the SD fills from logs during the exact incident
+# (HAM-112/113), and state that can't be written would make a healthy scrub
+# look hung. tmpfs stays writable when the SD is full.
+#
+# /run, NOT /dev/shm. systemd-logind's RemoveIPC=yes -- the compiled-in default,
+# left commented in logind.conf -- deletes every object in /dev/shm owned by a
+# user when that user's last login session ends. Both files here are written by
+# pi, so one ordinary `ssh pi@sensor` logout silently wiped the heartbeat AND
+# the scan cache. The next scrub then ran cold (on mj05, a >1000s full re-read
+# of 101k files) with no heartbeat to show for it, and check_scrub_health
+# reported the working scrub as hung. /run is tmpfs, cleared on reboot, and
+# RemoveIPC does not touch it. Created pi-owned by files/tmpfiles-hamma.conf;
+# pi cannot mkdir under /run itself, so that file is required for these paths.
+RUNTIME_DIR = "/run/hamma"
+
 # Heartbeat/status file the scrub updates as it advances, so the monitor
 # (state_monitor.check_scrub_health) can tell a working scrub from a hung one
 # (progress, not just lock age) and safely recover only genuine hangs.
-# On tmpfs (/dev/shm), NOT the SD root: the SD fills from logs during the exact
-# incident (HAM-112/113), and a heartbeat that can't be written would make a
-# healthy scrub look hung. tmpfs stays writable when the SD is full.
-DEFAULT_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
+DEFAULT_STATUS_FILE = RUNTIME_DIR + "/hamma_scrub_status.json"
 
 # Incremental-scan cache: per-hourly-dir MJ header sets keyed by a cheap
 # (mtime, .bin-count) signature, so unchanged dirs are reused instead of
 # re-reading every file's header (the ~99s-under-load MJ scan). On tmpfs so it
 # adds no SD wear; a reboot just costs one full scan.
-DEFAULT_MJ_CACHE = "/dev/shm/hamma_scrub_mj_cache.json"
+DEFAULT_MJ_CACHE = RUNTIME_DIR + "/hamma_scrub_mj_cache.json"
 
 # Durable per-run CSV of MJ-scan cache performance (hit-rate over time). Unlike
-# the /dev/shm status/cache, this lives on the SD so a cold scan (cache lost
+# the tmpfs status/cache, this lives on the SD so a cold scan (cache lost
 # between runs) leaves a reviewable trail. Size-capped in-place (one .1
 # generation) rather than relying on external logrotate -- keeps it bounded on
 # the SD in line with the HAM-112/113 SD-fill stance, since nothing else rotates
@@ -368,9 +381,10 @@ def _parse_since(since_str):
 def _load_scan_cache(path):
     """Load the incremental MJ-scan cache; {} on any problem (safe fallback).
 
-    JSON, NOT pickle: the cache lives on world-writable tmpfs (`/dev/shm` is
-    mode 1777), so unpickling it would be a local code-execution vector as the
-    scrub's user. JSON stores headers as hex and can never execute code on load.
+    JSON, NOT pickle: the cache lives on tmpfs under a directory this script
+    does not own exclusively, so unpickling it would be a local code-execution
+    vector as the scrub's user. JSON stores headers as hex and can never
+    execute code on load.
     """
     try:
         with open(path) as f:

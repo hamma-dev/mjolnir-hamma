@@ -26,10 +26,17 @@ import brokkr.utils.output
 # Lock file shared with the spawned `flock -n` scrub, so the monitor can probe
 # whether a prior scrub is still running (and detect a hung one).
 SCRUB_LOCK_FILE = "/tmp/hamma_scrub.lock"
+# Runtime dir for this plugin's tmpfs state (must match hamma_scrub.RUNTIME_DIR).
+# tmpfs so it stays writable when the SD root fills (the incident condition),
+# and /run rather than /dev/shm because systemd-logind's RemoveIPC=yes -- the
+# compiled-in default -- deletes everything in /dev/shm owned by the sensor user
+# when that user's last login session ends. An `ssh pi@sensor` logout was
+# silently wiping both files below. See hamma_scrub.RUNTIME_DIR for the full
+# account. Created pi-owned by files/tmpfiles-hamma.conf.
+RUNTIME_DIR = "/run/hamma"
 # Heartbeat/status file the scrub writes as it advances (must match
 # hamma_scrub.DEFAULT_STATUS_FILE); read to tell a working scrub from a hung one.
-# On tmpfs so it stays writable when the SD root fills (the incident condition).
-DEFAULT_SCRUB_STATUS_FILE = "/dev/shm/hamma_scrub_status.json"
+DEFAULT_SCRUB_STATUS_FILE = RUNTIME_DIR + "/hamma_scrub_status.json"
 # Durable log capturing the scrub's own stdout/stderr (mj05 ran blind because
 # this was DEVNULL'd). Rotated at SCRUB_LOG_MAX_BYTES so it can't fill the disk.
 DEFAULT_SCRUB_LOG = os.path.expanduser("~/brokkr/hamma/log/hamma_scrub.log")
@@ -82,7 +89,7 @@ DRIVE_TARGET_RENOTIFY_S = 3600
 # fsck on two others) that is pure noise: mj03's retained journal shows >=4
 # brokkr starts in a month.
 #
-# ON TMPFS, DELIBERATELY. /dev/shm survives a service restart -- the case that
+# ON TMPFS, DELIBERATELY. tmpfs survives a service restart -- the case that
 # produces the bursts, including the notifiers ImportError crash-loop -- and is
 # wiped by a reboot, so a rebooted unit always re-evaluates from scratch and
 # pages. That makes the dangerous failure mode structurally impossible rather
@@ -90,9 +97,13 @@ DRIVE_TARGET_RENOTIFY_S = 3600
 # SD card would also cover reboots, but it is the filesystem whose filling is a
 # documented recurring incident (HAM-112/113), it is unwritable during exactly
 # the disk-full event this check must survive, and it would reintroduce that
-# suppression path. DEFAULT_SCRUB_STATUS_FILE is on /dev/shm for the same
+# suppression path. DEFAULT_SCRUB_STATUS_FILE is on the same tmpfs for the same
 # reason, so this is one storage idiom rather than two.
-DEFAULT_DRIVE_STATE_FILE = "/dev/shm/hamma_drive_target_state.json"
+#
+# It is /run/hamma and NOT /dev/shm because RemoveIPC (see RUNTIME_DIR) deleted
+# this latch on every pi logout -- so "survives a service restart", the whole
+# point of persisting it, did not actually hold on any unit anyone SSHes into.
+DEFAULT_DRIVE_STATE_FILE = RUNTIME_DIR + "/hamma_drive_target_state.json"
 DRIVE_TARGET_STATE_VERSION = 1
 # A stored latch older than this is not trusted, independently of the tmpfs
 # wipe. On tmpfs the only gap the note has to bridge is a service restart,

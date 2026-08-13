@@ -299,7 +299,7 @@ class Tree:
         # including the `~` expansion, which is where the real bug was.
         self.home = tmp_path / "home" / USER
         self.fallback = self.home / "brokkr" / "hamma" / "science"
-        # Stands in for /dev/shm. Redirected by `sensor()` so the suite never
+        # Stands in for /run/hamma. Redirected by `sensor()` so the suite never
         # reads or writes the real one, and so each test starts with no latch.
         self.state_file = tmp_path / "shm" / "drive_state.json"
         self.media.mkdir(parents=True)
@@ -573,9 +573,10 @@ class TestFixtureIntegrity:
         assert MODULE.DRIVE_TARGET_BLIND_CYCLES == 60
         assert MODULE.DRIVE_TARGET_CLOCK_SLACK_S == 60
         assert MODULE.DRIVE_TARGET_STATE_MAX_AGE_S == 3600
-        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/dev/shm/"), (
+        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/run/hamma/"), (
             "the latch must live on tmpfs; see the docstring for why the SD "
-            "card is the wrong place")
+            "card is the wrong place, and test_the_store_is_not_on_dev_shm "
+            "for why /dev/shm is too")
 
     def test_quiet_age_is_not_derived_from_the_module(self):
         source = Path(__file__).read_text()
@@ -2068,7 +2069,7 @@ class TestLatchPersistence:
 
     def test_an_unwritable_store_costs_only_the_suppression(
             self, tmp_path, prompt):
-        """A full or read-only /dev/shm must not break the check."""
+        """A full or read-only tmpfs must not break the check."""
         tree = self.latched_tree(tmp_path)
         monitor = make_monitor()
         with sensor(tree):
@@ -2188,9 +2189,26 @@ class TestLatchPersistence:
 
     def test_the_shipped_location_is_tmpfs(self):
         """Moving this to the SD card trades a repeat for a suppression."""
-        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/dev/shm/")
-        assert MODULE.DEFAULT_SCRUB_STATUS_FILE.startswith("/dev/shm/"), (
+        assert MODULE.DEFAULT_DRIVE_STATE_FILE.startswith("/run/hamma/")
+        assert MODULE.DEFAULT_SCRUB_STATUS_FILE.startswith("/run/hamma/"), (
             "one storage idiom, not two")
+
+    def test_the_store_is_not_on_dev_shm(self):
+        """/dev/shm is tmpfs but is NOT durable against an ordinary logout.
+
+        systemd-logind's RemoveIPC=yes -- the compiled-in default, left
+        commented out in logind.conf -- deletes every object in /dev/shm owned
+        by a user when that user's last login session ends. brokkr and the
+        scrub both run as pi, so `ssh pi@sensor; exit` silently deleted this
+        latch, the scrub heartbeat and the MJ-scan cache. On mj05 that made
+        every post-logout scrub re-read 101k files (>1000 s, vs 4 s warm) with
+        no heartbeat, and check_scrub_health paged the working scrub as hung.
+        "Survives a service restart" did not hold on any unit anyone SSHes to.
+        """
+        for name in ("DEFAULT_DRIVE_STATE_FILE", "DEFAULT_SCRUB_STATUS_FILE"):
+            assert not getattr(MODULE, name).startswith("/dev/shm"), (
+                "%s is wiped by RemoveIPC on pi logout; use /run/hamma, which "
+                "is tmpfs and which logind does not touch" % name)
 
 
 # --- Alert-only --------------------------------------------------------------
