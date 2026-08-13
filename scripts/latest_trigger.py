@@ -1,4 +1,10 @@
-#!/usr/bin/env python
+#!/home/pi/dev/ltgenv/bin/python
+# The venv interpreter, NOT `env python` (which is Python 2.7 on Buster) and NOT
+# `env python3` (which is 3.7 but has no pandas/numpy/hamma). mjol_array invokes
+# this by bare path over ssh, so the shebang alone decides. With `env python` the
+# `from pathlib import Path` below raised ImportError on every unit, which is why
+# Trig time / Threshold / Num Sat read `nan` fleet-wide in the array status.
+# Matches relay.py, sensors.py and sunsaver.py, which have the same dependency.
 
 # Bring the entire array up or down, or just run a status report
 

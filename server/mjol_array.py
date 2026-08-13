@@ -18,6 +18,28 @@ PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
 AUMMA_SENSORS = [41, 42, 43, ]
 
 
+# Bounds on ssh round trips to a unit.
+#
+# These are NOT belt-and-braces. `ConnectTimeout=5` in _pi_ssh_cmd bounds only
+# establishing the TCP connection. A tunnel that accepts the connection and then
+# stalls -- "Connection timed out during banner exchange", routine on this fleet
+# -- leaves subprocess.run() blocking with no bound at all.
+#
+# That is what wedged the VPS array_status pipeline from 2026-08-03 to 08-13: the
+# worker processes blocked on ssh, never returned, and ended up defunct. brokkr's
+# main process stayed alive, so systemd reported the service `active (running)`
+# and `Restart=on-failure` never fired, while webgen kept regenerating the public
+# status page from a 10-day-old CSV. Nothing anywhere reported a fault.
+#
+# Values are ~15x the measured round trip on a reachable unit (services 0.9 s,
+# latest_trigger 0.8 s, brokkr status 2.4 s) -- generous enough never to fire in
+# normal operation, small enough that a whole array stays inside the 900 s
+# monitor interval even if every unit hangs.
+SSH_SERVICES_TIMEOUT_S = 15
+SSH_TRIGGER_TIMEOUT_S = 20
+SSH_STATUS_TIMEOUT_S = 30
+
+
 # These deliberately re-check what ags.py validates on the Pi. mjol_array
 # runs on the VPS and ags.py on the sensor; they deploy as separate git
 # checkouts on different hosts and cannot share a module. Validating here
@@ -80,8 +102,17 @@ class MjolnirArray():
 
         ret = list()
         for _s in services:
-            out = subprocess.run(cmd + [_s], stdout=subprocess.PIPE)
-            ret.append(not out.returncode)
+            # Unlike the two callers below, this one has no surrounding
+            # try/except, so TimeoutExpired must be caught here or it would abort
+            # the whole sweep instead of degrading one reading.
+            try:
+                out = subprocess.run(cmd + [_s], stdout=subprocess.PIPE,
+                                     timeout=SSH_SERVICES_TIMEOUT_S)
+                ret.append(not out.returncode)
+            except subprocess.TimeoutExpired:
+                # Report the service as down. A unit we cannot reach must not be
+                # reported as healthy -- that is the direction that hides faults.
+                ret.append(False)
 
         return ret
 
@@ -117,7 +148,11 @@ class MjolnirArray():
         cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
 
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+            # TimeoutExpired is an Exception, so the handler below catches it and
+            # the reading degrades to nan -- the same as any other failure here.
+            out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                 universal_newlines=True,
+                                 timeout=SSH_TRIGGER_TIMEOUT_S)
             if out.returncode:
                 raise Exception
             ret_val = ast.literal_eval(out.stdout)
@@ -267,7 +302,10 @@ class MjolnirArray():
         cmd = cmd + ['/home/pi/dev/ltgenv/bin/brokkr', 'status']
 
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE)
+            # On timeout the except below sets ping_code = 1, i.e. "sensor down".
+            # Failing toward down is correct: a hung probe must never read as up.
+            out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                 timeout=SSH_STATUS_TIMEOUT_S)
             retval = out.stdout.decode()
             retval = retval.split('\n')
 
