@@ -18,6 +18,38 @@ PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
 AUMMA_SENSORS = [41, 42, 43, ]
 
 
+# Bounds on ssh round trips to a unit.
+#
+# These are NOT belt-and-braces. `ConnectTimeout=5` in _pi_ssh_cmd bounds only
+# establishing the TCP connection. A tunnel that accepts the connection and then
+# stalls -- "Connection timed out during banner exchange", routine on this fleet
+# -- leaves subprocess.run() blocking with no bound at all.
+#
+# The VPS array_status pipeline wedged this way: worker processes blocked on ssh,
+# never returned, and ended up defunct while brokkr's main process stayed alive,
+# so `systemctl` reported `active (running)` and webgen kept regenerating the
+# public status page from a stale CSV. NOTE the service was NOT quiet about it --
+# `NRestarts` read 202 at the time. It was restarting repeatedly and nobody was
+# watching; the root cause of the recurring wedge is still not established, and
+# these bounds do not claim to explain it.
+#
+# Values are ~15x the round trip measured across the fleet, including the worst
+# geography (mj43/Australia, `brokkr status` 9.5 s -- 32% of its 30 s budget).
+#
+# Worst case per unit, if every call stalls: services 2x15 (it loops over TWO
+# services) + trigger 20 + fcm 30 = 80 s. Sweeps are sequential, so:
+#     hamma  9 units = 720 s  vs 600 s interval  -- EXCEEDS, see below
+#     pamma  6 units = 480 s  vs 900 s interval
+#     aumma  3 units = 240 s  vs 600 s interval
+# Overrunning does not overlap sweeps -- brokkr's run_periodic is a single
+# blocking loop, so hamma degrades to ~720 s cadence rather than compounding.
+# That is a bounded ~20% cadence loss in an all-units-stalled scenario, and is
+# accepted rather than fixed by tightening, which would risk false negatives.
+SSH_SERVICES_TIMEOUT_S = 15
+SSH_TRIGGER_TIMEOUT_S = 20
+SSH_STATUS_TIMEOUT_S = 30
+
+
 # These deliberately re-check what ags.py validates on the Pi. mjol_array
 # runs on the VPS and ags.py on the sensor; they deploy as separate git
 # checkouts on different hosts and cannot share a module. Validating here
@@ -80,8 +112,17 @@ class MjolnirArray():
 
         ret = list()
         for _s in services:
-            out = subprocess.run(cmd + [_s], stdout=subprocess.PIPE)
-            ret.append(not out.returncode)
+            # Unlike the two callers below, this one has no surrounding
+            # try/except, so TimeoutExpired must be caught here or it would abort
+            # the whole sweep instead of degrading one reading.
+            try:
+                out = subprocess.run(cmd + [_s], stdout=subprocess.PIPE,
+                                     timeout=SSH_SERVICES_TIMEOUT_S)
+                ret.append(not out.returncode)
+            except subprocess.TimeoutExpired:
+                # Report the service as down. A unit we cannot reach must not be
+                # reported as healthy -- that is the direction that hides faults.
+                ret.append(False)
 
         return ret
 
@@ -113,11 +154,28 @@ class MjolnirArray():
                 return _datetime.datetime.fromtimestamp(
                     int(epoch_s), _datetime.timezone.utc)
 
+        # Name the interpreter explicitly rather than relying on the script's
+        # shebang. The shebang is only correct once a unit has pulled the fix for
+        # it, so invoking by bare path makes this reading depend on per-unit
+        # deployment state: on any unit still carrying `#!/usr/bin/env python`
+        # (= Python 2.7 on Buster) the script dies on `from pathlib import Path`
+        # and Last trigger / GPS Satellites / Threshold all read `nan`.
+        #
+        # The legacy array.py did it this way and hamma's trigger columns were
+        # populated throughout; pamma and aumma, which have always used this
+        # script, have read `nan` for as long as they have been on it. Being
+        # explicit here fixes all three now and keeps working whatever state a
+        # unit's checkout is in.
         cmd = MjolnirArray._pi_ssh_cmd(port)
-        cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
+        cmd = cmd + ['/home/pi/dev/ltgenv/bin/python',
+                     '/home/pi/dev/mjolnir-hamma/scripts/latest_trigger.py']
 
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+            # TimeoutExpired is an Exception, so the handler below catches it and
+            # the reading degrades to nan -- the same as any other failure here.
+            out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                 universal_newlines=True,
+                                 timeout=SSH_TRIGGER_TIMEOUT_S)
             if out.returncode:
                 raise Exception
             ret_val = ast.literal_eval(out.stdout)
@@ -267,7 +325,10 @@ class MjolnirArray():
         cmd = cmd + ['/home/pi/dev/ltgenv/bin/brokkr', 'status']
 
         try:
-            out = subprocess.run(cmd, stdout=subprocess.PIPE)
+            # On timeout the except below sets ping_code = 1, i.e. "sensor down".
+            # Failing toward down is correct: a hung probe must never read as up.
+            out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                 timeout=SSH_STATUS_TIMEOUT_S)
             retval = out.stdout.decode()
             retval = retval.split('\n')
 
