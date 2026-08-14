@@ -1,5 +1,23 @@
 """
 Plugin to monitor Pi connectivity.
+
+NOTE: unlike every other plugin in this directory, this one does NOT run on a
+sensor. It runs in the *second* brokkr instance -- the one on the VPS, as user
+`monitor`, driving the `array_status` pipeline. Both instances are named
+`brokkr-hamma-default.service` and both are started with `--system hamma`, so
+establish which one you are looking at before drawing conclusions.
+
+It works by importing `script_name` (in practice `/home/monitor/mjol_array.py`,
+a symlink to `server/mjol_array.py` in this repo) and calling `collect_data()`
+on it once per pipeline iteration, then flattening the resulting DataFrame into
+one DataValue per sensor per field. So a change to `server/mjol_array.py`
+changes what this plugin reports -- but only after brokkr is restarted, since
+the module is imported at pipeline construction.
+
+The deployed copy lives in `/home/monitor/brokkr-vps-system/plugins/`, which is
+the VPS system dir -- deliberately outside the git checkout (HAM-192), so this
+file is the source of truth but is NOT what executes. Deploy changes by copying
+them there.
 """
 
 # Standard Library Imports
@@ -16,7 +34,12 @@ import brokkr.pipeline.datavalue
 
 
 class ArrayStatus(brokkr.pipeline.baseinput.ValueInputStep):
-    """LOL"""
+    """Input step yielding one DataValue per sensor per field in `data_names`.
+
+    `sensors` is the list of unit numbers for the array being polled (e.g.
+    [50, 51, 52, 53, 54, 56] for PAMMA); it defaults to range(1, 9), which is
+    stale -- the configs pass it explicitly.
+    """
 
     def __init__(
         self,
