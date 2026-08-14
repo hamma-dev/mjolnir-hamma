@@ -1,23 +1,40 @@
 """
 Plugin to monitor Pi connectivity.
 
-NOTE: unlike every other plugin in this directory, this one does NOT run on a
-sensor. It runs in the *second* brokkr instance -- the one on the VPS, as user
+NOTE: every other plugin in this directory runs on a sensor. This one does not:
+it runs in the *second* brokkr instance -- the one on the VPS, as user
 `monitor`, driving the `array_status` pipeline. Both instances are named
 `brokkr-hamma-default.service` and both are started with `--system hamma`, so
-establish which one you are looking at before drawing conclusions.
+establish which one you are looking at before drawing conclusions. (Sensor-side
+plugins are not exclusive to sensors -- `state_monitor` is deployed on the VPS
+too -- but this is the only one that exists solely for it.)
 
-It works by importing `script_name` (in practice `/home/monitor/mjol_array.py`,
-a symlink to `server/mjol_array.py` in this repo) and calling `collect_data()`
-on it once per pipeline iteration, then flattening the resulting DataFrame into
-one DataValue per sensor per field. So a change to `server/mjol_array.py`
-changes what this plugin reports -- but only after brokkr is restarted, since
-the module is imported at pipeline construction.
+It imports `script_name` (in practice `/home/monitor/mjol_array.py`, a symlink
+to `server/mjol_array.py` in this repo) and calls it once per pipeline
+iteration, then flattens the resulting DataFrame into one DataValue per sensor
+per field. A change to `server/mjol_array.py` therefore changes what this plugin
+reports -- but only after brokkr is restarted, since the module is imported at
+pipeline construction, not per iteration.
 
-The deployed copy lives in `/home/monitor/brokkr-vps-system/plugins/`, which is
-the VPS system dir -- deliberately outside the git checkout (HAM-192), so this
-file is the source of truth but is NOT what executes. Deploy changes by copying
-them there.
+Two traps worth knowing before editing:
+
+1. `read_raw_data` tries `status_module.collect_data()` first, but that name
+   exists only as a *method* of `MjolnirArray` -- there is no module-level
+   function -- so the `try` branch always raises AttributeError and the
+   `except` fallback is what has actually run every iteration since this was
+   written. Do not read the `try` branch as the live path.
+2. Values are matched to `data_types` **positionally**, not by name. The 6th
+   key `collect_data()` returns is `'Num GPS'` while the configs' 6th
+   `data_names` entry is `'GPS Satellites'`; this works only because both sit
+   in the same slot. Reordering either side silently mislabels sensor data
+   with no error. `monitor_input_steps` and `base_path` are likewise accepted
+   by __init__ and then dropped -- they are never forwarded to super().
+
+This file is the versioned source of truth but is NOT what executes: brokkr
+loads the plugin from whatever directory `systempath.toml` resolves to, which
+is currently a dedicated system dir outside this checkout (HAM-192). Check that
+before assuming an edit here is live. Whether that stays the arrangement is
+HAM-198.
 """
 
 # Standard Library Imports
