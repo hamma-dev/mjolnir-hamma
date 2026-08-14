@@ -1126,9 +1126,10 @@ class TestDiagnosis:
     def test_a_partial_loss_pages(self, tmp_path, prompt):
         """One partition hidden while another still works.
 
-        Without this the unit runs on half its storage for ~120 days at the
-        measured 14.75 GiB/day and the operator finds out when the survivor
-        fills -- by which point they have an emergency AND the original fault.
+        Without this the unit runs on half its storage until the survivor
+        fills and the operator finds out then -- by which point they have an
+        emergency AND the original fault. (Formerly "~120 days at the measured
+        14.75 GiB/day"; that is mj03's rate, and mj08 runs 6x faster.)
         Caught here the fix is still remount + rmdir the stale directory.
         """
         tree = Tree(tmp_path)
@@ -1775,10 +1776,16 @@ class TestDampingAndLatch:
 class TestCapacity:
     """The actionable event is the partition transition, not a fixed floor.
 
-    1.8 TB disks at mj03's measured 14.75 GiB/day: a 25 GiB floor is silent for
-    ~226 days and then gives 41 hours of warning, once. "The first partition is
-    full, the unit is on its last one" arrives months earlier, and "full" is
-    brokkr's own `min_free_gb`, so no new threshold is introduced.
+    On 1.8 TB disks a fixed 25 GiB floor gives one short warning very late.
+    "The first partition is full, the unit is on its last one" arrives well
+    before that, and "full" is brokkr's own `min_free_gb`, so no new threshold
+    is introduced.
+
+    How much earlier is NOT months, and this docstring used to say it was, on
+    mj03's measured 14.75 GiB/day. mj08 measured 91 GiB/day over 2.68 days and
+    ranged 36-218 GiB/day within that window; sensor-log #111 predicted its
+    transition at ~21 days and it arrived the next day. Do not restate a
+    fleet-wide rate here.
     """
 
     def test_two_roomy_partitions_are_silent(self, tmp_path, prompt):
@@ -1796,11 +1803,77 @@ class TestCapacity:
         assert alert is not None
         assert "1 of 2 DATA partitions are full" in alert
         assert "writing to the last one, DATA42" in alert
-        assert "900.0 GiB free" in alert
-        # The blanket auto-scrub caveat used to be appended here too. Pinned
-        # absent so it cannot come back; the capacity remedy wording itself is
-        # reworked separately.
         assert "auto-scrub" not in alert
+        # GOLDEN STRING, not substrings.
+        #
+        # Earlier versions of this test asserted things like `"empty" not in
+        # alert` and `"the full disk" not in alert`. Those pin the literal
+        # phrasing of one prior draft, not the defect. Verified by mutation:
+        # rewording the remedy to "delete the old data to reclaim the space"
+        # (the deletion instruction sensor-log #98 warns against) or to
+        # "replace the full drive before this one fills" (the two-disk claim
+        # that is wrong -- DATA69 and DATA70 are one physical disk) BOTH
+        # passed 109/109 against those substring assertions.
+        #
+        # Pinning the whole remedy verbatim is the only form that survives a
+        # synonym. Any reword fails here, which is the point: the wording is
+        # operator-approved and changing it should require deliberately
+        # updating this line.
+        # ENDSWITH, not `in`. `in` pins a prefix and lets anything be appended
+        # -- verified: adding " at your convenience next week" to the remedy
+        # passed a golden `in` assertion while destroying the urgency it was
+        # written to protect. This is the only capacity fault in this fixture,
+        # so the reason is the tail of the message.
+        assert alert.endswith(
+            "brokkr is now writing to the last one, DATA42, with "
+            "900.0 GiB free. File a Jira ticket to schedule a drive swap.")
+
+    def test_composed_alert_with_a_second_fault_reads_correctly(
+            self, tmp_path, prompt):
+        """Read a WHOLE multi-fault alert, not a fragment of a single one.
+
+        Every capacity-wording defect found across three attempts survived a
+        green suite because nothing here ever composed two reasons and read
+        the result. `_evaluate_drive_target` joins reasons with "; " into one
+        message, so a remedy that reads fine alone can contradict or collide
+        with its neighbour.
+
+        This case is specifically the collision that broke an earlier version
+        of these tests: the stray-mount remedy contains the word "empty"
+        ("rmdir the leftover empty directory"), so an `assert "empty" not in
+        alert` written to guard the capacity remedy fails here -- on a real,
+        reachable topology -- while passing on the single-fault fixture it was
+        written against.
+        """
+        tree = Tree(tmp_path)
+        tree.label("DATA31")
+        tree.label("DATA42")
+        tree.label("DATA43")
+        tree.stale_dir("DATA31")            # forces the suffixed mountpoint
+        tree.mount("DATA311", free_gib=500)  # brokkr cannot see this one
+        tree.mount("DATA42", free_gib=0)     # full
+        tree.mount("DATA43", free_gib=900)   # the survivor
+        monitor = make_monitor()
+        with sensor(tree):
+            alert = monitor.check_drive_target(None)
+        assert alert is not None
+
+        # Both faults are present, each with its own remedy, joined by "; ".
+        assert "rmdir the leftover empty directory" in alert
+        assert ("brokkr is now writing to the last one, DATA43, with "
+                "900.0 GiB free. File a Jira ticket to schedule a "
+                "drive swap") in alert
+
+        # The composed message must still be well-formed: one leading stem,
+        # one terminating period, no doubled punctuation from the join.
+        assert alert.startswith("Science drive target problem -- ")
+        assert alert.endswith(".")
+        assert ".." not in alert
+        assert "; ;" not in alert
+
+        # The emergency register belongs to `all_full` alone. A unit that
+        # still has a writable partition must not be told data is being lost.
+        assert "SCIENCE DATA IS BEING LOST NOW" not in alert
 
     def test_full_uses_brokkrs_decimal_min_free_gb(self, tmp_path, prompt):
         """min_free_gb is decimal GB (min_free_gb * 1e9), as select_drive uses.
@@ -1827,10 +1900,25 @@ class TestCapacity:
         assert "ENOSPC" not in alert
         assert {"DATA31", "DATA42"} <= named(alert)
         # The `all_full` branch is a SEPARATE reason string from
-        # `lastpartition`, so pinning the caveat's absence on only one of them
-        # leaves the other free to regress. A mutation reverting just this
-        # branch passed 109/109 before this line existed.
+        # `lastpartition`, so pinning wording on only one of them leaves the
+        # other free to regress. A mutation reverting just this branch passed
+        # 109/109 before these lines existed.
         assert "auto-scrub" not in alert
+        # GOLDEN STRING -- see the note in test_last_partition_transition_alerts.
+        # Asserted from the outcome clause onward rather than from the start of
+        # the reason, because `usable` is not sorted, so the partition-name list
+        # ahead of it can render in either order.
+        #
+        # This branch is ACTIVE LOSS, not a scheduling problem, and it pages
+        # once and then latches -- the wording is the only urgency signal there
+        # is. It must not converge on the lastpartition text.
+        # ENDSWITH, not `in` -- see the note in the lastpartition test.
+        assert alert.endswith(
+            "brokkr's own drive selection now fails outright "
+            "(RuntimeError: All drives full!). SCIENCE DATA IS BEING LOST "
+            "NOW -- free space or attach a drive today, and file a Jira "
+            "ticket.")
+        assert "schedule a drive swap" not in alert
 
     def test_a_single_full_partition_says_enospc_not_refusal(
             self, tmp_path, prompt):
@@ -1861,7 +1949,8 @@ class TestCapacity:
         """A documented gap, asserted so it stays visible.
 
         `last_partition` needs two usable partitions. A one-partition unit gets
-        only brokkr's 100 MB floor, which at 14.75 GiB/day is ~9 minutes.
+        only brokkr's 100 MB floor, which at mj03's 14.75 GiB/day is ~9
+        minutes -- and proportionally less on faster units.
         """
         tree = Tree(tmp_path)
         tree.label("DATA31")
