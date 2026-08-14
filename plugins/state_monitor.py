@@ -1494,10 +1494,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # cannot mute the fault permanently by latching without alerting.
         self._drive_target_alerted = signature
         self._drive_target_alerted_at = time.time()
-        return ("Science drive target problem -- " + "; ".join(reasons)
-                + ". Note the auto-scrub cannot help with any of this: it "
-                  "only deletes on the AGS, never on the mj-side DATA "
-                  "partitions.")
+        return "Science drive target problem -- " + "; ".join(reasons) + "."
 
     def check_power(self, input_data):
         """
