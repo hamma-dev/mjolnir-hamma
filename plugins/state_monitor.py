@@ -1066,9 +1066,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         - **unused**: some labelled partition is missing while another is
           mounted and working. Data is still landing, so this is not an
           emergency, but the unit is on part of its storage and will look
-          healthy until the survivor fills -- about 120 days at the measured
-          14.75 GiB/day, at which point the operator has both an emergency and
-          the original fault. Caught here it is still just remount + rmdir.
+          healthy until the survivor fills -- at which point the operator has
+          both an emergency and the original fault. Caught here it is still
+          just remount + rmdir. (This used to say "about 120 days at the
+          measured 14.75 GiB/day". That rate is mj03's; mj08 runs 6x faster
+          and varies 36-218 GiB/day day to day, so no single figure belongs
+          here.)
 
           This branch does NOT use the mtime gate, and does not need it. Its
           evidence is structural and strictly stronger: `mount_drives`
