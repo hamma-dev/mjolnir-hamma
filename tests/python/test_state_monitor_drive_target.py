@@ -1797,10 +1797,20 @@ class TestCapacity:
         assert "1 of 2 DATA partitions are full" in alert
         assert "writing to the last one, DATA42" in alert
         assert "900.0 GiB free" in alert
-        # The blanket auto-scrub caveat used to be appended here too. Pinned
-        # absent so it cannot come back; the capacity remedy wording itself is
-        # reworked separately.
         assert "auto-scrub" not in alert
+        # Names the tracker, so the operator is not left choosing between
+        # Jira and two GitHub repos at 2am.
+        assert "Jira ticket" in alert
+        # Must NOT claim a two-disk topology. The two DATA?? partitions are
+        # two partitions of one physical disk on the surveyed units, so
+        # "replace the full disk before this one fills" would name the disk
+        # brokkr is currently writing to.
+        assert "disk before" not in alert
+        assert "the full disk" not in alert
+        # No unqualified deletion instruction -- sensor-log #98.
+        assert "empty" not in alert
+        # Scheduled, not an emergency: this branch has weeks of runway.
+        assert "LOST NOW" not in alert
 
     def test_full_uses_brokkrs_decimal_min_free_gb(self, tmp_path, prompt):
         """min_free_gb is decimal GB (min_free_gb * 1e9), as select_drive uses.
@@ -1827,10 +1837,17 @@ class TestCapacity:
         assert "ENOSPC" not in alert
         assert {"DATA31", "DATA42"} <= named(alert)
         # The `all_full` branch is a SEPARATE reason string from
-        # `lastpartition`, so pinning the caveat's absence on only one of them
-        # leaves the other free to regress. A mutation reverting just this
-        # branch passed 109/109 before this line existed.
+        # `lastpartition`, so pinning wording on only one of them leaves the
+        # other free to regress. A mutation reverting just this branch passed
+        # 109/109 before these lines existed.
         assert "auto-scrub" not in alert
+        # This branch is ACTIVE LOSS, not a scheduling problem. It pages once
+        # and then latches, so the wording is the only urgency signal there
+        # is -- it must not read like the lastpartition warning.
+        assert "SCIENCE DATA IS BEING LOST NOW" in alert
+        assert "today" in alert
+        assert "Jira ticket" in alert
+        assert "schedule a drive swap" not in alert
 
     def test_a_single_full_partition_says_enospc_not_refusal(
             self, tmp_path, prompt):

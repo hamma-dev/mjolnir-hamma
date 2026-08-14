@@ -1099,17 +1099,27 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         stays silent for ~226 days and then gives 41 hours of warning, once --
         and nothing on the sensor can free these partitions (`hamma_scrub`
         only ever deletes on the AGS). What is reported instead is the
-        transition brokkr's name-ordered fill produces months earlier: the
-        earlier partitions are full and the unit is on its last one. "Full" is
-        brokkr's own `min_free_gb`, so no new threshold is introduced.
+        transition brokkr's name-ordered fill produces well before the unit
+        runs out: the earlier partitions are full and it is on its last one.
+        "Full" is brokkr's own `min_free_gb`, so no new threshold is
+        introduced.
 
-        Be honest about the limit of that: it needs at least two usable
-        partitions. The surveyed units are two partitions of ONE physical disk
-        (DATA31 -> sda1, DATA32 -> sda2), so they do get the early warning; a
-        single-partition unit gets only the `min_free_gb` floor, which at
-        100 MB and 14.75 GiB/day is about nine minutes. That is a real gap and
-        it is not fixed here -- fixing it needs a capacity policy, not another
-        threshold in this function.
+        How much notice that actually buys is NOT months, and an earlier
+        version of this docstring said it was. Measured on mj08 2026-08-14:
+        DATA70 took 244.0 GiB in 2.68 days = 91.1 GiB/day, leaving ~18 days
+        of runway. sensor-log #111 predicted that transition "in roughly 21
+        days" and it arrived the next day. Treat any fleet-wide GiB/day
+        constant as unreliable and measure the unit -- see the fill-rate note
+        in project memory.
+
+        Be honest about the other limit: this needs at least two usable
+        partitions. The surveyed units carry two DATA?? partitions on ONE
+        physical disk, so they do get the early warning; a single-partition
+        unit gets only the `min_free_gb` floor, which at 100 MB and even the
+        old 14.75 GiB/day estimate is about nine minutes -- and proportionally
+        less at the rates actually observed. That is a real gap and it is not
+        fixed here; fixing it needs a capacity policy, not another threshold
+        in this function.
 
         On restarts: the latch is persisted to `DEFAULT_DRIVE_STATE_FILE` so
         a brokkr restart does not re-page every latched fault -- on units whose
@@ -1476,17 +1486,36 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 outcome = ("brokkr does not apply that floor with only one "
                            "candidate, so it will keep writing until the "
                            "write fails with ENOSPC")
+            # This is not a warning, it is a loss report: brokkr either
+            # refuses to select or writes until ENOSPC, and either way
+            # triggers are being discarded right now. It also pages ONCE and
+            # then latches, so the wording carries the entire urgency signal.
+            # Do not level it with `lastpartition` below, which has weeks.
             reasons.append(
                 "every DATA partition brokkr can use ({}) is below its own "
-                "min_free_gb={:g} floor; {}. Swap or empty the disk".format(
+                "min_free_gb={:g} floor; {}. SCIENCE DATA IS BEING LOST NOW "
+                "-- free space or attach a drive today, and file a Jira "
+                "ticket".format(
                     ", ".join(name for name, _f in usable), view.min_free_gb,
                     outcome))
         elif last_partition:
             name, free = remaining[0]
+            # Name PARTITIONS, never "the disk". On the surveyed units the two
+            # DATA?? partitions are two partitions of ONE physical disk (mj08
+            # DATA69+DATA70; mj05 DATA55+DATA56, sensor-log #97 "Single
+            # physical disk, two partitions -- not two drives"). Wording like
+            # "replace the full disk before this one fills" only parses if
+            # they are separate disks, and taken literally it names the disk
+            # brokkr is currently writing to.
+            #
+            # No "empty it" instruction either: sensor-log #98 records a
+            # removed drive that held the ONLY copy of three months of science
+            # data. Deletion is a judgement call with a backup precondition,
+            # not something to put in an alert.
             reasons.append(
                 "{} of {} DATA partitions are full ({}); brokkr is now "
-                "writing to the last one, {}, with {:.1f} GiB free. Swap or "
-                "empty the disk before it fills".format(
+                "writing to the last one, {}, with {:.1f} GiB free. File a "
+                "Jira ticket to schedule a drive swap".format(
                     len(full), len(usable), ", ".join(full), name,
                     free / (2 ** 30)))
 
