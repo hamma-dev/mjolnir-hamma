@@ -1093,7 +1093,14 @@ class TestMj51Topology:
             alert = monitor.check_drive_target(None)
         assert config_drive_kwargs()["drive_glob"] not in alert
         assert "rmdir the leftover empty directory" in alert
-        assert "only deletes on the AGS" in alert
+        # The alert must carry the remedy for THIS fault and nothing else.
+        # It used to append a blanket "the auto-scrub cannot help with any of
+        # this" caveat to every drive-target alert. Operators already know the
+        # scrub is AGS-side, so it was noise on a message that has to be
+        # scannable -- and it was wrong to attach it to non-capacity faults
+        # like this one at all.
+        assert "auto-scrub" not in alert
+        assert "only deletes on the AGS" not in alert
 
     def test_healthy_tree_is_silent(self, tmp_path, prompt):
         tree = healthy_tree(tmp_path)
@@ -1790,6 +1797,10 @@ class TestCapacity:
         assert "1 of 2 DATA partitions are full" in alert
         assert "writing to the last one, DATA42" in alert
         assert "900.0 GiB free" in alert
+        # The blanket auto-scrub caveat used to be appended here too. Pinned
+        # absent so it cannot come back; the capacity remedy wording itself is
+        # reworked separately.
+        assert "auto-scrub" not in alert
 
     def test_full_uses_brokkrs_decimal_min_free_gb(self, tmp_path, prompt):
         """min_free_gb is decimal GB (min_free_gb * 1e9), as select_drive uses.
@@ -1815,6 +1826,11 @@ class TestCapacity:
         assert "All drives full!" in alert
         assert "ENOSPC" not in alert
         assert {"DATA31", "DATA42"} <= named(alert)
+        # The `all_full` branch is a SEPARATE reason string from
+        # `lastpartition`, so pinning the caveat's absence on only one of them
+        # leaves the other free to regress. A mutation reverting just this
+        # branch passed 109/109 before this line existed.
+        assert "auto-scrub" not in alert
 
     def test_a_single_full_partition_says_enospc_not_refusal(
             self, tmp_path, prompt):
