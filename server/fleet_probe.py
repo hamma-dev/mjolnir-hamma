@@ -328,9 +328,16 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
         lines.append("")
         lines.append("UNREACHABLE: " + ", ".join(unexpected))
     if known:
+        # "Offline" is the default reason and repeating it for every unit is
+        # noise; annotate only the distinctive ones (Retired, Shelf, Lab) so
+        # they still stand out in the list.
+        def _label(unit):
+            reason = expected[unit]
+            if reason.strip().lower() == "offline":
+                return unit
+            return "{} ({})".format(unit, reason)
         lines.append("")
-        lines.append("expected offline: " + ", ".join(
-            "{} ({})".format(u, expected[u]) for u in known))
+        lines.append("expected offline: " + ", ".join(_label(u) for u in known))
     return "\n".join(lines)
 
 
