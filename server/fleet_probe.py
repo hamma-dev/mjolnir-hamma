@@ -69,6 +69,16 @@ FIELDS = [
 UNREACHABLE = "unreachable"
 UNKNOWN = "unknown"
 
+# Fields read from the AGS startup file, which is only reachable while the front
+# end is powered. When front_end flips they go blank (off) or populate (on) as a
+# mechanical consequence, not an independent config change -- so the digest
+# suppresses them on a power transition and reports the front_end flip alone.
+# The snapshot still records their true values; only the human-facing digest
+# collapses. A threshold/gain change WITHOUT a front_end change is a real
+# adjustment and is always reported.
+POWER_DERIVED_FIELDS = frozenset(
+    {"threshold_1_mv", "threshold_2_mv", "gain_fast", "gain_slow"})
+
 # One ssh per unit. Every lookup is `|| echo unknown` so a single missing piece
 # degrades that field instead of losing the whole unit.
 REMOTE = r'''
@@ -211,8 +221,14 @@ def diff(previous, current):
         if old is None:
             changes.append((unit, "*", "-", "first seen"))
             continue
+        # A power transition drags the AGS-derived fields with it; report the
+        # front_end flip alone rather than the six-line cascade it causes.
+        front_changed = (str(old.get("front_end", ""))
+                         != str(new.get("front_end", "")))
         for field in FIELDS[1:]:
             if str(old.get(field, "")) != str(new.get(field, "")):
+                if front_changed and field in POWER_DERIVED_FIELDS:
+                    continue
                 changes.append((unit, field, old.get(field, ""), new.get(field, "")))
     return changes
 
