@@ -206,6 +206,36 @@ def render(rows):
     return buf.getvalue()
 
 
+def field_report(rows, field):
+    """Group units by their value of one field, for a fleet consistency check.
+
+    Answers "are all units on the same X" from the snapshot alone -- no probing.
+    Units sharing a value are listed together; groups are ordered largest first
+    so the consensus value leads and any outlier falls to the bottom and is
+    obvious. Returns text.
+    """
+    groups = {}
+    for unit in sorted(rows):
+        value = rows[unit].get(field, UNKNOWN)
+        value = value if str(value).strip() != "" else "(blank)"
+        groups.setdefault(value, []).append(unit)
+
+    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
+    total = len(rows)
+    lines = ["{}: {} unit(s) in snapshot, {} distinct value(s)".format(
+        field, total, len(groups))]
+    lines.append("")
+    for value, units in ordered:
+        count = len(units)
+        lines.append("  {:>2} {:<7}  {:<12}  {}".format(
+            count, "unit" if count == 1 else "units", value,
+            ", ".join(units)))
+    lines.append("")
+    lines.append("=> uniform" if len(groups) == 1
+                 else "=> NOT uniform ({} distinct values)".format(len(groups)))
+    return "\n".join(lines)
+
+
 def diff(previous, current):
     """[(unit, field, old, new)] for every changed field.
 
@@ -399,6 +429,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="print the snapshot and digest; write, commit and "
                              "send nothing")
+    parser.add_argument("--field", choices=FIELDS[1:], metavar="FIELD",
+                        help="report one field's value across the snapshot, "
+                             "grouped by value (a fleet consistency check); "
+                             "reads the snapshot only, does NOT probe. "
+                             "Choices: " + ", ".join(FIELDS[1:]))
     args = parser.parse_args()
 
     # Commit and notify are opt-in rather than default-on, so a hand-run probe
@@ -408,6 +443,24 @@ def main():
     snapshot_rel = os.path.join("state", "fleet-state.csv")
     snapshot = (os.path.join(args.repo, snapshot_rel) if args.repo
                 else args.snapshot)
+
+    # --field is a read-only report over the existing snapshot: no probing, no
+    # fleet contact, no write. It short-circuits before anything reaches out.
+    if args.field:
+        rows = read_snapshot(snapshot)
+        if not rows:
+            print("no snapshot to report on at {}".format(snapshot),
+                  file=sys.stderr)
+            return 1
+        if args.array:                       # narrow to one array if asked
+            wanted = {"mjolnir{:02d}".format(n) for n in ARRAYS[args.array]}
+            rows = {u: r for u, r in rows.items() if u in wanted}
+            if not rows:
+                print("snapshot has no {} units".format(args.array),
+                      file=sys.stderr)
+                return 1
+        print(field_report(rows, args.field))
+        return 0
 
     if args.ports:
         numbers = args.ports
