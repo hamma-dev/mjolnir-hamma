@@ -79,21 +79,42 @@ def _validate_gain_cli(channel, level):
 # state-change history. Its own docstring says every change surfaces until
 # something updates the snapshot as part of MAKING a change. This is that:
 # after a control operation below actually succeeds, the affected field of
-# the affected unit's row is updated (and committed+pushed) here, so the
-# next probe run finds no diff and stays quiet about it.
+# the affected unit's row is updated -- and, once per SWEEP rather than once
+# per unit (see _log_field_changes_batch()), committed+pushed -- so the next
+# probe run finds no diff and stays quiet about it.
 #
-# This must never be able to break fleet control -- see _log_field_change().
+# This must never be able to break fleet control -- see
+# _log_field_changes_batch() and the _resolve_*_entry() functions below,
+# every one of which reports a failure to stderr and swallows it rather
+# than raising, and none of which run until every control operation in the
+# sweep has already completed.
+#
 # It reuses fleet_probe's FIELDS/read_snapshot/render/commit_snapshot rather
 # than re-implementing CSV handling a second time, so the two cannot drift.
 #
-# Threshold/gain are a special case: fleet_probe reads them from the
-# sensor's PERSISTED startup file (/ags/scripts/startup), not the live AGS
-# register -- so a set-threshold/set-gain WITHOUT --persist is invisible to
-# the probe. Logging it anyway would make the snapshot claim a value the
-# probe can never confirm, and the very next probe run would "revert" it as
-# an unlogged change -- exactly the false alarm this feature exists to
-# prevent. So only a persisted change is logged; see
-# _log_threshold_change()/_log_gain_change().
+# Threshold/gain are a double special case:
+#
+#  1. fleet_probe reads them from the sensor's PERSISTED startup file
+#     (/ags/scripts/startup), not the live AGS register -- so a
+#     set-threshold/set-gain WITHOUT --persist is invisible to the probe.
+#     Logging it anyway would make the snapshot claim a value the probe can
+#     never confirm, and the very next probe run would "revert" it as an
+#     unlogged change -- exactly the false alarm this feature exists to
+#     prevent. So only a persisted change is logged.
+#
+#  2. ags.py's CLI has no sys.exit() calls (its set-threshold/set-gain
+#     subcommands just print() the AGS reply and return), so a successful
+#     ssh round trip proves nothing about whether the FIRMWARE accepted the
+#     value -- a rejected value (out of range) or a socket timeout with no
+#     reply both still exit 0. Logging in that case has the same false-alarm
+#     failure mode as (1): the persisted file was never actually written, so
+#     the next probe run reads the real, unchanged value and reports a
+#     spurious "unlogged change". _resolve_threshold_entry()/
+#     _resolve_gain_entry() gate on the AGS reply itself, reusing ags.py's
+#     own _reply_indicates_error() -- the same check ags.py uses to gate
+#     persist_startup() -- so the two cannot drift.
+#
+# See _resolve_threshold_entry()/_resolve_gain_entry().
 def _fleet_probe_module():
     """Load server/fleet_probe.py (a sibling file) by path.
 
@@ -126,56 +147,85 @@ def _load_ags_module():
     return sys.modules.get("ags")
 
 
-def _log_field_change(log_repo, unit, field, value, reason=None):
-    """Update one field of one unit's row in the fleet-state snapshot and
-    commit+push it. Best-effort: every failure is reported to stderr and
-    swallowed, never raised -- this bookkeeping must never be able to fail
-    (or slow down) the control operation it is recording after the fact.
-    Returns True only if the snapshot was updated and (when it changed)
-    committed and pushed.
+def _log_field_changes_batch(log_repo, entries, reason=None):
+    """Apply and commit MULTIPLE (unit, field, value) entries in ONE
+    read+write+commit+push, instead of one per entry.
+
+    HAM-189 red-team finding #2: updown_array()/set_threshold_array()/
+    set_gain_array() used to commit+push a single field change INSIDE the
+    per-port loop, so e.g. a 9-unit sweep with a slow network could
+    serialize up to ~9x the git round trip (up to ~240s each -- see
+    fleet_probe.commit_snapshot()) BETWEEN individual sensors' control
+    operations. That is the same class of problem PR #92 fixed for ssh --
+    unrelated slow I/O blocking a live fleet-control fan-out. Every control
+    operation in the sweep now runs to completion first (see
+    updown_array() etc.); this is called once at the end with every entry
+    whose op actually succeeded, mirroring fleet_probe.py's own main()
+    (one commit for all probed changes).
+
+    Best-effort: every failure is reported to stderr and swallowed, never
+    raised -- this bookkeeping must never be able to fail (or slow down)
+    the control operations it is recording, all of which have already
+    completed by the time this runs. Returns True only if every entry with
+    a snapshot row was applied and (if anything actually changed) committed
+    and pushed.
+
+    Entries are applied to one in-memory snapshot dict before anything is
+    written, so one entry with no baseline row yet (see below) is skipped
+    without discarding the others -- a partial batch still writes and
+    commits everything that COULD be applied, preserving per-unit accuracy.
     """
+    if not entries:
+        return True
     if not log_repo:
-        print(f"[LOG] no --log-repo/$FLEET_LOG_REPO configured; change to "
-              f"{unit} {field} not recorded in the fleet-state snapshot.",
-              file=sys.stderr)
+        for unit, field, _value in entries:
+            print(f"[LOG] no --log-repo/$FLEET_LOG_REPO configured; change "
+                  f"to {unit} {field} not recorded in the fleet-state "
+                  f"snapshot.", file=sys.stderr)
         return False
 
     # Everything below is inside one try/except, deliberately including
-    # loading fleet_probe.py itself: this is bookkeeping about a control
-    # operation that has ALREADY succeeded, and no failure in it -- however
-    # unexpected -- may be allowed to propagate back out to the caller.
+    # loading fleet_probe.py itself: this is bookkeeping about control
+    # operations that have ALREADY succeeded, and no failure in it --
+    # however unexpected -- may be allowed to propagate back out.
     try:
         fp = _fleet_probe_module()
         if fp is None:
-            print(f"[LOG] could not load fleet_probe.py; change to {unit} "
-                  f"{field} not recorded in the fleet-state snapshot.",
-                  file=sys.stderr)
+            for unit, field, _value in entries:
+                print(f"[LOG] could not load fleet_probe.py; change to "
+                      f"{unit} {field} not recorded in the fleet-state "
+                      f"snapshot.", file=sys.stderr)
             return False
 
         snapshot_rel = os.path.join("state", "fleet-state.csv")
         snapshot = os.path.join(log_repo, snapshot_rel)
 
         rows = fp.read_snapshot(snapshot)
-        row = rows.get(unit)
-        if row is None:
-            # No baseline row for this unit yet -- inventing one here (with
-            # the other ten fields reading "unknown") would itself pollute
-            # the history fleet_probe exists to keep clean. Let the next
-            # probe run establish the row; this change becomes its baseline
-            # value rather than a change.
-            print(f"[LOG] no snapshot row for {unit} yet; change to "
-                  f"{field} not recorded (the next fleet probe will "
-                  f"establish one).", file=sys.stderr)
-            return False
 
-        if row.get(field) == value:
-            # Already at rest. Writing anyway would produce a commit with
-            # no real content (and a failing `git commit`, since nothing
-            # changed).
+        applied = []
+        for unit, field, value in entries:
+            row = rows.get(unit)
+            if row is None:
+                # No baseline row for this unit yet -- inventing one here
+                # (with the other ten fields reading "unknown") would
+                # itself pollute the history fleet_probe exists to keep
+                # clean. Let the next probe run establish the row; this
+                # change becomes its baseline value rather than a change.
+                print(f"[LOG] no snapshot row for {unit} yet; change to "
+                      f"{field} not recorded (the next fleet probe will "
+                      f"establish one).", file=sys.stderr)
+                continue
+            if row.get(field) == value:
+                # Already at rest -- nothing to apply for this entry.
+                continue
+            row[field] = value
+            rows[unit] = row
+            applied.append((unit, field, value))
+
+        if not applied:
+            # Nothing to commit is not a failure -- and must not attempt
+            # one (an empty `git commit` fails).
             return True
-
-        row[field] = value
-        rows[unit] = row
 
         directory = os.path.dirname(snapshot)
         if directory:
@@ -183,76 +233,127 @@ def _log_field_change(log_repo, unit, field, value, reason=None):
         with open(snapshot, "w") as handle:
             handle.write(fp.render(rows))
 
-        message = f"state: {unit} {field} = {value}"
+        message = "state: " + ", ".join(
+            f"{u} {f} = {v}" for u, f, v in applied)
         if reason:
             message += f"\n\n{reason}"
         ok, detail = fp.commit_snapshot(log_repo, snapshot_rel, message)
         if not ok:
             print(f"[LOG] fleet-state snapshot updated locally but "
-                  f"commit/push failed for {unit} {field}: {detail}",
-                  file=sys.stderr)
+                  f"commit/push failed for {len(applied)} change(s): "
+                  f"{detail}", file=sys.stderr)
         return ok
     except Exception as error:            # noqa: BLE001 - report, don't mask
-        print(f"[LOG] failed to record {unit} {field} in the fleet-state "
-              f"snapshot: {type(error).__name__}: {error}", file=sys.stderr)
-        return False
-
-
-def _log_front_end_change(log_repo, port, bring_up, reason=None):
-    try:
-        unit = "mjolnir{:02d}".format(port - 10000)
-        return _log_field_change(log_repo, unit, "front_end",
-                                 "on" if bring_up else "off", reason=reason)
-    except Exception as error:            # noqa: BLE001 - report, don't mask
-        print(f"[LOG] failed to record front_end change for port {port}: "
-              f"{type(error).__name__}: {error}", file=sys.stderr)
-        return False
-
-
-def _log_threshold_change(log_repo, port, channel, millivolts, reason=None):
-    """Record a persisted threshold change -- in the same units and with the
-    same rounding fleet_probe's own parser will read back from the startup
-    file, computed with ags.py's own conversion functions so the two cannot
-    drift. If ags.py cannot be found, the change is skipped rather than
-    guessed at.
-    """
-    unit = "mjolnir{:02d}".format(port - 10000)
-    field = "threshold_1_mv" if str(channel) == "1" else "threshold_2_mv"
-
-    # As with _log_field_change(), this is post-hoc bookkeeping for a
-    # control operation that already succeeded, so no failure here --
-    # finding ags.py or doing the mV<->AGS conversion -- may propagate.
-    try:
-        ags = _load_ags_module()
-        if ags is None:
-            print(f"[LOG] ags.py not found; threshold change on {unit} "
-                  f"ch{channel} not recorded (cannot compute the "
-                  f"persisted-file round-trip value without it).",
-                  file=sys.stderr)
-            return False
-        ags_value = ags.mv_to_ags(millivolts)
-        formatted = ags._format_ags(ags_value)
-        roundtrip_mv = round(ags.ags_to_mv(float(formatted)), 1)
-    except Exception as error:
-        print(f"[LOG] could not compute the persisted threshold value for "
-              f"{unit} ch{channel}: {type(error).__name__}: {error}",
+        print(f"[LOG] failed to record {len(entries)} change(s) in the "
+              f"fleet-state snapshot: {type(error).__name__}: {error}",
               file=sys.stderr)
         return False
 
-    return _log_field_change(log_repo, unit, field, str(roundtrip_mv),
-                             reason=reason)
+
+def _resolve_front_end_entry(port, bring_up):
+    """Build the (unit, field, value) entry for a successful --up/--down,
+    or None on an unexpected failure. Pure -- no I/O; the caller batches
+    this with every other successful entry from the same sweep and commits
+    them together (see updown_array() / _log_field_changes_batch()).
+
+    Front-end resolution cannot really fail (there is no reply-acceptance
+    check to make -- sensors.py's own sys.exit(1), already checked by the
+    caller before this runs, is the only success signal). Wrapped in
+    try/except anyway, consistent with the threshold/gain resolvers below,
+    because this must never be able to break fleet control either.
+    """
+    try:
+        unit = "mjolnir{:02d}".format(port - 10000)
+        return (unit, "front_end", "on" if bring_up else "off")
+    except Exception as error:            # noqa: BLE001 - report, don't mask
+        print(f"[LOG] failed to build a front_end log entry for port "
+              f"{port}: {type(error).__name__}: {error}", file=sys.stderr)
+        return None
 
 
-def _log_gain_change(log_repo, port, channel, level, reason=None):
+def _resolve_threshold_entry(port, channel, millivolts, reply):
+    """Build a (unit, field, value) entry for a persisted threshold change,
+    or None if it must not be recorded. Pure -- no I/O; see
+    _resolve_front_end_entry().
+
+    HAM-189 red-team finding #1: gate on the AGS reply itself (via ags.py's
+    own _reply_indicates_error(), reused rather than re-implemented so the
+    two cannot drift) before ever computing a value to log -- see the
+    module comment above for why. This also folds in the mV<->AGS round
+    trip so the value recorded matches exactly what fleet_probe's own
+    parser will read back out of the persisted startup file.
+
+    Design decision (finding #1): a rejected/unconfirmed reply suppresses
+    ONLY this log entry, not the control op's own reported outcome.
+    mjol_array.py has no exit-code convention to plug a "the value was
+    rejected" signal into -- main() never calls sys.exit() for any control
+    op here, unlike sensors.py -- so changing it would be a separate,
+    larger design change. The operator is not left silently unaware,
+    though: _run_ags_command()'s non-quiet path already prints the raw AGS
+    reply (including any "Error -" line) to stdout, and the [LOG] notice
+    below adds an explicit, unmissable flag that the persisted value was
+    NOT recorded, right at the point the false alarm would otherwise start.
+    """
+    # unit/field are computed INSIDE the try (not before it, as an earlier
+    # revision of this pairing had it for the threshold path only) --
+    # matching _resolve_gain_entry() and _resolve_front_end_entry(): this
+    # must never be able to raise back out to the control-op caller either.
+    try:
+        unit = "mjolnir{:02d}".format(port - 10000)
+        field = "threshold_1_mv" if str(channel) == "1" else "threshold_2_mv"
+        ags = _load_ags_module()
+        if ags is None:
+            print(f"[LOG] ags.py not found; threshold change on {unit} "
+                  f"ch{channel} not recorded (cannot verify AGS accepted "
+                  f"it or compute the persisted-file round-trip value "
+                  f"without it).", file=sys.stderr)
+            return None
+        if ags._reply_indicates_error(reply):
+            print(f"[LOG] {unit} ch{channel}: AGS reply indicates the "
+                  f"persisted threshold value was REJECTED or not "
+                  f"confirmed; NOT recording it in the fleet-state "
+                  f"snapshot -- see the AGS reply above.", file=sys.stderr)
+            return None
+        ags_value = ags.mv_to_ags(millivolts)
+        formatted = ags._format_ags(ags_value)
+        roundtrip_mv = round(ags.ags_to_mv(float(formatted)), 1)
+    except Exception as error:            # noqa: BLE001 - report, don't mask
+        print(f"[LOG] could not compute the persisted threshold value for "
+              f"ch{channel} on port {port}: {type(error).__name__}: "
+              f"{error}", file=sys.stderr)
+        return None
+
+    return (unit, field, str(roundtrip_mv))
+
+
+def _resolve_gain_entry(port, channel, level, reply):
+    """Build a (unit, field, value) entry for a persisted gain change, or
+    None if it must not be recorded. See _resolve_threshold_entry() -- same
+    AGS-reply gate and the same reasoning for suppressing only the log
+    entry, not the control op's own reported outcome.
+    """
     try:
         unit = "mjolnir{:02d}".format(port - 10000)
         field = "gain_fast" if channel == "fast-e" else "gain_slow"
-        return _log_field_change(log_repo, unit, field, str(int(level)),
-                                 reason=reason)
+        ags = _load_ags_module()
+        if ags is None:
+            print(f"[LOG] ags.py not found; gain change on {unit} "
+                  f"{channel} not recorded (cannot verify AGS accepted "
+                  f"it).", file=sys.stderr)
+            return None
+        if ags._reply_indicates_error(reply):
+            print(f"[LOG] {unit} {channel}: AGS reply indicates the "
+                  f"persisted gain value was REJECTED or not confirmed; "
+                  f"NOT recording it in the fleet-state snapshot -- see "
+                  f"the AGS reply above.", file=sys.stderr)
+            return None
     except Exception as error:            # noqa: BLE001 - report, don't mask
-        print(f"[LOG] failed to record gain change for port {port}: "
-              f"{type(error).__name__}: {error}", file=sys.stderr)
-        return False
+        print(f"[LOG] could not verify the AGS reply for {channel} on "
+              f"port {port}: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        return None
+
+    return (unit, field, str(int(level)))
 
 
 class MjolnirArray():
@@ -549,7 +650,9 @@ class MjolnirArray():
         #
         # log_repo/no_log/reason are the HAM-189 write-hook: on a successful
         # change, front_end is recorded in the fleet-state snapshot unless
-        # no_log is set. See _log_field_change().
+        # no_log is set. Every port's control op runs to completion first;
+        # the snapshot is then committed ONCE for the whole sweep -- see
+        # _log_field_changes_batch().
 
         if ports is None:
             ports = [10000 + i for i in self.sensors]
@@ -558,10 +661,16 @@ class MjolnirArray():
             # local_sensor_nums = [self.sensors[int(p) - 1] for p in ports]
             ports = [10000 + int(p) for p in ports]  # Make this an integer
 
+        pending = []
         for p in ports:
             success = MjolnirArray.updown(p, bring_up)
             if success and not no_log:
-                _log_front_end_change(log_repo, p, bring_up, reason=reason)
+                entry = _resolve_front_end_entry(p, bring_up)
+                if entry is not None:
+                    pending.append(entry)
+
+        if pending:
+            _log_field_changes_batch(log_repo, pending, reason=reason)
 
     def _resolve_ports(self, ports):
         # Resolve sensor numbers (or None = all of this array's sensors) into
@@ -580,27 +689,41 @@ class MjolnirArray():
                             persist=False, log_repo=None, no_log=False,
                             reason=None):
         # log_repo/no_log/reason: HAM-189 write-hook, see updown_array().
-        # Only a PERSISTED change is logged -- fleet_probe reads the
-        # sensor's startup file, not the live register, so a live-only
-        # change is invisible to it and logging it would just be reverted
-        # (falsely) by the next probe run. See _log_threshold_change().
+        # Only a PERSISTED change that the AGS reply confirms is logged --
+        # fleet_probe reads the sensor's startup file, not the live
+        # register, so a live-only or firmware-rejected change is invisible
+        # to (or wrong in) it, and logging it would just be reverted
+        # (falsely) by the next probe run. See _resolve_threshold_entry().
+        pending = []
         for p in self._resolve_ports(ports):
-            success, _stdout = MjolnirArray.set_threshold(
+            success, stdout = MjolnirArray.set_threshold(
                 p, channel, millivolts, persist=persist)
             if success and persist and not no_log:
-                _log_threshold_change(log_repo, p, channel, millivolts,
-                                      reason=reason)
+                entry = _resolve_threshold_entry(p, channel, millivolts,
+                                                 stdout)
+                if entry is not None:
+                    pending.append(entry)
+
+        if pending:
+            _log_field_changes_batch(log_repo, pending, reason=reason)
 
     def set_gain_array(self, ports=None, channel=None, level=None,
                        persist=False, log_repo=None, no_log=False,
                        reason=None):
         # log_repo/no_log/reason: HAM-189 write-hook, see updown_array() and
-        # set_threshold_array() (same persist-only rule applies here).
+        # set_threshold_array() (same persist-only, AGS-reply-gated rule
+        # applies here).
+        pending = []
         for p in self._resolve_ports(ports):
-            success, _stdout = MjolnirArray.set_gain(
+            success, stdout = MjolnirArray.set_gain(
                 p, channel, level, persist=persist)
             if success and persist and not no_log:
-                _log_gain_change(log_repo, p, channel, level, reason=reason)
+                entry = _resolve_gain_entry(p, channel, level, stdout)
+                if entry is not None:
+                    pending.append(entry)
+
+        if pending:
+            _log_field_changes_batch(log_repo, pending, reason=reason)
 
     def status_array(self, ports=None, quiet=False):
         # Get status report for a number of sensors in an array
@@ -701,6 +824,23 @@ class MjolnirArray():
         df['Threshold'] = [f"{val:.2f}" for val in df['Threshold']]
 
         return df
+
+
+def _warn_if_persist_silently_omitted(log_repo, parsed_args, what):
+    """HAM-189 cheap improvement: --persist is opt-in and its CLI default
+    (False) silently produces a change the fleet-state snapshot can never
+    see -- functionally identical to --no-log, but without --no-log's
+    self-documenting opt-in flag. An operator who passes --log-repo (or has
+    $FLEET_LOG_REPO set) and simply forgets --persist gets no notice, and
+    the dashboard keeps showing the old value with nothing pointing at why.
+    Mirrors the existing "[LOG] no --log-repo configured" notice; silent
+    only when the operator explicitly said --no-log, since that is already
+    self-documenting.
+    """
+    if log_repo and not parsed_args.persist and not parsed_args.no_log:
+        print(f"[LOG] --persist not set; this {what} change will not be "
+              f"recorded in the fleet-state snapshot (same effect as "
+              f"--no-log, without saying so).", file=sys.stderr)
 
 
 def main(argv=None):
@@ -817,6 +957,7 @@ def main(argv=None):
         except ValueError as e:
             print(f"[ERROR] {e}")
             return
+        _warn_if_persist_silently_omitted(log_repo, parsed_args, "threshold")
         mj_array.set_threshold_array(
             ports=parsed_args.ports, channel=channel, millivolts=millivolts,
             persist=parsed_args.persist, log_repo=log_repo,
@@ -828,6 +969,7 @@ def main(argv=None):
         except ValueError as e:
             print(f"[ERROR] {e}")
             return
+        _warn_if_persist_silently_omitted(log_repo, parsed_args, "gain")
         mj_array.set_gain_array(
             ports=parsed_args.ports, channel=channel, level=level,
             persist=parsed_args.persist, log_repo=log_repo,
