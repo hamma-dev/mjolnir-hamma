@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 
+import importlib.util
+import os
 import subprocess
+import sys
 import argparse
 from pathlib import Path
 
@@ -68,6 +71,188 @@ def _validate_gain_cli(channel, level):
         raise ValueError("gain channel must be fast-e or slow-e")
     if int(level) not in (0, 1, 2, 3):
         raise ValueError("gain level must be 0, 1, 2, or 3")
+
+
+# HAM-189 write-hook. fleet_probe.py (server/fleet_probe.py) snapshots each
+# unit's configuration to state/fleet-state.csv in a sensor-log clone and
+# writes it only when it changed, so `git log` on that file is the fleet's
+# state-change history. Its own docstring says every change surfaces until
+# something updates the snapshot as part of MAKING a change. This is that:
+# after a control operation below actually succeeds, the affected field of
+# the affected unit's row is updated (and committed+pushed) here, so the
+# next probe run finds no diff and stays quiet about it.
+#
+# This must never be able to break fleet control -- see _log_field_change().
+# It reuses fleet_probe's FIELDS/read_snapshot/render/commit_snapshot rather
+# than re-implementing CSV handling a second time, so the two cannot drift.
+#
+# Threshold/gain are a special case: fleet_probe reads them from the
+# sensor's PERSISTED startup file (/ags/scripts/startup), not the live AGS
+# register -- so a set-threshold/set-gain WITHOUT --persist is invisible to
+# the probe. Logging it anyway would make the snapshot claim a value the
+# probe can never confirm, and the very next probe run would "revert" it as
+# an unlogged change -- exactly the false alarm this feature exists to
+# prevent. So only a persisted change is logged; see
+# _log_threshold_change()/_log_gain_change().
+def _fleet_probe_module():
+    """Load server/fleet_probe.py (a sibling file) by path.
+
+    Returns the module, or None if it could not be loaded -- caller must
+    treat that as "logging unavailable", not raise.
+    """
+    try:
+        here = Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location(
+            "fleet_probe", str(here / "fleet_probe.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _load_ags_module():
+    """Find ags.py the same way fleet_probe.py does (sibling ../scripts,
+    $FLEET_PROBE_AGS_PATH, then the VPS checkout) and return the module, or
+    None. Reuses fleet_probe.load_ags_parser() so this does not grow a
+    second, divergent way to find ags.py.
+    """
+    fp = _fleet_probe_module()
+    if fp is None:
+        return None
+    parser, _source = fp.load_ags_parser()
+    if parser is None:
+        return None
+    return sys.modules.get("ags")
+
+
+def _log_field_change(log_repo, unit, field, value, reason=None):
+    """Update one field of one unit's row in the fleet-state snapshot and
+    commit+push it. Best-effort: every failure is reported to stderr and
+    swallowed, never raised -- this bookkeeping must never be able to fail
+    (or slow down) the control operation it is recording after the fact.
+    Returns True only if the snapshot was updated and (when it changed)
+    committed and pushed.
+    """
+    if not log_repo:
+        print(f"[LOG] no --log-repo/$FLEET_LOG_REPO configured; change to "
+              f"{unit} {field} not recorded in the fleet-state snapshot.",
+              file=sys.stderr)
+        return False
+
+    # Everything below is inside one try/except, deliberately including
+    # loading fleet_probe.py itself: this is bookkeeping about a control
+    # operation that has ALREADY succeeded, and no failure in it -- however
+    # unexpected -- may be allowed to propagate back out to the caller.
+    try:
+        fp = _fleet_probe_module()
+        if fp is None:
+            print(f"[LOG] could not load fleet_probe.py; change to {unit} "
+                  f"{field} not recorded in the fleet-state snapshot.",
+                  file=sys.stderr)
+            return False
+
+        snapshot_rel = os.path.join("state", "fleet-state.csv")
+        snapshot = os.path.join(log_repo, snapshot_rel)
+
+        rows = fp.read_snapshot(snapshot)
+        row = rows.get(unit)
+        if row is None:
+            # No baseline row for this unit yet -- inventing one here (with
+            # the other ten fields reading "unknown") would itself pollute
+            # the history fleet_probe exists to keep clean. Let the next
+            # probe run establish the row; this change becomes its baseline
+            # value rather than a change.
+            print(f"[LOG] no snapshot row for {unit} yet; change to "
+                  f"{field} not recorded (the next fleet probe will "
+                  f"establish one).", file=sys.stderr)
+            return False
+
+        if row.get(field) == value:
+            # Already at rest. Writing anyway would produce a commit with
+            # no real content (and a failing `git commit`, since nothing
+            # changed).
+            return True
+
+        row[field] = value
+        rows[unit] = row
+
+        directory = os.path.dirname(snapshot)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(snapshot, "w") as handle:
+            handle.write(fp.render(rows))
+
+        message = f"state: {unit} {field} = {value}"
+        if reason:
+            message += f"\n\n{reason}"
+        ok, detail = fp.commit_snapshot(log_repo, snapshot_rel, message)
+        if not ok:
+            print(f"[LOG] fleet-state snapshot updated locally but "
+                  f"commit/push failed for {unit} {field}: {detail}",
+                  file=sys.stderr)
+        return ok
+    except Exception as error:            # noqa: BLE001 - report, don't mask
+        print(f"[LOG] failed to record {unit} {field} in the fleet-state "
+              f"snapshot: {type(error).__name__}: {error}", file=sys.stderr)
+        return False
+
+
+def _log_front_end_change(log_repo, port, bring_up, reason=None):
+    try:
+        unit = "mjolnir{:02d}".format(port - 10000)
+        return _log_field_change(log_repo, unit, "front_end",
+                                 "on" if bring_up else "off", reason=reason)
+    except Exception as error:            # noqa: BLE001 - report, don't mask
+        print(f"[LOG] failed to record front_end change for port {port}: "
+              f"{type(error).__name__}: {error}", file=sys.stderr)
+        return False
+
+
+def _log_threshold_change(log_repo, port, channel, millivolts, reason=None):
+    """Record a persisted threshold change -- in the same units and with the
+    same rounding fleet_probe's own parser will read back from the startup
+    file, computed with ags.py's own conversion functions so the two cannot
+    drift. If ags.py cannot be found, the change is skipped rather than
+    guessed at.
+    """
+    unit = "mjolnir{:02d}".format(port - 10000)
+    field = "threshold_1_mv" if str(channel) == "1" else "threshold_2_mv"
+
+    # As with _log_field_change(), this is post-hoc bookkeeping for a
+    # control operation that already succeeded, so no failure here --
+    # finding ags.py or doing the mV<->AGS conversion -- may propagate.
+    try:
+        ags = _load_ags_module()
+        if ags is None:
+            print(f"[LOG] ags.py not found; threshold change on {unit} "
+                  f"ch{channel} not recorded (cannot compute the "
+                  f"persisted-file round-trip value without it).",
+                  file=sys.stderr)
+            return False
+        ags_value = ags.mv_to_ags(millivolts)
+        formatted = ags._format_ags(ags_value)
+        roundtrip_mv = round(ags.ags_to_mv(float(formatted)), 1)
+    except Exception as error:
+        print(f"[LOG] could not compute the persisted threshold value for "
+              f"{unit} ch{channel}: {type(error).__name__}: {error}",
+              file=sys.stderr)
+        return False
+
+    return _log_field_change(log_repo, unit, field, str(roundtrip_mv),
+                             reason=reason)
+
+
+def _log_gain_change(log_repo, port, channel, level, reason=None):
+    try:
+        unit = "mjolnir{:02d}".format(port - 10000)
+        field = "gain_fast" if channel == "fast-e" else "gain_slow"
+        return _log_field_change(log_repo, unit, field, str(int(level)),
+                                 reason=reason)
+    except Exception as error:            # noqa: BLE001 - report, don't mask
+        print(f"[LOG] failed to record gain change for port {port}: "
+              f"{type(error).__name__}: {error}", file=sys.stderr)
+        return False
 
 
 class MjolnirArray():
@@ -191,6 +376,11 @@ class MjolnirArray():
     @staticmethod
     def updown(port, bring_up, quiet=False):
         # Here port is fully qualified
+        #
+        # Returns success (bool): True only once sensors.py has actually run
+        # and exited 0. Used by the HAM-189 write-hook (updown_array) to
+        # decide whether the front_end change is safe to record in the
+        # fleet-state snapshot.
         sensor_num = port - 10000
         action = "up" if bring_up else "down"
 
@@ -201,7 +391,7 @@ class MjolnirArray():
             if not quiet:
                 print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
                       f"sensor not brought {action}.")
-            return
+            return False
 
         flag = "--on" if bring_up else "--off"
 
@@ -222,38 +412,44 @@ class MjolnirArray():
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: sensors.py did not complete "
                       f"in 120s.")
-            return
+            return False
         except Exception as e:
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: error running sensors.py: {e}")
-            return
+            return False
 
-        if quiet:
-            return
+        if not quiet:
+            # Surface remote stdout/stderr so the operator sees what
+            # happened. sensors.py prints [OK]/[FAIL] lines describing each
+            # step.
+            stdout = out.stdout.decode(errors="replace") if out.stdout else ""
+            stderr = out.stderr.decode(errors="replace") if out.stderr else ""
+            if stdout:
+                print(stdout, end="" if stdout.endswith("\n") else "\n")
+            if stderr:
+                print(stderr, end="" if stderr.endswith("\n") else "\n")
+            if out.returncode != 0:
+                print(f"[FAIL] mj{sensor_num:02}: sensors.py exited "
+                      f"with code {out.returncode}.")
 
-        # Surface remote stdout/stderr so the operator sees what happened.
-        # sensors.py prints [OK]/[FAIL] lines describing each step.
-        stdout = out.stdout.decode(errors="replace") if out.stdout else ""
-        stderr = out.stderr.decode(errors="replace") if out.stderr else ""
-        if stdout:
-            print(stdout, end="" if stdout.endswith("\n") else "\n")
-        if stderr:
-            print(stderr, end="" if stderr.endswith("\n") else "\n")
-        if out.returncode != 0:
-            print(f"[FAIL] mj{sensor_num:02}: sensors.py exited "
-                  f"with code {out.returncode}.")
+        return out.returncode == 0
 
     @staticmethod
     def _run_ags_command(port, ags_args, action_label, quiet=False, timeout=30):
         # Run ags.py on the Pi over its autossh tunnel with the given args.
         # port is fully qualified (10000 + unit number).
+        #
+        # Returns (success, stdout_text). success is True only once ags.py
+        # has actually run and exited 0 -- the HAM-189 write-hook uses it to
+        # decide whether a threshold/gain change is safe to log; trigger()
+        # ignores it.
         sensor_num = port - 10000
 
         if not MjolnirArray.status(port):
             if not quiet:
                 print(f"[SKIP] mj{sensor_num:02} (port {port}): tunnel down, "
                       f"{action_label} not sent.")
-            return
+            return False, ""
 
         cmd = MjolnirArray._pi_ssh_cmd(port)
         cmd = cmd + ['/home/pi/dev/mjolnir-hamma/scripts/ags.py'] + list(ags_args)
@@ -269,24 +465,25 @@ class MjolnirArray():
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: ags.py did not complete "
                       f"in {timeout}s.")
-            return
+            return False, ""
         except Exception as e:
             if not quiet:
                 print(f"[FAIL] mj{sensor_num:02}: error running ags.py: {e}")
-            return
-
-        if quiet:
-            return
+            return False, ""
 
         stdout = out.stdout.decode(errors="replace") if out.stdout else ""
         stderr = out.stderr.decode(errors="replace") if out.stderr else ""
-        if stdout:
-            print(stdout, end="" if stdout.endswith("\n") else "\n")
-        if stderr:
-            print(stderr, end="" if stderr.endswith("\n") else "\n")
-        if out.returncode != 0:
-            print(f"[FAIL] mj{sensor_num:02}: ags.py exited "
-                  f"with code {out.returncode}.")
+
+        if not quiet:
+            if stdout:
+                print(stdout, end="" if stdout.endswith("\n") else "\n")
+            if stderr:
+                print(stderr, end="" if stderr.endswith("\n") else "\n")
+            if out.returncode != 0:
+                print(f"[FAIL] mj{sensor_num:02}: ags.py exited "
+                      f"with code {out.returncode}.")
+
+        return out.returncode == 0, stdout
 
     @staticmethod
     def trigger(port, command="das_manual_trigger", quiet=False):
@@ -296,10 +493,11 @@ class MjolnirArray():
 
     @staticmethod
     def set_threshold(port, channel, millivolts, persist=False, quiet=False):
+        # Returns (success, stdout_text) -- see _run_ags_command().
         ags_args = ["set-threshold", str(channel), str(millivolts)]
         if persist:
             ags_args.append("--persist")
-        MjolnirArray._run_ags_command(
+        return MjolnirArray._run_ags_command(
             port, ags_args,
             f"set threshold ch{channel} = {millivolts} mV"
             + (" (persist)" if persist else ""),
@@ -307,10 +505,11 @@ class MjolnirArray():
 
     @staticmethod
     def set_gain(port, channel, level, persist=False, quiet=False):
+        # Returns (success, stdout_text) -- see _run_ags_command().
         ags_args = ["set-gain", str(channel), str(level)]
         if persist:
             ags_args.append("--persist")
-        MjolnirArray._run_ags_command(
+        return MjolnirArray._run_ags_command(
             port, ags_args,
             f"set gain {channel} = {level}"
             + (" (persist)" if persist else ""),
@@ -340,12 +539,17 @@ class MjolnirArray():
 
         return not ping_code
 
-    def updown_array(self, bring_up, ports=None):
+    def updown_array(self, bring_up, ports=None, log_repo=None, no_log=False,
+                     reason=None):
         # Bring one or more sensors up or down.
         # bring up is boolean
         # ports is mod 10000.
         #    Can be string, but if it is, in needs to be in a list
         #    Even a one element list
+        #
+        # log_repo/no_log/reason are the HAM-189 write-hook: on a successful
+        # change, front_end is recorded in the fleet-state snapshot unless
+        # no_log is set. See _log_field_change().
 
         if ports is None:
             ports = [10000 + i for i in self.sensors]
@@ -355,7 +559,9 @@ class MjolnirArray():
             ports = [10000 + int(p) for p in ports]  # Make this an integer
 
         for p in ports:
-            MjolnirArray.updown(p, bring_up)
+            success = MjolnirArray.updown(p, bring_up)
+            if success and not no_log:
+                _log_front_end_change(log_repo, p, bring_up, reason=reason)
 
     def _resolve_ports(self, ports):
         # Resolve sensor numbers (or None = all of this array's sensors) into
@@ -371,14 +577,30 @@ class MjolnirArray():
             MjolnirArray.trigger(p, command=command)
 
     def set_threshold_array(self, ports=None, channel=None, millivolts=None,
-                            persist=False):
+                            persist=False, log_repo=None, no_log=False,
+                            reason=None):
+        # log_repo/no_log/reason: HAM-189 write-hook, see updown_array().
+        # Only a PERSISTED change is logged -- fleet_probe reads the
+        # sensor's startup file, not the live register, so a live-only
+        # change is invisible to it and logging it would just be reverted
+        # (falsely) by the next probe run. See _log_threshold_change().
         for p in self._resolve_ports(ports):
-            MjolnirArray.set_threshold(p, channel, millivolts, persist=persist)
+            success, _stdout = MjolnirArray.set_threshold(
+                p, channel, millivolts, persist=persist)
+            if success and persist and not no_log:
+                _log_threshold_change(log_repo, p, channel, millivolts,
+                                      reason=reason)
 
     def set_gain_array(self, ports=None, channel=None, level=None,
-                       persist=False):
+                       persist=False, log_repo=None, no_log=False,
+                       reason=None):
+        # log_repo/no_log/reason: HAM-189 write-hook, see updown_array() and
+        # set_threshold_array() (same persist-only rule applies here).
         for p in self._resolve_ports(ports):
-            MjolnirArray.set_gain(p, channel, level, persist=persist)
+            success, _stdout = MjolnirArray.set_gain(
+                p, channel, level, persist=persist)
+            if success and persist and not no_log:
+                _log_gain_change(log_repo, p, channel, level, reason=reason)
 
     def status_array(self, ports=None, quiet=False):
         # Get status report for a number of sensors in an array
@@ -525,6 +747,28 @@ def main(argv=None):
     arg_parser.add_argument("--persist", action="store_true", default=False,
                             help="Also persist to /ags/scripts/startup")
 
+    arg_parser.add_argument(
+        "--log-repo", dest="log_repo", default=None,
+        help="Path to a sensor-log clone. On a successful --up/--down/"
+             "--set-threshold/--set-gain (the last two only when combined "
+             "with --persist), update <repo>/state/fleet-state.csv (the "
+             "HAM-189 write-hook) so the change leaves no diff for the next "
+             "fleet probe. Also settable via $FLEET_LOG_REPO. Omitting both "
+             "is the same as --no-log.")
+    arg_parser.add_argument(
+        "--no-log", dest="no_log", action="store_true", default=False,
+        help="Make the change but do NOT update the fleet-state snapshot, "
+             "so the next fleet probe surfaces it as an unlogged change. "
+             "For a deliberate bench/test toggle that should not read as a "
+             "real fleet configuration change.")
+    arg_parser.add_argument(
+        "--reason", default=None,
+        help="Free-text reason for a logged change. Goes in the fleet-state "
+             "git commit message, NOT the snapshot itself -- a free-text "
+             "column would differ on every row and defeat the "
+             "write-if-changed signal the snapshot exists to preserve. "
+             "Ignored with --no-log.")
+
     grp = arg_parser.add_mutually_exclusive_group()
     grp.add_argument("--up",
                      dest='bring_up',
@@ -541,6 +785,10 @@ def main(argv=None):
                      )
 
     parsed_args = arg_parser.parse_args(argv)
+
+    # HAM-189 write-hook: --log-repo wins over $FLEET_LOG_REPO, mirroring
+    # fleet_probe.py's own --ags-path / $FLEET_PROBE_AGS_PATH precedence.
+    log_repo = parsed_args.log_repo or os.environ.get("FLEET_LOG_REPO")
 
     if parsed_args.ports is None:
         if parsed_args.array == 'hamma':
@@ -571,7 +819,8 @@ def main(argv=None):
             return
         mj_array.set_threshold_array(
             ports=parsed_args.ports, channel=channel, millivolts=millivolts,
-            persist=parsed_args.persist)
+            persist=parsed_args.persist, log_repo=log_repo,
+            no_log=parsed_args.no_log, reason=parsed_args.reason)
     elif parsed_args.set_gain is not None:
         channel, level = parsed_args.set_gain
         try:
@@ -581,12 +830,15 @@ def main(argv=None):
             return
         mj_array.set_gain_array(
             ports=parsed_args.ports, channel=channel, level=level,
-            persist=parsed_args.persist)
+            persist=parsed_args.persist, log_repo=log_repo,
+            no_log=parsed_args.no_log, reason=parsed_args.reason)
     elif parsed_args.bring_up | parsed_args.bring_down:
         # Is it up or down?
         # bring_up = parsed_args.bring_up
 
-        mj_array.updown_array(parsed_args.bring_up, ports=parsed_args.ports)
+        mj_array.updown_array(parsed_args.bring_up, ports=parsed_args.ports,
+                              log_repo=log_repo, no_log=parsed_args.no_log,
+                              reason=parsed_args.reason)
     else:
         pass
 
