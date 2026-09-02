@@ -340,3 +340,54 @@ class TestFieldCliDoesNotProbe:
                 "--snapshot", str(tmp_path / "absent.csv")]
         with patch.object(fp.sys, "argv", argv):
             assert fp.main() == 1
+
+
+# --------------------------------------------------------------------------
+# The ags parser must never degrade silently. Without it, thresholds/gains read
+# "unknown" for every unit AND -- because "unknown" != the previous value --
+# every unit registers a spurious change, polluting the snapshot history.
+# --------------------------------------------------------------------------
+class TestAgsParserIsRequiredToProbe:
+    def test_probing_refuses_when_ags_is_missing(self, fp, tmp_path):
+        argv = ["fleet_probe", "--snapshot", str(tmp_path / "snap.csv")]
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp.sys, "argv", argv), \
+                patch.object(fp.subprocess, "run",
+                             side_effect=AssertionError("must not probe")):
+            assert fp.main() == 1
+        assert not (tmp_path / "snap.csv").exists()   # and wrote nothing
+
+    def test_allow_missing_ags_overrides_deliberately(self, fp, tmp_path):
+        argv = ["fleet_probe", "--allow-missing-ags", "-p", "2",
+                "--snapshot", str(tmp_path / "snap.csv"), "--dry-run"]
+        run = MagicMock(returncode=0, stdout="front_end=on\n", stderr="")
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp.sys, "argv", argv), \
+                patch.object(fp.subprocess, "run", return_value=run):
+            assert fp.main() == 0
+
+    def test_field_report_does_not_require_ags(self, fp, tmp_path):
+        """--field reads the snapshot and never probes, so it is exempt."""
+        rows = {"mjolnir02": row(fp, "mjolnir02", brk="9988776")}
+        snap = tmp_path / "fleet-state.csv"
+        snap.write_text(fp.render(rows))
+        argv = ["fleet_probe", "--field", "brokkr", "--snapshot", str(snap)]
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp.sys, "argv", argv):
+            assert fp.main() == 0
+
+    def test_loader_finds_the_sibling_scripts_dir(self, fp):
+        """In the mjolnir-hamma layout ../scripts/ags.py must resolve."""
+        found, source = fp.load_ags_parser()
+        assert found is not None
+        assert source is not None
+
+    def test_explicit_path_is_searched_first(self, fp, tmp_path):
+        (tmp_path / "ags.py").write_text(
+            "def parse_startup_state(text):\n    return {'threshold_1_mv': 999}\n")
+        found, source = fp.load_ags_parser(str(tmp_path))
+        assert found is not None
+        assert source == str(tmp_path)

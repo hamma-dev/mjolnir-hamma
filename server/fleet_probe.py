@@ -46,12 +46,51 @@ import sys
 
 # Local imports -- ags.py is stdlib-only, so its startup-file parser imports
 # cleanly off-sensor. Reused rather than re-implemented so the two cannot drift.
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-try:
-    from ags import parse_startup_state
-except ImportError:                                    # pragma: no cover
-    parse_startup_state = None
+#
+# This file may run from either repo layout (mjolnir-hamma/server/, where
+# ../scripts/ags.py is a sibling, or brokkr-vps-system, where it is not), so the
+# parser is searched for rather than assumed.
+#
+# A MISSING parser is NOT silently tolerated. Without it, threshold_*_mv and
+# gain_* quietly read "unknown" -- losing 4 of the 11 fields AND, because
+# "unknown" differs from the previous value, firing a spurious change for every
+# unit on the next run, polluting the very history this probe exists to produce.
+# main() therefore refuses to probe unless the parser resolved.
+AGS_FALLBACK_DIRS = [
+    # the VPS checkout: present on the box the probe runs on
+    "/home/monitor/dev/mjolnir-hamma/scripts",
+]
+
+
+def load_ags_parser(extra_path=None):
+    """Find ags.parse_startup_state. Returns (parser_or_None, source_dir_or_None).
+
+    Search order: explicit path, $FLEET_PROBE_AGS_PATH, sibling ../scripts, then
+    the known VPS checkout.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if extra_path:
+        candidates.append(extra_path)
+    if os.environ.get("FLEET_PROBE_AGS_PATH"):
+        candidates.append(os.environ["FLEET_PROBE_AGS_PATH"])
+    candidates.append(os.path.join(here, "..", "scripts"))
+    candidates.extend(AGS_FALLBACK_DIRS)
+
+    for directory in candidates:
+        if not os.path.isfile(os.path.join(directory, "ags.py")):
+            continue
+        if directory not in sys.path:
+            sys.path.insert(0, directory)
+        try:
+            from ags import parse_startup_state as parser
+        except ImportError:                            # pragma: no cover
+            continue
+        return parser, directory
+    return None, None
+
+
+parse_startup_state, AGS_SOURCE = load_ags_parser()
 
 HAMMA_SENSORS = list(range(1, 10))
 PAMMA_SENSORS = [50, 51, 52, 53, 54, 56]
@@ -434,6 +473,15 @@ def main():
                              "grouped by value (a fleet consistency check); "
                              "reads the snapshot only, does NOT probe. "
                              "Choices: " + ", ".join(FIELDS[1:]))
+    parser.add_argument("--ags-path",
+                        help="directory containing ags.py (for the threshold/gain "
+                             "parser). Overrides the search path; also settable "
+                             "via $FLEET_PROBE_AGS_PATH")
+    parser.add_argument("--allow-missing-ags", action="store_true",
+                        help="probe even if ags.py cannot be found. Thresholds "
+                             "and gains will read 'unknown' for every unit -- "
+                             "expect a spurious change for each. Off by default "
+                             "so a missing parser fails loudly instead.")
     args = parser.parse_args()
 
     # Commit and notify are opt-in rather than default-on, so a hand-run probe
@@ -461,6 +509,23 @@ def main():
                 return 1
         print(field_report(rows, args.field))
         return 0
+
+    # Probing needs the AGS parser. Refuse rather than silently emit "unknown"
+    # thresholds/gains, which would also fire a bogus change for every unit.
+    # (--field above does not probe, so it is deliberately exempt.)
+    global parse_startup_state, AGS_SOURCE
+    if args.ags_path or parse_startup_state is None:
+        found, source = load_ags_parser(args.ags_path)
+        if found is not None:
+            parse_startup_state, AGS_SOURCE = found, source
+    if parse_startup_state is None and not args.allow_missing_ags:
+        print("ERROR: cannot find ags.py, so threshold/gain cannot be read.\n"
+              "       Probing now would record 'unknown' for those 4 fields on\n"
+              "       every unit and register a spurious change for each.\n"
+              "       Pass --ags-path DIR, set $FLEET_PROBE_AGS_PATH, or use\n"
+              "       --allow-missing-ags to override deliberately.",
+              file=sys.stderr)
+        return 1
 
     if args.ports:
         numbers = args.ports
