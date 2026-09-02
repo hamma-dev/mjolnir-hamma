@@ -411,7 +411,31 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
 
 
 def commit_snapshot(repo, snapshot_rel, message):
-    """Commit and push the snapshot. Returns (ok, detail)."""
+    """Commit and push the snapshot. Returns (ok, detail).
+
+    HAM-189 finding #5: fleet-state.csv has no locking. Two concurrent
+    writers on the same clone -- another `mjol_array --log-repo` run, or
+    this probe's own daily `--commit` cron overlapping one -- can race, and
+    a non-fast-forward push rejection is swallowed above (correctly: a git
+    failure here must never fail the caller) but was previously never
+    repaired, so that clone's logging silently degrades to a permanent
+    no-op until someone happens to notice.
+
+    Deliberately NOT building real locking for this -- a lock file/flock
+    over ssh-mounted or laptop-local clones is itself a new failure mode
+    (stale locks, cross-host semantics) for a resource written to at most a
+    few times a day. Cheapest responsible mitigation: on a push rejection
+    that LOOKS like a collision (git says "rejected"), retry ONCE --
+    `git pull --rebase` then push again -- which resolves the common single
+    -collision case for free. This does not cover every race (two pushes
+    landing inside the same retry window still lose one) and does not
+    retry a second time, so a genuinely wedged clone (rebase conflict, or a
+    second collision) is reported via the returned detail string, not
+    silently retried forever. That message is the whole mitigation for the
+    residual case: something an operator (or the caller printing `detail`)
+    can actually see and act on, which is strictly better than the
+    permanent silent no-op this replaces.
+    """
     try:
         add = subprocess.run(["git", "-C", repo, "add", "--", snapshot_rel],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -423,12 +447,42 @@ def commit_snapshot(repo, snapshot_rel, message):
                                 universal_newlines=True, timeout=60)
         if commit.returncode != 0:
             return False, commit.stdout.strip()
+
         push = subprocess.run(["git", "-C", repo, "push", "origin", "HEAD"],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               universal_newlines=True, timeout=120)
-        if push.returncode != 0:
-            return False, push.stdout.strip()
-        return True, "committed and pushed"
+        if push.returncode == 0:
+            return True, "committed and pushed"
+
+        detail = push.stdout.strip()
+        if "rejected" not in detail.lower():
+            # Some other push failure (auth, network, no remote, ...) --
+            # retrying blindly would not help and would just mask the real
+            # error behind a slower one.
+            return False, detail
+
+        # Looks like a non-fast-forward rejection: another writer pushed to
+        # this clone's remote since we last fetched. Try the cheap fix once.
+        rebase = subprocess.run(
+            ["git", "-C", repo, "pull", "--rebase", "origin", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=120)
+        if rebase.returncode != 0:
+            return False, (
+                "push rejected ({}); retry rebase also failed ({}) -- this "
+                "clone needs manual attention (conflicting local state); "
+                "logging from it will silently keep failing until someone "
+                "fixes it".format(detail, rebase.stdout.strip()))
+
+        retry = subprocess.run(["git", "-C", repo, "push", "origin", "HEAD"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=120)
+        if retry.returncode != 0:
+            return False, (
+                "push rejected ({}); rebased and retried once but the "
+                "retry also failed ({}) -- this clone needs manual "
+                "attention".format(detail, retry.stdout.strip()))
+        return True, "committed and pushed (after one rebase retry)"
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
 

@@ -482,8 +482,29 @@ class TestCliDispatch:
 # real fleet_probe.py by path (same pattern as test_fleet_probe.py) and
 # patch only its commit_snapshot() -- which shells out to git -- so nothing
 # here touches git or the network.
+#
+# Architecture under test (post red-team fixes):
+#   - _resolve_front_end_entry()/_resolve_threshold_entry()/
+#     _resolve_gain_entry() are pure: given a successful control op's
+#     result, they return a (unit, field, value) entry to log, or None if
+#     it must not be logged (AGS-reply rejection, missing baseline row's
+#     unit is NOT their job -- that is _log_field_changes_batch()'s).
+#   - updown_array()/set_threshold_array()/set_gain_array() run every
+#     port's control op first, collect entries, then call
+#     _log_field_changes_batch() ONCE per sweep.
+#   - _log_field_changes_batch() does the actual read+apply+write+commit,
+#     for one or many entries.
 # ==================================================================
 FLEET_PROBE_PATH = REPO_ROOT / "server" / "fleet_probe.py"
+
+# A representative successful AGS reply, matching the shape ags.py's own
+# tests use (test_ags.py's TestPersistGating) -- NOT indicating rejection.
+OK_REPLY = ('Use "help" command to display a list of commands.\n'
+            'Set DAS Threshold 1 to 1.2048.')
+# A representative firmware-rejected reply (an "Error -" line), same shape
+# as ags.py's own tests.
+REJECTED_REPLY = ('Use "help" command to display a list of commands.\n'
+                  'Error - Invalid threshold value: 12.048')
 
 
 @pytest.fixture
@@ -514,8 +535,10 @@ def _seed_snapshot(repo_path, fp, rows):
     return state_dir / "fleet-state.csv"
 
 
-class TestLogFieldChange:
-    """Unit tests for _log_field_change(), the core write-hook primitive."""
+class TestLogFieldChangesBatch:
+    """Unit tests for _log_field_changes_batch(), the core write-hook
+    primitive -- applies and commits one or more (unit, field, value)
+    entries in a single read+write+commit+push."""
 
     def test_updates_only_the_target_field(self, mjol, fp, tmp_path):
         _seed_snapshot(tmp_path, fp, {"mjolnir02": {"front_end": "off",
@@ -523,8 +546,8 @@ class TestLogFieldChange:
         with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
                 patch.object(fp, "commit_snapshot",
                             return_value=(True, "committed and pushed")) as mock_commit:
-            ok = mjol._log_field_change(str(tmp_path), "mjolnir02",
-                                        "front_end", "on")
+            ok = mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")])
         assert ok is True
         mock_commit.assert_called_once()
         updated = fp.read_snapshot(
@@ -533,17 +556,26 @@ class TestLogFieldChange:
         # Untouched fields are carried forward unchanged.
         assert updated["mjolnir02"]["brokkr_mode"] == "default"
 
+    def test_empty_entries_is_a_noop_success(self, mjol, tmp_path):
+        """No entries -- e.g. every op in the sweep failed -- must not
+        attempt to read/write/commit anything."""
+        with patch.object(mjol, "_fleet_probe_module") as mock_fp:
+            ok = mjol._log_field_changes_batch(str(tmp_path), [])
+        assert ok is True
+        mock_fp.assert_not_called()
+
     def test_no_repo_configured_is_reported_and_skipped(self, mjol, capsys):
-        ok = mjol._log_field_change(None, "mjolnir02", "front_end", "on")
+        ok = mjol._log_field_changes_batch(
+            None, [("mjolnir02", "front_end", "on")])
         assert ok is False
         assert "no --log-repo" in capsys.readouterr().err
 
     def test_missing_baseline_row_is_not_invented(self, mjol, fp, tmp_path):
         _seed_snapshot(tmp_path, fp, {})   # no rows at all yet
         with patch.object(mjol, "_fleet_probe_module", return_value=fp):
-            ok = mjol._log_field_change(str(tmp_path), "mjolnir02",
-                                        "front_end", "on")
-        assert ok is False
+            ok = mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")])
+        assert ok is True   # nothing applied is not a failure
         # Nothing was fabricated for the unit.
         assert fp.read_snapshot(
             str(tmp_path / "state" / "fleet-state.csv")) == {}
@@ -553,8 +585,8 @@ class TestLogFieldChange:
         _seed_snapshot(tmp_path, fp, {"mjolnir02": {"front_end": "on"}})
         with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
                 patch.object(fp, "commit_snapshot") as mock_commit:
-            ok = mjol._log_field_change(str(tmp_path), "mjolnir02",
-                                        "front_end", "on")
+            ok = mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")])
         assert ok is True
         mock_commit.assert_not_called()
 
@@ -564,16 +596,16 @@ class TestLogFieldChange:
         with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
                 patch.object(fp, "commit_snapshot",
                             return_value=(False, "no such remote")):
-            ok = mjol._log_field_change(str(tmp_path), "mjolnir02",
-                                        "front_end", "on")
+            ok = mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")])
         assert ok is False
         assert "commit/push failed" in capsys.readouterr().err
 
     def test_unavailable_fleet_probe_module_is_reported_not_raised(
             self, mjol, capsys):
         with patch.object(mjol, "_fleet_probe_module", return_value=None):
-            ok = mjol._log_field_change("/some/repo", "mjolnir02",
-                                        "front_end", "on")
+            ok = mjol._log_field_changes_batch(
+                "/some/repo", [("mjolnir02", "front_end", "on")])
         assert ok is False
         assert "could not load fleet_probe.py" in capsys.readouterr().err
 
@@ -584,8 +616,8 @@ class TestLogFieldChange:
         _seed_snapshot(tmp_path, fp, {"mjolnir02": {"front_end": "off"}})
         with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
                 patch.object(fp, "render", side_effect=OSError("disk full")):
-            ok = mjol._log_field_change(str(tmp_path), "mjolnir02",
-                                        "front_end", "on")
+            ok = mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")])
         assert ok is False
         assert "failed to record" in capsys.readouterr().err
 
@@ -595,8 +627,9 @@ class TestLogFieldChange:
         with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
                 patch.object(fp, "commit_snapshot",
                             return_value=(True, "ok")) as mock_commit:
-            mjol._log_field_change(str(tmp_path), "mjolnir02", "front_end",
-                                   "on", reason="bench test, HAM-999")
+            mjol._log_field_changes_batch(
+                str(tmp_path), [("mjolnir02", "front_end", "on")],
+                reason="bench test, HAM-999")
         message = mock_commit.call_args[0][2]
         assert "bench test, HAM-999" in message
         # The snapshot header must not have grown a reason/free-text column
@@ -604,13 +637,61 @@ class TestLogFieldChange:
         header = (tmp_path / "state" / "fleet-state.csv").read_text().splitlines()[0]
         assert header == ",".join(fp.FIELDS)
 
+    def test_multiple_entries_produce_one_commit(self, mjol, fp, tmp_path):
+        """HAM-189 finding #2: a multi-unit sweep must produce a single
+        commit+push for the whole batch, not one per entry."""
+        _seed_snapshot(tmp_path, fp, {
+            "mjolnir02": {"front_end": "off"},
+            "mjolnir03": {"front_end": "off"},
+            "mjolnir04": {"front_end": "off"},
+        })
+        entries = [("mjolnir02", "front_end", "on"),
+                   ("mjolnir03", "front_end", "on"),
+                   ("mjolnir04", "front_end", "on")]
+        with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot",
+                            return_value=(True, "ok")) as mock_commit:
+            ok = mjol._log_field_changes_batch(str(tmp_path), entries)
+        assert ok is True
+        mock_commit.assert_called_once()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert all(updated[u]["front_end"] == "on"
+                   for u in ("mjolnir02", "mjolnir03", "mjolnir04"))
 
-class TestThresholdGainLogHelpers:
-    """_log_threshold_change()/_log_gain_change() -- persist-only gating and
-    the mV round-trip through ags.py's own conversion functions."""
+    def test_one_bad_entry_does_not_lose_the_others(self, mjol, fp, tmp_path):
+        """A missing baseline row for one unit must not discard entries for
+        the others -- everything applicable is still written and committed
+        together."""
+        _seed_snapshot(tmp_path, fp, {"mjolnir02": {"front_end": "off"}})
+        entries = [("mjolnir02", "front_end", "on"),
+                   ("mjolnir99", "front_end", "on")]   # no row for mjolnir99
+        with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot",
+                            return_value=(True, "ok")) as mock_commit:
+            ok = mjol._log_field_changes_batch(str(tmp_path), entries)
+        assert ok is True
+        mock_commit.assert_called_once()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir02"]["front_end"] == "on"
+        assert "mjolnir99" not in updated
 
-    def test_threshold_roundtrip_matches_ags_py_exactly(self, mjol, fp,
-                                                        tmp_path):
+
+class TestResolveEntries:
+    """_resolve_front_end_entry()/_resolve_threshold_entry()/
+    _resolve_gain_entry() -- pure functions that decide WHAT (if anything)
+    a successful control op should log, before any I/O happens."""
+
+    def test_front_end_entry_on(self, mjol):
+        assert mjol._resolve_front_end_entry(10002, True) == (
+            "mjolnir02", "front_end", "on")
+
+    def test_front_end_entry_off(self, mjol):
+        assert mjol._resolve_front_end_entry(10003, False) == (
+            "mjolnir03", "front_end", "off")
+
+    def test_threshold_roundtrip_matches_ags_py_exactly(self, mjol):
         """The value recorded must be exactly what fleet_probe's parser will
         read back out of the persisted startup file -- computed with ags.py's
         own mv_to_ags/_format_ags/ags_to_mv, not re-derived."""
@@ -619,42 +700,49 @@ class TestThresholdGainLogHelpers:
             real_ags.ags_to_mv(float(real_ags._format_ags(
                 real_ags.mv_to_ags(830)))), 1)
 
-        _seed_snapshot(tmp_path, fp, {"mjolnir02": {"threshold_1_mv": "450"}})
-        with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
-                patch.object(fp, "commit_snapshot", return_value=(True, "ok")):
-            ok = mjol._log_threshold_change(str(tmp_path), 10002, "1", 830)
-        assert ok is True
-        updated = fp.read_snapshot(
-            str(tmp_path / "state" / "fleet-state.csv"))
-        assert updated["mjolnir02"]["threshold_1_mv"] == str(expected)
+        entry = mjol._resolve_threshold_entry(10002, "1", 830, OK_REPLY)
+        assert entry == ("mjolnir02", "threshold_1_mv", str(expected))
 
-    def test_channel_2_maps_to_threshold_2_field(self, mjol, fp, tmp_path):
-        _seed_snapshot(tmp_path, fp, {"mjolnir03": {"threshold_2_mv": "450"}})
-        with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
-                patch.object(fp, "commit_snapshot", return_value=(True, "ok")):
-            mjol._log_threshold_change(str(tmp_path), 10003, "2", 700)
-        updated = fp.read_snapshot(
-            str(tmp_path / "state" / "fleet-state.csv"))
-        assert updated["mjolnir03"]["threshold_1_mv"] == fp.UNKNOWN
-        assert updated["mjolnir03"]["threshold_2_mv"] != "450"
+    def test_channel_2_maps_to_threshold_2_field(self, mjol):
+        entry = mjol._resolve_threshold_entry(10003, "2", 700, OK_REPLY)
+        assert entry[0] == "mjolnir03"
+        assert entry[1] == "threshold_2_mv"
 
-    def test_missing_ags_module_skips_without_guessing(self, mjol, tmp_path,
-                                                        capsys):
+    def test_missing_ags_module_skips_without_guessing(self, mjol, capsys):
         with patch.object(mjol, "_load_ags_module", return_value=None):
-            ok = mjol._log_threshold_change(str(tmp_path), 10002, "1", 830)
-        assert ok is False
+            entry = mjol._resolve_threshold_entry(10002, "1", 830, OK_REPLY)
+        assert entry is None
         assert "ags.py not found" in capsys.readouterr().err
 
-    def test_gain_maps_fast_e_and_slow_e(self, mjol, fp, tmp_path):
-        _seed_snapshot(tmp_path, fp, {"mjolnir02": {"gain_fast": "1",
-                                                     "gain_slow": "1"}})
-        with patch.object(mjol, "_fleet_probe_module", return_value=fp), \
-                patch.object(fp, "commit_snapshot", return_value=(True, "ok")):
-            mjol._log_gain_change(str(tmp_path), 10002, "fast-e", 2)
-        updated = fp.read_snapshot(
-            str(tmp_path / "state" / "fleet-state.csv"))
-        assert updated["mjolnir02"]["gain_fast"] == "2"
-        assert updated["mjolnir02"]["gain_slow"] == "1"
+    def test_gain_maps_fast_e_and_slow_e(self, mjol):
+        entry = mjol._resolve_gain_entry(10002, "fast-e", 2, OK_REPLY)
+        assert entry == ("mjolnir02", "gain_fast", "2")
+        entry = mjol._resolve_gain_entry(10002, "slow-e", 1, OK_REPLY)
+        assert entry == ("mjolnir02", "gain_slow", "1")
+
+    # ---- HAM-189 finding #1: AGS-reply rejection gate ----
+
+    def test_threshold_rejected_reply_is_not_logged(self, mjol, capsys):
+        """A firmware-rejected reply, even with a successful ssh round trip,
+        must not produce an entry -- the value was never actually written
+        to the persisted startup file."""
+        entry = mjol._resolve_threshold_entry(
+            10002, "1", 2000, REJECTED_REPLY)
+        assert entry is None
+        assert "REJECTED" in capsys.readouterr().err
+
+    def test_gain_rejected_reply_is_not_logged(self, mjol, capsys):
+        entry = mjol._resolve_gain_entry(10002, "fast-e", 3, REJECTED_REPLY)
+        assert entry is None
+        assert "REJECTED" in capsys.readouterr().err
+
+    def test_threshold_empty_reply_is_not_logged(self, mjol):
+        """An empty/absent reply (e.g. a socket timeout with no data) means
+        the sensor never confirmed the command -- must not be logged."""
+        assert mjol._resolve_threshold_entry(10002, "1", 830, "") is None
+
+    def test_gain_empty_reply_is_not_logged(self, mjol):
+        assert mjol._resolve_gain_entry(10002, "fast-e", 2, "") is None
 
 
 class TestControlOpsRecordChanges:
@@ -686,7 +774,7 @@ class TestControlOpsRecordChanges:
         arr = mjol.MjolnirArray(sensors=[2])
         with patch.object(mjol, "subprocess") as mock_sub, \
                 patch.object(mjol.MjolnirArray, "status", return_value=False), \
-                patch.object(mjol, "_log_front_end_change") as mock_log:
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
             arr.updown_array(True, ports=[2], log_repo=str(tmp_path))
         mock_sub.run.assert_not_called()
         mock_log.assert_not_called()
@@ -698,7 +786,7 @@ class TestControlOpsRecordChanges:
         arr = mjol.MjolnirArray(sensors=[2])
         with patch.object(mjol, "subprocess") as mock_sub, \
                 patch.object(mjol.MjolnirArray, "status", return_value=True), \
-                patch.object(mjol, "_log_front_end_change") as mock_log:
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
             mock_sub.run.return_value = MagicMock(returncode=1, stdout=b"",
                                                    stderr=b"boom")
             mock_sub.TimeoutExpired = subprocess.TimeoutExpired
@@ -732,7 +820,7 @@ class TestControlOpsRecordChanges:
         arr = mjol.MjolnirArray(sensors=[2])
         with patch.object(mjol, "subprocess") as mock_sub, \
                 patch.object(mjol.MjolnirArray, "status", return_value=True), \
-                patch.object(mjol, "_log_threshold_change") as mock_log:
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
             mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
                                                    stderr=b"")
             mock_sub.TimeoutExpired = subprocess.TimeoutExpired
@@ -740,32 +828,181 @@ class TestControlOpsRecordChanges:
                                     persist=False, log_repo=str(tmp_path))
         mock_log.assert_not_called()
 
-    def test_threshold_with_persist_is_logged(self, mjol, tmp_path):
+    def test_gain_without_persist_is_not_logged(self, mjol, tmp_path):
+        """Same persist-only rule as threshold -- mutation-tested gap: the
+        gain path is structurally identical but was not covered."""
+        arr = mjol.MjolnirArray(sensors=[3])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
+                                                   stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.set_gain_array(ports=[3], channel="fast-e", level=2,
+                               persist=False, log_repo=str(tmp_path))
+        mock_log.assert_not_called()
+
+    def test_threshold_persist_with_no_log_is_not_logged(self, mjol, tmp_path):
+        """Mutation-tested gap: --no-log was covered for updown but not for
+        threshold/gain. Today's code already respects it (`not no_log` at
+        the persist-gate check) -- this test only guards against a future
+        regression, it is not fixing a live bug."""
         arr = mjol.MjolnirArray(sensors=[2])
         with patch.object(mjol, "subprocess") as mock_sub, \
                 patch.object(mjol.MjolnirArray, "status", return_value=True), \
-                patch.object(mjol, "_log_threshold_change") as mock_log:
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
             mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
                                                    stderr=b"")
             mock_sub.TimeoutExpired = subprocess.TimeoutExpired
             arr.set_threshold_array(ports=[2], channel="1", millivolts="830",
                                     persist=True, log_repo=str(tmp_path),
-                                    reason="bench")
-        mock_log.assert_called_once_with(str(tmp_path), 10002, "1", "830",
-                                         reason="bench")
+                                    no_log=True)
+        mock_log.assert_not_called()
 
-    def test_gain_with_persist_is_logged(self, mjol, tmp_path):
+    def test_gain_persist_with_no_log_is_not_logged(self, mjol, tmp_path):
+        """Same regression guard as above, for the gain path."""
         arr = mjol.MjolnirArray(sensors=[3])
         with patch.object(mjol, "subprocess") as mock_sub, \
                 patch.object(mjol.MjolnirArray, "status", return_value=True), \
-                patch.object(mjol, "_log_gain_change") as mock_log:
+                patch.object(mjol, "_log_field_changes_batch") as mock_log:
             mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
                                                    stderr=b"")
             mock_sub.TimeoutExpired = subprocess.TimeoutExpired
             arr.set_gain_array(ports=[3], channel="fast-e", level=2,
+                               persist=True, log_repo=str(tmp_path),
+                               no_log=True)
+        mock_log.assert_not_called()
+
+    def test_threshold_with_persist_is_logged(self, mjol, fp, tmp_path):
+        _seed_snapshot(tmp_path, fp, {"mjolnir02": {"threshold_1_mv": "1"}})
+        arr = mjol.MjolnirArray(sensors=[2])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot",
+                            return_value=(True, "ok")) as mock_commit:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0, stdout=OK_REPLY.encode(), stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.set_threshold_array(ports=[2], channel="1", millivolts="830",
+                                    persist=True, log_repo=str(tmp_path),
+                                    reason="bench")
+        mock_commit.assert_called_once()
+        message = mock_commit.call_args[0][2]
+        assert "bench" in message
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir02"]["threshold_1_mv"] != "1"
+
+    def test_gain_with_persist_is_logged(self, mjol, fp, tmp_path):
+        _seed_snapshot(tmp_path, fp, {"mjolnir03": {"gain_fast": "1"}})
+        arr = mjol.MjolnirArray(sensors=[3])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot",
+                            return_value=(True, "ok")) as mock_commit:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0, stdout=OK_REPLY.encode(), stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.set_gain_array(ports=[3], channel="fast-e", level=2,
                               persist=True, log_repo=str(tmp_path))
-        mock_log.assert_called_once_with(str(tmp_path), 10003, "fast-e", 2,
-                                         reason=None)
+        mock_commit.assert_called_once()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir03"]["gain_fast"] == "2"
+
+    # ---- HAM-189 finding #1: AGS-rejected persisted value ----
+
+    def test_threshold_ags_rejection_is_not_logged(self, mjol, fp, tmp_path):
+        """ssh/subprocess succeeds (returncode 0) but the AGS reply contains
+        an 'Error -' marker -- the firmware rejected the value, so it must
+        NOT be logged even though the control op itself "succeeded"."""
+        _seed_snapshot(tmp_path, fp, {"mjolnir02": {"threshold_1_mv": "450"}})
+        arr = mjol.MjolnirArray(sensors=[2])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot") as mock_commit:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0, stdout=REJECTED_REPLY.encode(), stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.set_threshold_array(ports=[2], channel="1", millivolts="2000",
+                                    persist=True, log_repo=str(tmp_path))
+        mock_commit.assert_not_called()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir02"]["threshold_1_mv"] == "450"   # unchanged
+
+    def test_gain_ags_rejection_is_not_logged(self, mjol, fp, tmp_path):
+        _seed_snapshot(tmp_path, fp, {"mjolnir03": {"gain_fast": "1"}})
+        arr = mjol.MjolnirArray(sensors=[3])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot") as mock_commit:
+            mock_sub.run.return_value = MagicMock(
+                returncode=0, stdout=REJECTED_REPLY.encode(), stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.set_gain_array(ports=[3], channel="fast-e", level=3,
+                              persist=True, log_repo=str(tmp_path))
+        mock_commit.assert_not_called()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir03"]["gain_fast"] == "1"   # unchanged
+
+    # ---- HAM-189 finding #2/#3: multi-unit fan-out with partial failure ----
+
+    def test_fan_out_partial_failure_logs_only_the_succeeding_unit(
+            self, mjol, fp, tmp_path):
+        """Every existing integration test used a single unit (ports=[2]).
+        A real sweep is multiple units, and one unit's tunnel being down
+        must not affect another's control op or its logging."""
+        _seed_snapshot(tmp_path, fp, {
+            "mjolnir02": {"front_end": "off"},
+            "mjolnir03": {"front_end": "off"},
+        })
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+
+        def fake_status(port):
+            return port == 10002   # only mjolnir02's tunnel is up
+
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status",
+                            side_effect=fake_status), \
+                patch.object(mjol, "_fleet_probe_module", return_value=fp), \
+                patch.object(fp, "commit_snapshot",
+                            return_value=(True, "ok")) as mock_commit:
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
+                                                   stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            arr.updown_array(True, ports=[2, 3], log_repo=str(tmp_path))
+
+        # One control op ran (mjolnir03's was skipped -- tunnel down).
+        mock_sub.run.assert_called_once()
+        # One commit for the whole sweep, covering only the unit that
+        # actually succeeded.
+        mock_commit.assert_called_once()
+        updated = fp.read_snapshot(
+            str(tmp_path / "state" / "fleet-state.csv"))
+        assert updated["mjolnir02"]["front_end"] == "on"
+        assert updated["mjolnir03"]["front_end"] == "off"
+
+    def test_fan_out_snapshot_failure_does_not_affect_other_units_control_op(
+            self, mjol, tmp_path):
+        """A snapshot/git failure for the batch must not retroactively
+        break or hide the fact that every unit's control op already ran."""
+        arr = mjol.MjolnirArray(sensors=[2, 3])
+        with patch.object(mjol, "subprocess") as mock_sub, \
+                patch.object(mjol.MjolnirArray, "status", return_value=True), \
+                patch.object(mjol, "_fleet_probe_module",
+                            side_effect=RuntimeError("no disk")):
+            mock_sub.run.return_value = MagicMock(returncode=0, stdout=b"",
+                                                   stderr=b"")
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            # Must not raise, and both control ops must still run.
+            arr.updown_array(True, ports=[2, 3], log_repo=str(tmp_path))
+        assert mock_sub.run.call_count == 2
 
 
 class TestWriteHookSafety:
@@ -830,3 +1067,42 @@ class TestWriteHookCliFlags:
         kwargs = mock_arr.call_args.kwargs
         assert kwargs["reason"] == "field adjustment"
         assert kwargs["log_repo"] is None
+
+
+class TestPersistOmissionWarning:
+    """HAM-189 cheap improvement: omitting --persist with --log-repo set
+    silently produces an untracked change. main() should print a one-line
+    [LOG] notice, mirroring the existing "no --log-repo" notice, UNLESS the
+    operator already said --no-log (self-documenting, no notice needed)."""
+
+    def test_warns_when_persist_omitted_with_log_repo(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array"):
+            mjol.main(["-p", "2", "--set-threshold", "1", "830",
+                      "--log-repo", "/some/repo"])
+        assert "--persist not set" in capsys.readouterr().err
+
+    def test_warns_for_gain_too(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_gain_array"):
+            mjol.main(["-p", "2", "--set-gain", "fast-e", "2",
+                      "--log-repo", "/some/repo"])
+        assert "--persist not set" in capsys.readouterr().err
+
+    def test_no_warning_when_persist_given(self, mjol, capsys):
+        with patch.object(mjol.MjolnirArray, "set_threshold_array"):
+            mjol.main(["-p", "2", "--set-threshold", "1", "830", "--persist",
+                      "--log-repo", "/some/repo"])
+        assert "--persist not set" not in capsys.readouterr().err
+
+    def test_no_warning_when_no_log_given(self, mjol, capsys):
+        """--no-log is already self-documenting -- no need to also warn."""
+        with patch.object(mjol.MjolnirArray, "set_threshold_array"):
+            mjol.main(["-p", "2", "--set-threshold", "1", "830", "--no-log",
+                      "--log-repo", "/some/repo"])
+        assert "--persist not set" not in capsys.readouterr().err
+
+    def test_no_warning_without_log_repo(self, mjol, capsys):
+        """No --log-repo/$FLEET_LOG_REPO -- the other, existing notice
+        already covers this case; do not double-warn."""
+        with patch.object(mjol.MjolnirArray, "set_threshold_array"):
+            mjol.main(["-p", "2", "--set-threshold", "1", "830"])
+        assert "--persist not set" not in capsys.readouterr().err
