@@ -26,6 +26,7 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
     mock_brokkr.pipeline.base = mock_base
 
     mock_hamma = MagicMock()
+    mock_hamma.diagnostic_data.return_value = diag_return
     if times_fast is None:
         times_fast = np.array(["2026-06-23T21:36:57.000", "2026-06-23T21:36:58.857",
                                "2026-06-23T21:36:59.000"], dtype="datetime64[ms]")
@@ -43,7 +44,6 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
         return col
     header.data.__getitem__.side_effect = _col
     mock_hamma.Header.return_value = header
-    mock_core = MagicMock(); mock_core._diagnostic_data.return_value = diag_return
 
     with patch.dict("sys.modules", {
         "brokkr": mock_brokkr, "brokkr.pipeline": mock_pipeline,
@@ -53,7 +53,6 @@ def load_module(diag_return=(0.1, 4.7, -4.7, 0.035), volt_fast=object(), thresho
         "brokkr.config.unit": MagicMock(),
         "brokkr.config.metadata": MagicMock(),
         "hamma": mock_hamma, "hamma.header": MagicMock(),
-        "hamma.header.core": mock_core,
         "notifiers": MagicMock(),
     }):
         spec = importlib.util.spec_from_file_location("noise_diag", str(PLUGIN_PATH))
@@ -135,7 +134,7 @@ def test_compute_skips_short_pretrigger():
     step.medsize = 200000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
-    with patch.object(module, "_diagnostic_data") as mock_diag:
+    with patch.object(module, "diagnostic_data") as mock_diag:
         result = step._compute(make_input())
     assert result is None
     mock_diag.assert_not_called()
