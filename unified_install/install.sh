@@ -44,6 +44,7 @@ SKIP_BROKKR=false
 SKIP_HARDWARE=false
 SKIP_EXTRAS=false
 SKIP_HAMMA=false
+SKIP_POSTINSTALL=false
 CELLULAR_APN=""
 GENERATE_HAMMA_KEY=false
 HAMMA_ONLY=false
@@ -62,6 +63,7 @@ print_usage() {
     echo "  --skip-hardware     Skip hardware setup"
     echo "  --skip-extras       Skip sindri/pyltg/hamma installation"
     echo "  --skip-hamma        Skip HAMMA installation (requires SSH key for private repo)"
+    echo "  --skip-postinstall  Skip post-install config (.googlechat key, datasync user)"
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Cellular options:"
@@ -100,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-extras)
             SKIP_EXTRAS=true
+            shift
+            ;;
+        --skip-postinstall)
+            SKIP_POSTINSTALL=true
             shift
             ;;
         --skip-hamma)
@@ -272,8 +278,10 @@ log_step "Updating mjolnir-hamma repository..."
 
 REPO_PATH="/home/pi/dev/mjolnir-hamma"
 REPO_URL="https://github.com/hamma-dev/mjolnir-hamma.git"
-# TODO: Update this branch when releasing or changing version branches
-REPO_BRANCH="0.3.x"
+# Current mjolnir-hamma version branch. The self-update below only pulls when
+# the unit is already on this branch, so a stale value silently skips updates.
+# TODO: bump on each version-branch change (last: 0.3.x -> 0.4.x).
+REPO_BRANCH="0.4.x"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log_dry_run "git -C $REPO_PATH remote set-url origin $REPO_URL"
@@ -373,6 +381,27 @@ if [[ "$SKIP_EXTRAS" != "true" ]]; then
     fi
 else
     log_info "Skipping additional software (--skip-extras)"
+fi
+
+echo ""
+
+# ============================================================================
+# PHASE 7: Post-install configuration
+# ============================================================================
+# Small, documented-but-previously-manual steps that kept getting skipped on
+# bring-up (HAM-120 umbrella). All best-effort — a failure here logs a warning
+# and never aborts the install.
+log_info "=== Phase 7: Post-install configuration ==="
+echo ""
+
+if [[ "$SKIP_POSTINSTALL" != "true" ]]; then
+    source "$SCRIPT_DIR/lib/software.sh"
+    cleanup_legacy_services     # sensor-log #43/#9: drop retired pre-default units
+    fetch_notification_key      # HAM-118: .googlechat key for state_monitor
+    setup_datasync_local        # HAM-80: datasync account for hamma_download.py
+    normalize_pi_ownership      # sensor-log #78/#11/#33: fix root-owned pi paths
+else
+    log_info "Skipping post-install configuration (--skip-postinstall)"
 fi
 
 echo ""

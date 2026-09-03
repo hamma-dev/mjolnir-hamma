@@ -1,0 +1,27 @@
+[Unit]
+Description=Remove stale udisks2 orphan mountpoint dirs for HAMMA DATA?? drives
+Documentation=https://github.com/hamma-dev/sensor-log
+# A dirty unmount (hard reset / brown-out) leaves an empty /media/pi/DATA?? dir.
+# On next boot the drive gets mounted at a suffixed path (/media/pi/DATA071)
+# that brokkr's strict DATA?? glob misses, so science data silently falls back
+# to the SD card. Remove the empty orphan dirs before the drive is mounted.
+#
+# Ordering note: brokkr (not udisks) is the actual mounter — it issues
+# `udisksctl mount` at runtime via mount_glob, and brokkr-hamma-default.service
+# starts as part of multi-user.target. So Before=multi-user.target /
+# Before=brokkr-hamma-default.service is the load-bearing guarantee that the
+# rmdir runs first; Before=udisks2.service is belt-and-suspenders (udisks2 is
+# D-Bus-activated, so that edge is not by itself sufficient). Do not drop the
+# multi-user.target / brokkr ordering.
+After=local-fs.target
+Before=brokkr-hamma-default.service udisks2.service multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# rmdir removes ONLY empty dirs; an active mountpoint is busy and is skipped,
+# so this is a safe no-op once drives are correctly mounted.
+ExecStart=/bin/sh -c 'for d in /media/pi/DATA??; do [ -d "$d" ] && rmdir "$d" 2>/dev/null; done; exit 0'
+
+[Install]
+WantedBy=multi-user.target

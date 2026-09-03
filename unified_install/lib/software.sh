@@ -359,3 +359,172 @@ EOT
         log_success "HAMMA installation complete!"
     fi
 }
+
+# --- Fetch Google Chat notification key ---
+# The brokkr state_monitor plugin needs /home/pi/.googlechat to send
+# notifications (low-space, disconnect, low-power). Without it, state_monitor
+# throws FileNotFoundError every cycle and all notifications are silently off.
+# The key lives on the server; pull it here so the manual scp (documented in
+# README.md Step 6 but never invoked) is no longer needed. (HAM-118)
+#
+# Best-effort: needs pi's id_rsa authorized on hamma.dev first. If that isn't
+# set up yet, warn and continue — never abort the install over a missing key.
+fetch_notification_key() {
+    local key_src="pi@www.hamma.dev:/home/pi/.googlechat"
+    local key_dst="/home/pi/.googlechat"
+    local scp_err
+
+    log_step "Fetching Google Chat notification key..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "scp $key_src $key_dst (as pi user, best-effort)"
+        manifest_add "command" "cmd" "scp $key_src $key_dst" "user" "pi" "best_effort" "true"
+        return 0
+    fi
+
+    if [[ -f "$key_dst" ]]; then
+        log_info ".googlechat already present, skipping fetch"
+        return 0
+    fi
+
+    # Run as pi so the fetch uses pi's SSH identity and the file lands pi-owned.
+    # Capture stderr so the warning shows the real cause (auth vs DNS vs
+    # unreachable) — DNS on cellular units is a known recurring failure mode.
+    if scp_err=$(sudo -H -u pi scp -o BatchMode=yes -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no "$key_src" "$key_dst" 2>&1); then
+        chown pi:pi "$key_dst" 2>/dev/null || true
+        chmod 600 "$key_dst" 2>/dev/null || true  # webhook token — keep it private
+        log_success "Fetched .googlechat notification key"
+    else
+        log_warn "Could not fetch .googlechat key: ${scp_err:-unknown error}"
+        log_warn "state_monitor notifications stay disabled until you run manually:"
+        log_warn "  sudo -H -u pi scp $key_src $key_dst"
+    fi
+}
+
+# --- Set up local datasync user ---
+# The datasync user lets hamma_download.py pull data from this unit via rsync.
+# scripts/setup_datasync.sh does this remotely (from a workstation over the
+# jump host); this does the on-Pi plumbing during install so future units are
+# pre-provisioned. (HAM-80)
+#
+# Note: the login key (bitzer@matrix pubkey) is NOT available locally during
+# install, so authorized_keys is left for the operator / setup_datasync.sh to
+# populate. This step only creates the account, group membership, .ssh dir and
+# /media/pi permissions — the tedious part. Best-effort, non-fatal.
+setup_datasync_local() {
+    log_step "Setting up local datasync user..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "useradd -m -s /bin/bash datasync"
+        log_dry_run "usermod -a -G pi datasync"
+        log_dry_run "mkdir -p /home/datasync/.ssh (mode 700, owned datasync)"
+        log_dry_run "chmod o+rx /media/pi/"
+        manifest_add "command" "cmd" "useradd -m -s /bin/bash datasync" "sudo" "true"
+        manifest_add "command" "cmd" "usermod -a -G pi datasync" "sudo" "true"
+        manifest_add "mkdir" "path" "/home/datasync/.ssh"
+        manifest_add "command" "cmd" "chmod o+rx /media/pi/" "sudo" "true"
+        return 0
+    fi
+
+    if id datasync >/dev/null 2>&1; then
+        log_info "datasync user already exists, skipping creation"
+    else
+        useradd -m -s /bin/bash datasync || {
+            log_warn "Could not create datasync user (continuing)"
+            return 0
+        }
+    fi
+
+    usermod -a -G pi datasync || log_warn "Could not add datasync to pi group"
+    # Guard every command: this step is best-effort and must never abort the
+    # install under set -e (e.g. an odd /home/datasync state on a re-run).
+    { mkdir -p /home/datasync/.ssh && chmod 700 /home/datasync/.ssh; } \
+        || log_warn "Could not create /home/datasync/.ssh"
+    chown -R datasync:datasync /home/datasync/.ssh 2>/dev/null \
+        || log_warn "Could not set /home/datasync/.ssh ownership"
+    # Let datasync traverse pi's removable-media mounts for rsync
+    chmod o+rx /media/pi/ 2>/dev/null || log_warn "/media/pi not present yet (set o+rx after drives mount)"
+
+    log_success "datasync account provisioned (local plumbing)"
+    log_warn "Install the pull-side public key into /home/datasync/.ssh/authorized_keys"
+    log_warn "  (e.g. via scripts/setup_datasync.sh --key <pubkey> <sensor_num>)"
+}
+
+# --- Remove legacy systemd units ---
+# Pre-"-default" unit names get left behind when re-installing older units and
+# compete with the current -default units for the tunnel port / config. Remove
+# the known-legacy names. Best-effort, non-fatal. (sensor-log #43, #9)
+cleanup_legacy_services() {
+    log_step "Removing legacy systemd units..."
+
+    # Current names are autossh-hamma-default / brokkr-hamma-default; these
+    # bare names are the retired pre-default units, safe to remove.
+    local legacy=(autossh-hamma.service brokkr-hamma.service)
+    # Overridable for tests (defaults to the real path).
+    local systemd_dir="${LEGACY_SYSTEMD_DIR:-/etc/systemd/system}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local svc
+        for svc in "${legacy[@]}"; do
+            log_dry_run "disable + rm + reset-failed $svc (if present)"
+            manifest_add "command" "cmd" "rm -f $systemd_dir/$svc" "sudo" "true" "best_effort" "true"
+        done
+        return 0
+    fi
+
+    local removed=0 svc unit
+    for svc in "${legacy[@]}"; do
+        unit="$systemd_dir/$svc"
+        [[ -f "$unit" ]] || continue
+        log_info "Removing legacy $svc"
+        systemctl disable --now "$svc" 2>/dev/null || true
+        rm -f "$unit" 2>/dev/null || log_warn "Could not remove $unit"
+        systemctl reset-failed "$svc" 2>/dev/null || true
+        removed=$((removed + 1))
+    done
+    if [[ "$removed" -gt 0 ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+        log_success "Removed $removed legacy unit(s)"
+    else
+        log_info "No legacy units present"
+    fi
+}
+
+# --- Normalize ownership of pi-owned paths ---
+# Any step that ran `sudo` without -H (older installs) left repos, .ssh, and
+# venvs root-owned, which breaks `git pull` ("dubious ownership") and pip. A
+# best-effort belt-and-suspenders pass so that recurring breakage can't ship.
+# (sensor-log #78, #11, #33)
+normalize_pi_ownership() {
+    log_step "Normalizing pi ownership of home paths..."
+
+    # Overridable for tests (defaults to the real pi-owned paths).
+    local paths
+    if [[ -n "${PI_OWN_PATHS:-}" ]]; then
+        read -ra paths <<< "$PI_OWN_PATHS"
+    else
+        paths=(/home/pi/dev /home/pi/.ssh /home/pi/.config)
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local p
+        for p in "${paths[@]}"; do
+            log_dry_run "chown -R pi:pi $p"
+            manifest_add "command" "cmd" "chown -R pi:pi $p" "sudo" "true" "best_effort" "true"
+        done
+        log_dry_run "chmod 755 /etc/systemd/system"
+        manifest_add "command" "cmd" "chmod 755 /etc/systemd/system" "sudo" "true" "best_effort" "true"
+        return 0
+    fi
+
+    local p
+    for p in "${paths[@]}"; do
+        [[ -e "$p" ]] || continue
+        chown -R pi:pi "$p" 2>/dev/null || log_warn "Could not normalize ownership of $p"
+    done
+    # /etc/systemd/system left mode 644 (no traverse bit) blocks unit reads.
+    chmod 755 /etc/systemd/system 2>/dev/null || log_warn "Could not set /etc/systemd/system mode"
+
+    log_success "Ownership normalized"
+}

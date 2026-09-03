@@ -89,9 +89,11 @@ setup_automount() {
     log_step "Setting up automount..."
 
     local mount_file="mount-udisks.pkla"
+    local cleanup_unit="hamma-cleanup-stale-mountpoints.service"
+    local systemd_path="/etc/systemd/system"
 
     # --- Step 1: Create polkit directory if needed ---
-    log_step "[Automount 1/2] Setting up polkit directory..."
+    log_step "[Automount 1/3] Setting up polkit directory..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "mkdir -p $POLKIT_PATH"
@@ -106,7 +108,7 @@ setup_automount() {
     fi
 
     # --- Step 2: Copy mount rules ---
-    log_step "[Automount 2/2] Installing mount rules..."
+    log_step "[Automount 2/3] Installing mount rules..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "cp $FILES_DIR/$mount_file $POLKIT_PATH/"
@@ -123,6 +125,28 @@ setup_automount() {
             log_success "Mount rules installed"
         else
             log_warn "Mount rules file not found at $FILES_DIR/$mount_file"
+        fi
+    fi
+
+    # --- Step 3: Install stale-mountpoint cleanup oneshot ---
+    # Removes orphan /media/pi/DATA?? dirs before udisks auto-mounts, so a dirty
+    # unmount can't push the drive to a suffixed path brokkr misses. (sensor-log
+    # #52; udisks orphan-mountpoint conflict)
+    log_step "[Automount 3/3] Installing stale-mountpoint cleanup service..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "cp $FILES_DIR/$cleanup_unit $systemd_path/"
+        log_dry_run "systemctl enable $cleanup_unit"
+        manifest_add "copy" "src" "$FILES_DIR/$cleanup_unit" "dst" "$systemd_path/$cleanup_unit" "sudo" "true"
+        manifest_add "systemctl" "action" "enable" "service" "$cleanup_unit"
+    else
+        if [[ -f "$FILES_DIR/$cleanup_unit" ]]; then
+            sudo cp "$FILES_DIR/$cleanup_unit" "$systemd_path/"
+            sudo systemctl enable "$cleanup_unit" 2>/dev/null || \
+                log_warn "Could not enable $cleanup_unit"
+            log_success "Stale-mountpoint cleanup service installed"
+        else
+            log_warn "Cleanup unit not found at $FILES_DIR/$cleanup_unit"
         fi
     fi
 

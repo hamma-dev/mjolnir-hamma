@@ -300,6 +300,74 @@ check_brokkr_status() {
     fi
 }
 
+check_post_install_config() {
+    print_section "Post-Install Configuration"
+
+    # Timezone must be UTC — a local timezone silently costs the daily
+    # compression plugin hours of quiet-time each day (HAM-71).
+    local tz
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "unknown")
+    if [[ "$tz" == "UTC" || "$tz" == "Etc/UTC" ]]; then
+        pass "Timezone is UTC"
+    else
+        fail "Timezone is '$tz' (expected UTC) — run: sudo timedatectl set-timezone UTC"
+    fi
+
+    # gpiozero must import in ltgenv — gpiozero 2.0 on Python 3.7 raises
+    # ModuleNotFoundError and breaks relay.py (HAM-84).
+    local ltgenv_py="/home/pi/dev/ltgenv/bin/python"
+    if [[ -x "$ltgenv_py" ]]; then
+        if "$ltgenv_py" -c "import gpiozero" 2>/dev/null; then
+            pass "gpiozero imports in ltgenv"
+        else
+            fail "gpiozero fails to import in ltgenv (pin gpiozero<2.0 on Python 3.7 — HAM-84)"
+        fi
+    else
+        skip "ltgenv python not found — cannot check gpiozero"
+    fi
+
+    # .googlechat key enables state_monitor notifications (HAM-118). Optional,
+    # so a miss is a warning, not a failure.
+    if [[ -f /home/pi/.googlechat ]]; then
+        pass ".googlechat notification key present"
+    else
+        warn ".googlechat key missing — state_monitor notifications disabled (HAM-118)"
+    fi
+
+    # datasync user enables hamma_download.py pulls (HAM-80).
+    if id datasync >/dev/null 2>&1; then
+        pass "datasync user exists"
+    else
+        warn "datasync user missing — hamma_download.py cannot pull data (HAM-80)"
+    fi
+
+    # pi-owned paths must not be root-owned (breaks git pull / pip). Recurring
+    # fallout from `sudo` without -H on older installs (sensor-log #78/#11/#33).
+    check_file_ownership "/home/pi/dev/mjolnir-hamma" "pi" "mjolnir-hamma repo owned by pi"
+    if [[ -e /home/pi/.ssh/config ]]; then
+        check_file_ownership "/home/pi/.ssh/config" "pi" "SSH config owned by pi"
+    fi
+}
+
+check_hamma_repo_access() {
+    print_section "HAMMA Repo Access (deploy key)"
+
+    if [[ ! -d /home/pi/dev/hamma/.git ]]; then
+        skip "hamma repo not present — cannot test deploy key"
+        return
+    fi
+
+    # The private pbitzer/hamma repo needs the ed25519 deploy key authorized on
+    # GitHub. Key generation is automated, but authorization is a manual step
+    # that gets missed (sensor-log #11). ls-remote exercises the key.
+    if sudo -H -u pi env GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10' \
+            git -C /home/pi/dev/hamma ls-remote >/dev/null 2>&1; then
+        pass "hamma deploy key authorized (git ls-remote works)"
+    else
+        fail "hamma deploy key not working — add id_ed25519.pub to pbitzer/hamma deploy keys"
+    fi
+}
+
 check_server_connection() {
     print_section "Server Connection"
 
@@ -439,9 +507,11 @@ main() {
     check_wifi_services
     check_file_setup
     check_brokkr_status
+    check_post_install_config
 
     if $full_check; then
         check_server_connection
+        check_hamma_repo_access
     else
         print_section "Server Connection"
         skip "Use --full to test server connection"
