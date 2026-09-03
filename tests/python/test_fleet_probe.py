@@ -391,3 +391,80 @@ class TestAgsParserIsRequiredToProbe:
         found, source = fp.load_ags_parser(str(tmp_path))
         assert found is not None
         assert source == str(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# commit_snapshot() -- HAM-189 finding #5: no locking around fleet-state.csv,
+# so a non-fast-forward push rejection (a concurrent writer on the same
+# clone) is retried ONCE (pull --rebase, then push again) rather than
+# silently degrading that clone's logging to a permanent no-op. subprocess
+# is mocked throughout -- nothing here touches git or the network.
+# --------------------------------------------------------------------------
+class TestCommitSnapshotRetry:
+    def _run(self, returncode, stdout=""):
+        return MagicMock(returncode=returncode, stdout=stdout)
+
+    def test_normal_push_succeeds_without_any_retry(self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [self._run(0), self._run(0), self._run(0)]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is True
+        assert detail == "committed and pushed"
+        assert mock_run.call_count == 3   # add, commit, push -- no rebase
+
+    def test_non_rejection_push_failure_is_not_retried(self, fp, tmp_path):
+        """A network/auth failure looks nothing like a collision -- retrying
+        blindly would not help and would just mask the real error."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "fatal: unable to access '...': Could not "
+                            "resolve host"),
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "Could not resolve host" in detail
+        assert mock_run.call_count == 3   # no rebase attempted
+
+    def test_rejected_push_retries_and_succeeds(self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(0),   # pull --rebase
+                self._run(0),   # retry push
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is True
+        assert "rebase retry" in detail
+        assert mock_run.call_count == 5
+        rebase_cmd = mock_run.call_args_list[3][0][0]
+        assert rebase_cmd[3:6] == ["pull", "--rebase", "origin"]
+
+    def test_rejected_push_with_failed_rebase_reports_manual_attention(
+            self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(1, "CONFLICT (content): Merge conflict"),
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "manual attention" in detail
+        assert "CONFLICT" in detail
+        assert mock_run.call_count == 4   # no second push after a failed rebase
+
+    def test_rejected_push_with_failed_retry_reports_manual_attention(
+            self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(0),                              # rebase ok
+                self._run(1, "! [rejected]  HEAD -> main"),  # retry also fails
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "manual attention" in detail
+        assert mock_run.call_count == 5   # does not retry a second time
