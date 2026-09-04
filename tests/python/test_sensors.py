@@ -313,14 +313,14 @@ class TestSensorOff:
              patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
              patch.object(sensors, "archive_telemetry_csv",
                           side_effect=track("archive")), \
-             patch.object(sensors, "write_dropin", side_effect=track("dropin")), \
+             patch.object(sensors, "apply_mode", side_effect=track("mode")), \
              patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
              patch.object(sensors, "start_brokkr", side_effect=track("start")), \
              patch.object(sensors, "start_sindri", side_effect=track("start_sindri")):
             sensors.sensor_off(pin=17, active_high=False)
 
         assert calls == ["stop", "stop_sindri", "relay", "archive",
-                         "dropin", "reload", "start", "start_sindri"]
+                         "mode", "reload", "start", "start_sindri"]
 
     def test_off_polarity_active_high_false(self, sensors):
         """Off + active_high=false -> relay energized (--on)."""
@@ -328,7 +328,7 @@ class TestSensorOff:
              patch.object(sensors, "stop_sindri", return_value=0), \
              patch.object(sensors, "toggle_relay", return_value=0) as mock_relay, \
              patch.object(sensors, "archive_telemetry_csv"), \
-             patch.object(sensors, "write_dropin", return_value=0), \
+             patch.object(sensors, "apply_mode", return_value=0), \
              patch.object(sensors, "daemon_reload", return_value=0), \
              patch.object(sensors, "start_brokkr", return_value=0), \
              patch.object(sensors, "start_sindri", return_value=0):
@@ -347,8 +347,8 @@ class TestSensorOff:
         with patch.object(sensors, "stop_brokkr", return_value=1), \
              patch.object(sensors, "toggle_relay",
                           side_effect=track("relay")), \
-             patch.object(sensors, "write_dropin",
-                          side_effect=track("dropin")):
+             patch.object(sensors, "apply_mode",
+                          side_effect=track("mode")):
             rc = sensors.sensor_off(pin=17, active_high=False)
 
         assert rc != 0
@@ -371,15 +371,15 @@ class TestSensorOn:
              patch.object(sensors, "stop_sindri", side_effect=track("stop_sindri")), \
              patch.object(sensors, "archive_telemetry_csv",
                           side_effect=track("archive")), \
-             patch.object(sensors, "remove_dropin",
-                          side_effect=track("remove")), \
+             patch.object(sensors, "apply_mode",
+                          side_effect=track("mode")), \
              patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
              patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
              patch.object(sensors, "start_brokkr", side_effect=track("start")), \
              patch.object(sensors, "start_sindri", side_effect=track("start_sindri")):
             sensors.sensor_on(pin=17, active_high=False)
 
-        assert calls == ["stop", "stop_sindri", "archive", "remove",
+        assert calls == ["stop", "stop_sindri", "archive", "mode",
                          "reload", "relay", "start", "start_sindri"]
 
     def test_on_polarity_active_high_false(self, sensors):
@@ -387,7 +387,7 @@ class TestSensorOn:
         with patch.object(sensors, "stop_brokkr", return_value=0), \
              patch.object(sensors, "stop_sindri", return_value=0), \
              patch.object(sensors, "archive_telemetry_csv"), \
-             patch.object(sensors, "remove_dropin", return_value=0), \
+             patch.object(sensors, "apply_mode", return_value=0), \
              patch.object(sensors, "daemon_reload", return_value=0), \
              patch.object(sensors, "toggle_relay", return_value=0) as mock_relay, \
              patch.object(sensors, "start_brokkr", return_value=0), \
@@ -407,8 +407,8 @@ class TestSensorOn:
         with patch.object(sensors, "stop_brokkr", return_value=1), \
              patch.object(sensors, "toggle_relay",
                           side_effect=track("relay")), \
-             patch.object(sensors, "remove_dropin",
-                          side_effect=track("remove")):
+             patch.object(sensors, "apply_mode",
+                          side_effect=track("mode")):
             rc = sensors.sensor_on(pin=17, active_high=False)
 
         assert rc != 0
@@ -873,3 +873,186 @@ class TestRunNotifications:
             rc = sensors.run(
                 ["--off"], config_path=unit, main_toml_path=main)
         assert rc == 0
+
+
+# --- Mode parsing and composition (HAM-184) ---
+
+EXECSTART_DROPIN = (
+    "[Service]\n"
+    "ExecStart=\n"
+    "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
+    "--system hamma --mode {} start\n"
+)
+
+ENVIRONMENT_DROPIN = "[Service]\nEnvironment=BROKKR_MODE={}\n"
+
+
+class TestParseMode:
+    """parse_mode() must read BOTH valid drop-in forms, not guess."""
+
+    def test_environment_form(self, sensors):
+        mode, form = sensors.parse_mode(ENVIRONMENT_DROPIN.format("nosensor"))
+        assert mode == "nosensor"
+        assert form == "environment"
+
+    def test_execstart_form(self, sensors):
+        mode, form = sensors.parse_mode(
+            EXECSTART_DROPIN.format("nochargecontroller"))
+        assert mode == "nochargecontroller"
+        assert form == "execstart"
+
+    def test_execstart_combined_mode(self, sensors):
+        mode, form = sensors.parse_mode(
+            EXECSTART_DROPIN.format("nosensor_nochargecontroller"))
+        assert mode == "nosensor_nochargecontroller"
+        assert form == "execstart"
+
+    def test_unparseable_returns_unknown(self, sensors):
+        """Content we don't recognise must report unknown, never a guess."""
+        mode, form = sensors.parse_mode("[Service]\nRestart=always\n")
+        assert mode == sensors.MODE_UNKNOWN
+
+    def test_empty_execstart_reset_line_ignored(self, sensors):
+        """The bare 'ExecStart=' reset line must not parse as a mode."""
+        mode, _ = sensors.parse_mode("[Service]\nExecStart=\n")
+        assert mode == sensors.MODE_UNKNOWN
+
+
+class TestModeComposition:
+    """Mode is two independent axes; on/off touches only the sensor axis."""
+
+    def test_decompose(self, sensors):
+        assert sensors.decompose_mode("default") == (False, False)
+        assert sensors.decompose_mode("nosensor") == (True, False)
+        assert sensors.decompose_mode("nochargecontroller") == (False, True)
+        assert sensors.decompose_mode(
+            "nosensor_nochargecontroller") == (True, True)
+
+    def test_compose(self, sensors):
+        assert sensors.compose_mode(False, False) == "default"
+        assert sensors.compose_mode(True, False) == "nosensor"
+        assert sensors.compose_mode(False, True) == "nochargecontroller"
+        assert sensors.compose_mode(True, True) == "nosensor_nochargecontroller"
+
+    def test_roundtrip(self, sensors):
+        for mode in ("default", "nosensor", "nochargecontroller",
+                     "nosensor_nochargecontroller"):
+            assert sensors.compose_mode(*sensors.decompose_mode(mode)) == mode
+
+    @pytest.mark.parametrize("current,expected", [
+        ("default", "nosensor"),
+        ("nochargecontroller", "nosensor_nochargecontroller"),
+        ("nosensor", "nosensor"),
+        ("nosensor_nochargecontroller", "nosensor_nochargecontroller"),
+    ])
+    def test_target_mode_off_is_sticky(self, sensors, current, expected):
+        """--off sets nosensor and PRESERVES nochargecontroller."""
+        assert sensors.target_mode(current, sensor_on=False) == expected
+
+    @pytest.mark.parametrize("current,expected", [
+        ("nosensor", "default"),
+        ("nosensor_nochargecontroller", "nochargecontroller"),
+        ("default", "default"),
+        ("nochargecontroller", "nochargecontroller"),
+    ])
+    def test_target_mode_on_is_sticky(self, sensors, current, expected):
+        """--on clears nosensor and PRESERVES nochargecontroller."""
+        assert sensors.target_mode(current, sensor_on=True) == expected
+
+
+class TestReadMode:
+    """read_mode() reports the real mode from disk."""
+
+    def test_no_dropin_is_default(self, sensors, tmp_path):
+        with patch.object(sensors, "DROPIN_PATH", str(tmp_path / "none.conf")):
+            assert sensors.read_mode() == ("default", None)
+
+    def test_execstart_dropin(self, sensors, tmp_path):
+        p = tmp_path / "mode.conf"
+        p.write_text(EXECSTART_DROPIN.format("nochargecontroller"))
+        with patch.object(sensors, "DROPIN_PATH", str(p)):
+            assert sensors.read_mode() == ("nochargecontroller", "execstart")
+
+
+class TestRenderDropin:
+    """Writing back must PRESERVE the form already on the unit."""
+
+    def test_execstart_form_preserved_and_interpreter_kept(self, sensors):
+        existing = EXECSTART_DROPIN.format("nochargecontroller")
+        out = sensors.render_dropin(
+            "nosensor_nochargecontroller", "execstart", existing)
+        assert "--mode nosensor_nochargecontroller start" in out
+        # the unit's own interpreter path must survive
+        assert "/home/pi/dev/ltgenv/bin/python3" in out
+        assert "nochargecontroller start" in out
+        assert "--mode nochargecontroller " not in out
+
+    def test_environment_form_preserved(self, sensors):
+        existing = ENVIRONMENT_DROPIN.format("nosensor")
+        out = sensors.render_dropin("nosensor", "environment", existing)
+        assert "Environment=BROKKR_MODE=nosensor" in out
+
+    def test_no_existing_dropin_uses_environment_form(self, sensors):
+        out = sensors.render_dropin("nosensor", None, None)
+        assert out == sensors.ENVIRONMENT_DROPIN_TEMPLATE.format("nosensor")
+
+
+class TestStickyRegression:
+    """The exact HAM-184 field cases, end to end through the drop-in writer."""
+
+    def _run(self, sensors, tmp_path, existing, sensor_on):
+        p = tmp_path / "mode.conf"
+        if existing is not None:
+            p.write_text(existing)
+        written = {}
+
+        def fake_run_command(cmd, description, stdin_data=None):
+            if cmd[:2] == ["sudo", "tee"]:
+                written["content"] = stdin_data
+            elif cmd[:3] == ["sudo", "rm", "-f"]:
+                written["removed"] = True
+            return 0
+
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "run_command", fake_run_command):
+            rc = sensors.apply_mode(sensor_on=sensor_on)
+        return rc, written
+
+    def test_mj54_off_keeps_nochargecontroller(self, sensors, tmp_path):
+        """mj54 is nochargecontroller; --off must NOT drop that half."""
+        rc, w = self._run(
+            sensors, tmp_path,
+            EXECSTART_DROPIN.format("nochargecontroller"), sensor_on=False)
+        assert rc == 0
+        assert "--mode nosensor_nochargecontroller start" in w["content"]
+
+    def test_mj06_on_keeps_nochargecontroller(self, sensors, tmp_path):
+        """mj06 is nosensor_nochargecontroller; --on must leave nochargecontroller."""
+        rc, w = self._run(
+            sensors, tmp_path,
+            EXECSTART_DROPIN.format("nosensor_nochargecontroller"),
+            sensor_on=True)
+        assert rc == 0
+        assert "--mode nochargecontroller start" in w["content"]
+        assert "removed" not in w, "must not delete a nochargecontroller drop-in"
+
+    def test_plain_nosensor_on_still_removes_dropin(self, sensors, tmp_path):
+        """The ordinary case must keep working: nosensor + --on -> no drop-in."""
+        rc, w = self._run(
+            sensors, tmp_path,
+            ENVIRONMENT_DROPIN.format("nosensor"), sensor_on=True)
+        assert rc == 0
+        assert w.get("removed") is True
+
+    def test_default_off_writes_plain_nosensor(self, sensors, tmp_path):
+        """No drop-in + --off -> plain nosensor, as today."""
+        rc, w = self._run(sensors, tmp_path, None, sensor_on=False)
+        assert rc == 0
+        assert "BROKKR_MODE=nosensor" in w["content"]
+
+    def test_unknown_mode_refuses(self, sensors, tmp_path):
+        """An unrecognised drop-in must be refused, not overwritten."""
+        rc, w = self._run(
+            sensors, tmp_path, "[Service]\nRestart=always\n", sensor_on=False)
+        assert rc != 0
+        assert "content" not in w and "removed" not in w
