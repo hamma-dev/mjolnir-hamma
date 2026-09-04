@@ -56,9 +56,9 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 2. Stop sindri service
 3. Toggle relay to power off sensor
 4. Archive today's telemetry CSV (rename to `.bak`)
-5. Write systemd drop-in (`BROKKR_MODE=nosensor`)
+5. Set the mode drop-in, adding `nosensor` and **keeping `nochargecontroller`**
 6. Reload systemd
-7. Start brokkr (now runs in nosensor mode)
+7. Start brokkr (now runs in a `nosensor*` mode)
 8. Start sindri
 
 ### `--on` Sequence
@@ -66,11 +66,36 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 1. Stop brokkr service
 2. Stop sindri service
 3. Archive today's telemetry CSV
-4. Remove systemd drop-in (back to default mode)
+4. Set the mode drop-in, clearing `nosensor` and **keeping `nochargecontroller`**
+   (removes the drop-in entirely only when the result is plain `default`)
 5. Reload systemd
 6. Toggle relay to power on sensor
-7. Start brokkr (back to default mode)
+7. Start brokkr
 8. Start sindri
+
+### Mode is two axes, and on/off only moves one
+
+`nochargecontroller` describes the unit's **hardware** — whether a SunSaver MPPT is
+wired up. It has nothing to do with whether the sensor is powered, so it is **sticky**
+across `--on` and `--off`:
+
+| Current mode | `--off` → | `--on` → |
+|---|---|---|
+| `default` | `nosensor` | *(unchanged)* |
+| `nochargecontroller` | `nosensor_nochargecontroller` | *(unchanged)* |
+| `nosensor` | *(unchanged)* | `default` |
+| `nosensor_nochargecontroller` | *(unchanged)* | `nochargecontroller` |
+
+`mode.conf` is the **shared filename for every mode override** and appears in two
+equally valid forms in the field — `Environment=BROKKR_MODE=<mode>` and an
+`ExecStart=` override carrying `--mode <mode>`. Both are read, and the existing form
+is preserved when writing back (the unit's own interpreter path is kept). A drop-in
+that cannot be parsed is **refused, not overwritten**.
+
+> Before HAM-184 this file was treated as a boolean — present meant `nosensor`,
+> absent meant `default`. On mj06, mj50 and mj54 that made `--status` report
+> `nosensor` regardless of the real mode, and `--on` silently dropped them to
+> `default`, re-enabling charge-controller polling against hardware that isn't there.
 
 ### Why the CSV is archived
 
