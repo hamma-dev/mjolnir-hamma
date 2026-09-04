@@ -20,6 +20,8 @@ set -euo pipefail
 SERVER_HOST="www.hamma.dev"
 PING_TARGET="8.8.8.8"
 PING_TIMEOUT=5
+# ssh alias for the AGS Pi (root@10.10.10.1); defined in pi's ~/.ssh/config
+AGS_SSH_ALIAS="hamma"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -300,6 +302,115 @@ check_brokkr_status() {
     fi
 }
 
+# Verify the AGS records to its USB stick and not to the SD card.
+#
+# Two failure modes this catches (HAM-165, HAM-166, HAM-182):
+#   1. The stick never mounts, so /ags/data stays a plain directory on the SD
+#      root and the AGS writes full-rate science data to it with no error.
+#   2. The stick mounts *over* data already written to the bare directory. The
+#      files stay on the SD consuming root but are invisible to df, du and the
+#      scrubber. mj43 stranded 55 GB this way and filled its root to 100%.
+#
+# Note that "is it mounted" does NOT detect case 2 — the drive is mounted, NTFS,
+# correctly labelled, with no USB errors. The only reliable gate is reading the
+# bare directory inode underneath the mount, which is what debugfs does here.
+#
+# Deliberately NOT used as a gate: the journal message "Directory /ags/data to
+# mount over is not empty". It fires on verifiably empty directories and tracks
+# when in boot the mount happens, not whether anything is stranded. Gating on it
+# fails healthy units (HAM-166).
+check_ags_data_mount() {
+    print_section "AGS Data Mount"
+
+    local probe ags_out
+    # Single round trip; emits key=value lines parsed below. Runs as root on the
+    # AGS, which debugfs requires.
+    # Single quotes are required: every $ below must be evaluated on the AGS, not here.
+    # shellcheck disable=SC2016
+    probe='
+        root_dev=$(findmnt -no SOURCE /)
+        dev=$(findmnt -no SOURCE /ags/data 2>/dev/null)
+        echo "DEV=${dev}"
+        echo "FSTYPE=$(findmnt -no FSTYPE /ags/data 2>/dev/null)"
+        echo "MOUNTS=$(grep -c " /ags/data " /proc/mounts)"
+        echo "LABEL=$(blkid -s LABEL -o value "$dev" 2>/dev/null)"
+        echo "TYPE=$(blkid -s TYPE -o value "$dev" 2>/dev/null)"
+        echo "ENTRIES=$(debugfs -R "ls -d /ags/data" "$root_dev" 2>/dev/null | grep -o "(" | wc -l)"
+        echo "FSTAB=$(grep -c "/ags/data" /etc/fstab 2>/dev/null)"
+        echo "AFTER=$(systemctl show ags -p After 2>/dev/null | tr " " "\n" | grep -c ags-data.mount)"
+    '
+
+    if ! ags_out=$(sudo -H -u pi ssh -o BatchMode=yes -o ConnectTimeout=8 \
+                        -o StrictHostKeyChecking=no "$AGS_SSH_ALIAS" "$probe" 2>/dev/null); then
+        # Expected whenever the front end is powered off — the AGS Pi is fed by
+        # the same relay, so it is dark. Not a fault, and must not fail the run.
+        skip "AGS Pi unreachable via '$AGS_SSH_ALIAS' (expected if the front end is powered off)"
+        return
+    fi
+
+    local dev fstype mounts label fstype_raw entries fstab after
+    dev=$(echo "$ags_out" | sed -n 's/^DEV=//p')
+    fstype=$(echo "$ags_out" | sed -n 's/^FSTYPE=//p')
+    mounts=$(echo "$ags_out" | sed -n 's/^MOUNTS=//p')
+    label=$(echo "$ags_out" | sed -n 's/^LABEL=//p')
+    fstype_raw=$(echo "$ags_out" | sed -n 's/^TYPE=//p')
+    entries=$(echo "$ags_out" | sed -n 's/^ENTRIES=//p')
+    fstab=$(echo "$ags_out" | sed -n 's/^FSTAB=//p')
+    after=$(echo "$ags_out" | sed -n 's/^AFTER=//p')
+
+    # 1. /ags/data must be backed by the USB stick, not the SD card.
+    if [[ -z "$dev" ]]; then
+        fail "/ags/data is NOT a mountpoint — the AGS is writing to the SD card root"
+        info "Science data is landing on /dev/mmcblk0p2 and will fill it (HAM-166)"
+        return
+    elif [[ "$dev" == /dev/sd* ]]; then
+        pass "/ags/data is mounted from $dev ($fstype)"
+    else
+        fail "/ags/data is backed by $dev, expected a USB device (/dev/sd*)"
+    fi
+
+    # 2. Fleet standard is NTFS labelled exactly 'data'. The udev automounter
+    #    gates on the label, so a non-conforming stick never mounts at all.
+    if [[ "$label" == "data" && "$fstype_raw" == "ntfs" ]]; then
+        pass "Data stick conforms to standard (LABEL=data, TYPE=ntfs)"
+    else
+        fail "Data stick is LABEL='${label:-none}' TYPE='${fstype_raw:-none}', expected LABEL=data TYPE=ntfs"
+        info "The udev rule matches on the label — a mislabelled stick silently never mounts (HAM-110)"
+    fi
+
+    # 3. Exactly one mount on the path.
+    if [[ "$mounts" == "1" ]]; then
+        pass "Single mount on /ags/data (no double-mount)"
+    else
+        warn "Expected 1 mount on /ags/data, found ${mounts:-unknown}"
+    fi
+
+    # 4. THE SHADOW GATE. Reads the bare directory inode on the root device,
+    #    which the mount cannot hide. Healthy is exactly 2 entries: . and ..
+    if [[ -z "$entries" || "$entries" == "0" ]]; then
+        warn "Could not read the bare /ags/data inode (debugfs unavailable?) — shadowing not verified"
+    elif [[ "$entries" -le 2 ]]; then
+        pass "Nothing shadowed beneath the mountpoint (bare /ags/data is empty)"
+    else
+        fail "SHADOWED DATA: bare /ags/data holds $((entries - 2)) entries beneath the mount"
+        info "These consume the SD root but are invisible to df/du and the scrubber (HAM-182)"
+        info "Recover with: hamma_scrub.py --since auto, then move them onto the stick"
+    fi
+
+    # 5. Durable mount + ordering. Without these the mount is a transient unit
+    #    in /run (tmpfs) that evaporates every reboot, making each boot a race
+    #    between the recorder starting and the stick mounting.
+    if [[ "$fstab" -ge 1 && "$after" -ge 1 ]]; then
+        pass "Mount is durable and ordered before ags.service (fstab + After=)"
+    elif [[ "$fstab" -ge 1 ]]; then
+        warn "fstab entry present but ags.service lacks After=ags-data.mount — boot order still raced"
+    else
+        warn "No /etc/fstab entry for /ags/data — mount is transient, every boot is a race (HAM-166)"
+        info "Fix: add 'LABEL=data /ags/data ntfs-3g nofail,noatime,x-systemd.device-timeout=30s 0 0'"
+        info "plus /etc/systemd/system/ags.service.d/10-ags-data-mount.conf with After=ags-data.mount"
+    fi
+}
+
 check_server_connection() {
     print_section "Server Connection"
 
@@ -439,6 +550,7 @@ main() {
     check_wifi_services
     check_file_setup
     check_brokkr_status
+    check_ags_data_mount
 
     if $full_check; then
         check_server_connection
