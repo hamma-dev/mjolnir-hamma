@@ -85,6 +85,55 @@ class TestDiffCollapse:
         assert fp.diff(prev, cur) == [("mjolnir08", "brokkr", "e4f5a6b", "9988776")]
 
 
+class TestReachabilityCollapse:
+    """A unit coming back into view is ONE event, not eleven field changes.
+
+    Found against real fleet data: three units unreachable at baseline produced
+    21 of 24 lines in the digest simply by becoming reachable again.
+    """
+
+    def _never_probed(self, fp, unit):
+        """The row merge() writes for a unit with no prior row: all UNKNOWN."""
+        r = {f: fp.UNKNOWN for f in fp.FIELDS}
+        r["unit"] = unit
+        r["front_end"] = fp.UNREACHABLE
+        return r
+
+    def test_coming_back_reports_only_front_end(self, fp):
+        prev = {"mjolnir02": self._never_probed(fp, "mjolnir02")}
+        cur = {"mjolnir02": row(fp, "mjolnir02", front_end="on")}
+        changes = fp.diff(prev, cur)
+        assert changes == [("mjolnir02", "front_end", fp.UNREACHABLE, "on")]
+
+    def test_coming_back_as_no_relay_also_collapses(self, fp):
+        prev = {"mjolnir50": self._never_probed(fp, "mjolnir50")}
+        cur = {"mjolnir50": row(fp, "mjolnir50", front_end="no_relay")}
+        fields = [c[1] for c in fp.diff(prev, cur)]
+        assert fields == ["front_end"]
+
+    def test_a_real_old_value_that_changed_is_still_reported(self, fp):
+        """Only genuinely-UNKNOWN fields are suppressed, not everything."""
+        prev = self._never_probed(fp, "mjolnir02")
+        prev["brokkr"] = "0000000"          # a real value, not UNKNOWN
+        cur = row(fp, "mjolnir02", front_end="on", brk="9999999")
+        fields = {c[1] for c in fp.diff({"mjolnir02": prev},
+                                        {"mjolnir02": cur})}
+        assert "front_end" in fields
+        assert "brokkr" in fields           # must survive the collapse
+
+    def test_normal_change_on_a_reachable_unit_is_unaffected(self, fp):
+        prev = {"mjolnir08": row(fp, "mjolnir08", brk="e4f5a6b")}
+        cur = {"mjolnir08": row(fp, "mjolnir08", brk="9988776")}
+        assert fp.diff(prev, cur) == [
+            ("mjolnir08", "brokkr", "e4f5a6b", "9988776")]
+
+    def test_going_unreachable_is_still_skipped(self, fp):
+        """The reverse direction was already handled; keep it that way."""
+        prev = {"mjolnir41": row(fp, "mjolnir41")}
+        cur = {"mjolnir41": row(fp, "mjolnir41", front_end=fp.UNREACHABLE)}
+        assert fp.diff(prev, cur) == []
+
+
 class TestDiffEdges:
     def test_first_seen_unit_is_one_entry(self, fp):
         cur = {"mjolnir05": row(fp, "mjolnir05")}

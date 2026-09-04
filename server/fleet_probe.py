@@ -280,6 +280,12 @@ def diff(previous, current):
 
     An unreachable unit is skipped entirely rather than diffed -- otherwise every
     outage would read as "everything about this unit changed".
+
+    Two cascades are collapsed to the single event that caused them, because a
+    digest nobody reads is worth nothing: a power transition (which drags the
+    AGS-derived fields) and a unit coming back into view after never having been
+    probed (which drags every field at once). Both report the front_end line
+    alone.
     """
     changes = []
     for unit in sorted(current):
@@ -294,9 +300,24 @@ def diff(previous, current):
         # front_end flip alone rather than the six-line cascade it causes.
         front_changed = (str(old.get("front_end", ""))
                          != str(new.get("front_end", "")))
+        # Same shape, different cause: a unit that was never successfully probed
+        # is stored as unreachable with every field UNKNOWN (merge() only writes
+        # that row when there is no prior one). The first time it answers, all
+        # eleven fields go UNKNOWN -> value at once. That is ONE event -- it came
+        # back into view -- not eleven configuration changes, and reporting it as
+        # eleven buries the real changes in the same digest. Report the front_end
+        # transition alone.
+        came_back = (str(old.get("front_end", "")) == UNREACHABLE
+                     and str(new.get("front_end", "")) != UNREACHABLE)
         for field in FIELDS[1:]:
             if str(old.get(field, "")) != str(new.get(field, "")):
                 if front_changed and field in POWER_DERIVED_FIELDS:
+                    continue
+                # Suppress only the fields that were genuinely unknown. If a
+                # field somehow carried a real old value and changed, that is a
+                # real change and still deserves a line.
+                if (came_back and field != "front_end"
+                        and str(old.get(field, "")) == UNKNOWN):
                     continue
                 changes.append((unit, field, old.get(field, ""), new.get(field, "")))
     return changes
