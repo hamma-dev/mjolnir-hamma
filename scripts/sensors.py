@@ -16,6 +16,7 @@ import argparse
 import datetime
 import glob as glob_module
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -39,7 +40,40 @@ BROKKR_SERVICE = "brokkr-hamma-default.service"
 SINDRI_SERVICE = "sindri-hamma-client.service"
 DROPIN_DIR = "/etc/systemd/system/{}.d".format(BROKKR_SERVICE)
 DROPIN_PATH = os.path.join(DROPIN_DIR, "mode.conf")
-DROPIN_CONTENT = "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"
+
+# Brokkr modes are a single string key, NOT composable on the command line
+# (--mode nosensor,nochargecontroller raises KeyError). But the key encodes two
+# independent axes, and only the sensor axis belongs to --on/--off:
+#
+#     nosensor            <- what --off/--on toggles
+#     nochargecontroller  <- a property of the unit's hardware; STICKY
+#
+# mode.conf is the shared filename for every mode override, and the field uses
+# two equally valid forms (HAM-184):
+#
+#     Environment=BROKKR_MODE=<mode>              <- what this script writes
+#     ExecStart=\nExecStart=... --mode <mode> ... <- documented manual method
+#
+# Treating the file as a boolean (present => nosensor) misreports the mode and
+# destroys the nochargecontroller half on any unit using it.
+MODE_DEFAULT = "default"
+MODE_UNKNOWN = "unknown"
+NOSENSOR_TOKEN = "nosensor"
+NOCHARGE_TOKEN = "nochargecontroller"
+
+ENVIRONMENT_DROPIN_TEMPLATE = "[Service]\nEnvironment=BROKKR_MODE={}\n"
+# Used only when no drop-in exists yet and we must invent one.
+DEFAULT_EXECSTART = (
+    "/home/pi/dev/ltgenv/bin/python3 -m brokkr --system hamma "
+    "--mode {} start")
+
+RE_ENV_MODE = re.compile(
+    r"^\s*Environment\s*=\s*[\"']?BROKKR_MODE=(\S+?)[\"']?\s*$", re.MULTILINE)
+RE_EXECSTART_MODE = re.compile(r"^\s*ExecStart\s*=.*?--mode\s+(\S+)",
+                               re.MULTILINE)
+
+# Retained for backward compatibility: the plain nosensor drop-in.
+DROPIN_CONTENT = ENVIRONMENT_DROPIN_TEMPLATE.format(NOSENSOR_TOKEN)
 
 TELEMETRY_DIR = os.path.expanduser("~/brokkr/hamma/telemetry")
 SENSOR_IP = "10.10.10.1"
@@ -430,8 +464,141 @@ def toggle_relay(relay_on, pin):
         [RELAY_SCRIPT, "--pin", str(pin), flag], description)
 
 
-def write_dropin():
-    """Create the systemd drop-in for nosensor mode."""
+def parse_mode(content):
+    """Parse the brokkr mode out of drop-in content.
+
+    Handles both valid field forms. Never guesses: unrecognised content
+    reports MODE_UNKNOWN so the caller can refuse rather than clobber.
+
+    Parameters
+    ----------
+    content : str
+        Raw contents of mode.conf.
+
+    Returns
+    -------
+    tuple of (str, str or None)
+        (mode, form) where form is "environment", "execstart" or None.
+    """
+    if content:
+        match = RE_ENV_MODE.search(content)
+        if match:
+            return match.group(1), "environment"
+        # Note the bare "ExecStart=" reset line carries no --mode and must
+        # not match; the regex requires --mode to be present.
+        match = RE_EXECSTART_MODE.search(content)
+        if match:
+            return match.group(1), "execstart"
+    return MODE_UNKNOWN, None
+
+
+def read_mode(path=None):
+    """Return the (mode, form) currently configured on this unit.
+
+    No drop-in means default mode -- that much the original code got right.
+    """
+    path = DROPIN_PATH if path is None else path
+    if not os.path.isfile(path):
+        return MODE_DEFAULT, None
+    try:
+        with open(path) as file:
+            content = file.read()
+    except OSError:
+        return MODE_UNKNOWN, None
+    return parse_mode(content)
+
+
+def decompose_mode(mode):
+    """Split a mode key into its (nosensor, nochargecontroller) axes."""
+    if mode == MODE_DEFAULT:
+        return False, False
+    parts = mode.split("_")
+    return NOSENSOR_TOKEN in parts, NOCHARGE_TOKEN in parts
+
+
+def compose_mode(nosensor, nocharge):
+    """Build the mode key for a pair of axis flags."""
+    tokens = []
+    if nosensor:
+        tokens.append(NOSENSOR_TOKEN)
+    if nocharge:
+        tokens.append(NOCHARGE_TOKEN)
+    return "_".join(tokens) if tokens else MODE_DEFAULT
+
+
+def target_mode(current_mode, sensor_on):
+    """Apply an on/off transition to the sensor axis only.
+
+    nochargecontroller is a property of the unit's hardware, not of whether
+    the sensor is powered, so it is preserved across both transitions.
+    """
+    _, nocharge = decompose_mode(current_mode)
+    return compose_mode(nosensor=not sensor_on, nocharge=nocharge)
+
+
+def render_dropin(mode, form, existing):
+    """Render drop-in content for `mode`, preserving the unit's existing form.
+
+    For the ExecStart form the existing command line is edited in place so the
+    unit's own interpreter path survives; it is not reconstructed from a
+    template that might not match this unit.
+    """
+    if form == "execstart" and existing:
+        return RE_EXECSTART_MODE.sub(
+            lambda m: m.group(0).replace(
+                "--mode {}".format(m.group(1)), "--mode {}".format(mode)),
+            existing)
+    if form == "execstart":
+        return "[Service]\nExecStart=\nExecStart={}\n".format(
+            DEFAULT_EXECSTART.format(mode))
+    return ENVIRONMENT_DROPIN_TEMPLATE.format(mode)
+
+
+def apply_mode(sensor_on):
+    """Set the mode drop-in for an on/off transition, keeping sticky axes.
+
+    Returns
+    -------
+    int
+        0 on success, nonzero on failure or refusal.
+    """
+    current, form = read_mode()
+    if current == MODE_UNKNOWN:
+        print("  [ERROR] {} exists but its mode could not be parsed."
+              .format(DROPIN_PATH))
+        print("          Refusing to overwrite it. Inspect it by hand.")
+        return 1
+
+    target = target_mode(current, sensor_on=sensor_on)
+    if target == current:
+        print("  [OK] Mode already {} (unchanged)".format(current))
+        return 0
+
+    if target == MODE_DEFAULT:
+        return remove_dropin()
+
+    existing = None
+    if form is not None and os.path.isfile(DROPIN_PATH):
+        try:
+            with open(DROPIN_PATH) as file:
+                existing = file.read()
+        except OSError:
+            existing = None
+
+    content = render_dropin(target, form, existing)
+    if current != MODE_DEFAULT and current != target:
+        print("  [INFO] Mode {} -> {} (preserving {})".format(
+            current, target, NOCHARGE_TOKEN)
+            if NOCHARGE_TOKEN in target
+            else "  [INFO] Mode {} -> {}".format(current, target))
+    return write_dropin(content, target)
+
+
+def write_dropin(content=None, mode=None):
+    """Create the systemd drop-in with the given content."""
+    if content is None:
+        content = DROPIN_CONTENT
+        mode = NOSENSOR_TOKEN
     rc = run_command(
         ["sudo", "mkdir", "-p", DROPIN_DIR],
         "Created drop-in directory")
@@ -439,8 +606,8 @@ def write_dropin():
         return rc
     return run_command(
         ["sudo", "tee", DROPIN_PATH],
-        "Wrote mode drop-in (nosensor)",
-        stdin_data=DROPIN_CONTENT)
+        "Wrote mode drop-in ({})".format(mode or NOSENSOR_TOKEN),
+        stdin_data=content)
 
 
 def remove_dropin():
@@ -480,7 +647,7 @@ def sensor_off(pin, active_high):
 
     archive_telemetry_csv()
 
-    rc = write_dropin()
+    rc = apply_mode(sensor_on=False)
     if rc != 0:
         return rc
 
@@ -521,7 +688,7 @@ def sensor_on(pin, active_high):
 
     archive_telemetry_csv()
 
-    rc = remove_dropin()
+    rc = apply_mode(sensor_on=True)
     if rc != 0:
         return rc
 
@@ -557,9 +724,12 @@ def sensor_status(config):
     """
     lines = []
 
-    # Drop-in
+    # Drop-in. Report the mode the file actually sets, not its mere existence
+    # -- mode.conf is the shared filename for every override (HAM-184).
+    mode, form = read_mode()
     if os.path.isfile(DROPIN_PATH):
-        lines.append("Drop-in: yes (nosensor mode)")
+        lines.append("Drop-in: yes ({} mode{})".format(
+            mode, ", {} form".format(form) if form else ""))
         with open(DROPIN_PATH) as f:
             lines.append("  Contents: {}".format(f.read().strip()))
     else:
@@ -573,7 +743,6 @@ def sensor_status(config):
     lines.append("Brokkr service: {}".format(state))
 
     # Brokkr mode
-    mode = "nosensor" if os.path.isfile(DROPIN_PATH) else "default"
     lines.append("Brokkr mode: {}".format(mode))
 
     # Sensor reachable
@@ -685,10 +854,18 @@ def run(argv=None, config_path=None, main_toml_path=None):
             print("  {} --pin {} {}".format(
                 RELAY_SCRIPT, config["pin"], relay_flag))
         print("  Archive telemetry CSV")
-        if args.sensor_on:
-            print("  sudo rm -f {}".format(DROPIN_PATH))
+        current_mode, _ = read_mode()
+        if current_mode == MODE_UNKNOWN:
+            print("  REFUSE: {} is present but unparseable".format(DROPIN_PATH))
         else:
-            print("  Write {} (nosensor mode)".format(DROPIN_PATH))
+            new_mode = target_mode(current_mode, sensor_on=args.sensor_on)
+            print("  Mode: {} -> {}".format(current_mode, new_mode))
+            if new_mode == current_mode:
+                print("  (no drop-in change)")
+            elif new_mode == MODE_DEFAULT:
+                print("  sudo rm -f {}".format(DROPIN_PATH))
+            else:
+                print("  Write {} ({} mode)".format(DROPIN_PATH, new_mode))
         print("  sudo systemctl daemon-reload")
         if args.sensor_on:
             print("  {} --pin {} {}".format(
