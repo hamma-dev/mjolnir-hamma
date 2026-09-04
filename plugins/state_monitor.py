@@ -2,7 +2,7 @@
 Plugin to monitor state variables from the charge controller.
 """
 
-from math import nan
+from math import isnan, nan
 import collections
 import fcntl
 import inspect
@@ -1577,8 +1577,34 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         """
         no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
+
+        # now_then() turns 'NA' into float nan, and bool(nan) is True -- so an
+        # NA reading would otherwise be counted as a bad ping and page. That is
+        # absence of evidence, not evidence of an outage. Skip without touching
+        # the counter, so a genuine streak either side of an NA sample still
+        # reaches ping_max rather than being reset by it.
+        if isinstance(no_comm_now, float) and isnan(no_comm_now):
+            return None
+
         # If the ping !=0, then we can't reach the sensor
         if no_comm_now:
+            # HAM-114: on a unit the operator deliberately powered down, an
+            # unreachable sensor is the commanded state, not a fault. Paging for
+            # it is pure noise and trains people to ignore the channel.
+            #
+            # The decision comes from the RENDERED config, not the mode name --
+            # the same semantic check_power_state_divergence uses. A substring
+            # test on "nosensor" only tracks it by convention and would break
+            # silently the day a preset disables ingest without saying so.
+            if not self._science_ingest_enabled():
+                # Reset rather than freeze: coming back on must not leave a
+                # primed counter that pages on the first stray ping.
+                if self.bad_ping:
+                    self.bad_ping = 0
+                self.logger.debug(
+                    "Sensor unreachable, but science ingest is disabled on this "
+                    "unit -- suppressing the no-communication alert (HAM-114)")
+                return None
             # If any bad ping, increment the counter.
             self.bad_ping += 1
             if not no_comm_pre:
@@ -1988,7 +2014,6 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self._next_power_check = now + self.power_check_interval_s
 
         from brokkr.config.unit import UNIT_CONFIG
-        from brokkr.config.main import CONFIG
 
         relay = UNIT_CONFIG.get("relay")
         if relay is None or relay == {}:
@@ -2045,14 +2070,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         sensor_powered = ((level == 0) == active_high)
 
         # Ask the RENDERED config whether the science-ingest pipeline is actually
-        # enabled, rather than matching on the mode's name. `_enabled` is absent
-        # when not overridden (= enabled) and False under the nosensor* presets --
-        # verified on mj03 across default/nosensor/nosensor_nochargecontroller/
-        # nochargecontroller. This is the real semantic; a substring test on the
-        # mode name only tracked it by convention and would break silently the day
-        # a preset disabled ingest without saying "nosensor".
-        science = CONFIG.get("pipelines", {}).get("science_ingest", {})
-        declared_on = bool(science.get("_enabled", True))
+        # enabled, rather than matching on the mode's name. Shared with
+        # check_ping (HAM-114) -- see _science_ingest_enabled for why.
+        declared_on = self._science_ingest_enabled()
         # Name is for the operator-facing message only, never for the decision.
         mode = self._brokkr_mode()
 
@@ -2085,6 +2105,25 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             "ACTION: run `mjol_array.py -p {n} --up` on the VPS to power the front "
             "end, or `--down` to put brokkr in nosensor. Then update the field log. "
             "({detail})".format(mode=mode, n=number, detail=detail))
+
+    @staticmethod
+    def _science_ingest_enabled():
+        """Is this unit supposed to be capturing, per the RENDERED config?
+
+        `_enabled` is absent when not overridden (= enabled) and False under the
+        nosensor* presets -- verified on mj03 across default / nosensor /
+        nosensor_nochargecontroller / nochargecontroller. This is the real
+        semantic for "is the sensor meant to be up"; matching on the mode name
+        only tracks it by convention.
+
+        Deliberately NOT guarded: a caller that cannot determine this must not
+        quietly assume the sensor is down and go silent. Failing loudly here
+        surfaces as a logged exception; failing closed would suppress real
+        outage alerts forever.
+        """
+        from brokkr.config.main import CONFIG
+        science = CONFIG.get("pipelines", {}).get("science_ingest", {})
+        return bool(science.get("_enabled", True))
 
     @staticmethod
     def _brokkr_mode():
