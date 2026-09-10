@@ -180,6 +180,20 @@ _DriveView = collections.namedtuple("_DriveView", [
     ])
 
 
+def _is_na(value):
+    """Is this telemetry reading absent rather than a real measurement?
+
+    One idiom for the whole file. `now_then()` renders the string 'NA' as float
+    nan, and `bool(nan)` is True -- so an NA that is not recognised explicitly
+    masquerades as a failure and pages. Anything non-numeric is treated the same
+    way: absence of evidence, not evidence of a fault.
+
+    Note `nan != nan` rather than `isnan()`: the isinstance test already ran, so
+    both work, but this form needs no import and holds for any numeric type.
+    """
+    return not isinstance(value, (int, float)) or value != value
+
+
 def sensor_prefix():
     """Return the '<name><NN> (<site>): ' prefix for this unit's messages."""
     from brokkr.config.unit import UNIT_CONFIG
@@ -1577,6 +1591,35 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
 
         """
         no_comm_now, no_comm_pre = self.now_then(input_data, 'ping')
+
+        # HAM-114: on a unit the operator deliberately powered down, an
+        # unreachable sensor is the commanded state, not a fault. Paging for it
+        # is pure noise and trains people to ignore the channel.
+        #
+        # The decision comes from the RENDERED config, not the mode name -- the
+        # same semantic check_power_state_divergence uses. A substring test on
+        # "nosensor" only tracks it by convention and would break silently the
+        # day a preset disables ingest without saying so.
+        #
+        # This is tested FIRST, ahead of the NA branch below. An NA sample
+        # landing on the cycle a unit goes down must not be able to skip the
+        # reset, or the unit reactivates with a primed counter and pages on its
+        # first bad ping -- the very thing the reset exists to prevent.
+        if not self._science_ingest_enabled():
+            self.bad_ping = 0
+            self.logger.debug(
+                "Science ingest is disabled on this unit -- suppressing "
+                "no-communication alerting (HAM-114)")
+            return None
+
+        # now_then() turns 'NA' into float nan, and bool(nan) is True -- so an
+        # NA reading would otherwise be counted as a bad ping and page. That is
+        # absence of evidence, not evidence of an outage. Skip without touching
+        # the counter, so a genuine streak either side of an NA sample still
+        # reaches ping_max rather than being reset by it.
+        if _is_na(no_comm_now):
+            return None
+
         # If the ping !=0, then we can't reach the sensor
         if no_comm_now:
             # If any bad ping, increment the counter.
@@ -1616,7 +1659,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             Alert message when free first drops below `alert_space`, else None.
         """
         space_now, _space_pre = self.now_then(input_data, 'bytes_remaining')
-        if not isinstance(space_now, (int, float)) or space_now != space_now:
+        if _is_na(space_now):
             # NA / non-numeric: can't evaluate space. Persistent NA means the
             # AGS is dark (not sending H&S) -- the drive can fill unseen, so
             # alert once rather than fail silent (the mj05 blind spot).
@@ -1988,7 +2031,6 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         self._next_power_check = now + self.power_check_interval_s
 
         from brokkr.config.unit import UNIT_CONFIG
-        from brokkr.config.main import CONFIG
 
         relay = UNIT_CONFIG.get("relay")
         if relay is None or relay == {}:
@@ -2045,14 +2087,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         sensor_powered = ((level == 0) == active_high)
 
         # Ask the RENDERED config whether the science-ingest pipeline is actually
-        # enabled, rather than matching on the mode's name. `_enabled` is absent
-        # when not overridden (= enabled) and False under the nosensor* presets --
-        # verified on mj03 across default/nosensor/nosensor_nochargecontroller/
-        # nochargecontroller. This is the real semantic; a substring test on the
-        # mode name only tracked it by convention and would break silently the day
-        # a preset disabled ingest without saying "nosensor".
-        science = CONFIG.get("pipelines", {}).get("science_ingest", {})
-        declared_on = bool(science.get("_enabled", True))
+        # enabled, rather than matching on the mode's name. Shared with
+        # check_ping (HAM-114) -- see _science_ingest_enabled for why.
+        declared_on = self._science_ingest_enabled()
         # Name is for the operator-facing message only, never for the decision.
         mode = self._brokkr_mode()
 
@@ -2085,6 +2122,41 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             "ACTION: run `mjol_array.py -p {n} --up` on the VPS to power the front "
             "end, or `--down` to put brokkr in nosensor. Then update the field log. "
             "({detail})".format(mode=mode, n=number, detail=detail))
+
+    def _science_ingest_enabled(self):
+        """Is this unit supposed to be capturing, per the RENDERED config?
+
+        `_enabled` is absent when not overridden (= enabled) and False under the
+        nosensor* presets -- verified on mj03 across default / nosensor /
+        nosensor_nochargecontroller / nochargecontroller. This is the real
+        semantic for "is the sensor meant to be up"; matching on the mode name
+        only tracks it by convention.
+
+        Every ambiguous case resolves to True (enabled), because the two ways to
+        be wrong are not symmetric: a false "enabled" costs one noisy page that
+        a human immediately recognises, while a false "disabled" silently
+        suppresses real outage alerts for as long as the condition lasts.
+
+        Deliberately NOT guarded against exceptions, and the cost of that is
+        real: `run_checks` catches and logs, but no message goes out and the
+        caller's own bookkeeping for that cycle is skipped too, so a genuine
+        concurrent outage is detected at least one cycle late. That is accepted
+        over failing closed, which would go silent indefinitely.
+        """
+        from brokkr.config.main import CONFIG
+        science = CONFIG.get("pipelines", {}).get("science_ingest", {})
+        enabled = science.get("_enabled", True)
+        # Same footgun check_power_state_divergence guards `active_high` against:
+        # a quoted `_enabled = "false"` is valid TOML, and bare bool() would read
+        # it as True -- here that direction is the safe one, but only by luck, so
+        # say so rather than let a future flip inherit a silent coercion.
+        if not isinstance(enabled, bool):
+            self.logger.warning(
+                "science_ingest._enabled is %r (want a bare true/false, not a "
+                "quoted string); treating this unit as capturing so outage "
+                "alerting stays live", enabled)
+            return True
+        return enabled
 
     @staticmethod
     def _brokkr_mode():
