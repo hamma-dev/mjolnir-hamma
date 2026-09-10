@@ -565,14 +565,38 @@ class TestPingSuppressedWhenIngestDisabled:
             msg = m.check_ping({"ping": _dv(1)})
         assert "No communication with sensor" in msg
 
-    def test_config_import_failure_still_alerts(self):
-        """If the config lookup blows up, alert rather than go silent."""
+    def test_quoted_enabled_string_is_treated_as_capturing(self):
+        """A quoted `_enabled = "false"` must not silently disable alerting.
+
+        Valid TOML, and bare bool() reads it as True. That happens to be the
+        safe direction, but only by luck -- pin it so a future refactor cannot
+        quietly invert it into permanent suppression.
+        """
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        cfg = {"pipelines": {"science_ingest": {"_enabled": "false"}}}
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=cfg)}):
+            for _ in range(2):
+                m.check_ping({"ping": _dv(1)})
+            msg = m.check_ping({"ping": _dv(1)})
+        assert "No communication with sensor" in msg
+
+    def test_config_import_failure_propagates_rather_than_going_silent(self):
+        """A failed config lookup must not be read as "sensor is down".
+
+        The exception escapes to run_checks, which logs it. Note what that
+        costs: no message goes out this cycle and the bad_ping increment is
+        skipped too, so a real concurrent outage is caught at least one cycle
+        late. Accepted over failing closed, which would suppress alerts forever.
+        """
         m = _make_monitor()
         m._previous_data = {"ping": _dv(1)}
         with patch.object(MODULE.StateMonitor, "_science_ingest_enabled",
                           side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError):
                 m.check_ping({"ping": _dv(1)})
+        assert m.bad_ping == 0, "the increment is skipped -- documented cost"
 
     def test_good_ping_resets_counter(self):
         """Unchanged: a successful ping clears the counter."""
@@ -601,6 +625,33 @@ class TestPingNaIsNotABadPing:
             for _ in range(5):
                 assert m.check_ping({"ping": _dv("NA")}) is None
         assert m.bad_ping == 0
+
+    def test_na_while_ingest_disabled_still_resets_the_counter(self):
+        """Powering a unit down mid-outage must clear the primed counter.
+
+        The suppression branch resets `bad_ping` so a unit coming back on needs
+        a fresh full streak. An NA sample landing on the cycle the unit goes
+        down must not be able to skip that reset -- otherwise the unit
+        reactivates already primed and pages on its very first bad ping, the
+        exact scenario the reset exists to prevent.
+        """
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        enabled = {"pipelines": {"science_ingest": {"_enabled": True}}}
+        disabled = {"pipelines": {"science_ingest": {"_enabled": False}}}
+
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=enabled)}):
+            m.check_ping({"ping": _dv(1)})
+            m.check_ping({"ping": _dv(1)})
+        assert m.bad_ping == 2
+
+        # Operator powers the unit down; telemetry reads NA on that same cycle.
+        m._previous_data = {"ping": _dv("NA")}
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=disabled)}):
+            assert m.check_ping({"ping": _dv("NA")}) is None
+        assert m.bad_ping == 0, "suppression must reset even on an NA sample"
 
     def test_nan_does_not_reset_a_real_streak(self):
         """An NA sample mid-outage must neither page nor wipe the evidence."""
