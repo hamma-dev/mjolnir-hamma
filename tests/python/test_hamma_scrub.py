@@ -610,6 +610,42 @@ class TestDecodeGpsTime:
         result = hamma_scrub.decode_gps_time(bytes(header))
         assert result == "2025-03-05T11:19:43.500"
 
+    @staticmethod
+    def _gps_header(tow=300000.0, utc_offset=18.0):
+        header = bytearray(128)
+        header[0:4] = b'\xf5\xff\x50\x5d'
+        struct.pack_into('<f', header, 80, tow)
+        struct.pack_into('<h', header, 84, 2356)
+        struct.pack_into('<f', header, 86, utc_offset)
+        struct.pack_into('<I', header, 94, 500000000)
+        struct.pack_into('<I', header, 98, 1000000000)
+        return bytes(header)
+
+    @pytest.mark.parametrize("bad_tow", [float('nan'), float('inf'),
+                                         float('-inf')])
+    def test_non_finite_time_of_week_returns_none(self, hamma_scrub, bad_tow):
+        """math.floor(nan) raises ValueError and math.floor(inf) raises
+        OverflowError, from outside the try -- so without the guard a single
+        bad-GPS record raises out of decode_gps_time() and takes down whatever
+        is walking the headers."""
+        assert hamma_scrub.decode_gps_time(
+            self._gps_header(tow=bad_tow)) is None
+
+    @pytest.mark.parametrize("bad_offset", [float('nan'), float('inf'),
+                                            float('-inf')])
+    def test_non_finite_utc_offset_returns_none(self, hamma_scrub,
+                                                bad_offset):
+        """NaN alone is a weak case here -- it is already caught downstream by
+        the existing `except ValueError` around datetime.fromtimestamp(). The
+        +/-inf cases are what make the utc_offset half of the guard matter."""
+        assert hamma_scrub.decode_gps_time(
+            self._gps_header(utc_offset=bad_offset)) is None
+
+    def test_good_header_still_decodes(self, hamma_scrub):
+        """The guard must not reject valid records."""
+        assert hamma_scrub.decode_gps_time(
+            self._gps_header()) == "2025-03-05T11:19:43.500"
+
 
 class TestEarliestAgsTimestamp:
     """Test earliest_ags_timestamp() — derives --since cutoff from AGS data."""

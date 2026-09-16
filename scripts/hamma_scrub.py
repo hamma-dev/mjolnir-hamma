@@ -986,6 +986,21 @@ def decode_gps_time(header):
     except struct.error:
         return None
 
+    # Bad-GPS records carry NaN/inf in the float fields, and the struct.error
+    # guard above catches neither: math.floor() raises ValueError on NaN and
+    # OverflowError on inf, from OUTSIDE the try below. One such record
+    # therefore raises out of decode_gps_time() entirely.
+    #
+    # Observed: 8 such headers on mj08's data drive, which aborted a full-drive
+    # header walk. The scheduled scrub is less exposed -- `--since auto` only
+    # decodes the FIRST trigger of each AGS file -- but the same call sits on
+    # the recovery write path (compute_target_path) and in both report
+    # formatters, so a single bad record can take down a recover/purge run.
+    # Such records now decode to None and land under the existing "unknown/"
+    # target prefix, which the MJ scanners already sort above any date dir.
+    if not (math.isfinite(time_of_week) and math.isfinite(utc_offset)):
+        return None
+
     # Compute base time (seconds since Unix epoch)
     # Matches hamma version20 convert(): passes floor(gpsTimeWeek)+1 to base_trigger_time
     base_time = (GPS_EPOCH
