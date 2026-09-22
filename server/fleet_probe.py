@@ -39,6 +39,7 @@ change surfaces.
 # Standard library imports
 import argparse
 import csv
+import glob
 import io
 import os
 import subprocess
@@ -227,6 +228,58 @@ def expected_offline(repo):
     return out
 
 
+def returned_units(changes):
+    """Units that came back into view this run, from diff()'s own output.
+
+    diff() already collapses a return to the single front_end transition, so
+    that one line IS the event -- no extra bookkeeping, and nothing new to keep
+    in sync. A front end merely being switched back on is NOT a return: the
+    unit was reachable throughout and nothing was deferred on it.
+    """
+    return sorted({unit for unit, field, old, _ in changes
+                   if field == "front_end" and old == UNREACHABLE})
+
+
+PENDING_HEADING = "## Pending"
+PENDING_UNCHECKED = "- [ ] "
+
+
+def pending_items(repo, unit):
+    """Deferred actions for `unit`, from its own sensor-log profile.
+
+    Same reasoning as expected_offline(): read what a human already maintains
+    rather than adding a place to record fleet state. The profile is what
+    somebody opens before touching a unit, so the action lives beside the
+    history that explains it -- and the originating ticket can be CLOSED,
+    cited as background, instead of held open for months waiting on hardware.
+
+    Only `- [ ] ` lines count. A `- [x] ` line is done and stays in the file as
+    the record that it was done.
+    """
+    if not repo:
+        return []
+    matches = glob.glob(os.path.join(repo, "deployments", "*",
+                                     "{}.md".format(unit)))
+    if not matches:
+        return []
+    try:
+        with open(matches[0]) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    inside = False
+    for line in lines:
+        if line.strip() == PENDING_HEADING:
+            inside = True
+            continue
+        if inside and line.startswith("## "):
+            break
+        if inside and line.startswith(PENDING_UNCHECKED):
+            out.append(line[len(PENDING_UNCHECKED):].strip())
+    return out
+
+
 def read_snapshot(path):
     """Existing snapshot as {unit: row}, or {} if there is not one yet."""
     if not os.path.isfile(path):
@@ -398,6 +451,18 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
             for unit, field, old, new in changes:
                 lines.append("  {}  {} {} -> {}".format(unit, field, old, new)
                              if field != "*" else "  {}  {}".format(unit, new))
+    # A unit coming back is the only moment its deferred actions can be done,
+    # and it is also the moment nobody is thinking about them -- the ticket
+    # that recorded them was closed weeks ago. Surface them here, unprompted,
+    # attached to the return that made them possible.
+    for unit in returned_units(changes):
+        items = pending_items(repo, unit)
+        if not items:
+            continue
+        lines.append("")
+        lines.append("{} is back -- pending actions:".format(unit))
+        for item in items:
+            lines.append("  [ ] {}".format(item))
     standing = not_capturing(rows)
     if standing:
         lines.append("")

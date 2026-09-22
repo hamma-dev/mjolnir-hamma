@@ -440,3 +440,87 @@ class TestAgsParserIsRequiredToProbe:
         found, source = fp.load_ags_parser(str(tmp_path))
         assert found is not None
         assert source == str(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# pending_items() -- deferred per-unit actions, read from the unit's profile
+# --------------------------------------------------------------------------
+def write_profile(tmp_path, array, unit, body):
+    """Write a unit profile into a fake sensor-log checkout."""
+    directory = tmp_path / "deployments" / array
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "{}.md".format(unit)
+    path.write_text(body)
+    return path
+
+
+class TestPendingItems:
+    def test_unchecked_item_is_returned(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "# mjolnir51: Somewhere\n"
+            "\n"
+            "## Pending\n"
+            "\n"
+            "- [ ] Confirm DATA07/DATA08 mount without a suffix (HAM-185)\n"
+        ))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Confirm DATA07/DATA08 mount without a suffix (HAM-185)"]
+
+    def test_block_ends_at_the_next_heading(self, fp, tmp_path):
+        # A checkbox further down the profile is NOT a pending action.
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n"
+            "\n"
+            "- [ ] Real pending action\n"
+            "\n"
+            "## Field Log\n"
+            "\n"
+            "- [ ] Not a pending action, it lives under another heading\n"
+        ))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Real pending action"]
+
+
+# --------------------------------------------------------------------------
+# returned_units() -- the moment a deferred action becomes doable
+# --------------------------------------------------------------------------
+class TestReturnedUnits:
+    def test_unreachable_to_reachable_is_a_return(self, fp):
+        changes = [("mjolnir51", "front_end", "unreachable", "on")]
+        assert fp.returned_units(changes) == ["mjolnir51"]
+
+    def test_an_ordinary_power_on_is_not_a_return(self, fp):
+        # The unit was reachable all along; only its front end was off.
+        changes = [("mjolnir06", "front_end", "off", "on")]
+        assert fp.returned_units(changes) == []
+
+    def test_a_config_change_is_not_a_return(self, fp):
+        changes = [("mjolnir04", "threshold_1_mv", "450", "750")]
+        assert fp.returned_units(changes) == []
+
+
+# --------------------------------------------------------------------------
+# digest() -- surfacing pending actions at the moment the unit is back
+# --------------------------------------------------------------------------
+class TestDigestPending:
+    def test_a_returned_unit_surfaces_its_pending_items(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n\n- [ ] Confirm the mountpoints (HAM-185)\n"))
+        rows = {"mjolnir51": row(fp, "mjolnir51")}
+        changes = [("mjolnir51", "front_end", "unreachable", "on")]
+        text = fp.digest(rows, changes, [], repo=str(tmp_path))
+        assert "Confirm the mountpoints (HAM-185)" in text
+
+    def test_nothing_returned_means_no_pending_section(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n\n- [ ] Confirm the mountpoints (HAM-185)\n"))
+        rows = {"mjolnir51": row(fp, "mjolnir51")}
+        text = fp.digest(rows, [], [], repo=str(tmp_path))
+        assert "Confirm the mountpoints (HAM-185)" not in text
+        assert "pending" not in text.lower()
+
+    def test_a_returned_unit_with_no_pending_items_adds_nothing(self, fp, tmp_path):
+        rows = {"mjolnir51": row(fp, "mjolnir51")}
+        changes = [("mjolnir51", "front_end", "unreachable", "on")]
+        text = fp.digest(rows, changes, [], repo=str(tmp_path))
+        assert "pending" not in text.lower()
