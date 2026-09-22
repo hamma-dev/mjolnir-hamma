@@ -440,3 +440,205 @@ class TestAgsParserIsRequiredToProbe:
         found, source = fp.load_ags_parser(str(tmp_path))
         assert found is not None
         assert source == str(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# pending_items() -- deferred per-unit actions, read from the unit's profile
+# --------------------------------------------------------------------------
+def write_profile(tmp_path, array, unit, body):
+    """Write a unit profile into a fake sensor-log checkout."""
+    directory = tmp_path / "deployments" / array
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "{}.md".format(unit)
+    path.write_text(body)
+    return path
+
+
+class TestPendingItems:
+    def test_unchecked_item_is_returned(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "# mjolnir51: Somewhere\n"
+            "\n"
+            "## Pending\n"
+            "\n"
+            "- [ ] Confirm DATA07/DATA08 mount without a suffix (HAM-185)\n"
+        ))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Confirm DATA07/DATA08 mount without a suffix (HAM-185)"]
+
+    def test_block_ends_at_the_next_heading(self, fp, tmp_path):
+        # A checkbox further down the profile is NOT a pending action.
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n"
+            "\n"
+            "- [ ] Real pending action\n"
+            "\n"
+            "## Field Log\n"
+            "\n"
+            "- [ ] Not a pending action, it lives under another heading\n"
+        ))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Real pending action"]
+
+
+# --------------------------------------------------------------------------
+# digest() -- surfacing pending actions at the moment the unit is back
+# --------------------------------------------------------------------------
+class TestDigestPending:
+    def test_a_returned_unit_surfaces_its_pending_items(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n\n- [ ] Confirm the mountpoints (HAM-185)\n"))
+        rows = {"mjolnir51": row(fp, "mjolnir51")}
+        changes = [("mjolnir51", "front_end", "unreachable", "on")]
+        text = fp.digest(rows, changes, [], repo=str(tmp_path))
+        assert "Confirm the mountpoints (HAM-185)" in text
+
+    def test_a_unit_with_no_pending_items_adds_nothing(self, fp, tmp_path):
+        rows = {"mjolnir51": row(fp, "mjolnir51")}
+        changes = [("mjolnir51", "front_end", "unreachable", "on")]
+        text = fp.digest(rows, changes, [], repo=str(tmp_path))
+        assert "pending" not in text.lower()
+
+
+class TestPendingItemsEdges:
+    def test_an_empty_checkbox_is_not_an_action(self, fp, tmp_path):
+        # The profile template ships a bare `- [ ]`; an unfilled copy of it
+        # must not become a nightly digest line saying nothing.
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [ ] \n- [ ] Real one\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["Real one"]
+
+    def test_a_checked_item_is_not_returned(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [x] Already done\n- [ ] Still open\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["Still open"]
+
+    def test_missing_profile_is_empty(self, fp, tmp_path):
+        assert fp.pending_items(str(tmp_path), "mjolnir99") == []
+
+    def test_profile_without_a_pending_block_is_empty(self, fp, tmp_path):
+        write_profile(tmp_path, "hamma", "mjolnir08", "# mjolnir08\n\n## Banner\n\n> hi\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir08") == []
+
+    def test_no_repo_is_empty(self, fp):
+        assert fp.pending_items(None, "mjolnir51") == []
+
+    def test_continuation_lines_are_not_actions(self, fp, tmp_path):
+        # Regression guard, not a driven test: the digest goes to chat, so the
+        # checkbox line is the short action and the rationale sits under it on
+        # indented lines. Capturing those would put paragraphs in the digest.
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n"
+            "\n"
+            "- [ ] Verify the mountpoints (HAM-185)\n"
+            "  mj51 is the sensor-log #52 topology, the only real-world\n"
+            "  instance of the hidden-partition case.\n"))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Verify the mountpoints (HAM-185)"]
+
+
+# --------------------------------------------------------------------------
+# The trigger, end to end. These drive diff()/merge()/digest() the way main()
+# does, rather than hand-building change tuples -- which is how the original
+# transition-gated version shipped broken: merge() never stores `unreachable`
+# for a unit that was reachable when it entered the snapshot, so the return
+# produced no change line at all and the block never printed.
+# --------------------------------------------------------------------------
+class TestPendingSurvivesARealOutage:
+    def test_pending_shows_after_a_unit_goes_dark_and_returns(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [ ] Verify the mountpoints (HAM-185)\n")
+        repo = str(tmp_path)
+        previous = {"mjolnir51": row(fp, "mjolnir51", front_end="on")}
+
+        dark = {"mjolnir51": row(fp, "mjolnir51", front_end="unreachable")}
+        snapshot = fp.merge(previous, dark)
+
+        back = {"mjolnir51": row(fp, "mjolnir51", front_end="on")}
+        changes = fp.diff(snapshot, back)
+        text = fp.digest(fp.merge(snapshot, back), changes, [], repo=repo)
+        assert "Verify the mountpoints (HAM-185)" in text
+
+    def test_pending_shows_every_day_not_just_on_the_return(self, fp, tmp_path):
+        # A quiet fleet produces no changes at all. The item must still show,
+        # or it is announced once and invisible thereafter.
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [ ] Verify the mountpoints (HAM-185)\n")
+        rows = {"mjolnir51": row(fp, "mjolnir51", front_end="on")}
+        text = fp.digest(rows, [], [], repo=str(tmp_path))
+        assert "Verify the mountpoints (HAM-185)" in text
+
+    def test_pending_is_hidden_while_the_unit_is_unreachable(self, fp, tmp_path):
+        # Nobody can act on it, so it is noise until the unit is back.
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [ ] Verify the mountpoints (HAM-185)\n")
+        rows = {"mjolnir51": row(fp, "mjolnir51", front_end="on")}
+        text = fp.digest(rows, [], ["mjolnir51"], repo=str(tmp_path))
+        assert "Verify the mountpoints (HAM-185)" not in text
+
+    def test_the_pending_block_is_bounded(self, fp, tmp_path):
+        # An over-long chat message is REJECTED, not truncated, so an
+        # unbounded block loses the whole digest -- changes and all -- exactly
+        # when a whole array has just come back. Measured 18 units x 3 items
+        # ~= 6.2 kB against a 4 kB ceiling.
+        rows = {}
+        for n in range(12):
+            unit = "mjolnir{:02d}".format(n)
+            rows[unit] = row(fp, unit)
+            write_profile(tmp_path, "hamma", unit,
+                          "## Pending\n\n- [ ] a\n- [ ] b\n- [ ] c\n")
+        text = fp.digest(rows, [], [], repo=str(tmp_path))
+        body = [ln for ln in text.splitlines() if "[ ]" in ln]
+        assert len(body) == fp.PENDING_DIGEST_MAX
+        assert "and 16 more" in text
+
+
+class TestPendingParserHardening:
+    """Each case here was a demonstrated failure in review, not a hypothetical."""
+
+    def test_an_example_inside_an_html_comment_is_not_an_action(self, fp, tmp_path):
+        # Both the template and every profile carry their instructions in a
+        # comment INSIDE this block, complete with an example item. The old
+        # parser was saved only by that example happening to be indented;
+        # dedent it and every new profile broadcasts boilerplate nightly.
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n"
+            "<!--\n"
+            "Example:\n"
+            "- [ ] TEMPLATE BOILERPLATE\n"
+            "-->\n"
+            "- [ ] A real action\n"))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["A real action"]
+
+    @pytest.mark.parametrize("terminator", ["### Notes", "# Other", "##Field Log"])
+    def test_any_heading_ends_the_block(self, fp, tmp_path, terminator):
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n- [ ] real\n{}\n- [ ] LEAKED\n".format(terminator))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["real"]
+
+    @pytest.mark.parametrize("heading", [
+        "## Pending", "### Pending", "##Pending", "## pending", "## Pending:"])
+    def test_heading_spellings_people_actually_write(self, fp, tmp_path, heading):
+        # Silently ignoring these means somebody's deferred work vanishes while
+        # the profile still looks correct when rendered.
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "{}\n\n- [ ] found it\n".format(heading))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["found it"]
+
+    def test_a_non_utf8_byte_does_not_kill_the_probe(self, fp, tmp_path):
+        # digest() is built BEFORE the snapshot is written and pushed, so an
+        # exception here discarded every unit's configuration change for the
+        # day, not just this line. A pasted Word em-dash was enough.
+        directory = tmp_path / "deployments" / "pamma"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "mjolnir51.md").write_bytes(
+            b"## Pending\n\n- [ ] Word em-dash \x97 here\n")
+        items = fp.pending_items(str(tmp_path), "mjolnir51")
+        assert len(items) == 1 and items[0].startswith("Word em-dash")
+
+    def test_duplicate_profiles_resolve_deterministically(self, fp, tmp_path):
+        # Profiles do move between array dirs (mj05 hamma<->lab, mj07 camma->lab).
+        # A stale copy left behind must not make the VPS and a laptop disagree.
+        write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
+        write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
