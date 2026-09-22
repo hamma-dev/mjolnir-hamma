@@ -524,3 +524,40 @@ class TestDigestPending:
         changes = [("mjolnir51", "front_end", "unreachable", "on")]
         text = fp.digest(rows, changes, [], repo=str(tmp_path))
         assert "pending" not in text.lower()
+
+
+class TestPendingItemsEdges:
+    def test_an_empty_checkbox_is_not_an_action(self, fp, tmp_path):
+        # The profile template ships a bare `- [ ]`; an unfilled copy of it
+        # must not become a nightly digest line saying nothing.
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [ ] \n- [ ] Real one\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["Real one"]
+
+    def test_a_checked_item_is_not_returned(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir51",
+                      "## Pending\n\n- [x] Already done\n- [ ] Still open\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == ["Still open"]
+
+    def test_missing_profile_is_empty(self, fp, tmp_path):
+        assert fp.pending_items(str(tmp_path), "mjolnir99") == []
+
+    def test_profile_without_a_pending_block_is_empty(self, fp, tmp_path):
+        write_profile(tmp_path, "hamma", "mjolnir08", "# mjolnir08\n\n## Banner\n\n> hi\n")
+        assert fp.pending_items(str(tmp_path), "mjolnir08") == []
+
+    def test_no_repo_is_empty(self, fp):
+        assert fp.pending_items(None, "mjolnir51") == []
+
+    def test_continuation_lines_are_not_actions(self, fp, tmp_path):
+        # Regression guard, not a driven test: the digest goes to chat, so the
+        # checkbox line is the short action and the rationale sits under it on
+        # indented lines. Capturing those would put paragraphs in the digest.
+        write_profile(tmp_path, "pamma", "mjolnir51", (
+            "## Pending\n"
+            "\n"
+            "- [ ] Verify the mountpoints (HAM-185)\n"
+            "  mj51 is the sensor-log #52 topology, the only real-world\n"
+            "  instance of the hidden-partition case.\n"))
+        assert fp.pending_items(str(tmp_path), "mjolnir51") == [
+            "Verify the mountpoints (HAM-185)"]

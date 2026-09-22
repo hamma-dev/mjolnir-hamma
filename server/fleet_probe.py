@@ -276,7 +276,11 @@ def pending_items(repo, unit):
         if inside and line.startswith("## "):
             break
         if inside and line.startswith(PENDING_UNCHECKED):
-            out.append(line[len(PENDING_UNCHECKED):].strip())
+            # The template ships a bare `- [ ]`. An unfilled copy of it is not
+            # an action, and must not become a nightly line saying nothing.
+            text = line[len(PENDING_UNCHECKED):].strip()
+            if text:
+                out.append(text)
     return out
 
 
