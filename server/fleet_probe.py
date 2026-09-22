@@ -228,20 +228,27 @@ def expected_offline(repo):
     return out
 
 
-def returned_units(changes):
-    """Units that came back into view this run, from diff()'s own output.
-
-    diff() already collapses a return to the single front_end transition, so
-    that one line IS the event -- no extra bookkeeping, and nothing new to keep
-    in sync. A front end merely being switched back on is NOT a return: the
-    unit was reachable throughout and nothing was deferred on it.
-    """
-    return sorted({unit for unit, field, old, _ in changes
-                   if field == "front_end" and old == UNREACHABLE})
-
-
-PENDING_HEADING = "## Pending"
 PENDING_UNCHECKED = "- [ ] "
+
+# Bound on the pending block. The chat sender posts the digest as one message
+# and an over-limit message is rejected outright -- the whole digest is lost,
+# not just the overflow. Measured: 18 units x 3 items is ~6.2 kB against a
+# 4 kB ceiling, which one array-wide recovery would reach.
+PENDING_DIGEST_MAX = 20
+
+
+def _is_pending_heading(line):
+    """True for `## Pending` and the spellings people actually write.
+
+    Heading drift is a documented problem in sensor-log, and the failure here
+    is silent: a profile with `### Pending` or `## Pending actions` renders
+    perfectly in Markdown and simply never produces a digest line. Accept the
+    variants rather than quietly ignore somebody's deferred work.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return False
+    return stripped.lstrip("#").strip().rstrip(":").strip().lower() == "pending"
 
 
 def pending_items(repo, unit):
@@ -253,31 +260,52 @@ def pending_items(repo, unit):
     history that explains it -- and the originating ticket can be CLOSED,
     cited as background, instead of held open for months waiting on hardware.
 
-    Only `- [ ] ` lines count. A `- [x] ` line is done and stays in the file as
-    the record that it was done.
+    Only `- [ ] ` lines count, and only between the heading and the next one.
+    A `- [x] ` line is done and stays in the file as the record that it was.
+    HTML comments are skipped: both the template and the profiles carry their
+    instructions in a comment INSIDE this block, complete with an example
+    item, and broadcasting that example nightly would discredit the whole
+    section. Do not "simplify" that away.
     """
     if not repo:
         return []
-    matches = glob.glob(os.path.join(repo, "deployments", "*",
-                                     "{}.md".format(unit)))
+    # sorted(): glob order is os.scandir order, so a unit with a stale profile
+    # left behind in another array directory (profiles do get moved -- mj05
+    # hamma<->lab, mj07 camma->lab) would otherwise resolve differently on the
+    # VPS than on a developer's box.
+    matches = sorted(glob.glob(os.path.join(repo, "deployments", "*",
+                                            "{}.md".format(unit))))
     if not matches:
         return []
     try:
-        with open(matches[0]) as handle:
+        # encoding is explicit and errors are replaced: a single smart quote
+        # pasted in from Word would otherwise raise UnicodeDecodeError, which
+        # is a ValueError, escape this function, and kill the whole probe run
+        # before the digest is built -- losing every unit's configuration
+        # change for that day, not just this one line.
+        with open(matches[0], encoding="utf-8", errors="replace") as handle:
             lines = handle.read().splitlines()
     except OSError:
         return []
     out = []
     inside = False
+    in_comment = False
     for line in lines:
-        if line.strip() == PENDING_HEADING:
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if "<!--" in line and "-->" not in line:
+            in_comment = True
+            continue
+        if _is_pending_heading(line):
             inside = True
             continue
-        if inside and line.startswith("## "):
+        if inside and line.strip().startswith("#"):
             break
         if inside and line.startswith(PENDING_UNCHECKED):
-            # The template ships a bare `- [ ]`. An unfilled copy of it is not
-            # an action, and must not become a nightly line saying nothing.
+            # An unfilled `- [ ]` is not an action, and must not become a
+            # nightly digest line saying nothing.
             text = line[len(PENDING_UNCHECKED):].strip()
             if text:
                 out.append(text)
@@ -455,18 +483,34 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
             for unit, field, old, new in changes:
                 lines.append("  {}  {} {} -> {}".format(unit, field, old, new)
                              if field != "*" else "  {}  {}".format(unit, new))
-    # A unit coming back is the only moment its deferred actions can be done,
-    # and it is also the moment nobody is thinking about them -- the ticket
-    # that recorded them was closed weeks ago. Surface them here, unprompted,
-    # attached to the return that made them possible.
-    for unit in returned_units(changes):
-        items = pending_items(repo, unit)
-        if not items:
-            continue
+    # STANDING, not a transition -- see the rule at the top of this file.
+    #
+    # The first cut of this fired only when a unit went unreachable -> reachable.
+    # That is dead code for most of the fleet: merge() never stores `unreachable`
+    # for a unit that was reachable when it entered the snapshot, so a real
+    # outage-and-return produces no change line at all. It also announced each
+    # item exactly once, which is the failure the standing-section rule exists
+    # to prevent -- a deferred action is unresolved-until-done by definition.
+    #
+    # Listed for every unit reachable THIS RUN, every day, until the box is
+    # ticked. Hidden while a unit is unreachable: nobody can act on it, and the
+    # ticket that recorded it is closed, so a permanent nag would train people
+    # to skim past the section.
+    pending_lines = []
+    for unit in sorted(set(rows) - set(unreachable)):
+        for item in pending_items(repo, unit):
+            pending_lines.append("  {}  [ ] {}".format(unit, item))
+    if pending_lines:
         lines.append("")
-        lines.append("{} is back -- pending actions:".format(unit))
-        for item in items:
-            lines.append("  [ ] {}".format(item))
+        lines.append("pending actions (edit the unit's profile to tick one off):")
+        # A whole array returning at once can push the digest past the chat
+        # message limit, and an over-long message is REJECTED, not truncated --
+        # losing the entire digest, changes and all. Bound this section rather
+        # than risk that; the full list is always in the profiles.
+        lines.extend(pending_lines[:PENDING_DIGEST_MAX])
+        if len(pending_lines) > PENDING_DIGEST_MAX:
+            lines.append("  ... and {} more, see sensor-log/deployments/".format(
+                len(pending_lines) - PENDING_DIGEST_MAX))
     standing = not_capturing(rows)
     if standing:
         lines.append("")
