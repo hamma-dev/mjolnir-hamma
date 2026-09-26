@@ -522,7 +522,13 @@ def _seed_snapshot(repo_path, fp, rows):
 
     rows: {unit: {field: value, ...}}. Fields not given default to
     fp.UNKNOWN, matching a real probe run's row shape.
+
+    Also creates the `.git` marker: the hook now refuses a log repo that is
+    not a git worktree, because a wrong path was otherwise indistinguishable
+    from "this unit has no baseline row yet" and reported success. A seeded
+    snapshot with no `.git` beside it cannot occur in production.
     """
+    (repo_path / ".git").mkdir(exist_ok=True)
     state_dir = repo_path / "state"
     state_dir.mkdir(exist_ok=True)
     full_rows = {}
@@ -602,10 +608,13 @@ class TestLogFieldChangesBatch:
         assert "commit/push failed" in capsys.readouterr().err
 
     def test_unavailable_fleet_probe_module_is_reported_not_raised(
-            self, mjol, capsys):
+            self, mjol, tmp_path, capsys):
+        # Needs a VALID log repo: the repo-path validation now runs first, so a
+        # made-up path is rejected before this branch can be reached.
+        repo = _fake_repo(tmp_path)
         with patch.object(mjol, "_fleet_probe_module", return_value=None):
             ok = mjol._log_field_changes_batch(
-                "/some/repo", [("mjolnir02", "front_end", "on")])
+                str(repo), [("mjolnir02", "front_end", "on")])
         assert ok is False
         assert "could not load fleet_probe.py" in capsys.readouterr().err
 
@@ -1106,3 +1115,92 @@ class TestPersistOmissionWarning:
         with patch.object(mjol.MjolnirArray, "set_threshold_array"):
             mjol.main(["-p", "2", "--set-threshold", "1", "830"])
         assert "--persist not set" not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# HAM-189 write-hook: fail-open is right, fail-SILENT is not.
+#
+# Logging must never fail a control operation -- every case here keeps that
+# property. What these pin down is that the two situations which cost the most
+# stop reporting success: a log repo that cannot work at all, and a commit
+# that did not land.
+# --------------------------------------------------------------------------
+def _fake_repo(tmp_path, with_snapshot=True, rows="unit,front_end\nmjolnir02,on\n"):
+    """A directory that looks like a git worktree, optionally with a snapshot."""
+    repo = tmp_path / "sensor-log"
+    (repo / ".git").mkdir(parents=True)
+    if with_snapshot:
+        state = repo / "state"
+        state.mkdir()
+        (state / "fleet-state.csv").write_text(rows)
+    return repo
+
+
+class TestWriteHookFailsLoudlyNotSilently:
+    def test_a_log_repo_that_is_not_a_git_worktree_is_a_failure(self, mjol, tmp_path):
+        """A typo in $FLEET_LOG_REPO otherwise kills the feature permanently
+        while printing a message saying the next probe will sort it out."""
+        missing = tmp_path / "not-a-clone"
+        missing.mkdir()
+        ok = mjol._log_field_changes_batch(
+            str(missing), [("mjolnir02", "front_end", "off")])
+        assert ok is False, "an unusable log repo must not report success"
+
+    def test_a_log_repo_with_no_snapshot_is_a_failure(self, mjol, tmp_path):
+        repo = _fake_repo(tmp_path, with_snapshot=False)
+        ok = mjol._log_field_changes_batch(
+            str(repo), [("mjolnir02", "front_end", "off")])
+        assert ok is False
+
+    def test_a_genuinely_new_unit_is_still_only_skipped(self, mjol, tmp_path):
+        """The repo is fine; this one unit just has no baseline row yet. That
+        is the benign case and must stay distinguishable from the above."""
+        repo = _fake_repo(tmp_path)
+        with patch.object(mjol, "_fleet_probe_module") as load:
+            fp = MagicMock()
+            fp.read_snapshot.return_value = {"mjolnir02": {"unit": "mjolnir02",
+                                                           "front_end": "on"}}
+            load.return_value = fp
+            ok = mjol._log_field_changes_batch(
+                str(repo), [("mjolnir99", "front_end", "off")])
+        assert ok is True, "a missing row for one unit is not a repo failure"
+
+    def test_no_log_repo_prints_one_line_not_one_per_unit(self, mjol, capsys):
+        """`mjol_array --up -a hamma` is the documented command and passes no
+        --log-repo. It must not gain nine stderr lines."""
+        entries = [("mjolnir%02d" % n, "front_end", "on") for n in range(1, 10)]
+        mjol._log_field_changes_batch(None, entries)
+        err = capsys.readouterr().err
+        assert err.count("[LOG]") <= 1, \
+            "one notice for the sweep, not one per unit:\n" + err
+
+    def test_a_failed_commit_leaves_the_snapshot_as_it_was(self, mjol, tmp_path):
+        """If the commit fails the change must surface as UNLOGGED on the next
+        probe. Leaving it written-but-uncommitted hides it from the digest AND
+        from git log -- the one outcome worse than not logging at all."""
+        repo = _fake_repo(tmp_path)
+        snapshot = repo / "state" / "fleet-state.csv"
+        before = snapshot.read_text()
+        with patch.object(mjol, "_fleet_probe_module") as load:
+            fp = MagicMock()
+            fp.read_snapshot.return_value = {"mjolnir02": {"unit": "mjolnir02",
+                                                           "front_end": "on"}}
+            fp.render.return_value = "unit,front_end\nmjolnir02,off\n"
+            fp.commit_snapshot.return_value = (False, "index.lock exists")
+            load.return_value = fp
+            ok = mjol._log_field_changes_batch(
+                str(repo), [("mjolnir02", "front_end", "off")])
+        assert ok is False
+        assert snapshot.read_text() == before, \
+            "a failed commit must not leave the change in the working tree"
+
+    def test_keyboard_interrupt_does_not_escape(self, mjol, tmp_path):
+        """The control action already succeeded. A Ctrl-C during the multi-second
+        git work must not produce a traceback and exit 130, which an operator
+        reads as 'the shutdown failed'."""
+        repo = _fake_repo(tmp_path)
+        with patch.object(mjol, "_fleet_probe_module") as load:
+            load.side_effect = KeyboardInterrupt()
+            ok = mjol._log_field_changes_batch(
+                str(repo), [("mjolnir02", "front_end", "off")])
+        assert ok is False

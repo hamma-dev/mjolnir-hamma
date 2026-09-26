@@ -177,11 +177,40 @@ def _log_field_changes_batch(log_repo, entries, reason=None):
     """
     if not entries:
         return True
+    # The control operations above printed to stdout, which is BLOCK-buffered
+    # when it is not a tty -- i.e. `ssh vps '...--down -p 2'`, a pipe, or cron,
+    # which is the scripted emergency path. Without this flush the operator sees
+    # this function's stderr first and the "[OK] relay off" line only when the
+    # process exits, so a logging complaint appears to precede -- or replace --
+    # confirmation that the shutdown happened.
+    sys.stdout.flush()
+
     if not log_repo:
-        for unit, field, _value in entries:
-            print(f"[LOG] no --log-repo/$FLEET_LOG_REPO configured; change "
-                  f"to {unit} {field} not recorded in the fleet-state "
-                  f"snapshot.", file=sys.stderr)
+        # ONE line for the sweep. `mjol_array --up -a hamma` is the documented
+        # command and passes no --log-repo; it must not grow nine stderr lines.
+        print(f"[LOG] no --log-repo/$FLEET_LOG_REPO configured; "
+              f"{len(entries)} change(s) not recorded in the fleet-state "
+              f"snapshot.", file=sys.stderr)
+        return False
+
+    # A log repo that cannot possibly work is NOT the same as a unit that has
+    # no baseline row yet, and must not be reported the same way. Without this,
+    # a typo in $FLEET_LOG_REPO makes read_snapshot() return {}, every entry
+    # take the benign "no snapshot row yet" path, and the function return True
+    # -- so the feature dies permanently while printing a message saying the
+    # next probe will establish the rows. Meanwhile the digest flags every real
+    # change as unlogged and nothing points at the cause.
+    snapshot_rel = os.path.join("state", "fleet-state.csv")
+    if not os.path.exists(os.path.join(log_repo, ".git")):
+        print(f"[LOG] --log-repo {log_repo} is not a git worktree; "
+              f"{len(entries)} change(s) NOT recorded. Fix the path -- until "
+              f"then every change will be reported as unlogged.",
+              file=sys.stderr)
+        return False
+    if not os.path.exists(os.path.join(log_repo, snapshot_rel)):
+        print(f"[LOG] --log-repo {log_repo} has no {snapshot_rel}; "
+              f"{len(entries)} change(s) NOT recorded. Wrong clone, or the "
+              f"fleet probe has never run there.", file=sys.stderr)
         return False
 
     # Everything below is inside one try/except, deliberately including
@@ -197,7 +226,6 @@ def _log_field_changes_batch(log_repo, entries, reason=None):
                       f"snapshot.", file=sys.stderr)
             return False
 
-        snapshot_rel = os.path.join("state", "fleet-state.csv")
         snapshot = os.path.join(log_repo, snapshot_rel)
 
         rows = fp.read_snapshot(snapshot)
@@ -230,8 +258,18 @@ def _log_field_changes_batch(log_repo, entries, reason=None):
         directory = os.path.dirname(snapshot)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(snapshot, "w") as handle:
+
+        # Keep the old content so a failed commit can be rolled back, and write
+        # via a temp file in the same directory + os.replace. A truncate-in-place
+        # write that is interrupted leaves a short or empty CSV, and an EMPTY one
+        # makes the next probe read previous={} -- which it treats as a fleet
+        # baseline, reporting NO changes at all and swallowing a whole day.
+        with open(snapshot) as handle:
+            previous_text = handle.read()
+        tmp_path = snapshot + ".mjol-tmp"
+        with open(tmp_path, "w") as handle:
             handle.write(fp.render(rows))
+        os.replace(tmp_path, snapshot)
 
         message = "state: " + ", ".join(
             f"{u} {f} = {v}" for u, f, v in applied)
@@ -239,13 +277,34 @@ def _log_field_changes_batch(log_repo, entries, reason=None):
             message += f"\n\n{reason}"
         ok, detail = fp.commit_snapshot(log_repo, snapshot_rel, message)
         if not ok:
-            print(f"[LOG] fleet-state snapshot updated locally but "
-                  f"commit/push failed for {len(applied)} change(s): "
-                  f"{detail}", file=sys.stderr)
+            # Roll the file back. Left written-but-uncommitted, the next probe
+            # MEASURES the new value, READS the new value, sees no diff, and
+            # reports nothing -- so the change is in neither the digest nor git
+            # log, and the tree stays dirty. Restoring it makes the change
+            # surface as unlogged, which is the correct fail-open outcome.
+            try:
+                tmp_path = snapshot + ".mjol-tmp"
+                with open(tmp_path, "w") as handle:
+                    handle.write(previous_text)
+                os.replace(tmp_path, snapshot)
+                restored = ("; rolled the snapshot back so the next probe "
+                            "reports these as unlogged")
+            except OSError as restore_error:
+                restored = ("; AND rolling the snapshot back failed ({}) -- "
+                            "the working tree is dirty and these changes are "
+                            "invisible to both the digest and git log"
+                            .format(restore_error))
+            print(f"[LOG] commit/push failed for {len(applied)} change(s): "
+                  f"{detail}{restored}", file=sys.stderr)
         return ok
-    except Exception as error:            # noqa: BLE001 - report, don't mask
+    except BaseException as error:        # noqa: BLE001 - report, don't mask
+        # BaseException, not Exception, on purpose. An operator who Ctrl-Cs
+        # during the multi-second git work would otherwise get a traceback and
+        # exit 130 from a tool whose shutdown ALREADY SUCCEEDED -- which reads
+        # as "the shutdown failed" and invites a retry.
         print(f"[LOG] failed to record {len(entries)} change(s) in the "
-              f"fleet-state snapshot: {type(error).__name__}: {error}",
+              f"fleet-state snapshot: {type(error).__name__}: {error}"
+              f" (the control operation itself already completed)",
               file=sys.stderr)
         return False
 
