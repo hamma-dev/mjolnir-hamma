@@ -642,3 +642,212 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+# --------------------------------------------------------------------------
+# commit_snapshot() -- HAM-189 finding #5: no locking around fleet-state.csv,
+# so a non-fast-forward push rejection (a concurrent writer on the same
+# clone) is retried ONCE (pull --rebase, then push again) rather than
+# silently degrading that clone's logging to a permanent no-op. subprocess
+# is mocked throughout -- nothing here touches git or the network.
+# --------------------------------------------------------------------------
+class TestCommitSnapshotRetry:
+    def _run(self, returncode, stdout=""):
+        return MagicMock(returncode=returncode, stdout=stdout)
+
+    def test_normal_push_succeeds_without_any_retry(self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [self._run(0), self._run(0), self._run(0)]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is True
+        assert detail == "committed and pushed"
+        assert mock_run.call_count == 3   # add, commit, push -- no rebase
+
+    def test_non_rejection_push_failure_is_not_retried(self, fp, tmp_path):
+        """A network/auth failure looks nothing like a collision -- retrying
+        blindly would not help and would just mask the real error."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "fatal: unable to access '...': Could not "
+                            "resolve host"),
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "Could not resolve host" in detail
+        assert mock_run.call_count == 3   # no rebase attempted
+
+    def test_rejected_push_retries_and_succeeds(self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(0),   # pull --rebase
+                self._run(0),   # retry push
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is True
+        assert "rebase retry" in detail
+        assert mock_run.call_count == 5
+        rebase_cmd = mock_run.call_args_list[3][0][0]
+        assert rebase_cmd[3:6] == ["pull", "--rebase", "origin"]
+
+    def test_rejected_push_with_failed_rebase_reports_manual_attention(
+            self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(1, "CONFLICT (content): Merge conflict"),
+                self._run(0),   # git rebase --abort
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "manual attention" in detail
+        assert "CONFLICT" in detail
+        # 5, not 4: add, commit, push, failed rebase, AND the abort. Leaving the
+        # clone mid-rebase put conflict markers in the snapshot that the next
+        # run committed as data, so the abort is now required. Still no second
+        # push after a failed rebase.
+        assert mock_run.call_count == 5
+        assert not any("push" in c for c in
+                       [call[0][0] for call in mock_run.call_args_list][3:])
+
+    def test_rejected_push_with_failed_retry_reports_manual_attention(
+            self, fp, tmp_path):
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(0),                              # rebase ok
+                self._run(1, "! [rejected]  HEAD -> main"),  # retry also fails
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert "manual attention" in detail
+        assert mock_run.call_count == 5   # does not retry a second time
+
+
+# --------------------------------------------------------------------------
+# The write-hook's premise, previously unasserted: a change the hook LOGGED
+# must leave no diff for the probe to report. The first version of this PR
+# failed it -- by pre-writing front_end the hook removed the very condition
+# diff() used to collapse the AGS-derived cascade, so one --down produced
+# four threshold/gain "adjustments" nobody made.
+#
+# The AGS fields are only readable while the front end is POWERED. That, not
+# "front_end changed", is the real reason to suppress them -- and it must not
+# over-reach: a no_relay unit (mj05, mj54) is powered and carries genuine
+# threshold and gain values, so real changes there must still surface.
+# --------------------------------------------------------------------------
+class TestHookLoggedPowerChangeLeavesNoFalseAdjustments:
+    def test_logged_power_down_does_not_report_threshold_or_gain(self, fp):
+        prev = row(fp, "mjolnir02", front_end="off", mode="default",
+                   t1="830.0", t2="0.0", gf="1", gs="1")
+        cur = row(fp, "mjolnir02", front_end="off", mode="nosensor",
+                  t1=fp.UNKNOWN, t2=fp.UNKNOWN, gf=fp.UNKNOWN, gs=fp.UNKNOWN)
+        fields = {c[1] for c in fp.diff({"mjolnir02": prev}, {"mjolnir02": cur})}
+        assert not (fields & fp.POWER_DERIVED_FIELDS), (
+            "the hook logged the power-down; the AGS fields going unreadable "
+            "is a mechanical consequence, not four config adjustments")
+
+    def test_logged_power_up_does_not_report_threshold_or_gain(self, fp):
+        prev = row(fp, "mjolnir02", front_end="on", mode="nosensor",
+                   t1=fp.UNKNOWN, t2=fp.UNKNOWN, gf=fp.UNKNOWN, gs=fp.UNKNOWN)
+        cur = row(fp, "mjolnir02", front_end="on", mode="default",
+                  t1="830.0", t2="0.0", gf="1", gs="1")
+        fields = {c[1] for c in fp.diff({"mjolnir02": prev}, {"mjolnir02": cur})}
+        assert not (fields & fp.POWER_DERIVED_FIELDS)
+
+    def test_a_real_threshold_change_while_powered_is_still_reported(self, fp):
+        prev = row(fp, "mjolnir04", front_end="on", t1="498.0")
+        cur = row(fp, "mjolnir04", front_end="on", t1="750.0")
+        assert fp.diff({"mjolnir04": prev}, {"mjolnir04": cur}) == [
+            ("mjolnir04", "threshold_1_mv", "498.0", "750.0")]
+
+    def test_a_real_threshold_change_on_a_no_relay_unit_is_still_reported(self, fp):
+        # mj05 and mj54 are no_relay AND powered, with genuine values on record.
+        prev = row(fp, "mjolnir05", front_end="no_relay", t1="78.0")
+        cur = row(fp, "mjolnir05", front_end="no_relay", t1="100.0")
+        assert fp.diff({"mjolnir05": prev}, {"mjolnir05": cur}) == [
+            ("mjolnir05", "threshold_1_mv", "78.0", "100.0")]
+
+
+# --------------------------------------------------------------------------
+# commit_snapshot hardening. Every case below was demonstrated against real
+# git repos in review, not imagined.
+# --------------------------------------------------------------------------
+class TestCommitSnapshotHardening:
+    def _run(self, returncode, stdout=""):
+        return MagicMock(returncode=returncode, stdout=stdout)
+
+    def _cmds(self, mock_run):
+        return [c[0][0] for c in mock_run.call_args_list]
+
+    def test_a_failed_rebase_is_aborted(self, fp, tmp_path):
+        """Otherwise the clone is left mid-rebase with conflict markers IN the
+        snapshot -- and read_snapshot() is a bare csv.DictReader, so the next
+        run parses '<<<<<<< HEAD' as a unit and commits it as data."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [rejected]  HEAD -> main (fetch first)"),
+                self._run(1, "CONFLICT (content): Merge conflict"),
+                self._run(0),   # the abort
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        flat = [tok for cmd in self._cmds(mock_run) for tok in cmd]
+        assert "--abort" in flat, \
+            "a failed rebase must be aborted, not left in place"
+
+    def test_the_commit_is_scoped_to_the_snapshot_path(self, fp, tmp_path):
+        """`git commit -m MSG` commits the whole index. Anything else staged in
+        the clone would be pushed to sensor-log main under a 'state: ...'
+        message."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [self._run(0), self._run(0), self._run(0)]
+            fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        commit = next(c for c in self._cmds(mock_run) if "commit" in c)
+        assert "--" in commit and "state/x.csv" in commit, \
+            "commit must be path-scoped: git commit -m MSG -- <snapshot>"
+
+    def test_the_push_names_main_explicitly(self, fp, tmp_path):
+        """`push origin HEAD` pushes whatever branch the clone is parked on,
+        creating a junk remote branch and reporting success while main never
+        sees the change."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [self._run(0), self._run(0), self._run(0)]
+            fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        push = next(c for c in self._cmds(mock_run) if "push" in c)
+        assert any("refs/heads/main" in tok for tok in push), \
+            "push must target main explicitly, not whatever HEAD is"
+
+    def test_git_never_inherits_the_operators_stdin(self, fp, tmp_path):
+        """An https origin with no cached credential makes git sit on a
+        username prompt, eating the operator's keystrokes for the full
+        timeout -- during an emergency shutdown."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [self._run(0), self._run(0), self._run(0)]
+            fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        for call in mock_run.call_args_list:
+            kwargs = call[1]
+            assert kwargs.get("stdin") is fp.subprocess.DEVNULL, \
+                "every git call needs stdin=DEVNULL"
+            assert kwargs.get("env", {}).get("GIT_TERMINAL_PROMPT") == "0", \
+                "every git call needs GIT_TERMINAL_PROMPT=0"
+
+    def test_a_remote_rejection_is_not_retried(self, fp, tmp_path):
+        """'! [remote rejected] ... (pre-receive hook declined)' can never
+        succeed on retry, and the pointless pull --rebase is what wedges a
+        diverged clone."""
+        with patch.object(fp.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                self._run(0), self._run(0),
+                self._run(1, "! [remote rejected] HEAD -> main "
+                            "(pre-receive hook declined)"),
+            ]
+            ok, detail = fp.commit_snapshot(str(tmp_path), "state/x.csv", "m")
+        assert ok is False
+        assert not any("rebase" in c for c in self._cmds(mock_run)), \
+            "a remote rejection must not trigger the rebase retry"
