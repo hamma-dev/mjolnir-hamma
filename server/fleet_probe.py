@@ -472,7 +472,7 @@ def changed_since(repo, snapshot_rel, unit, current_state, limit=200):
 
 
 def digest(rows, changes, unreachable, baseline=False, repo=None,
-           snapshot_rel=None, expected=None):
+           snapshot_rel=None, expected=None, probed_units=None):
     probed = len(rows) - len(unreachable)
     if baseline:
         lines = ["fleet probe: baseline established, {} units".format(probed)]
@@ -497,7 +497,15 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     # ticket that recorded it is closed, so a permanent nag would train people
     # to skim past the section.
     pending_lines = []
-    for unit in sorted(set(rows) - set(unreachable)):
+    # `probed` is the set actually contacted this run. On a scoped run (-a/-p)
+    # the units left alone are in neither `rows`-minus-`unreachable` nor in
+    # `unreachable`, so without this they counted as reachable and their
+    # pending items flooded the digest -- 46 items on a 3-unit `-a aumma` run.
+    # None means "everything in the snapshot was probed", the unscoped case.
+    # NB: `probed` above is the unit COUNT, an int. This is the SET.
+    reachable = (set(rows) if probed_units is None
+                 else set(rows) & set(probed_units))
+    for unit in sorted(reachable - set(unreachable)):
         for item in pending_items(repo, unit):
             pending_lines.append("  {}  [ ] {}".format(unit, item))
     if pending_lines:
@@ -685,7 +693,8 @@ def main():
 
     # "since" comes from the snapshot's own git history, so it is only available
     # once there is one to read.
-    report = digest(merged, changes, unreachable, baseline=baseline,
+    report = digest(merged, changes, unreachable, probed_units=set(current),
+                    baseline=baseline,
                     repo=args.repo if not baseline else None,
                     snapshot_rel=snapshot_rel,
                     expected=expected_offline(args.repo))
