@@ -42,11 +42,20 @@ It must run as a user who can write the clone. On the VPS that is `monitor`:
 # dry run first -- probes, prints the snapshot and digest, writes nothing
 fleet_probe --repo /home/monitor/sensor-log --dry-run
 
-# the scheduled form (monitor's crontab)
-10 6 * * * cd /home/monitor/dev/mjolnir-hamma && /usr/bin/python3 server/fleet_probe.py \
-    --repo /home/monitor/sensor-log --commit --notify \
-    >> /home/monitor/fleet_probe.log 2>&1
+# the scheduled form: one line in monitor's crontab
+10 6 * * * cd /home/monitor/dev/mjolnir-hamma && /home/monitor/dev/ltgenv/bin/python server/fleet_probe.py --repo /home/monitor/sensor-log --commit --notify >> /home/monitor/fleet_probe.log 2>&1
 ```
+
+**Use the venv interpreter, not `/usr/bin/python3`.** `--notify` imports
+`notifiers.google_chat`, which is installed in `/home/monitor/dev/ltgenv` and
+not in the system python. With the wrong interpreter the probe still measures,
+commits and pushes correctly and only the digest fails, with
+`digest FAILED to send: ModuleNotFoundError: No module named 'notifiers'` --
+a partial success that is easy to miss in a cron log. Verified on the VPS
+2026-09-27.
+
+The digest reads its key from `/home/pi/.googlechat` by default, which is
+world-readable, so `monitor` can send without a copy of its own.
 
 `--commit` and `--notify` are opt-in so a hand-run probe cannot surprise anyone
 by pushing or paging; the cron line asks for them.
