@@ -25,7 +25,7 @@ fi
 
 $SUDO mkdir -p "$TARGET_DIR"
 
-for tool in mjol_array webgen; do
+for tool in mjol_array webgen fleet_probe; do
     src="$SCRIPT_DIR/${tool}.py"
     dest="$TARGET_DIR/$tool"
 
