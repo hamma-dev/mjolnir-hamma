@@ -56,9 +56,9 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 2. Stop sindri service
 3. Toggle relay to power off sensor
 4. Archive today's telemetry CSV (rename to `.bak`)
-5. Write systemd drop-in (`BROKKR_MODE=nosensor`)
+5. Set the mode drop-in, adding `nosensor` and **keeping `nochargecontroller`**
 6. Reload systemd
-7. Start brokkr (now runs in nosensor mode)
+7. Start brokkr (now runs in a `nosensor*` mode)
 8. Start sindri
 
 ### `--on` Sequence
@@ -66,11 +66,73 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 1. Stop brokkr service
 2. Stop sindri service
 3. Archive today's telemetry CSV
-4. Remove systemd drop-in (back to default mode)
+4. Set the mode drop-in, clearing `nosensor` and **keeping `nochargecontroller`**
+   (removes the drop-in entirely only when the result is plain `default`)
 5. Reload systemd
 6. Toggle relay to power on sensor
-7. Start brokkr (back to default mode)
+7. Start brokkr
 8. Start sindri
+
+### Mode is two axes, and on/off only moves one
+
+`nochargecontroller` describes the unit's **hardware** — whether a SunSaver MPPT is
+wired up. It has nothing to do with whether the sensor is powered, so it is **sticky**
+across `--on` and `--off`:
+
+| Current mode | `--off` → | `--on` → |
+|---|---|---|
+| `default` | `nosensor` | *(unchanged)* |
+| `nochargecontroller` | `nosensor_nochargecontroller` | *(unchanged)* |
+| `nosensor` | *(unchanged)* | `default` |
+| `nosensor_nochargecontroller` | *(unchanged)* | `nochargecontroller` |
+
+`mode.conf` is the **shared filename for every mode override** and appears in two
+forms in the field — `Environment=BROKKR_MODE=<mode>` and an `ExecStart=` override
+carrying `--mode <mode>`. Both are read, and the existing form is preserved when
+writing back (the unit's own interpreter path, quoting and co-resident directives
+are kept).
+
+**The two forms are not equal in force.** brokkr resolves its mode as
+
+```
+CLI --mode  >  BROKKR_MODE in the environment  >  mode.toml
+```
+
+so on a drop-in holding both, the `ExecStart=` override wins and the
+`Environment=` line is dead text. `--status` reports the mode brokkr will
+**actually run**, by that order, and for a repeated `Environment=` assignment the
+last one (systemd's own rule).
+
+**Reading is always answered; writing can refuse.** `--on`/`--off` refuse, and
+leave the file exactly as it was, when:
+
+| Case | Why |
+|---|---|
+| A mode is named in **more than one place** (two forms, two `Environment=` lines, two `--mode` flags on a line) | The resolved mode is knowable, but *which directive to edit* is not — editing one and leaving the other silently changes the mode in force |
+| A mode is named in a shape it cannot parse (`--mode=x`, a line continuation, an unhandled quoting, `--mode` on `ExecStartPre=`/`ExecReload=`) | Guessing could destroy the sticky axis |
+| The mode is outside the two-axis model (`test`, `realtime`, `sindri02x`, anything new) | `--on` would compute `default` and discard whatever the operator set |
+
+A file that provably names **no** mode reports `default` — including a bare
+`ExecStart=` reset line and a commented-out old command line (`#` *and* `;`, per
+`systemd.syntax(7)`).
+
+**Every refusal happens before any service is stopped and before the relay moves**,
+including a failure of the post-condition check on the bytes about to be written.
+`sensors.py` is the emergency power tool, used at low battery; it fails
+empty-handed or not at all. The refusal also goes to the same chat channel as the
+on/off notifications, because a message printed to a tunnelled stdout is a silent
+no-op from the operator's side.
+
+> Before HAM-184 this file was treated as a boolean — present meant `nosensor`,
+> absent meant `default`. On mj06, mj50 and mj54 that made `--status` report
+> `nosensor` regardless of the real mode, and `--on` silently dropped them to
+> `default`, re-enabling charge-controller polling against hardware that isn't there.
+
+> **Do not remove a mode override with `rm -rf` on the drop-in directory.**
+> hamma-expert's `services-and-pipelines.md` still gives that as the manual
+> recipe. `mode.conf` is hand-edited in the field and routinely carries other
+> directives; `sensors.py` removes only the mode and keeps the rest, deleting the
+> file only when the mode was all it set.
 
 ### Why the CSV is archived
 
