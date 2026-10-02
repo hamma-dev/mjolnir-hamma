@@ -544,6 +544,34 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     return "\n".join(lines)
 
 
+def pull_snapshot(repo):
+    """Fast-forward the snapshot clone. Returns (ok, detail).
+
+    commit_snapshot() only ever pushed, and sensor-log takes human commits, so
+    the first change-bearing run after one was rejected non-fast-forward. That
+    failure was invisible: --notify fires regardless, so the digest kept
+    arriving while the snapshot stopped being published, and the staleness
+    banner on log.hamma.dev cannot detect it either -- write-if-changed means
+    real commit gaps already run to three weeks, far past STATE_STALE_DAYS.
+
+    `--ff-only`, deliberately, not `--rebase`: nothing watches this clone, so a
+    conflicted working tree on the VPS would be worse than a loud refusal. A
+    refusal means local commits are stacked up from earlier rejected pushes,
+    which a human resolves with `pull --rebase` and one push.
+    """
+    try:
+        pull = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=120)
+        detail = pull.stdout.strip()
+        if pull.returncode != 0:
+            return False, detail or "git pull --ff-only failed"
+        return True, detail or "already up to date"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, str(error)
+
+
 def commit_snapshot(repo, snapshot_rel, message):
     """Commit and push the snapshot. Returns (ok, detail)."""
     try:
@@ -677,6 +705,19 @@ def main():
 
     unreachable = sorted(u for u, r in current.items()
                          if r.get("front_end") == UNREACHABLE)
+    # Refresh the clone BEFORE reading the baseline, so the diff is against
+    # what is actually published. After probing rather than before, to keep the
+    # window between pull and push short -- the sweep is serial and can take
+    # ~27 minutes. A failure here is recorded, not raised: the digest still has
+    # to go out, because a wedged clone and a dead probe must not look alike.
+    repo_problems = []
+    if args.repo and not args.dry_run:
+        pulled, detail = pull_snapshot(args.repo)
+        print("pull: {}".format(detail), file=sys.stderr)
+        if not pulled:
+            repo_problems.append(
+                "could not refresh the sensor-log clone: {}".format(detail))
+
     previous = read_snapshot(snapshot)
     baseline = not previous
     changes = diff(previous, current)
@@ -698,30 +739,52 @@ def main():
 
     # Write-if-changed: an identical snapshot must leave no trace at all, so that
     # `git log` on it stays a clean list of real state changes.
-    wrote = False
-    if baseline or changes:
-        directory = os.path.dirname(snapshot)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(snapshot, "w") as handle:
-            handle.write(text)
-        wrote = True
-
     status = 0
-    if wrote and args.commit:
-        summary = ("state: fleet baseline" if baseline else
-                   "state: {}".format(", ".join(
-                       sorted({u for u, _, _, _ in changes}))))
-        ok, detail = commit_snapshot(args.repo, snapshot_rel, summary)
-        print("commit: {}".format(detail), file=sys.stderr)
-        if not ok:
-            status = 1
+    if repo_problems:
+        # Do not write or commit onto a baseline we could not refresh: it would
+        # diverge further, and the written file becomes the next run's
+        # baseline, so the change would be lost from the history entirely.
+        status = 1
+        print("SKIPPED write and commit: {}".format("; ".join(repo_problems)),
+              file=sys.stderr)
+    else:
+        wrote = False
+        if baseline or changes:
+            directory = os.path.dirname(snapshot)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(snapshot, "w") as handle:
+                handle.write(text)
+            wrote = True
+
+        if wrote and args.commit:
+            summary = ("state: fleet baseline" if baseline else
+                       "state: {}".format(", ".join(
+                           sorted({u for u, _, _, _ in changes}))))
+            ok, detail = commit_snapshot(args.repo, snapshot_rel, summary)
+            print("commit: {}".format(detail), file=sys.stderr)
+            if not ok:
+                repo_problems.append(
+                    "snapshot commit/push FAILED: {}".format(detail))
+                status = 1
 
     # Notify even when nothing changed -- the digest IS the liveness signal. A
     # silent probe and a dead probe must not look the same.
     if args.notify:
+        outgoing = report
+        if repo_problems:
+            # Say it where humans actually read. This failure was silent for
+            # exactly one reason: it went to a cron log while the digest looked
+            # completely normal.
+            outgoing = (
+                "*** THE FLEET RECORD IS NOT BEING PUBLISHED ***\n"
+                + "".join("  - {}\n".format(p) for p in repo_problems)
+                + "  The state below was measured but is NOT in git.\n"
+                + "  Recover: git -C {} pull --rebase origin main"
+                  " && git push\n\n".format(args.repo)
+                + report)
         try:
-            send_digest(report, args.key_file, args.channel)
+            send_digest(outgoing, args.key_file, args.channel)
             print("digest sent to '{}'".format(args.channel), file=sys.stderr)
         except Exception as error:            # noqa: BLE001 - report, don't mask
             print("digest FAILED to send: {}: {}".format(
