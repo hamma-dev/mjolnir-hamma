@@ -642,3 +642,207 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+# --------------------------------------------------------------------------
+# Publishing the snapshot: pull before the write, and fail loudly
+# --------------------------------------------------------------------------
+
+def _git(repo, *args):
+    """Run git in `repo`, raising on failure so a broken fixture is obvious."""
+    done = subprocess.run(("git", "-C", str(repo)) + args,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True, timeout=60)
+    assert done.returncode == 0, done.stdout
+    return done.stdout
+
+
+@pytest.fixture
+def clone_pair(tmp_path):
+    """A bare 'origin' plus a clone, as the VPS has.
+
+    Returns (clone, origin, snapshot_rel).
+    """
+    origin, work, clone = (tmp_path / "origin.git", tmp_path / "work",
+                           tmp_path / "clone")
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    _git(tmp_path, "clone", str(origin), str(work))
+    _git(work, "config", "user.email", "probe@test")
+    _git(work, "config", "user.name", "probe")
+    (work / "state").mkdir()
+    (work / "state" / "fleet-state.csv").write_text("seed\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "seed")
+    _git(work, "push", "origin", "main")
+    _git(tmp_path, "clone", str(origin), str(clone))
+    _git(clone, "config", "user.email", "probe@test")
+    _git(clone, "config", "user.name", "probe")
+    return clone, work, pathlib.Path("state") / "fleet-state.csv"
+
+
+class TestPullBeforePublishing:
+    """commit_snapshot() only ever pushed.
+
+    sensor-log takes human commits, so the first change-bearing run after one
+    was rejected non-fast-forward -- and because --notify fires regardless, the
+    digest kept arriving while the snapshot silently stopped being published.
+    """
+
+    def test_pull_fast_forwards_a_behind_clone(self, fp, clone_pair):
+        clone, work, rel = clone_pair
+        (work / "other.txt").write_text("human edit\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", "a human commit")
+        _git(work, "push", "origin", "main")
+
+        ok, detail = fp.pull_snapshot(str(clone))
+        assert ok, detail
+        assert (clone / "other.txt").exists(), "clone was not fast-forwarded"
+
+    def test_pull_refuses_a_diverged_clone_rather_than_merging(
+            self, fp, clone_pair):
+        """--ff-only, not --rebase: nothing watches this clone, so a conflicted
+        working tree on the VPS would be worse than a loud refusal."""
+        clone, work, rel = clone_pair
+        (work / "other.txt").write_text("human edit\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", "a human commit")
+        _git(work, "push", "origin", "main")
+        # A local commit the clone never pushed -- the wedged state.
+        (clone / rel).write_text("local change\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "an un-pushed probe commit")
+
+        ok, detail = fp.pull_snapshot(str(clone))
+        assert not ok
+        assert detail, "a refusal with no detail is not actionable"
+
+    def test_push_after_a_human_commit_succeeds(self, fp, clone_pair):
+        """The end-to-end case that used to fail: human commit, then a probe
+        run that changes state."""
+        clone, work, rel = clone_pair
+        (work / "other.txt").write_text("human edit\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-m", "a human commit")
+        _git(work, "push", "origin", "main")
+
+        assert fp.pull_snapshot(str(clone))[0]
+        (clone / rel).write_text("probed change\n")
+        ok, detail = fp.commit_snapshot(str(clone), str(rel), "state: mjolnir03")
+        assert ok, detail
+
+
+class TestAStaleCloneDoesNotCompound:
+    """A failed pull must not write or commit on top of a stale baseline, and
+    must not look like a healthy run."""
+
+    def _run(self, fp, repo, extra=()):
+        argv = (["fleet_probe", "--allow-missing-ags", "-p", "2",
+                 "--repo", str(repo), "--commit"] + list(extra))
+        probe = MagicMock(returncode=0, stdout="front_end=on\n", stderr="")
+        sent = {}
+
+        def fake_send(text, key_file, channel):
+            sent["text"] = text
+
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp, "pull_snapshot",
+                             return_value=(False, "fatal: Not possible to "
+                                                  "fast-forward, aborting.")), \
+                patch.object(fp, "send_digest", fake_send), \
+                patch.object(fp, "commit_snapshot") as commit, \
+                patch.object(fp.sys, "argv", argv), \
+                patch.object(fp.subprocess, "run", return_value=probe):
+            rc = fp.main()
+        return rc, sent, commit
+
+    def test_a_failed_pull_skips_the_commit_and_exits_nonzero(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        before = (clone / rel).read_text()
+        rc, _, commit = self._run(fp, clone)
+        assert rc != 0, "a run that could not publish reported success"
+        commit.assert_not_called()
+        assert (clone / rel).read_text() == before, \
+            "wrote a snapshot on top of a baseline it could not refresh"
+
+    def test_a_failed_pull_still_sends_a_digest(self, fp, clone_pair):
+        """The digest is the liveness signal; losing it would make a wedged
+        clone indistinguishable from a dead probe."""
+        clone, _, _ = clone_pair
+        _, sent, _ = self._run(fp, clone, extra=["--notify"])
+        assert "text" in sent, "no digest was sent"
+
+    def test_the_digest_says_the_record_is_not_being_published(
+            self, fp, clone_pair):
+        """This is the whole fix. The failure used to go only to a cron log
+        while the digest looked completely normal, and the staleness banner on
+        log.hamma.dev cannot detect it -- write-if-changed means real commit
+        gaps already exceed STATE_STALE_DAYS."""
+        clone, _, _ = clone_pair
+        _, sent, _ = self._run(fp, clone, extra=["--notify"])
+        text = sent.get("text", "")
+        assert "fast-forward" in text, \
+            "the git error never reaches the humans: {!r}".format(text)
+        assert "pull --rebase" in text, \
+            "no recovery command in the digest: {!r}".format(text)
+
+    def test_the_pull_happens_before_the_baseline_is_read(self, fp,
+                                                          clone_pair):
+        """Order is the whole point: a pull after read_snapshot() would diff
+        against a baseline it had just made stale."""
+        clone, _, _ = clone_pair
+        order = []
+        argv = ["fleet_probe", "--allow-missing-ags", "-p", "2",
+                "--repo", str(clone), "--commit"]
+        probe = MagicMock(returncode=0, stdout="front_end=on\n", stderr="")
+        real_read = fp.read_snapshot
+
+        def spy_pull(repo):
+            order.append("pull")
+            return True, "already up to date"
+
+        def spy_read(path):
+            order.append("read")
+            return real_read(path)
+
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp, "pull_snapshot", spy_pull), \
+                patch.object(fp, "read_snapshot", spy_read), \
+                patch.object(fp, "commit_snapshot",
+                             return_value=(True, "committed and pushed")), \
+                patch.object(fp.sys, "argv", argv), \
+                patch.object(fp.subprocess, "run", return_value=probe):
+            fp.main()
+        assert "pull" in order and "read" in order, order
+        assert order.index("pull") < order.index("read"), \
+            "baseline was read before the clone was refreshed: {}".format(order)
+
+    def test_a_failed_push_also_reaches_the_digest(self, fp, clone_pair):
+        """A rejected push is the original failure. It must not stay in the log
+        either -- status=1 only ever became a cron exit code nobody reads."""
+        clone, _, _ = clone_pair
+        argv = ["fleet_probe", "--allow-missing-ags", "-p", "2",
+                "--repo", str(clone), "--commit", "--notify"]
+        probe = MagicMock(returncode=0, stdout="front_end=on\n", stderr="")
+        sent = {}
+
+        with patch.object(fp, "parse_startup_state", None), \
+                patch.object(fp, "load_ags_parser", return_value=(None, None)), \
+                patch.object(fp, "pull_snapshot",
+                             return_value=(True, "already up to date")), \
+                patch.object(fp, "commit_snapshot",
+                             return_value=(False, "! [rejected] HEAD -> main "
+                                                  "(fetch first)")), \
+                patch.object(fp, "send_digest",
+                             lambda text, key_file, channel:
+                                 sent.__setitem__("text", text)), \
+                patch.object(fp.sys, "argv", argv), \
+                patch.object(fp.subprocess, "run", return_value=probe):
+            rc = fp.main()
+        assert rc != 0
+        assert "rejected" in sent.get("text", ""), \
+            "the push failure never reached the channel: {!r}".format(
+                sent.get("text"))
