@@ -561,7 +561,9 @@ class TestDryRun:
         config_file = tmp_path / "unit.toml"
         config_file.write_text("[relay]\npin = 17\nactive_high = false\n")
         dropin = tmp_path / "mode.conf"
-        dropin.write_text("[Service]\nRestart=always\n")   # parses as UNKNOWN
+        # A mode named in a shape parse_mode cannot read -> UNKNOWN -> refuse.
+        dropin.write_text(
+            "[Service]\nExecStart=/x -m brokkr --mode=nosensor start\n")
 
         with patch.object(sensors, "DROPIN_PATH", str(dropin)):
             rc = sensors.run(["--off", "--dry-run"],
@@ -931,15 +933,44 @@ class TestParseMode:
         assert mode == "nosensor_nochargecontroller"
         assert form == "execstart"
 
-    def test_unparseable_returns_unknown(self, sensors):
-        """Content we don't recognise must report unknown, never a guess."""
-        mode, form = sensors.parse_mode("[Service]\nRestart=always\n")
+    @pytest.mark.parametrize("content", [
+        "[Service]\nExecStart=/x -m brokkr --mode=nosensor start\n",
+        "[Service]\nEnvironment=BROKKR_MODE=\n",
+        '[Service]\nEnvironment="BROKKR_MODE=nosensor extra"\n',
+        "[Service]\nExecStart=/x -m brokkr \\\n  --mode nosensor start\n",
+        "[Service]\nExecStartPre=/x --mode nosensor\n",
+    ])
+    def test_a_mode_named_in_a_shape_we_cannot_read_is_unknown(
+            self, sensors, content):
+        """A mode we cannot parse must report unknown, never a guess.
+
+        This is the half of the old test_unparseable_returns_unknown that
+        still holds: content that NAMES a mode in a shape this script cannot
+        read must refuse. The other half -- that a file naming no mode at all
+        is also "unknown" -- was wrong, and is now pinned the other way by
+        test_a_mode_free_file_is_default_not_unknown below.
+        """
+        mode, _ = sensors.parse_mode(content)
         assert mode == sensors.MODE_UNKNOWN
 
-    def test_empty_execstart_reset_line_ignored(self, sensors):
-        """The bare 'ExecStart=' reset line must not parse as a mode."""
-        mode, _ = sensors.parse_mode("[Service]\nExecStart=\n")
-        assert mode == sensors.MODE_UNKNOWN
+    @pytest.mark.parametrize("content", [
+        "[Service]\nRestart=always\n",
+        "[Service]\nExecStart=\n",
+        "[Service]\n# was: ExecStart=/x --mode nosensor start\n",
+        "[Service]\n; was: ExecStart=/x --mode nosensor start\n",
+    ])
+    def test_a_mode_free_file_is_default_not_unknown(self, sensors, content):
+        """A file that names no mode means brokkr runs in default mode.
+
+        The bare `ExecStart=` reset line carries no mode -- the property the
+        old test_empty_execstart_reset_line_ignored protected, now stated as
+        "not a mode" rather than "unknown". A commented-out old command line
+        is the operator's own record, and systemd comments start with EITHER
+        '#' or ';' (systemd.syntax(7)).
+        """
+        mode, form = sensors.parse_mode(content)
+        assert mode == sensors.MODE_DEFAULT
+        assert form is None
 
 
 class TestModeComposition:
@@ -1145,9 +1176,26 @@ class TestStickyRegression:
     def test_unknown_mode_refuses(self, sensors, tmp_path):
         """An unrecognised drop-in must be refused, not overwritten."""
         rc, w = self._run(
-            sensors, tmp_path, "[Service]\nRestart=always\n", sensor_on=False)
+            sensors, tmp_path,
+            "[Service]\nExecStart=/x -m brokkr --mode=nosensor start\n",
+            sensor_on=False)
         assert rc != 0
         assert "content" not in w and "removed" not in w
+
+    def test_mode_free_file_gets_a_mode_added_not_substituted(
+            self, sensors, tmp_path):
+        """A file that names no mode transitions; its directives survive.
+
+        `[Service]\\nRestart=always\\n` used to be the fixture for "refuse",
+        which conflated "sets no mode" with "sets one we cannot read". It now
+        transitions -- so the rewrite has to carry the operator's directives
+        across rather than emitting the bare template over the top of them.
+        """
+        rc, w = self._run(
+            sensors, tmp_path, "[Service]\nRestart=always\n", sensor_on=False)
+        assert rc == 0
+        assert "Environment=BROKKR_MODE=nosensor" in w["content"]
+        assert "Restart=always" in w["content"]
 
     def test_mode_outside_the_two_axis_model_refuses(self, sensors, tmp_path):
         """A parseable mode the two-axis model doesn't know must not be rewritten.
@@ -1247,3 +1295,696 @@ class TestRemoveDropinPreservesOtherDirectives:
             sensors, tmp_path, ENVIRONMENT_DROPIN.format("nosensor"))
         assert rc == 0
         assert w.get("removed") is True
+
+
+# --- HAM-184: brokkr's own mode precedence, and refusing ambiguity ---
+
+MIXED_DROPIN = (
+    "[Service]\n"
+    "Environment=BROKKR_MODE=nosensor\n"
+    "ExecStart=\n"
+    "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
+    "--system hamma --mode nosensor_nochargecontroller start\n"
+)
+
+
+def _orphan_reset(text):
+    """True if `text` has a bare `ExecStart=` and no real one to reset."""
+    lines = [line.strip() for line in (text or "").splitlines()]
+    return ("ExecStart=" in lines
+            and not any(line.startswith("ExecStart=") and line != "ExecStart="
+                        for line in lines))
+
+
+def _apply(sensors, tmp_path, existing, sensor_on):
+    """Run apply_mode against `existing`, capturing what it tried to do."""
+    p = tmp_path / "mode.conf"
+    if existing is not None:
+        p.write_text(existing)
+    written = {}
+
+    def fake_run_command(cmd, description, stdin_data=None):
+        if cmd[:2] == ["sudo", "tee"]:
+            written["content"] = stdin_data
+        elif cmd[:3] == ["sudo", "rm", "-f"]:
+            written["removed"] = True
+        return 0
+
+    with patch.object(sensors, "DROPIN_PATH", str(p)), \
+         patch.object(sensors, "run_command", fake_run_command):
+        rc = sensors.apply_mode(sensor_on=sensor_on)
+    after = p.read_text() if p.exists() else None
+    return rc, written, after
+
+
+class TestModePrecedence:
+    """brokkr resolves CLI --mode > BROKKR_MODE env > mode.toml.
+
+    Authoritative: server/fleet_probe.py's mode probe, and
+    docs/sensors-usage.md's "four placements" note. The parser checked the
+    Environment= form FIRST, so on a drop-in holding both forms it reported
+    the LOSER -- and every decision downstream was made about a mode that
+    was not in force.
+    """
+
+    def test_execstart_beats_environment(self, sensors):
+        mode, form = sensors.parse_mode(MIXED_DROPIN)
+        assert mode == "nosensor_nochargecontroller", (
+            "reported the Environment= form, which brokkr ignores when a "
+            "--mode is on the command line")
+        assert form == "execstart"
+
+    def test_last_environment_line_wins(self, sensors):
+        """systemd applies the LAST assignment of a repeated variable."""
+        content = ("[Service]\n"
+                   "Environment=BROKKR_MODE=nosensor\n"
+                   "Environment=BROKKR_MODE=nochargecontroller\n")
+        mode, form = sensors.parse_mode(content)
+        assert mode == "nochargecontroller"
+        assert form == "environment"
+
+    def test_status_reports_the_mode_in_force(self, sensors, tmp_path):
+        p = tmp_path / "mode.conf"
+        p.write_text(MIXED_DROPIN)
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "subprocess") as mock_sub, \
+             patch.object(sensors, "TELEMETRY_DIR", "/nonexistent"):
+            mock_sub.run.return_value = MagicMock(stdout="active",
+                                                  returncode=1)
+            out = sensors.sensor_status({"pin": 17, "active_high": False})
+        assert "Brokkr mode: nosensor_nochargecontroller" in out
+
+
+class TestRefusesAmbiguousDropins:
+    """A mode named in more than one place is refused, never reconciled.
+
+    Rewriting one site and leaving another is how the sticky axis gets
+    destroyed while the tool prints `(preserving nochargecontroller)` and
+    `[OK]`: with `nosensor` in Environment= and
+    `nosensor_nochargecontroller` on the ExecStart override, an --off that
+    edits only the Environment= line reports a transition to
+    `nosensor_nochargecontroller` and leaves the unit on whatever the
+    ExecStart line says.
+    """
+
+    AMBIGUOUS = {
+        "two forms": MIXED_DROPIN,
+        "two forms, same mode": (
+            "[Service]\n"
+            "Environment=BROKKR_MODE=nosensor\n"
+            "ExecStart=\n"
+            "ExecStart=/x -m brokkr --mode nosensor start\n"),
+        "two environment lines": (
+            "[Service]\n"
+            "Environment=BROKKR_MODE=nosensor\n"
+            "Environment=BROKKR_MODE=nochargecontroller\n"),
+        "two mode flags on one line": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/x -m brokkr --mode nosensor --mode default start\n"),
+        "two execstart overrides": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/x -m brokkr --mode nosensor start\n"
+            "ExecStart=/y -m brokkr --mode nochargecontroller start\n"),
+    }
+
+    @pytest.mark.parametrize("name", sorted(AMBIGUOUS))
+    @pytest.mark.parametrize("sensor_on", [True, False])
+    def test_refuses_and_leaves_the_file_alone(self, sensors, tmp_path,
+                                               name, sensor_on):
+        existing = self.AMBIGUOUS[name]
+        rc, w, after = _apply(sensors, tmp_path, existing,
+                              sensor_on=sensor_on)
+        assert rc != 0, "{}: was rewritten".format(name)
+        assert "content" not in w, "{}: wrote a new file".format(name)
+        assert "removed" not in w, "{}: deleted the file".format(name)
+        assert after == existing, "{}: file changed on disk".format(name)
+
+    # Two `--mode` flags on ONE line is excluded: that is argparse's
+    # precedence, not systemd's, and brokkr is not in this repo (the local
+    # clone is five years stale and must not be used to conclude production
+    # behaviour). With no authority for which flag wins, "unknown" IS the
+    # truthful answer -- it is a shape this script cannot read, not an
+    # ambiguity across two places whose winner systemd's rules decide.
+    RESOLVABLE = [name for name in sorted(AMBIGUOUS)
+                  if name != "two mode flags on one line"]
+
+    @pytest.mark.parametrize("name", RESOLVABLE)
+    def test_resolution_stays_truthful_while_writing_refuses(
+            self, sensors, tmp_path, name):
+        """Ambiguity across places is a WRITE problem, never a mode value.
+
+        Encoding it as a sentinel would have --status -- a read-only command
+        -- tell an operator it cannot say what a live unit is running, when
+        systemd's own rules say exactly what it is running. Resolution
+        answers; only the rewrite refuses, because which directive to edit
+        is the part that is genuinely unknowable.
+        """
+        existing = self.AMBIGUOUS[name]
+        mode, _ = sensors.parse_mode(existing)
+        assert mode != sensors.MODE_UNKNOWN, (
+            "{}: resolution returned a refusal sentinel".format(name))
+        assert mode in sensors.KNOWN_MODES or mode == "default", name
+        # ... and it is the one systemd/brokkr will obey.
+        sites, problems = sensors.scan_modes(existing)
+        assert not problems and len(sites) > 1, name
+        assert mode == sensors.winning_site(sites)["mode"], name
+        # The write still refuses.
+        rc, w, after = _apply(sensors, tmp_path, existing, sensor_on=False)
+        assert rc != 0 and after == existing, name
+
+    def test_refusal_names_what_to_inspect(self, sensors, tmp_path, capsys):
+        _apply(sensors, tmp_path, MIXED_DROPIN, sensor_on=False)
+        out = capsys.readouterr().out
+        assert "mode.conf" in out
+        assert "more than one" in out.lower()
+        # Both offending lines, so the operator knows which to delete.
+        assert "Environment=BROKKR_MODE=nosensor" in out
+        assert "--mode nosensor_nochargecontroller" in out
+
+
+class TestRefusesUnreadableModeShapes:
+    """A mode token in a shape we cannot parse refuses -- and never deletes.
+
+    `strip_mode_directive` returning None meant "nothing left to keep", and
+    the collapse path answered that with `rm -f`. Reaching it with a mode
+    token still in the file turned a parse failure into data loss. Refusal
+    is the only safe answer; the file must be left exactly as it was.
+    """
+
+    UNREADABLE = {
+        "mode with an equals sign": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/x -m brokkr --mode=nosensor start\n"),
+        "mode on a continued line": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/x -m brokkr \\\n  --mode nosensor start\n"),
+        "mode on ExecStartPre": (
+            "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"
+            "ExecStartPre=/x/precheck --mode nosensor\n"),
+        "mode on ExecReload": (
+            "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"
+            "ExecReload=/x/reload --mode nosensor\n"),
+        "empty environment value": "[Service]\nEnvironment=BROKKR_MODE=\n",
+        "quoted multi-word environment": (
+            '[Service]\nEnvironment="BROKKR_MODE=nosensor extra"\n'),
+    }
+
+    @pytest.mark.parametrize("name", sorted(UNREADABLE))
+    @pytest.mark.parametrize("sensor_on", [True, False])
+    def test_refuses_without_touching_the_file(self, sensors, tmp_path,
+                                               name, sensor_on):
+        existing = self.UNREADABLE[name]
+        rc, w, after = _apply(sensors, tmp_path, existing,
+                              sensor_on=sensor_on)
+        assert rc != 0, "{}: was rewritten".format(name)
+        assert "removed" not in w, (
+            "{}: DELETED the drop-in instead of refusing".format(name))
+        assert "content" not in w, "{}: wrote a new file".format(name)
+        assert after == existing, "{}: file changed on disk".format(name)
+
+    def test_a_semicolon_comment_is_a_comment_not_an_unreadable_mode(
+            self, sensors, tmp_path):
+        """A ';'-commented old command line must not block the toggle."""
+        existing = ("[Service]\n"
+                    "; was: ExecStart=/x -m brokkr --mode nosensor start\n"
+                    "Environment=BROKKR_MODE=nosensor_nochargecontroller\n")
+        rc, w, _ = _apply(sensors, tmp_path, existing, sensor_on=True)
+        assert rc == 0
+        assert "BROKKR_MODE=nochargecontroller" in w["content"]
+
+
+class TestCollapseNeverBricksTheUnit:
+    """A collapse leaves a file that works, or no file -- never a half one.
+
+    A bare `ExecStart=` reset line with no replacement clears brokkr's
+    command line, and the unit then will not start at all (the empty line
+    exists precisely to clear the original -- hamma-expert
+    services-and-pipelines.md). Keeping the file because some other line
+    survived, while the real ExecStart went with the mode, is worse than
+    deleting it.
+    """
+
+    def test_orphaned_reset_line_is_never_left_behind(self, sensors,
+                                                      tmp_path):
+        existing = ("[Service]\n"
+                    "ExecStart=\n"
+                    "Environment=BROKKR_MODE=nosensor\n"
+                    "; operator note: front end removed 2026-09-01\n")
+        rc, w, _ = _apply(sensors, tmp_path, existing, sensor_on=True)
+        assert rc == 0
+        content = w.get("content")
+        if content is None:
+            assert w.get("removed") is True
+            return
+        lines = [ln.strip() for ln in content.splitlines()]
+        assert "ExecStart=" not in lines, (
+            "left a bare ExecStart= reset with nothing to replace it; "
+            "brokkr will not start: {!r}".format(content))
+
+    def test_reset_line_survives_when_the_real_execstart_does(
+            self, sensors, tmp_path):
+        """The reset is required while a real ExecStart override remains."""
+        existing = EXECSTART_DROPIN.format("nosensor") + "Restart=always\n"
+        rc, w, _ = _apply(sensors, tmp_path, existing, sensor_on=True)
+        assert rc == 0
+        lines = [ln.strip() for ln in w["content"].splitlines()]
+        assert "ExecStart=" in lines, "dropped the required reset line"
+        assert any(ln.startswith("ExecStart=/") for ln in lines)
+        assert "--mode" not in w["content"]
+
+    def test_collapse_leaves_a_file_the_next_toggle_can_read(self, sensors,
+                                                             tmp_path):
+        """Stripping --mode must leave a mode-free file, not an unknown one."""
+        p = tmp_path / "mode.conf"
+        p.write_text(EXECSTART_DROPIN.format("nosensor"))
+
+        def fake_run_command(cmd, description, stdin_data=None):
+            if cmd[:2] == ["sudo", "tee"]:
+                p.write_text(stdin_data)
+            elif cmd[:3] == ["sudo", "rm", "-f"] and p.exists():
+                p.unlink()
+            return 0
+
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "run_command", fake_run_command):
+            assert sensors.apply_mode(sensor_on=True) == 0
+            mode_after = sensors.read_mode()[0]
+        assert mode_after == "default", (
+            "the next --on/--off would refuse forever; file is {!r}".format(
+                p.read_text() if p.exists() else None))
+
+
+class TestCollapseStripsEveryForm:
+    """The second layer, below the refusal: strip ALL of them, not the winner.
+
+    apply_mode never reaches this with two sites -- refuse_reason stops an
+    ambiguous file first -- so this is defence in depth, pinned directly.
+    Stripping only the form that parsed is what left `--mode nosensor` on an
+    ExecStart override after the Environment= line went: relay energized,
+    brokkr ingesting nothing, reported as default.
+    """
+
+    def test_collapse_removes_both_forms(self, sensors):
+        sites, problems = sensors.scan_modes(MIXED_DROPIN)
+        assert len(sites) == 2 and not problems
+        remainder = sensors.collapse_content(MIXED_DROPIN, sites)
+        assert remainder is not None
+        assert "BROKKR_MODE" not in remainder
+        assert "--mode" not in remainder
+        assert sensors.parse_mode(remainder)[0] == sensors.MODE_DEFAULT
+
+    def test_strip_mode_directive_never_licenses_a_delete(self, sensors):
+        """Its None means "nothing left to keep" -- and nothing acts on it.
+
+        plan_mode decides the delete itself, from content it has proved
+        mode-free. A None here used to double as "a mode token survived that
+        I could not strip", and remove_dropin answered that with `rm -f`.
+        """
+        unreadable = "[Service]\nExecStart=/x --mode=nosensor start\n"
+        assert sensors.strip_mode_directive(unreadable) is None
+        with patch.object(sensors, "run_command") as run:
+            plan = sensors.plan_mode(sensor_on=True, path="/nonexistent/x")
+            assert plan["kind"] == "noop"
+        run.assert_not_called()
+
+
+class TestWritePostConditionsAreChecked:
+    """The bytes about to be written are verified, and a bad render refuses.
+
+    The previous attempt's verifier never fired on any reachable input: it
+    re-parsed with a first-match parser and compared with plain list
+    membership, so a reordering, a lost duplicate and a silent no-op all
+    passed. Driving a deliberately wrong render through it is the only way
+    to show the check is load-bearing.
+    """
+
+    def _apply_with_render(self, sensors, tmp_path, existing, render):
+        p = tmp_path / "mode.conf"
+        p.write_text(existing)
+        written = {}
+
+        def fake_run_command(cmd, description, stdin_data=None):
+            if cmd[:2] == ["sudo", "tee"]:
+                written["content"] = stdin_data
+            elif cmd[:3] == ["sudo", "rm", "-f"]:
+                written["removed"] = True
+            return 0
+
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "run_command", fake_run_command), \
+             patch.object(sensors, "set_mode_at", render):
+            rc = sensors.apply_mode(sensor_on=False)
+        return rc, written
+
+    def test_a_silent_no_op_rewrite_refuses(self, sensors, tmp_path):
+        """A render that does not change the mode must not report success."""
+        rc, w = self._apply_with_render(
+            sensors, tmp_path, EXECSTART_DROPIN.format("nochargecontroller"),
+            lambda content, site, mode: content)
+        assert rc != 0, "reported a transition that did not happen"
+        assert "content" not in w
+
+    def test_a_rewrite_that_drops_a_directive_refuses(self, sensors,
+                                                      tmp_path):
+        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
+                    + "Restart=always\nTimeoutStopSec=90\n")
+        rc, w = self._apply_with_render(
+            sensors, tmp_path, existing,
+            lambda content, site, mode: ENVIRONMENT_DROPIN.format(mode))
+        assert rc != 0, "threw away the operator's other directives"
+        assert "content" not in w
+
+    def test_a_rewrite_that_reorders_directives_refuses(self, sensors,
+                                                        tmp_path):
+        """Order is semantic in systemd: the LAST assignment wins."""
+        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
+                    + "Environment=FOO=1\nEnvironment=FOO=2\n")
+
+        def reordering(content, site, mode):
+            return ("[Service]\n"
+                    "Environment=BROKKR_MODE={}\n"
+                    "Environment=FOO=2\n"
+                    "Environment=FOO=1\n".format(mode))
+
+        rc, w = self._apply_with_render(sensors, tmp_path, existing,
+                                        reordering)
+        assert rc != 0, "reordered Environment= lines, changing which wins"
+        assert "content" not in w
+
+    def test_a_rewrite_that_loses_a_duplicate_refuses(self, sensors,
+                                                      tmp_path):
+        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
+                    + "Environment=FOO=1\nEnvironment=FOO=1\n")
+
+        def dedup(content, site, mode):
+            return ("[Service]\nEnvironment=BROKKR_MODE={}\n"
+                    "Environment=FOO=1\n".format(mode))
+
+        rc, w = self._apply_with_render(sensors, tmp_path, existing, dedup)
+        assert rc != 0, "dropped a duplicate, changing which assignment wins"
+        assert "content" not in w
+
+
+class TestCollapsePostConditionsAreChecked:
+    """The collapse side of the same check, driven with a wrong collapse.
+
+    collapse_content cannot produce any of these today, so the only way to
+    show the check would catch them -- rather than shipping a second
+    never-fires verifier -- is to hand it a bad collapse on purpose.
+    """
+
+    def _collapse_with(self, sensors, tmp_path, existing, collapse):
+        p = tmp_path / "mode.conf"
+        p.write_text(existing)
+        written = {}
+
+        def fake_run_command(cmd, description, stdin_data=None):
+            if cmd[:2] == ["sudo", "tee"]:
+                written["content"] = stdin_data
+            elif cmd[:3] == ["sudo", "rm", "-f"]:
+                written["removed"] = True
+            return 0
+
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "run_command", fake_run_command), \
+             patch.object(sensors, "collapse_content", collapse):
+            rc = sensors.apply_mode(sensor_on=True)
+        return rc, written, p.read_text()
+
+    EXISTING = EXECSTART_DROPIN.format("nosensor") + "TimeoutStopSec=90\n"
+
+    BAD = {
+        "a mode survived the collapse": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
+            "--system hamma --mode nosensor start\nTimeoutStopSec=90\n"),
+        "left an orphaned reset line": "[Service]\nExecStart=\n"
+                                       "TimeoutStopSec=90\n",
+        "dropped a co-resident directive": (
+            "[Service]\nExecStart=\n"
+            "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
+            "--system hamma start\n"),
+    }
+
+    @pytest.mark.parametrize("name", sorted(BAD))
+    def test_refuses_a_bad_collapse(self, sensors, tmp_path, name):
+        rc, w, after = self._collapse_with(
+            sensors, tmp_path, self.EXISTING,
+            lambda content, sites, _b=self.BAD[name]: _b)
+        assert rc != 0, "{}: written anyway".format(name)
+        assert "content" not in w, "{}: wrote the bad bytes".format(name)
+        assert "removed" not in w, (
+            "{}: DELETED the drop-in to satisfy the check".format(name))
+        assert after == self.EXISTING, "{}: file changed".format(name)
+
+
+class TestEveryRefusalHappensBeforeAnythingMoves:
+    """Refuse empty-handed: no service stopped, no relay moved.
+
+    apply_mode ran at step 4 of the off sequence, after brokkr and sindri
+    were stopped and the relay de-energized. A refusal there leaves the unit
+    dark with nothing restarted. This is the emergency power tool, used at
+    low battery -- it has to fail before it touches anything, or not at all.
+    """
+
+    UNREWRITABLE = "[Service]\nExecStart=/x -m brokkr --mode=nosensor start\n"
+
+    # EVERY reason refuse_reason can give, not just the unparseable one. The
+    # `test`/`realtime`/`sindri02x` refusals already worked at the baseline
+    # -- and already left the unit with brokkr stopped, sindri stopped and
+    # the front end POWERED DOWN, because apply_mode was the fifth step of
+    # the off sequence. That is a live half-completion on exactly the units
+    # the refusal exists to protect.
+    REASONS = {
+        "unreadable shape": UNREWRITABLE,
+        "ambiguous: two forms": MIXED_DROPIN,
+        "ambiguous: two env lines": (
+            "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"
+            "Environment=BROKKR_MODE=nochargecontroller\n"),
+        "outside the two-axis model": "[Service]\n"
+                                      "Environment=BROKKR_MODE=test\n",
+        "outside the model (realtime)": "[Service]\n"
+                                        "Environment=BROKKR_MODE=realtime\n",
+        "outside the model (sindri02x)": (
+            "[Service]\nEnvironment=BROKKR_MODE=sindri02x\n"),
+    }
+
+    @pytest.mark.parametrize("reason", sorted(REASONS))
+    @pytest.mark.parametrize("flag", ["--on", "--off"])
+    def test_run_refuses_before_any_side_effect(
+            self, sensors, tmp_path, flag, reason):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = false\n")
+        dropin = tmp_path / "mode.conf"
+        existing = self.REASONS[reason]
+        dropin.write_text(existing)
+
+        with patch.object(sensors, "DROPIN_PATH", str(dropin)), \
+             patch.object(sensors, "stop_brokkr") as stop_b, \
+             patch.object(sensors, "stop_sindri") as stop_s, \
+             patch.object(sensors, "toggle_relay") as relay, \
+             patch.object(sensors, "archive_telemetry_csv") as archive, \
+             patch.object(sensors, "daemon_reload") as reload_, \
+             patch.object(sensors, "start_brokkr") as start_b, \
+             patch.object(sensors, "build_sender", return_value=None):
+            rc = sensors.run([flag], config_path=str(unit))
+
+        assert rc != 0
+        for name, mock in [("stop_brokkr", stop_b), ("stop_sindri", stop_s),
+                           ("toggle_relay", relay),
+                           ("archive_telemetry_csv", archive),
+                           ("daemon_reload", reload_),
+                           ("start_brokkr", start_b)]:
+            assert not mock.called, "{} ran before the refusal".format(name)
+        assert dropin.read_text() == existing
+
+    @pytest.mark.parametrize("entry", ["sensor_on", "sensor_off"])
+    def test_the_sequence_functions_refuse_before_stopping_brokkr(
+            self, sensors, tmp_path, entry):
+        """The guarantee must not depend on run() having pre-flighted."""
+        dropin = tmp_path / "mode.conf"
+        dropin.write_text(self.UNREWRITABLE)
+        with patch.object(sensors, "DROPIN_PATH", str(dropin)), \
+             patch.object(sensors, "stop_brokkr") as stop_b, \
+             patch.object(sensors, "toggle_relay") as relay:
+            rc = getattr(sensors, entry)(pin=17, active_high=False)
+        assert rc != 0
+        stop_b.assert_not_called()
+        relay.assert_not_called()
+
+    def test_a_refusal_still_reaches_the_notification_path(self, sensors,
+                                                           tmp_path):
+        """Hoisting the pre-flight must not hoist it past build_sender.
+
+        A refusal that prints to a tunnelled stdout nobody is watching and
+        sends no chat notice is a silent no-op from the operator's side.
+        """
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = false\n")
+        dropin = tmp_path / "mode.conf"
+        dropin.write_text(self.UNREWRITABLE)
+        fake_sender = MagicMock()
+
+        with patch.object(sensors, "DROPIN_PATH", str(dropin)), \
+             patch.object(sensors, "build_sender",
+                          return_value=fake_sender) as build, \
+             patch.object(sensors, "stop_brokkr"), \
+             patch.object(sensors, "toggle_relay"):
+            rc = sensors.run(["--off"], config_path=str(unit))
+
+        assert rc != 0
+        build.assert_called_once()
+        fake_sender.send.assert_called_once()
+        msg = fake_sender.send.call_args[0][0]
+        assert "OFF" in msg
+        assert "REFUS" in msg.upper() or "FAIL" in msg.upper()
+
+
+class TestInvariantsOverEveryDropinShape:
+    """Sweep the shapes a hand-edited mode.conf can take, and assert the
+    four things that must hold for all of them.
+
+    Case-by-case tests show the cases someone thought of. The defects here
+    were all reached by a shape nobody thought of -- a ';' comment, an
+    ExecStartPre=, a duplicate Environment= line -- so the properties are
+    asserted over the product instead.
+    """
+
+    PIECES = [
+        ("", "[Service]\n"),
+        ("env", "Environment=BROKKR_MODE=nosensor\n"),
+        ("env2", "Environment=BROKKR_MODE=nochargecontroller\n"),
+        ("reset", "ExecStart=\n"),
+        ("exec", "ExecStart=/opt/v/bin/python3 -m brokkr --system hamma "
+                 "--mode nochargecontroller start\n"),
+        ("execbad", "ExecStart=/opt/v/bin/python3 -m brokkr --mode=nosensor "
+                    "start\n"),
+        ("pre", "ExecStartPre=/x/check --mode nosensor\n"),
+        ("hash", "# was: ExecStart=/x --mode nosensor start\n"),
+        ("semi", "; was: ExecStart=/x --mode nosensor start\n"),
+        ("other", "TimeoutStopSec=90\n"),
+        ("other2", "Restart=always\n"),
+    ]
+
+    def _shapes(self):
+        import itertools
+        seen = set()
+        for size in (1, 2, 3):
+            for combo in itertools.permutations(self.PIECES, size):
+                text = "".join(piece for _, piece in combo)
+                if text not in seen:
+                    seen.add(text)
+                    yield text
+
+    def test_every_shape_upholds_the_four_invariants(self, sensors, tmp_path):
+        p = tmp_path / "mode.conf"
+        checked = 0
+        for existing in self._shapes():
+            for sensor_on in (True, False):
+                p.write_text(existing)
+                with patch.object(sensors, "DROPIN_PATH", str(p)):
+                    plan = sensors.plan_mode(sensor_on=sensor_on)
+                where = "{!r} --{}".format(
+                    existing, "on" if sensor_on else "off")
+                checked += 1
+
+                # 1. plan_mode decides without touching the file.
+                assert p.read_text() == existing, where
+
+                if plan["kind"] in ("refuse", "noop"):
+                    continue
+
+                if plan["kind"] == "delete":
+                    # 2. Delete only when the mode was all the file set.
+                    for line in existing.splitlines():
+                        stripped = line.strip()
+                        if not stripped or stripped[0] in ("#", ";"):
+                            continue
+                        if stripped.startswith("[") and \
+                                stripped.endswith("]"):
+                            continue
+                        if stripped == "ExecStart=":
+                            continue
+                        assert ("BROKKR_MODE" in stripped
+                                or "--mode" in stripped), (
+                            "deleted a file still holding {!r}: {}".format(
+                                stripped, where))
+                    continue
+
+                content = plan["content"]
+                # 3. What gets written parses back as the target mode.
+                assert sensors.parse_mode(content)[0] == plan["mode"], where
+
+                # 4. A write never INTRODUCES an orphaned `ExecStart=`
+                #    reset, which clears brokkr's command line with nothing
+                #    to replace it. An orphan already in the file survives
+                #    on purpose: a file like that has brokkr down already,
+                #    and refusing would block an emergency power-down for a
+                #    breakage this tool did not cause and cannot judge.
+                if _orphan_reset(content):
+                    assert _orphan_reset(existing), (
+                        "introduced a bare ExecStart= reset: " + where)
+        assert checked > 1500, "swept only {} shapes".format(checked)
+
+
+class TestWritesPreserveEverythingButTheMode:
+    """A write changes the mode and nothing else, verified by re-reading."""
+
+    def _roundtrip(self, sensors, tmp_path, existing, sensor_on):
+        p = tmp_path / "mode.conf"
+        if existing is not None:
+            p.write_text(existing)
+
+        def fake_run_command(cmd, description, stdin_data=None):
+            if cmd[:2] == ["sudo", "tee"]:
+                p.write_text(stdin_data)
+            elif cmd[:3] == ["sudo", "rm", "-f"] and p.exists():
+                p.unlink()
+            return 0
+
+        with patch.object(sensors, "DROPIN_PATH", str(p)), \
+             patch.object(sensors, "run_command", fake_run_command):
+            rc = sensors.apply_mode(sensor_on=sensor_on)
+            mode_after = sensors.read_mode()[0]
+        return rc, mode_after, (p.read_text() if p.exists() else None)
+
+    def test_keeps_the_units_own_interpreter_path(self, sensors, tmp_path):
+        existing = EXECSTART_DROPIN.format("nochargecontroller").replace(
+            "/home/pi/dev/ltgenv/bin/python3", "/opt/custom/venv/bin/python3")
+        rc, mode_after, text = self._roundtrip(
+            sensors, tmp_path, existing, sensor_on=False)
+        assert rc == 0
+        assert mode_after == "nosensor_nochargecontroller"
+        assert "/opt/custom/venv/bin/python3" in text
+        assert "/home/pi/dev/ltgenv" not in text
+
+    def test_tolerates_whitespace_around_the_mode_flag(self, sensors,
+                                                       tmp_path):
+        """The parser accepts --mode<WS>value, so the rewriter must too."""
+        spaced = EXECSTART_DROPIN.format("nochargecontroller").replace(
+            "--mode nochargecontroller", "--mode\tnochargecontroller")
+        rc, mode_after, text = self._roundtrip(
+            sensors, tmp_path, spaced, sensor_on=False)
+        assert rc == 0
+        assert mode_after == "nosensor_nochargecontroller", (
+            "silent no-op: file is {!r}".format(text))
+
+    def test_environment_rewrite_keeps_other_directives(self, sensors,
+                                                        tmp_path):
+        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
+                    + "Restart=always\nTimeoutStopSec=90\n")
+        rc, mode_after, text = self._roundtrip(
+            sensors, tmp_path, existing, sensor_on=False)
+        assert rc == 0
+        assert mode_after == "nosensor_nochargecontroller"
+        assert "Restart=always" in text
+        assert "TimeoutStopSec=90" in text
+
+    def test_quoted_environment_form_keeps_its_quoting(self, sensors,
+                                                       tmp_path):
+        existing = '[Service]\nEnvironment="BROKKR_MODE=nochargecontroller"\n'
+        rc, mode_after, text = self._roundtrip(
+            sensors, tmp_path, existing, sensor_on=False)
+        assert rc == 0
+        assert mode_after == "nosensor_nochargecontroller"
+        assert '"BROKKR_MODE=nosensor_nochargecontroller"' in text

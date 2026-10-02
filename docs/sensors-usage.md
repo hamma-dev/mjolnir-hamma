@@ -87,15 +87,52 @@ across `--on` and `--off`:
 | `nosensor_nochargecontroller` | *(unchanged)* | `nochargecontroller` |
 
 `mode.conf` is the **shared filename for every mode override** and appears in two
-equally valid forms in the field — `Environment=BROKKR_MODE=<mode>` and an
-`ExecStart=` override carrying `--mode <mode>`. Both are read, and the existing form
-is preserved when writing back (the unit's own interpreter path is kept). A drop-in
-that cannot be parsed is **refused, not overwritten**.
+forms in the field — `Environment=BROKKR_MODE=<mode>` and an `ExecStart=` override
+carrying `--mode <mode>`. Both are read, and the existing form is preserved when
+writing back (the unit's own interpreter path, quoting and co-resident directives
+are kept).
+
+**The two forms are not equal in force.** brokkr resolves its mode as
+
+```
+CLI --mode  >  BROKKR_MODE in the environment  >  mode.toml
+```
+
+so on a drop-in holding both, the `ExecStart=` override wins and the
+`Environment=` line is dead text. `--status` reports the mode brokkr will
+**actually run**, by that order, and for a repeated `Environment=` assignment the
+last one (systemd's own rule).
+
+**Reading is always answered; writing can refuse.** `--on`/`--off` refuse, and
+leave the file exactly as it was, when:
+
+| Case | Why |
+|---|---|
+| A mode is named in **more than one place** (two forms, two `Environment=` lines, two `--mode` flags on a line) | The resolved mode is knowable, but *which directive to edit* is not — editing one and leaving the other silently changes the mode in force |
+| A mode is named in a shape it cannot parse (`--mode=x`, a line continuation, an unhandled quoting, `--mode` on `ExecStartPre=`/`ExecReload=`) | Guessing could destroy the sticky axis |
+| The mode is outside the two-axis model (`test`, `realtime`, `sindri02x`, anything new) | `--on` would compute `default` and discard whatever the operator set |
+
+A file that provably names **no** mode reports `default` — including a bare
+`ExecStart=` reset line and a commented-out old command line (`#` *and* `;`, per
+`systemd.syntax(7)`).
+
+**Every refusal happens before any service is stopped and before the relay moves**,
+including a failure of the post-condition check on the bytes about to be written.
+`sensors.py` is the emergency power tool, used at low battery; it fails
+empty-handed or not at all. The refusal also goes to the same chat channel as the
+on/off notifications, because a message printed to a tunnelled stdout is a silent
+no-op from the operator's side.
 
 > Before HAM-184 this file was treated as a boolean — present meant `nosensor`,
 > absent meant `default`. On mj06, mj50 and mj54 that made `--status` report
 > `nosensor` regardless of the real mode, and `--on` silently dropped them to
 > `default`, re-enabling charge-controller polling against hardware that isn't there.
+
+> **Do not remove a mode override with `rm -rf` on the drop-in directory.**
+> hamma-expert's `services-and-pipelines.md` still gives that as the manual
+> recipe. `mode.conf` is hand-edited in the field and routinely carries other
+> directives; `sensors.py` removes only the mode and keeps the rest, deleting the
+> file only when the mode was all it set.
 
 ### Why the CSV is archived
 

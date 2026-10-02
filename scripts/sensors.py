@@ -14,6 +14,7 @@ Usage:
 # Standard library imports
 import argparse
 import datetime
+import difflib
 import glob as glob_module
 import os
 import re
@@ -56,6 +57,23 @@ DROPIN_PATH = os.path.join(DROPIN_DIR, "mode.conf")
 #
 # Treating the file as a boolean (present => nosensor) misreports the mode and
 # destroys the nochargecontroller half on any unit using it.
+#
+# The two forms are NOT equal in force. brokkr resolves its mode as
+#
+#     CLI --mode  >  BROKKR_MODE in the environment  >  mode.toml
+#
+# (server/fleet_probe.py's mode probe; docs/sensors-usage.md "four
+# placements"). So on a drop-in holding both, the ExecStart override wins and
+# the Environment= line is dead text. Reading the Environment= form first --
+# which is what this script did -- reports the LOSER, and then every decision
+# downstream is made about a mode that is not in force.
+#
+# There are FOUR placements and this file can see only two of them: the
+# drop-in's Environment= and its ExecStart=. The unit's own ExecStart= and
+# ~/.config/brokkr/hamma/mode.toml are invisible here. That is why a write
+# only ever EDITS what is in the drop-in and never reconstructs it: an axis
+# set elsewhere is not ours to move, and claiming otherwise is how mj05
+# (mode.toml) got reported as `default`.
 MODE_DEFAULT = "default"
 MODE_UNKNOWN = "unknown"
 NOSENSOR_TOKEN = "nosensor"
@@ -76,10 +94,34 @@ KNOWN_MODES = frozenset([
 
 ENVIRONMENT_DROPIN_TEMPLATE = "[Service]\nEnvironment=BROKKR_MODE={}\n"
 
-RE_ENV_MODE = re.compile(
-    r"^\s*Environment\s*=\s*[\"']?BROKKR_MODE=(\S+?)[\"']?\s*$", re.MULTILINE)
-RE_EXECSTART_MODE = re.compile(r"^\s*ExecStart\s*=.*?--mode\s+(\S+)",
-                               re.MULTILINE)
+# systemd comments start with EITHER '#' or ';' -- systemd.syntax(7).
+# Honouring only '#' made a ';'-commented old command line look like a mode
+# token in an unreadable shape, which then refused every toggle.
+COMMENT_PREFIXES = ("#", ";")
+
+# The drop-in is scanned one logical line at a time, so EVERY declaration is
+# found rather than the first match of a file-wide regex. Finding only the
+# first is what let a second, winning declaration sit untouched behind a
+# rewrite that reported success.
+RE_ENV_MODE_LINE = re.compile(
+    r"^\s*Environment\s*=\s*[\"']?BROKKR_MODE=(\S+?)[\"']?\s*$")
+RE_ENV_MODE_VALUE = re.compile(r"(BROKKR_MODE=)(\S+?)([\"']?\s*)$")
+RE_BROKKR_MODE = re.compile(r"BROKKR_MODE")
+RE_EXECSTART_LINE = re.compile(r"^\s*ExecStart\s*=")
+RE_REAL_EXECSTART = re.compile(r"^\s*ExecStart\s*=\s*\S")
+# A bare `ExecStart=` with no replacement clears brokkr's command line; the
+# line exists precisely to clear the unit's original before the override sets
+# a new one, so on its own it stops the unit from starting at all.
+RE_BARE_RESET = re.compile(r"^\s*ExecStart\s*=\s*$")
+RE_SECTION = re.compile(r"^\s*\[[^\]]*\]\s*$")
+# `--mode` as its own word. `--mode=x` matches too, deliberately: it names a
+# mode in a shape this script cannot rewrite, so it must be seen and refused
+# rather than missed.
+RE_MODE_TOKEN = re.compile(r"(?<![\w-])--mode(?![\w-])")
+# `--mode <value>`, split so a rewrite keeps the operator's own separator.
+RE_MODE_FLAG_SET = re.compile(r"((?<![\w-])--mode)(\s+)(\S+)")
+# The same flag plus the whitespace in front of it, for removal.
+RE_MODE_FLAG_DEL = re.compile(r"\s*(?<![\w-])--mode\s+\S+")
 
 # Retained for backward compatibility: the plain nosensor drop-in.
 DROPIN_CONTENT = ENVIRONMENT_DROPIN_TEMPLATE.format(NOSENSOR_TOKEN)
@@ -286,7 +328,7 @@ def get_unit_identifier(local_path=None):
     return socket.gethostname(), None
 
 
-def build_message(sensor_name, site, action, success, rc=None):
+def build_message(sensor_name, site, action, success, rc=None, reason=None):
     """Construct the notification message for an on/off event.
 
     Parameters
@@ -301,6 +343,10 @@ def build_message(sensor_name, site, action, success, rc=None):
         True for success, False for failure.
     rc : int, optional
         Return code on failure. Included in the message if provided.
+    reason : str, optional
+        Short explanation appended on failure. A refusal is a failure the
+        operator cannot diagnose from `rc=1` alone, and the chat notice is
+        often the only part of a tunnelled run anyone reads.
 
     Returns
     -------
@@ -312,6 +358,8 @@ def build_message(sensor_name, site, action, success, rc=None):
     else:
         rc_str = "rc={}".format(rc) if rc is not None else "rc=?"
         body = "sensor turn-{} FAILED ({})".format(action.upper(), rc_str)
+        if reason:
+            body += " -- {}".format(reason)
     return header + body
 
 
@@ -473,11 +521,142 @@ def toggle_relay(relay_on, pin):
         [RELAY_SCRIPT, "--pin", str(pin), flag], description)
 
 
+def logical_lines(content):
+    """Split `content` into systemd logical lines.
+
+    Yields (text, index, span): the joined text, the index of its first
+    physical line, and how many physical lines it spans. A trailing
+    backslash continues a directive onto the next line, so a scan that works
+    physical line by physical line can see half a directive and parse it as
+    whole.
+    """
+    out = []
+    lines = (content or "").split("\n")
+    index = 0
+    while index < len(lines):
+        start = index
+        parts = [lines[index]]
+        while (lines[index].rstrip().endswith("\\")
+               and index + 1 < len(lines)):
+            index += 1
+            parts.append(lines[index])
+        if len(parts) == 1:
+            text = parts[0]
+        else:
+            text = " ".join(part.rstrip().rstrip("\\") for part in parts)
+        out.append((text, start, index - start + 1))
+        index += 1
+    return out
+
+
+def scan_modes(content):
+    """Find every mode declaration in `content`.
+
+    Returns (sites, problems).
+
+    `sites` is one dict per declaration this script can both read and
+    rewrite, in file order: {"form", "mode", "index", "text"}. `problems` is
+    one (lineno, text, why) per mode token in a shape it cannot -- an
+    `--mode=x`, a line continuation, a quoting it does not handle, a mode on
+    a directive other than ExecStart=.
+
+    Finding ALL of them is the point. The old file-wide first-match regexes
+    could not tell one declaration from three, so a file naming the mode
+    twice looked exactly like a file naming it once.
+    """
+    sites = []
+    problems = []
+    for text, start, span in logical_lines(content):
+        stripped = text.strip()
+        if not stripped or stripped[0] in COMMENT_PREFIXES:
+            continue
+        env_tokens = RE_BROKKR_MODE.findall(text)
+        flag_tokens = RE_MODE_TOKEN.findall(text)
+        if not env_tokens and not flag_tokens:
+            continue
+        lineno = start + 1
+        if span > 1:
+            problems.append((lineno, stripped,
+                             "the mode is on a continued line"))
+        elif env_tokens and flag_tokens:
+            problems.append((lineno, stripped,
+                             "one line names the mode two ways"))
+        elif len(env_tokens) > 1 or len(flag_tokens) > 1:
+            problems.append((lineno, stripped,
+                             "one line names the mode twice"))
+        elif env_tokens:
+            match = RE_ENV_MODE_LINE.match(text)
+            if match:
+                sites.append({"form": "environment", "mode": match.group(1),
+                              "index": start, "text": stripped})
+            else:
+                problems.append((lineno, stripped,
+                                 "unrecognised BROKKR_MODE assignment"))
+        elif not RE_EXECSTART_LINE.match(text):
+            # ExecStartPre=/ExecStartPost=/ExecReload= carrying --mode are
+            # not brokkr's command line, and editing them would change a
+            # co-resident directive's meaning. Hand them back.
+            problems.append((lineno, stripped,
+                             "--mode on a directive this script does not "
+                             "rewrite"))
+        else:
+            match = RE_MODE_FLAG_SET.search(text)
+            if match:
+                sites.append({"form": "execstart", "mode": match.group(3),
+                              "index": start, "text": stripped})
+            else:
+                problems.append((lineno, stripped,
+                                 "--mode without a separate value"))
+    return sites, problems
+
+
+def winning_site(sites):
+    """The declaration brokkr will actually obey, per its precedence order.
+
+    CLI `--mode` beats `BROKKR_MODE` in the environment, and for a repeated
+    assignment of either, systemd applies the LAST one.
+    """
+    execstarts = [site for site in sites if site["form"] == "execstart"]
+    return (execstarts or sites)[-1] if sites else None
+
+
+def inspect_content(content):
+    """Everything this script knows about a mode.conf, from one read.
+
+    Returns a dict:
+        mode     -- the mode in force, by brokkr's precedence order;
+                    MODE_DEFAULT for a provably mode-free file,
+                    MODE_UNKNOWN when a mode is named unreadably
+        form     -- "environment", "execstart" or None
+        site     -- the winning declaration, or None
+        sites    -- every readable declaration, in file order
+        problems -- mode tokens in shapes this script cannot read
+    """
+    sites, problems = scan_modes(content)
+    if problems:
+        # Something here names a mode and we cannot say which one, so we
+        # cannot say what is in force either -- the unreadable one may be
+        # the winner.
+        return {"mode": MODE_UNKNOWN, "form": None, "site": None,
+                "sites": sites, "problems": problems}
+    site = winning_site(sites)
+    if site is None:
+        # Provably mode-free: no mode token on any live line. brokkr runs in
+        # default mode. Calling this "unknown" conflated "sets no mode" with
+        # "sets one we cannot read", and bricked the toggle after a collapse
+        # -- stripping --mode leaves a legitimate, mode-free file.
+        return {"mode": MODE_DEFAULT, "form": None, "site": None,
+                "sites": [], "problems": []}
+    return {"mode": site["mode"], "form": site["form"], "site": site,
+            "sites": sites, "problems": []}
+
+
 def parse_mode(content):
     """Parse the brokkr mode out of drop-in content.
 
-    Handles both valid field forms. Never guesses: unrecognised content
-    reports MODE_UNKNOWN so the caller can refuse rather than clobber.
+    Reports the mode in FORCE, by brokkr's precedence order, so --status
+    tells the truth even about a file that must not be rewritten. Never
+    guesses: a mode named in a shape it cannot read reports MODE_UNKNOWN.
 
     Parameters
     ----------
@@ -489,74 +668,159 @@ def parse_mode(content):
     tuple of (str, str or None)
         (mode, form) where form is "environment", "execstart" or None.
     """
-    if content:
-        match = RE_ENV_MODE.search(content)
-        if match:
-            return match.group(1), "environment"
-        # Note the bare "ExecStart=" reset line carries no --mode and must
-        # not match; the regex requires --mode to be present.
-        match = RE_EXECSTART_MODE.search(content)
-        if match:
-            return match.group(1), "execstart"
-    return MODE_UNKNOWN, None
+    detail = inspect_content(content)
+    return detail["mode"], detail["form"]
+
+
+def read_mode_detail(path=None):
+    """Read mode.conf once and return everything decided from those bytes.
+
+    The dict is inspect_content()'s, plus:
+        content  -- the raw bytes, or None if there is no drop-in
+        readable -- False when the file is there but could not be read
+
+    One read. Reading the file a second time to get the content meant the
+    mode and the rewrite could come from two different versions of it, and an
+    error on that second read looked exactly like "no drop-in".
+    """
+    path = DROPIN_PATH if path is None else path
+    if not os.path.isfile(path):
+        detail = inspect_content(None)
+        detail.update({"content": None, "readable": True})
+        return detail
+    try:
+        with open(path) as file:
+            content = file.read()
+    except OSError:
+        # Absent and unreadable are different facts. Reporting a live
+        # override as "default" would have apply_mode treat it as absent.
+        return {"mode": MODE_UNKNOWN, "form": None, "site": None,
+                "sites": [], "problems": [], "content": None,
+                "readable": False}
+    detail = inspect_content(content)
+    detail.update({"content": content, "readable": True})
+    return detail
 
 
 def read_mode(path=None):
     """Return the (mode, form, content) currently configured on this unit.
 
     No drop-in means default mode -- that much the original code got right.
-
-    The raw content comes back with the parse so every caller works from the
-    same bytes. Reading the file a second time to get the content meant the mode
-    and the rewrite could come from two different versions of it, and an error
-    on that second read looked exactly like "no drop-in".
     """
-    path = DROPIN_PATH if path is None else path
-    if not os.path.isfile(path):
-        return MODE_DEFAULT, None, None
-    try:
-        with open(path) as file:
-            content = file.read()
-    except OSError:
-        return MODE_UNKNOWN, None, None
-    mode, form = parse_mode(content)
-    return mode, form, content
+    detail = read_mode_detail(path)
+    return detail["mode"], detail["form"], detail["content"]
 
 
-def strip_mode_directive(existing, form):
-    """Drop just the mode override from `existing`, or None if nothing remains.
+def is_directive(text):
+    """True if this line configures something, rather than being scaffolding.
 
-    Collapsing to default used to `rm -f` the whole file. mode.conf is the
-    shared filename for every override and is hand-edited in the field, so
-    anything an operator put alongside the mode directive went with it -- the
-    hazard the power-state-reconciliation review named as "could delete a custom
-    mode.conf".
-
-    Returns None when the mode directive was all the file held, because then
-    removing it IS removing the file and saying so is more honest than leaving
-    an empty `[Service]` stanza behind.
+    Blank lines, comments (BOTH '#' and ';') and section headers are
+    scaffolding: a file holding nothing else sets nothing, so removing its
+    mode IS removing the file.
     """
-    if not existing:
+    stripped = text.strip()
+    if not stripped or stripped[0] in COMMENT_PREFIXES:
+        return False
+    return not RE_SECTION.match(stripped)
+
+
+def mode_free_lines(content):
+    """`content`'s directives, in order, with every mode reference removed.
+
+    Blanks and comments drop out, so a rewrite that only moves whitespace
+    around compares equal -- while a changed interpreter path, a reordering
+    or a lost duplicate does not. Order and multiplicity are kept because
+    both are semantic in systemd: for a repeated assignment the LAST one
+    wins.
+    """
+    out = []
+    for text, _, _ in logical_lines(content):
+        stripped = text.strip()
+        if not stripped or stripped[0] in COMMENT_PREFIXES:
+            continue
+        if RE_BROKKR_MODE.search(stripped):
+            continue
+        out.append(RE_MODE_FLAG_DEL.sub("", stripped).strip())
+    return [line for line in out if line]
+
+
+def directive_delta(before, after):
+    """(lost, gained) between two files, ignoring the mode itself.
+
+    An ordered diff, not a set difference. Plain list membership -- which is
+    what the previous attempt used -- cannot see a reordering or a lost
+    duplicate at all, which is why its check never fired.
+    """
+    old = mode_free_lines(before)
+    new = mode_free_lines(after)
+    lost = []
+    gained = []
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("delete", "replace"):
+            lost.extend(old[i1:i2])
+        if tag in ("insert", "replace"):
+            gained.extend(new[j1:j2])
+    return lost, gained
+
+
+def drop_orphan_resets(lines):
+    """Remove a bare `ExecStart=` that has no real ExecStart to reset.
+
+    The empty line is required while an ExecStart override is present -- it
+    clears the unit's original before the override sets a new one. Left on
+    its own it clears the command line and nothing replaces it, so brokkr
+    never starts. Keeping such a file because some other line survived is
+    worse than not keeping it.
+    """
+    if any(RE_REAL_EXECSTART.match(line) for line in lines):
+        return list(lines)
+    return [line for line in lines if not RE_BARE_RESET.match(line)]
+
+
+def collapse_content(content, sites):
+    """`content` with every mode declaration removed, or None.
+
+    None means the file held nothing but the mode, so removing the mode IS
+    removing the file -- which is more honest than leaving an empty
+    `[Service]` stanza behind.
+
+    Every site goes, not just the one that happened to parse first: removing
+    one of two leaves the other's mode in force while the tool reports
+    default. mode.conf is the shared filename for every override and is
+    hand-edited in the field, so anything an operator put alongside the mode
+    has to survive -- the hazard the power-state-reconciliation review named
+    as "could delete a custom mode.conf".
+    """
+    if not content:
         return None
-    if form == "execstart":
-        # The ExecStart override often carries the unit's real interpreter path,
-        # so keep the line and drop only the mode flag from it.
-        remainder = re.sub(r"\s+--mode\s+\S+", "", existing)
-    else:
-        remainder = RE_ENV_MODE.sub("", existing)
+    lines = content.split("\n")
+    dropped = set()
+    for site in sites:
+        index = site["index"]
+        if site["form"] == "environment":
+            dropped.add(index)
+        else:
+            lines[index] = RE_MODE_FLAG_DEL.sub("", lines[index], count=1)
+    kept = drop_orphan_resets(
+        [line for index, line in enumerate(lines) if index not in dropped])
+    if not any(is_directive(line) for line in kept):
+        return None
+    return "\n".join(kept)
 
-    # Anything left worth keeping? A bare section header is not.
-    for line in remainder.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            continue
-        if form == "execstart" and stripped in ("ExecStart=", "ExecStart ="):
-            # The reset line is meaningless once the real ExecStart is gone.
-            continue
-        return remainder
-    return None
+
+def strip_mode_directive(existing, form=None):
+    """Back-compatible wrapper: the collapsed content, or None.
+
+    `form` is ignored -- the content is authoritative, and trusting a
+    separately-derived form is what made a mixed-form file strip only half
+    of itself. A None return no longer licenses a delete on its own: see
+    plan_mode(), which proves the delete is safe before taking it.
+    """
+    detail = inspect_content(existing)
+    if detail["problems"]:
+        return None
+    return collapse_content(existing, detail["sites"])
 
 
 def decompose_mode(mode):
@@ -587,71 +851,165 @@ def target_mode(current_mode, sensor_on):
     return compose_mode(nosensor=not sensor_on, nocharge=nocharge)
 
 
-def render_dropin(mode, form, existing):
-    """Render drop-in content for `mode`, preserving the unit's existing form.
+def set_mode_at(content, site, mode):
+    """`content` with the mode at `site` changed to `mode`, nothing else.
 
-    For the ExecStart form the existing command line is edited in place so the
-    unit's own interpreter path survives; it is not reconstructed from a
-    template that might not match this unit.
+    Only that one line is touched, found by index rather than by a regex
+    `count=1` -- which rewrote the FIRST match and left a later, winning
+    duplicate in place.
     """
-    if form == "execstart" and existing:
-        return RE_EXECSTART_MODE.sub(
-            lambda m: m.group(0).replace(
-                "--mode {}".format(m.group(1)), "--mode {}".format(mode)),
-            existing)
-    # No existing content to edit. There used to be an ExecStart template here
-    # with a hardcoded interpreter path, which is a guess about the unit -- and
-    # the exact guess that got written when the second read failed. It cannot be
-    # reached now that `form` and `existing` come from one read (an execstart
-    # form implies content to edit), and the Environment= form expresses the
-    # same mode without inventing a command line, so use that unconditionally.
+    lines = content.split("\n")
+    index = site["index"]
+    if site["form"] == "environment":
+        # Keep the operator's quoting and indentation; swap only the value.
+        lines[index] = RE_ENV_MODE_VALUE.sub(
+            lambda m: m.group(1) + mode + m.group(3), lines[index], count=1)
+    else:
+        # Keep the operator's separator too: the parser accepts any
+        # whitespace run, so a single-space str.replace silently matched
+        # nothing on `--mode\tnosensor` and reported a transition that never
+        # happened.
+        lines[index] = RE_MODE_FLAG_SET.sub(
+            lambda m: m.group(1) + m.group(2) + mode, lines[index], count=1)
+    return "\n".join(lines)
+
+
+def add_mode_line(content, mode):
+    """Add a mode to a file that sets none, keeping what is already there."""
+    directive = "Environment=BROKKR_MODE={}".format(mode)
+    lines = content.split("\n")
+    for index, line in enumerate(lines):
+        if line.strip().lower() == "[service]":
+            lines.insert(index + 1, directive)
+            return "\n".join(lines)
+    # No [Service] section to extend. Append one rather than restructure
+    # what is there; verify_write() allows exactly this one added header.
+    separator = "" if content.endswith("\n") else "\n"
+    return "{}{}[Service]\n{}\n".format(content, separator, directive)
+
+
+def render_dropin(mode, form=None, existing=None):
+    """Render drop-in content for `mode`, preserving everything else.
+
+    The existing declaration is edited in place so the unit's own
+    interpreter path, quoting and co-resident directives survive; nothing is
+    reconstructed from a template that might not match this unit.
+
+    `form` is accepted but ignored: the content is authoritative. Taking the
+    form from somewhere other than the bytes being edited is how a
+    mixed-form file got its losing half rewritten.
+    """
+    detail = inspect_content(existing)
+    if detail["site"] is not None:
+        return set_mode_at(existing, detail["site"], mode)
+    if existing:
+        return add_mode_line(existing, mode)
+    # Nothing to preserve. There used to be an ExecStart template here with a
+    # hardcoded interpreter path, which is a guess about the unit. The
+    # Environment= form states the mode without inventing a command line.
     return ENVIRONMENT_DROPIN_TEMPLATE.format(mode)
 
 
-def apply_mode(sensor_on):
-    """Set the mode drop-in for an on/off transition, keeping sticky axes.
+def _untouched(what):
+    """The tail every post-condition refusal ends with."""
+    return ("          {}\n"
+            "          The drop-in was NOT changed. Inspect it by hand: {}"
+            .format(what, DROPIN_PATH))
 
-    Returns
-    -------
-    int
-        0 on success, nonzero on failure or refusal.
+
+def verify_write(content, target, existing):
+    """Why these bytes must not be written, or None if they are correct.
+
+    Checking our own output is what turns "the rewrite silently did not
+    take" from a confident [OK] over a wrong file into a refusal that leaves
+    the file alone. It has to re-scan with the real scanner and compare
+    ordered directives, or it passes everything: the previous attempt
+    re-parsed with a first-match parser and compared with list membership,
+    and so never fired on any input.
     """
-    # One read. `existing` is the same bytes `current`/`form` were parsed from,
-    # so the rewrite can never be based on a different version of the file than
-    # the decision was.
-    current, form, existing = read_mode()
-    rc = refuse_reason(current)
-    if rc is not None:
-        print(rc)
-        return 1
-
-    target = target_mode(current, sensor_on=sensor_on)
-    if target == current:
-        print("  [OK] Mode already {} (unchanged)".format(current))
-        return 0
-
-    if target == MODE_DEFAULT:
-        return remove_dropin(existing, form)
-
-    content = render_dropin(target, form, existing)
-    # Unconditional: an equal-and-no-change and a collapse-to-default have both
-    # already returned, so reaching here IS a transition. The old guard reduced
-    # to `current != MODE_DEFAULT`, which announced the sticky transitions but
-    # stayed quiet on default -> nosensor, the most common one of all.
-    print("  [INFO] Mode {} -> {} (preserving {})".format(
-        current, target, NOCHARGE_TOKEN)
-        if NOCHARGE_TOKEN in target
-        else "  [INFO] Mode {} -> {}".format(current, target))
-    return write_dropin(content, target)
+    detail = inspect_content(content)
+    if detail["problems"]:
+        return ("  [ERROR] Refusing to write: the rewrite produced a mode "
+                "it cannot read back\n"
+                + _untouched("({}).".format(detail["problems"][0][2])))
+    if len(detail["sites"]) != 1:
+        return ("  [ERROR] Refusing to write: the rewrite would leave {} "
+                "mode declarations,\n".format(len(detail["sites"]))
+                + _untouched("and exactly one is correct."))
+    if detail["mode"] != target:
+        return ("  [ERROR] Refusing to write: the rewrite produced mode "
+                "'{}', not '{}'.\n".format(detail["mode"], target)
+                + _untouched("The mode change did not take."))
+    lost, gained = directive_delta(existing, content)
+    gained = [line for line in gained if line.lower() != "[service]"]
+    if lost or gained:
+        return ("  [ERROR] Refusing to write: the rewrite would change more "
+                "than the mode\n"
+                + _untouched("(dropped {!r}, added {!r}).".format(
+                    lost[:2], gained[:2])))
+    return None
 
 
-def refuse_reason(mode):
+def verify_collapse(remainder, existing):
+    """Why this collapsed file must not be written, or None if it is correct.
+
+    A collapse has to leave a file that is both mode-free AND startable. A
+    mode token we could not strip must never be answered by deleting the
+    file: that turns a parse failure into data loss.
+    """
+    detail = inspect_content(remainder)
+    if detail["problems"] or detail["sites"]:
+        return ("  [ERROR] Refusing to write: a mode declaration survived "
+                "the collapse,\n"
+                + _untouched("so 'default' would be a false report."))
+    if any(RE_BARE_RESET.match(line) for line in remainder.split("\n")) \
+            and not any(RE_REAL_EXECSTART.match(line)
+                        for line in remainder.split("\n")):
+        return ("  [ERROR] Refusing to write: that would leave a bare "
+                "'ExecStart=' reset\n"
+                + _untouched("with nothing to replace it, and brokkr would "
+                             "not start."))
+    lost, gained = directive_delta(existing, remainder)
+    lost = [line for line in lost if not RE_BARE_RESET.match(line)]
+    if lost or gained:
+        return ("  [ERROR] Refusing to write: the collapse would change more "
+                "than the mode\n"
+                + _untouched("(dropped {!r}, added {!r}).".format(
+                    lost[:2], gained[:2])))
+    return None
+
+
+def refuse_reason(mode, detail=None):
     """Why this mode must not be rewritten, or None if it is safe to.
 
-    Two ways to be unsafe, one rule: never guess at a mode we do not fully
-    understand. Both are reported here so apply_mode and --dry-run cannot drift
-    apart on which cases refuse.
+    One rule: never guess at a mode we do not fully understand. Every way of
+    not understanding it is reported here, so apply_mode and --dry-run cannot
+    drift apart on which cases refuse.
     """
+    problems = (detail or {}).get("problems") or []
+    if problems:
+        lines = ["  [ERROR] {} names a mode in a shape this script cannot "
+                 "read.".format(DROPIN_PATH),
+                 "          Refusing to rewrite it. Fix or remove these "
+                 "lines by hand:"]
+        for lineno, text, why in problems:
+            lines.append("            line {}: {} ({})".format(
+                lineno, text, why))
+        return "\n".join(lines)
+    sites = (detail or {}).get("sites") or []
+    if len(sites) > 1:
+        winner = winning_site(sites)
+        lines = ["  [ERROR] {} names a mode in more than one place.".format(
+            DROPIN_PATH),
+            "          Refusing to rewrite it -- editing one and leaving "
+            "the others would",
+            "          silently change the mode in force. Keep exactly one "
+            "of these:"]
+        for site in sites:
+            lines.append("            line {}: {}{}".format(
+                site["index"] + 1, site["text"],
+                "   <- the one brokkr obeys" if site is winner else ""))
+        return "\n".join(lines)
     if mode == MODE_UNKNOWN:
         return ("  [ERROR] {} exists but its mode could not be parsed.\n"
                 "          Refusing to overwrite it. Inspect it by hand."
@@ -664,6 +1022,96 @@ def refuse_reason(mode):
                 "          collapsing it would silently discard it. Change it "
                 "by hand.".format(DROPIN_PATH, mode))
     return None
+
+
+def plan_mode(sensor_on, path=None):
+    """Decide AND verify the whole mode change without touching anything.
+
+    Everything that can refuse happens in here, off the live hardware, so a
+    refusal costs nothing. apply_mode ran at step 4 of the off sequence --
+    after brokkr and sindri were stopped and the relay de-energized -- so a
+    refusal there left the unit dark with nothing restarted. This is the
+    emergency power tool, used at low battery: it has to fail empty-handed
+    or not at all.
+
+    Returns a dict:
+        kind    -- "noop", "write", "delete" or "refuse"
+        current -- the mode in force now
+        mode    -- the target mode
+        content -- the bytes to write, for "write"
+        reason  -- the operator-facing text, for "refuse"
+        summary -- one short line of it, for the notification
+    """
+    detail = read_mode_detail(path)
+    current = detail["mode"]
+    reason = refuse_reason(current, detail)
+    if reason is not None:
+        return {"kind": "refuse", "current": current, "mode": None,
+                "reason": reason,
+                "summary": "mode drop-in cannot be rewritten"}
+
+    existing = detail["content"]
+    target = target_mode(current, sensor_on=sensor_on)
+    if target == current:
+        return {"kind": "noop", "current": current, "mode": current}
+
+    if target == MODE_DEFAULT:
+        remainder = collapse_content(existing, detail["sites"])
+        if remainder is None:
+            # collapse_content has already established that the mode was all
+            # this file set, so deleting it IS removing the mode and nothing
+            # else. Note which way the arrows point: NO post-condition
+            # failure routes here. Every one of them returns "refuse" and
+            # leaves the file alone, because answering a check we could not
+            # satisfy with `rm -f` turns a parse failure into data loss.
+            return {"kind": "delete", "current": current, "mode": target}
+        reason = verify_collapse(remainder, existing)
+        if reason is not None:
+            return {"kind": "refuse", "current": current, "mode": target,
+                    "reason": reason,
+                    "summary": "mode drop-in cannot be collapsed"}
+        return {"kind": "write", "current": current, "mode": target,
+                "content": remainder}
+
+    content = render_dropin(target, detail["form"], existing)
+    reason = verify_write(content, target, existing)
+    if reason is not None:
+        return {"kind": "refuse", "current": current, "mode": target,
+                "reason": reason,
+                "summary": "mode drop-in rewrite could not be verified"}
+    return {"kind": "write", "current": current, "mode": target,
+            "content": content}
+
+
+def apply_mode(sensor_on, plan=None):
+    """Execute a mode plan. Decides one first if the caller did not.
+
+    Returns
+    -------
+    int
+        0 on success, nonzero on failure or refusal.
+    """
+    if plan is None:
+        plan = plan_mode(sensor_on=sensor_on)
+
+    if plan["kind"] == "refuse":
+        print(plan["reason"])
+        return 1
+    if plan["kind"] == "noop":
+        print("  [OK] Mode already {} (unchanged)".format(plan["mode"]))
+        return 0
+    if plan["kind"] == "delete":
+        return remove_dropin()
+
+    # Unconditional: an equal-and-no-change and a delete have both already
+    # returned, so reaching here IS a transition. The old guard reduced to
+    # `current != MODE_DEFAULT`, which announced the sticky transitions but
+    # stayed quiet on default -> nosensor, the most common one of all.
+    print("  [INFO] Mode {} -> {} (preserving {})".format(
+        plan["current"], plan["mode"], NOCHARGE_TOKEN)
+        if NOCHARGE_TOKEN in plan["mode"]
+        else "  [INFO] Mode {} -> {}".format(plan["current"], plan["mode"]))
+    return write_dropin(plan["content"], plan["mode"])
 
 
 def write_dropin(content=None, mode=None):
@@ -682,30 +1130,35 @@ def write_dropin(content=None, mode=None):
         stdin_data=content)
 
 
-def remove_dropin(existing=None, form=None):
-    """Restore default mode by removing the mode override.
+def remove_dropin():
+    """Delete the drop-in, restoring default mode.
 
-    Removes only the mode directive when the file holds anything else, so a
-    hand-added directive is not collateral damage. Falls back to deleting the
-    file when the override was all it contained.
+    Only ever called once plan_mode() has PROVEN the mode was all the file
+    set -- see verify_delete(). It used to decide that for itself from
+    strip_mode_directive() returning None, which also meant "a mode token
+    survived that I could not strip": answering a parse failure with `rm -f`
+    turned it into data loss. Deleting is never a way to satisfy a
+    post-condition.
     """
-    remainder = strip_mode_directive(existing, form)
-    if remainder is not None:
-        return write_dropin(remainder, MODE_DEFAULT)
     return run_command(
         ["sudo", "rm", "-f", DROPIN_PATH],
         "Removed mode drop-in (default)")
 
 
-def sensor_off(pin, active_high):
+def sensor_off(pin, active_high, plan=None):
     """Execute the sensor off sequence.
 
-    1. Stop brokkr and sindri
-    2. Toggle relay to power off sensor
-    3. Archive today's telemetry CSV
-    4. Write nosensor mode drop-in
-    5. Reload systemd
-    6. Start brokkr in nosensor mode, then sindri
+    1. Decide and verify the mode change (refuses here, before anything moves)
+    2. Stop brokkr and sindri
+    3. Toggle relay to power off sensor
+    4. Archive today's telemetry CSV
+    5. Apply the mode plan
+    6. Reload systemd
+    7. Start brokkr in nosensor mode, then sindri
+
+    `plan` is the pre-flight from run(); it is computed here if absent so the
+    "refuse before anything moves" guarantee holds for every caller, not
+    only the one that remembered to pre-flight.
 
     Returns
     -------
@@ -713,6 +1166,12 @@ def sensor_off(pin, active_high):
         0 on success, nonzero on failure.
     """
     print("--- Turning sensor OFF ---")
+
+    if plan is None:
+        plan = plan_mode(sensor_on=False)
+    if plan["kind"] == "refuse":
+        print(plan["reason"])
+        return 1
 
     rc = stop_brokkr()
     if rc != 0:
@@ -727,7 +1186,7 @@ def sensor_off(pin, active_high):
 
     archive_telemetry_csv()
 
-    rc = apply_mode(sensor_on=False)
+    rc = apply_mode(sensor_on=False, plan=plan)
     if rc != 0:
         return rc
 
@@ -743,15 +1202,16 @@ def sensor_off(pin, active_high):
     return 0
 
 
-def sensor_on(pin, active_high):
+def sensor_on(pin, active_high, plan=None):
     """Execute the sensor on sequence.
 
-    1. Stop brokkr and sindri
-    2. Archive today's telemetry CSV
-    3. Remove nosensor mode drop-in
-    4. Reload systemd
-    5. Toggle relay to power on sensor
-    6. Start brokkr in default mode, then sindri
+    1. Decide and verify the mode change (refuses here, before anything moves)
+    2. Stop brokkr and sindri
+    3. Archive today's telemetry CSV
+    4. Apply the mode plan
+    5. Reload systemd
+    6. Toggle relay to power on sensor
+    7. Start brokkr in default mode, then sindri
 
     Returns
     -------
@@ -759,6 +1219,12 @@ def sensor_on(pin, active_high):
         0 on success, nonzero on failure.
     """
     print("--- Turning sensor ON ---")
+
+    if plan is None:
+        plan = plan_mode(sensor_on=True)
+    if plan["kind"] == "refuse":
+        print(plan["reason"])
+        return 1
 
     rc = stop_brokkr()
     if rc != 0:
@@ -768,7 +1234,7 @@ def sensor_on(pin, active_high):
 
     archive_telemetry_csv()
 
-    rc = apply_mode(sensor_on=True)
+    rc = apply_mode(sensor_on=True, plan=plan)
     if rc != 0:
         return rc
 
@@ -810,11 +1276,22 @@ def sensor_status(config):
     # plus a bare open() could contradict what was just parsed, and the bare
     # open() would raise straight out of a read-only status command if the file
     # went away in between.
-    mode, form, content = read_mode()
+    detail = read_mode_detail()
+    mode, form, content = detail["mode"], detail["form"], detail["content"]
     if content is not None:
         lines.append("Drop-in: yes ({} mode{})".format(
             mode, ", {} form".format(form) if form else ""))
         lines.append("  Contents: {}".format(content.strip()))
+        # Say so when on/off will refuse. "--status lies" was the original
+        # HAM-184 complaint; staying quiet about a file this script cannot
+        # rewrite is the same failure one step further on.
+        if detail["problems"]:
+            lines.append("  WARNING: names a mode in a shape sensors.py "
+                         "cannot read; --on/--off will refuse")
+        elif len(detail["sites"]) > 1:
+            lines.append("  WARNING: names a mode in {} places; --on/--off "
+                         "will refuse until one remains"
+                         .format(len(detail["sites"])))
     elif mode == MODE_UNKNOWN:
         # Present but unreadable is not the same as absent, and reporting it as
         # "default mode" would be a confident lie about a live unit.
@@ -942,27 +1419,26 @@ def run(argv=None, config_path=None, main_toml_path=None):
             print("  {} --pin {} {}".format(
                 RELAY_SCRIPT, config["pin"], relay_flag))
         print("  Archive telemetry CSV")
-        current_mode, current_form, current_content = read_mode()
-        # Stop where the real run would stop. Printing the rest of the sequence
-        # after a REFUSE showed an operator a run that completes, for a case
-        # that hard-fails -- which defeats the point of checking first.
-        reason = refuse_reason(current_mode)
-        if reason is not None:
-            print("  REFUSE: mode drop-in cannot be rewritten")
-            print(reason)
+        # The SAME plan the real run would execute, so the two cannot drift
+        # apart on which cases refuse or on what gets written. Stop where the
+        # real run would stop: printing the rest of the sequence after a
+        # REFUSE showed an operator a run that completes, for a case that
+        # hard-fails.
+        plan = plan_mode(sensor_on=args.sensor_on)
+        if plan["kind"] == "refuse":
+            print("  REFUSE: {}".format(plan["summary"]))
+            print(plan["reason"])
             return 1
-        new_mode = target_mode(current_mode, sensor_on=args.sensor_on)
-        print("  Mode: {} -> {}".format(current_mode, new_mode))
-        if new_mode == current_mode:
+        print("  Mode: {} -> {}".format(plan["current"], plan["mode"]))
+        if plan["kind"] == "noop":
             print("  (no drop-in change)")
-        elif new_mode == MODE_DEFAULT:
-            if strip_mode_directive(current_content, current_form) is not None:
-                print("  Rewrite {} without the mode directive "
-                      "(other directives present)".format(DROPIN_PATH))
-            else:
-                print("  sudo rm -f {}".format(DROPIN_PATH))
+        elif plan["kind"] == "delete":
+            print("  sudo rm -f {}".format(DROPIN_PATH))
+        elif plan["mode"] == MODE_DEFAULT:
+            print("  Rewrite {} without the mode directive "
+                  "(other directives present)".format(DROPIN_PATH))
         else:
-            print("  Write {} ({} mode)".format(DROPIN_PATH, new_mode))
+            print("  Write {} ({} mode)".format(DROPIN_PATH, plan["mode"]))
         print("  sudo systemctl daemon-reload")
         if args.sensor_on:
             print("  {} --pin {} {}".format(
@@ -971,16 +1447,32 @@ def run(argv=None, config_path=None, main_toml_path=None):
         return 0
 
     # Prepare the notifier up front; failures here are non-fatal and just
-    # disable notifications for this run.
+    # disable notifications for this run. This has to come BEFORE the
+    # pre-flight: a refusal that returns before build_sender() prints to a
+    # tunnelled stdout nobody is watching and sends no chat notice, which
+    # from the operator's side is a silent no-op.
     sender = build_sender(load_notifier_config(main_toml_path))
     sensor_name, site = get_unit_identifier(config_path)
     action = "on" if args.sensor_on else "off"
 
+    # Pre-flight. Every refusal -- including a failed post-condition on the
+    # bytes we were about to write -- happens here, before any service is
+    # stopped and before the relay moves.
+    plan = plan_mode(sensor_on=args.sensor_on)
+    if plan["kind"] == "refuse":
+        print(plan["reason"])
+        send_notification(sender, build_message(
+            sensor_name, site, action, success=False, rc=1,
+            reason="REFUSED: {}".format(plan["summary"])))
+        return 1
+
     # Execute
     if args.sensor_on:
-        rc = sensor_on(pin=config["pin"], active_high=config["active_high"])
+        rc = sensor_on(pin=config["pin"], active_high=config["active_high"],
+                       plan=plan)
     else:
-        rc = sensor_off(pin=config["pin"], active_high=config["active_high"])
+        rc = sensor_off(pin=config["pin"], active_high=config["active_high"],
+                        plan=plan)
 
     msg = build_message(
         sensor_name, site, action,
