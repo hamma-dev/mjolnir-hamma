@@ -70,6 +70,7 @@ def test_compute_derives_vpp_snr_ratio():
     module = load_module(diag_return=(0.1, 4.7, -4.7, 0.035), trig_pos=1)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
@@ -87,6 +88,7 @@ def test_compute_returns_none_without_fast_channel():
     module = load_module(volt_fast=None)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     assert step._compute(make_input()) is None
@@ -96,6 +98,7 @@ def test_compute_snr_nan_when_noise_zero():
     module = load_module(diag_return=(0.1, 4.7, -4.7, 0.0))  # noise == 0
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
@@ -107,6 +110,7 @@ def test_compute_ratio_nan_when_threshold_zero():
     module = load_module(threshold=0.0)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
@@ -120,6 +124,7 @@ def test_compute_trigger_time_out_of_range_falls_back_to_first():
     module = load_module(trig_pos=999, times_fast=times)  # 999 >= len=2
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
@@ -132,6 +137,7 @@ def test_compute_skips_short_pretrigger():
     module = load_module(pretrigger_size=300000)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     with patch.object(module, "diagnostic_data") as mock_diag:
@@ -146,6 +152,7 @@ def test_compute_keeps_long_pretrigger():
     module = load_module(pretrigger_size=953250)
     step = module.NoiseDiag.__new__(module.NoiseDiag)
     step.medsize = 200000
+    step.medsize_slow = 20000
     step.min_pretrigger_ms = 50
     step.logger = MagicMock()
     m = step._compute(make_input())
@@ -163,14 +170,85 @@ def test_write_csv_creates_header_then_appends(tmp_path):
     with patch.object(module, "render_output_filename", return_value=csv_file):
         metrics = {"trigger_time": "2026-06-23T21:36:58.857",
                    "fast_offset": 0.1, "fast_noise": 0.035, "fast_vpp": 9.4,
-                   "fast_snr": 268.5, "threshold": 0.083, "noise_thresh_ratio": 0.42}
+                   "fast_snr": 268.5, "threshold": 0.083, "noise_thresh_ratio": 0.42,
+                   "slow_offset": 0.02, "slow_noise": 0.004, "slow_vpp": 1.2,
+                   "slow_snr": 300.0, "slow_noise_thresh_ratio": 0.048}
         step._write_csv(metrics, "2026-06-23T17:00:00")
         step._write_csv(metrics, "2026-06-23T17:01:00")
     lines = csv_file.read_text().strip().splitlines()
-    assert lines[0] == "time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio"
+    assert lines[0] == ("time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio,"
+                        "slow_offset,slow_noise,slow_vpp,slow_snr,slow_noise_thresh_ratio")
     assert len(lines) == 3  # header + 2 rows
     assert lines[1].startswith("2026-06-23T17:00:00,")
     assert lines[2].startswith("2026-06-23T17:01:00,")
+
+
+def test_write_csv_upgrades_old_header_keeping_rows(tmp_path):
+    """A day file started before slow-channel tracking is rewritten with the
+    full header; old rows are kept with blank slow columns."""
+    module = load_module()
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.logger = MagicMock()
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_text(
+        "time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio\n"
+        "2026-06-23T16:59:00,t0,0.1,0.035,9.4,268.5,0.083,0.42\n")
+    step.output_path = str(tmp_path)
+    step.filename_template = csv_file.name
+    with patch.object(module, "render_output_filename", return_value=csv_file):
+        metrics = {"trigger_time": "t1",
+                   "fast_offset": 0.1, "fast_noise": 0.035, "fast_vpp": 9.4,
+                   "fast_snr": 268.5, "threshold": 0.083, "noise_thresh_ratio": 0.42,
+                   "slow_offset": 0.02, "slow_noise": 0.004, "slow_vpp": 1.2,
+                   "slow_snr": 300.0, "slow_noise_thresh_ratio": 0.048}
+        step._write_csv(metrics, "2026-06-23T17:00:00")
+    lines = csv_file.read_text().strip().splitlines()
+    assert lines[0].split(",") == module.NoiseDiag.CSV_COLUMNS
+    assert lines[1] == "2026-06-23T16:59:00,t0,0.1,0.035,9.4,268.5,0.083,0.42,,,,,"
+    assert lines[2].startswith("2026-06-23T17:00:00,t1,")
+    assert lines[2].endswith(",0.02,0.004,1.2,300.0,0.048")
+    assert not (tmp_path / (csv_file.name + ".tmp")).exists()
+
+
+def test_compute_derives_slow_channel_metrics():
+    module = load_module(diag_return=(0.1, 4.7, -4.7, 0.035))
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.medsize_slow = 20000
+    step.min_pretrigger_ms = 50
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert m["slow_offset"] == pytest.approx(0.1)
+    assert m["slow_noise"] == pytest.approx(0.035)
+    assert m["slow_vpp"] == pytest.approx(9.4)
+    assert m["slow_snr"] == pytest.approx(9.4 / 0.035)
+    assert m["slow_noise_thresh_ratio"] == pytest.approx(0.035 / 0.083)
+    # Slow channel uses its own window size.
+    windows = [c.args[1] for c in module.diagnostic_data.call_args_list]
+    assert windows == [200000, 20000]
+
+
+def test_compute_slow_nan_without_slow_channel():
+    """Missing slow channel -> slow columns NaN, fast sample still recorded."""
+    module = load_module()
+    module.hamma.Header.return_value.read_stream.return_value.volt = None
+    step = module.NoiseDiag.__new__(module.NoiseDiag)
+    step.medsize = 200000
+    step.medsize_slow = 20000
+    step.min_pretrigger_ms = 50
+    step.logger = MagicMock()
+    m = step._compute(make_input())
+    assert m["fast_noise"] == pytest.approx(0.035)
+    for key in ("slow_offset", "slow_noise", "slow_vpp", "slow_snr",
+                "slow_noise_thresh_ratio"):
+        assert math.isnan(m[key])
+
+
+def test_default_medsize_slow_is_20000():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag()
+    assert step.medsize_slow == 20000
 
 
 def _alert_step(module, sustain_s=300, reset_after_under=2):
