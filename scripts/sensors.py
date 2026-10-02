@@ -1134,7 +1134,7 @@ def remove_dropin():
     """Delete the drop-in, restoring default mode.
 
     Only ever called once plan_mode() has PROVEN the mode was all the file
-    set -- see verify_delete(). It used to decide that for itself from
+    set. It used to decide that for itself from
     strip_mode_directive() returning None, which also meant "a mode token
     survived that I could not strip": answering a parse failure with `rm -f`
     turned it into data loss. Deleting is never a way to satisfy a
