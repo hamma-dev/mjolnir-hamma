@@ -3,6 +3,7 @@ Plugin to compute fast- and slow-channel noise diagnostics from live HAMMA trigg
 """
 
 import csv
+import os
 from pathlib import Path
 
 import hamma
@@ -33,8 +34,7 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
     # older readers that select columns by name keep working.
     CSV_COLUMNS = ["time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
                    "fast_snr", "threshold", "noise_thresh_ratio",
-                   "slow_offset", "slow_noise", "slow_vpp", "slow_snr",
-                   "slow_noise_thresh_ratio"]
+                   "slow_offset", "slow_noise", "slow_vpp", "slow_snr"]
 
     def __init__(self,
                  min_update_time=60,
@@ -80,7 +80,9 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         out_file.parent.mkdir(parents=True, exist_ok=True)
         if out_file.exists():
             self._upgrade_csv_header(out_file)
-        new_file = not out_file.exists()
+        # A 0-byte file (e.g. power loss right after creation) also needs the
+        # header, or every row that day lands headerless.
+        new_file = not out_file.exists() or out_file.stat().st_size == 0
         with open(out_file, "a", newline="") as f:
             writer = csv.writer(f)
             if new_file:
@@ -93,15 +95,16 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         Without this, a file started before an upgrade would get rows wider
         than its header for the rest of that day."""
         with open(out_file, newline="") as f:
-            rows = list(csv.reader(f))
-        if not rows or rows[0] == self.CSV_COLUMNS:
+            old_header = next(csv.reader(f), None)
+        if not old_header or old_header == self.CSV_COLUMNS:
             return
-        old_header = rows[0]
         if not set(old_header) <= set(self.CSV_COLUMNS):
             self.logger.warning(
                 "noise_diag: %s has unexpected columns %s; leaving it as is.",
                 out_file, old_header)
             return
+        with open(out_file, newline="") as f:
+            rows = list(csv.reader(f))
         tmp_file = out_file.with_name(out_file.name + ".tmp")
         with open(tmp_file, "w", newline="") as f:
             writer = csv.writer(f)
@@ -109,17 +112,19 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             for row in rows[1:]:
                 by_name = dict(zip(old_header, row))
                 writer.writerow([by_name.get(c, "") for c in self.CSV_COLUMNS])
+            f.flush()
+            os.fsync(f.fileno())
         tmp_file.replace(out_file)
         self.logger.info("noise_diag: upgraded CSV header of %s.", out_file)
 
-    def _channel_metrics(self, volt, medsize, threshold):
-        """Offset, noise, Vpp, SNR and noise/threshold ratio for one channel
-        (same derivation as the fast-channel block in _compute)."""
+    def _channel_metrics(self, volt, medsize):
+        """Offset, noise, Vpp and SNR for one channel (same derivation as the
+        fast-channel block in _compute; no threshold ratio, since the AGS
+        trigger threshold does not apply to the slow channel)."""
         offset, vmax, vmin, noise = diagnostic_data(volt, medsize)
         vpp = float(vmax) - float(vmin)
         snr = vpp / noise if noise else float("nan")
-        ratio = noise / threshold if threshold else float("nan")
-        return float(offset), float(noise), float(vpp), float(snr), float(ratio)
+        return float(offset), float(noise), float(vpp), float(snr)
 
     def _compute(self, input_data):
         """Decode the packet and derive fast- and slow-channel noise metrics."""
@@ -148,14 +153,18 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         ratio = noise / threshold if threshold else float("nan")
 
         # Slow channel: same pre-trigger baseline approach, its own window size.
-        # A missing slow channel leaves the slow columns NaN rather than
-        # dropping the fast-channel sample.
+        # A missing or unreadable slow channel leaves the slow columns NaN
+        # rather than dropping the fast-channel sample.
         nan = float("nan")
-        slow_offset = slow_noise = slow_vpp = slow_snr = slow_ratio = nan
+        slow_offset = slow_noise = slow_vpp = slow_snr = nan
         if getattr(data, "volt", None) is not None:
-            (slow_offset, slow_noise, slow_vpp, slow_snr,
-             slow_ratio) = self._channel_metrics(
-                data.volt, self.medsize_slow, threshold)
+            try:
+                (slow_offset, slow_noise, slow_vpp,
+                 slow_snr) = self._channel_metrics(data.volt, self.medsize_slow)
+            except Exception as e:
+                self.logger.warning(
+                    "Slow-channel noise failed (%s: %s); slow noise left blank.",
+                    type(e).__name__, e)
         else:
             self.logger.info("No slow channel in trigger; slow noise left blank.")
 
@@ -182,7 +191,6 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             "slow_noise": slow_noise,
             "slow_vpp": slow_vpp,
             "slow_snr": slow_snr,
-            "slow_noise_thresh_ratio": slow_ratio,
         }
 
     def _maybe_alert(self, metrics, now):

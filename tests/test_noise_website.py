@@ -557,37 +557,60 @@ def test_clamp_threshold_into_range(ns):
 # ---------------------------------------------------------------------------
 
 SLOW_CSV_CONTENT = textwrap.dedent("""\
-    time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio,slow_offset,slow_noise,slow_vpp,slow_snr,slow_noise_thresh_ratio
-    2026-06-27 14:23:01.123456+00:00,2026-06-27 14:23:01.000000+00:00,0.012,0.0045,0.1,5.0,0.05,0.09,0.020,0.0030,0.1,10.0,0.06
-    2026-06-27 14:24:01.123456+00:00,2026-06-27 14:24:01.000000+00:00,0.013,0.0045,0.1,5.0,0.05,0.09,-0.025,0.0040,0.1,10.0,0.08
+    time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio,slow_offset,slow_noise,slow_vpp,slow_snr
+    2026-06-27 14:23:01.123456+00:00,2026-06-27 14:23:01.000000+00:00,0.012,0.0045,0.1,5.0,0.05,0.09,,,,
+    2026-06-27 14:24:01.123456+00:00,2026-06-27 14:24:01.000000+00:00,0.013,0.0045,0.1,5.0,0.05,0.09,-0.025,0.0040,0.1,10.0
+    2026-06-27 14:25:01.123456+00:00,2026-06-27 14:25:01.000000+00:00,0.013,0.0045,0.1,5.0,0.05,0.09,0.020,0.0030,0.1,10.0
 """)
+
+
+def _use_noise_dir(ns, monkeypatch, data_dir):
+    orig = ns["ingest_noise_data"]
+    monkeypatch.setitem(
+        ns, "ingest_noise_data",
+        lambda n_days=None, data_dir=data_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+            orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
 
 
 def test_slow_gauges_registered(ns):
     plots = ns["STATUS_DASHBOARD_PLOTS"]
     assert plots["slownoisefloor"]["plot_metadata"]["plot_title"] == "Slow Noise Floor"
     assert plots["slowdcoffset"]["plot_metadata"]["plot_title"] == "Slow DC Offset"
-    assert plots["slowdcoffset"]["plot_params"]["range"] == ns["OFFSET_GAUGE_RANGE"]
 
 
 def test_slow_subplots_and_names(ns):
     assert "slow_noise" in ns["NOISE_PLOT_SUBPLOTS"]
     assert "slow_offset" in ns["NOISE_PLOT_SUBPLOTS"]
     assert ns["VARIABLE_NAME_MAP"]["slow_noise"] == "Slow Noise Floor"
-    assert ns["LAYOUT_MAP"]["slow_noise"]["suffix"] == " mV"
-    assert ns["LAYOUT_MAP"]["slow_offset"]["suffix"] == " mV"
+    assert ns["VARIABLE_NAME_MAP"]["slow_offset"] == "Slow DC Offset"
+    assert "slow_noise_thresh_ratio" not in ns["NOISE_CSV_COLUMNS"]
 
 
-def test_slow_layout_no_data_fallback(ns):
-    # No noise data in the test env -> documented fallbacks.
-    assert ns["LAYOUT_MAP"]["slow_noise"]["range"] == [0, 100]
-    assert ns["LAYOUT_MAP"]["slow_offset"]["range"] == [-300.0, 300.0]
+def test_slow_axes_match_fast(ns):
+    """For now the slow channel reuses the fast-channel axes and gauge ranges."""
+    lm = ns["LAYOUT_MAP"]
+    assert lm["slow_noise"] == lm["fast_noise"]
+    assert lm["slow_offset"] == lm["fast_offset"]
+    assert lm["slow_noise"] is not lm["fast_noise"]  # independent copies
+    plots = ns["STATUS_DASHBOARD_PLOTS"]
+    slow, fast = plots["slownoisefloor"]["plot_params"], plots["noisefloor"]["plot_params"]
+    assert slow["range"] == fast["range"]
+    assert slow["dtick"] == fast["dtick"]
+    assert plots["slowdcoffset"]["plot_params"]["range"] == plots["dcoffset"]["plot_params"]["range"]
+    assert plots["slowdcoffset"]["plot_params"]["steps"] == plots["dcoffset"]["plot_params"]["steps"]
+
+
+def test_slow_noise_has_no_threshold_band(ns):
+    assert "slow_noise" not in ns["NOISE_COLOR_TABLE_MAP"]
+    params = ns["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
+    assert params["steps"] is None
+    assert params["threshold_value"] == 0
 
 
 def test_ingest_old_csv_adds_float_slow_columns(ns, tmp_noise_dir):
     """CSVs written before slow tracking load with NaN float slow columns."""
     df = ns["ingest_noise_data"](data_dir=tmp_noise_dir)
-    for col in ("slow_noise", "slow_offset", "slow_noise_thresh_ratio"):
+    for col in ("slow_noise", "slow_offset", "slow_vpp", "slow_snr"):
         assert col in df.columns
         assert pd.api.types.is_float_dtype(df[col])
         assert df[col].isna().all()
@@ -597,49 +620,31 @@ def test_ingest_mixed_old_and_new_csvs(ns, tmp_path):
     (tmp_path / "noise_hamma02_2026-06-26.csv").write_text(SAMPLE_CSV_CONTENT)
     (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
     df = ns["ingest_noise_data"](data_dir=tmp_path)
-    assert len(df) == 4
-    assert df["slow_noise"].isna().sum() == 2
-    assert abs(df["slow_noise"].iloc[-1] - 0.004) < 1e-9
+    assert len(df) == 5
+    assert df["slow_noise"].isna().sum() == 3
+    assert abs(df["slow_noise"].iloc[-1] - 0.003) < 1e-9
 
 
-def test_preprocess_slow_mv_conversion(ns, tmp_path):
+def test_preprocess_slow_mv_conversion(ns, tmp_path, monkeypatch):
     (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
-    orig = ns["ingest_noise_data"]
-    ns["ingest_noise_data"] = lambda n_days=None, data_dir=tmp_path, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=tmp_path, glob_pattern=glob_pattern)
-    try:
-        result = ns["_noise_plot_preprocess"](pd.DataFrame())
-        assert abs(result["slow_noise"].iloc[-1] - 4.0) < 0.01
-        assert abs(result["slow_offset"].iloc[-1] - (-25.0)) < 0.01
-        gauge = ns["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_data"]["variable"]
-        assert abs(gauge(None).iloc[-1] - 4.0) < 0.01
-    finally:
-        ns["ingest_noise_data"] = orig
+    _use_noise_dir(ns, monkeypatch, tmp_path)
+    result = ns["_noise_plot_preprocess"](pd.DataFrame())
+    assert abs(result["slow_noise"].iloc[-1] - 3.0) < 0.01
+    assert abs(result["slow_offset"].iloc[-2] - (-25.0)) < 0.01
 
 
-def test_resolve_slow_noise_config(ns):
-    resolve = ns["_resolve_slow_noise_config"]
-    assert resolve(2, 0.0, overrides={})["noise_range"] == [0, 100]
-    cfg = resolve(2, 40.0, overrides={})
-    assert cfg["noise_range"] == [0, 44.0]
-    assert cfg["noise_dtick"] > 0
-    cfg = resolve(2, 40.0, overrides={2: {"slow_noise_range": [0, 250],
-                                          "slow_noise_dtick": 50}})
-    assert cfg["noise_range"] == [0, 250]
-    assert cfg["noise_dtick"] == 50
-    # Malformed override falls through to derived.
-    cfg = resolve(2, 40.0, overrides={2: {"slow_noise_range": "bad"}})
-    assert cfg["noise_range"] == [0, 44.0]
+def test_slow_gauge_series_drops_leading_blank(ns, tmp_path, monkeypatch):
+    """A blank first row must not poison sindri's max() (max([nan, ...]) is nan)."""
+    (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
+    _use_noise_dir(ns, monkeypatch, tmp_path)
+    series = ns["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_data"]["variable"](None)
+    assert not series.isna().any()
+    assert abs(max(series) - 4.0) < 0.01
+    assert abs(series.iloc[-1] - 3.0) < 0.01
 
 
-def test_slow_offset_range_override_key(ns):
-    rng = ns["get_noise_offset_range_mv"](
-        unit_n=2, overrides={2: {"slow_offset_range": [-50, 50]}},
-        column="slow_offset", override_key="slow_offset_range")
-    assert rng == [-50.0, 50.0]
-
-
-def test_wiring_slow_channel_from_data(tmp_path, monkeypatch):
-    """E2E: slow axes derive from slow data; fast threshold wiring unchanged."""
+def test_wiring_slow_axes_follow_fast_with_data(tmp_path, monkeypatch):
+    """E2E: with data present, slow axes still mirror the fast-derived axes."""
     noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
     noise_dir.mkdir(parents=True)
     (noise_dir / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
@@ -648,16 +653,11 @@ def test_wiring_slow_channel_from_data(tmp_path, monkeypatch):
     ns2 = {}
     exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
 
-    # slow_noise peak 4.0 mV -> [0, 4.4]
-    assert ns2["LAYOUT_MAP"]["slow_noise"]["range"] == [0, 4.4]
-    assert ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]["range"] == [0, 4.4]
-    # slow_offset max |-25| mV * 1.1 = 27.5, symmetric.
-    slow_off = ns2["LAYOUT_MAP"]["slow_offset"]["range"]
-    assert abs(slow_off[1] - 27.5) < 0.01
-    assert slow_off[0] == -slow_off[1]
-    # Fast wiring still keyed to the 50 mV threshold.
     assert ns2["LAYOUT_MAP"]["fast_noise"]["range"] == [0, 62.5]
-    assert "slow_noise" not in ns2["NOISE_COLOR_TABLE_MAP"]
+    assert ns2["LAYOUT_MAP"]["slow_noise"]["range"] == [0, 62.5]
+    assert ns2["LAYOUT_MAP"]["slow_offset"] == ns2["LAYOUT_MAP"]["fast_offset"]
+    params = ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
+    assert params["range"] == [0, 62.5]
 
 
 # ---------------------------------------------------------------------------
