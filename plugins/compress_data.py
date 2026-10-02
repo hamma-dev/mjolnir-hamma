@@ -55,16 +55,25 @@ class CompressData(brokkr.pipeline.base.OutputStep):
             Default is False.
         method : str
             Compression method for hamma.compression:
-            - 'lossless': Lossless LZMA compression (~25% of original)
+            - 'lossless': Lossless LZMA compression (size is
+              data-dependent; ~45% measured on mj03 field data, not the
+              ~25% once claimed)
             - 'quantize': Quantization + LZMA (smaller, configurable fidelity)
             Default is 'quantize'.
         step : int
             Quantization step size (only used if method='quantize'):
             - step=1: lossless
-            - step=2: ~18% of original, RMSE<1 (virtually lossless)
-            - step=4: ~12% of original, RMSE~2 (high fidelity)
-            - step=8: ~7% of original, RMSE~4
+            - step=2: RMSE<1 (virtually lossless)
+            - step=4: RMSE~2 (high fidelity)
+            - step=8: RMSE~4
             Default is 8.
+
+            RMSE is set by the step and is reproducible. The output SIZE is
+            data-dependent and deliberately not quoted: noisier records
+            compress far worse. Measured on mj03 field data (HAM-220),
+            step=8 ran 10-40% per record and 24-27% in aggregate, against
+            the ~7% previously claimed here. Do not size a drive or plan a
+            deletion from a fixed ratio -- measure the data in question.
         quiet_start : int
             Hour (0-23 UTC) when quiet period starts. Compression only
             runs during quiet hours. Supports wraparound (e.g., 22 to 5
