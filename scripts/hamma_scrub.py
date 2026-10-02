@@ -513,19 +513,23 @@ def write_scan_metrics(path, mj, recovered, purged):
         logger.debug("Could not write scan metrics %s: %s", path, e)
 
 
-def scan_mj_files(base_path, since=None, cache_file=None):
+def scan_mj_files(base_path, since=None, cache_file=None, until=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Dispatches to the incremental scanner when ``cache_file`` is given (reuses
     per-hourly-dir header sets whose ``(mtime, .bin-count)`` signature is
     unchanged -- the fix for the O(all-files) MJ scan), else the full scanner.
+
+    ``since``/``until`` bound the hourly directories read, inclusive, as
+    ``'YYYY-MM-DDTHH'``. Both scanners honour both bounds: silently ignoring
+    ``until`` on one path would make the caller's restriction a lie.
     """
     if cache_file:
-        return _scan_mj_incremental(base_path, since, cache_file)
-    return _scan_mj_full(base_path, since)
+        return _scan_mj_incremental(base_path, since, cache_file, until=until)
+    return _scan_mj_full(base_path, since, until=until)
 
 
-def _scan_mj_incremental(base_path, since, cache_file):
+def _scan_mj_incremental(base_path, since, cache_file, until=None):
     """MJ scan that re-reads only new/changed hourly dirs; reuses the rest.
 
     A directory whose ``(mtime, .bin-count)`` signature matches the cache is
@@ -561,6 +565,9 @@ def _scan_mj_incremental(base_path, since, cache_file):
             if name == "compressed" or not os.path.isdir(subdir):
                 continue
             if since and name < since:
+                dirs_skipped += 1
+                continue
+            if until and name > until:
                 dirs_skipped += 1
                 continue
             subdirs.append((name, subdir))
@@ -602,6 +609,12 @@ def _scan_mj_incremental(base_path, since, cache_file):
         "headers": headers,
         "file_count": file_count,
         "duplicate_count": duplicate_count,
+        # None, not []: a cached dir stores a header SET, so which header was
+        # duplicated inside it is not recoverable. [] would read as "no
+        # duplicates" and silently disarm the --audit-loss blocker, so the
+        # audit refuses on None instead (and run() forces cache_file=None for
+        # that path, making this unreachable from there).
+        "duplicate_headers": None,
         "skipped": skipped,
         "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
@@ -610,7 +623,7 @@ def _scan_mj_incremental(base_path, since, cache_file):
     }
 
 
-def _scan_mj_full(base_path, since=None):
+def _scan_mj_full(base_path, since=None, until=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Parameters
@@ -620,6 +633,9 @@ def _scan_mj_full(base_path, since=None):
     since : str or None
         If set, skip directories with names before this cutoff
         (format: 'YYYY-MM-DDTHH').
+    until : str or None
+        If set, skip directories with names after this cutoff (same format).
+        Inclusive, like ``since``.
 
     Returns
     -------
@@ -627,13 +643,16 @@ def _scan_mj_full(base_path, since=None):
         headers: set of bytes (128-byte raw headers)
         file_count: int (total .bin files found)
         duplicate_count: int (files with headers already seen)
+        duplicate_headers: list of bytes (one per duplicate OCCURRENCE)
         skipped: int (files < 128 bytes)
         dirs_skipped: int (directories before --since cutoff)
         elapsed: float (seconds)
     """
     headers = set()
     file_count = 0
-    duplicate_count = 0
+    # See scan_ags_files: the duplicate headers themselves, so --audit-loss can
+    # place each one in (or outside) its window.
+    duplicate_headers = []
     skipped = 0
     dirs_skipped = 0
     t0 = time.time()
@@ -645,7 +664,7 @@ def _scan_mj_full(base_path, since=None):
 
     for drive in drives:
         try:
-            if since:
+            if since or until:
                 # Per-directory filtering: only glob .bin in qualifying dirs
                 dir_pattern = os.path.join(drive, "*")
                 subdirs = sorted(glob.glob(dir_pattern))
@@ -654,7 +673,10 @@ def _scan_mj_full(base_path, since=None):
                     if not os.path.isdir(subdir):
                         continue
                     dirname = os.path.basename(subdir)
-                    if dirname < since:
+                    if since and dirname < since:
+                        dirs_skipped += 1
+                        continue
+                    if until and dirname > until:
                         dirs_skipped += 1
                         continue
                     try:
@@ -687,7 +709,7 @@ def _scan_mj_full(base_path, since=None):
                     skipped += 1
                     continue
                 if header in headers:
-                    duplicate_count += 1
+                    duplicate_headers.append(header)
                 else:
                     headers.add(header)
             except PermissionError:
@@ -706,7 +728,8 @@ def _scan_mj_full(base_path, since=None):
     return {
         "headers": headers,
         "file_count": file_count,
-        "duplicate_count": duplicate_count,
+        "duplicate_count": len(duplicate_headers),
+        "duplicate_headers": duplicate_headers,
         "skipped": skipped,
         "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
@@ -839,6 +862,7 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
         entries: list of dict (filename, offset, index, header)
         headers: set of bytes (unique 128-byte headers)
         duplicate_count: int
+        duplicate_headers: list of bytes (one per duplicate OCCURRENCE)
         elapsed: float (seconds)
 
     Raises
@@ -903,12 +927,16 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
     entries = decode_strider_output(result.stdout)
 
     headers = set()
-    duplicate_count = 0
+    # The duplicate HEADERS, not merely a tally. --audit-loss has to know which
+    # window each duplicate falls in, and the raw header bytes are what carries
+    # the trigger time (see duplicates_in_window).
+    duplicate_headers = []
     for entry in entries:
         if entry["header"] in headers:
-            duplicate_count += 1
+            duplicate_headers.append(entry["header"])
         else:
             headers.add(entry["header"])
+    duplicate_count = len(duplicate_headers)
 
     elapsed = time.time() - t0
     file_count = len(set(e["filename"] for e in entries))
@@ -924,6 +952,7 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
         "entries": entries,
         "headers": headers,
         "duplicate_count": duplicate_count,
+        "duplicate_headers": duplicate_headers,
         "elapsed": elapsed,
     }
 
@@ -1986,6 +2015,17 @@ DEFAULT_EDGE_SECONDS = 10.0
 # result is considered to describe a different window than the one asked for.
 DEFAULT_BOUND_TOLERANCE_S = 120.0
 
+# How far a record's GPS trigger time may sit outside the hourly directory it
+# was filed under. The two disagree because the directory name comes from the
+# PI'S wall clock, sampled after a ~22 MB socket read, while the header carries
+# the GPS trigger instant. Measured on mj08 (3,689 records over 25 random
+# dirs, 0 undecodable): 3 records outside their dir hour, worst case 3 s early,
+# none late. That sample is normal operation and this skew widens during
+# exactly the episodes that cause drops, so this allowance is deliberately
+# ~1000x the measurement rather than fitted to it. It only ever costs
+# directories, and surplus directories are free (see window_dir_range).
+DIR_NAME_SKEW_SECONDS = 3600.0
+
 # The only telemetry columns this reconciliation reads. Projecting to these at
 # parse time matters: units retain 240-270 days of 1/min telemetry (>500k rows,
 # 49 columns), and on the sensors' Python 3.7 csv.DictReader yields OrderedDict.
@@ -1994,6 +2034,10 @@ TELEMETRY_COLUMNS = ("time", "valid_packets", "bytes_written",
                      "packets_sent", "packets_dropped")
 
 _TELEMETRY_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.csv(?:\.bak)?$")
+
+# The fractional-seconds run of an ISO stamp. The only '.' in an ISO timestamp
+# is this separator (the UTC offset uses ':'), so the first match is it.
+_ISO_FRACTION_RE = re.compile(r"\.(\d+)")
 
 
 def _normalize_stamp(raw):
@@ -2009,6 +2053,79 @@ def _normalize_stamp(raw):
     return stamp.replace(" ", "T", 1) if stamp else ""
 
 
+def window_dir_range(t0, t1, edge_seconds=DEFAULT_EDGE_SECONDS,
+                     bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
+    """Hourly-dir bounds (inclusive) covering every record the audit reads.
+
+    Returns ``(since, until)`` as ``'YYYY-MM-DDTHH'`` -- the same lexicographic
+    form the scanners already compare directory names against -- or
+    ``(None, None)`` when a bound cannot be parsed, which means "do not
+    restrict". Deriving nothing here rather than raising is deliberate: the
+    authoritative bound validation lives in counter_window(), and a full scan
+    reaches it with the same verdict, just slower.
+
+    This is an I/O optimization and MUST NOT change the report. It is sound
+    where --since is not: --since auto derives a cutoff from AGS retention,
+    which is unrelated to the window and can therefore truncate the union and
+    inflate loss, whereas a WINDOW-derived range can only drop records that
+    headers_in_window() already discards.
+
+    The range is wider than the literal bounds for two reasons:
+      * the MJ scan runs before counter_window() picks the actual counter rows,
+        which may sit up to ``bound_tolerance_s`` outside the request, and
+        boundary_activity() then reaches a further ``edge_seconds`` past each;
+      * a record's trigger time can fall outside its directory's hour
+        (``DIR_NAME_SKEW_SECONDS``).
+
+    The asymmetry of failure drives the margin: over-inclusion costs a few
+    seconds of header reads and is discarded downstream, while
+    under-inclusion silently shrinks the union and manufactures a false FAIL
+    for someone hunting data loss that never happened. So the margin is summed
+    from all three named constants and then rounded OUTWARD to whole hours.
+    """
+    start_epoch, end_epoch = _iso_epoch(t0), _iso_epoch(t1)
+    if start_epoch is None or end_epoch is None:
+        return None, None
+    margin = bound_tolerance_s + edge_seconds + DIR_NAME_SKEW_SECONDS
+    low = _floor_hour(start_epoch - margin)
+    high = _floor_hour(end_epoch + margin)
+    return _hour_dir_name(low), _hour_dir_name(high)
+
+
+def _floor_hour(epoch):
+    """Round an epoch down to the start of its UTC hour."""
+    return epoch - (epoch % 3600.0)
+
+
+def _hour_dir_name(epoch):
+    """Format an epoch as the 'YYYY-MM-DDTHH' name of its hourly directory.
+
+    UTC, because that is what the units run and what the existing --since
+    comparison already assumes: earliest_ags_timestamp() builds this same form
+    from GPS trigger times and compares it to directory names directly.
+    """
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def _pad_iso_fraction(text):
+    """Normalize fractional seconds to exactly 6 digits, or leave them absent.
+
+    datetime.fromisoformat() on Python 3.7-3.10 accepts ONLY 3 or 6 fractional
+    digits -- it was written to read isoformat()'s own output, not ISO 8601 in
+    general. The sensors run 3.7 (Buster) while dev boxes run 3.11+, which
+    accepts any number of digits. Without this, an operator bound as ordinary
+    as '2026-09-10T23:59:18.5' parses on the dev box and is rejected ON THE
+    UNIT, i.e. a window bound that is "unparseable" only in the field. More
+    than 6 digits is sub-microsecond, which datetime cannot represent at all,
+    so truncating there matches what 3.11+ does itself.
+    """
+    found = _ISO_FRACTION_RE.search(text)
+    if found is None:
+        return text
+    padded = (found.group(1) + "000000")[:6]
+    return text[:found.start()] + "." + padded + text[found.end():]
+
+
 def _iso_epoch(stamp):
     """Parse an ISO stamp to epoch seconds; None if unparseable.
 
@@ -2020,6 +2137,7 @@ def _iso_epoch(stamp):
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    text = _pad_iso_fraction(text)
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -2107,6 +2225,41 @@ def _counter(row, field):
     return value if math.isfinite(value) else None
 
 
+def _row_epochs(rows):
+    """Attach an epoch to every telemetry row; None where it cannot be placed.
+
+    Unplaceable rows are kept, not dropped: ``counter_window`` refuses on the
+    ones that land inside the span it measures (see ``_refuse_unplaceable``),
+    because a row missing from the reset scan is how a real loss becomes a
+    PASS -- the same hole ``_counter`` closes for NaN. Outside that span a
+    torn row cannot affect the result, so aborting on it would be noise.
+    """
+    return [(_iso_epoch(stamp), stamp, row) for stamp, row in rows]
+
+
+def _refuse_unplaceable(placed, start_index, end_index):
+    """Refuse if any row inside the measured span has no usable timestamp.
+
+    The reset scan examines only ``start < t <= end``, so only unplaceable
+    rows in that span can hide a ``valid_packets`` reset; a NUL-torn row a day
+    away aborts a run it could not have influenced.
+
+    "Inside" has to be POSITIONAL, because an unplaceable row has no instant to
+    compare. That leans on load_telemetry_rows() returning rows in timestamp
+    order, which holds for same-format stamps but could be disturbed by a clock
+    jump that reorders the file. The failure direction is safe either way: a
+    row misplaced by such a jump is at worst refused when it need not have
+    been, never silently skipped while inside the span.
+    """
+    for epoch, stamp, _row in placed[start_index + 1:end_index + 1]:
+        if epoch is None:
+            raise RuntimeError(
+                "telemetry row timestamp {!r} inside the measured window is "
+                "unparseable, so a counter reset could hide behind it. "
+                "Narrow the window or repair the telemetry file.".format(
+                    stamp))
+
+
 def counter_window(rows, t0, t1, bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
     """Snapshot H&S counters at the last telemetry row at or before each bound.
 
@@ -2130,18 +2283,35 @@ def counter_window(rows, t0, t1, bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
     t0, t1 = _normalize_stamp(t0), _normalize_stamp(t1)
     if not (t0 and t1):
         raise RuntimeError("window bounds must both be supplied")
-    if t0 >= t1:
+
+    # Compare INSTANTS, not strings. Telemetry rows always carry an explicit
+    # +00:00 and the documented --window-start form does not; at an equal
+    # prefix the longer string loses, so '...23:59:18+00:00' <= '...23:59:18'
+    # is False. A bound landing exactly on a row therefore excluded that row
+    # and snapped the window up to one telemetry interval (~60 s) early -- well
+    # inside the 120 s drift tolerance, so nothing below caught it.
+    t0_epoch, t1_epoch = _iso_epoch(t0), _iso_epoch(t1)
+    if t0_epoch is None or t1_epoch is None:
+        raise RuntimeError(
+            "window bounds must be ISO timestamps; got {} .. {}".format(
+                t0, t1))
+    if t0_epoch >= t1_epoch:
         raise RuntimeError(
             "window start {} is not before end {}".format(t0, t1))
 
+    placed = _row_epochs(rows)
     start = end = None
-    for stamp, row in rows:
+    start_index = end_index = None
+    for index, entry in enumerate(placed):
+        epoch, _stamp, row = entry
+        if epoch is None:
+            continue
         if _counter(row, "valid_packets") is None:
             continue
-        if stamp <= t0:
-            start = (stamp, row)
-        if stamp <= t1:
-            end = (stamp, row)
+        if epoch <= t0_epoch:
+            start, start_index = entry, index
+        if epoch <= t1_epoch:
+            end, end_index = entry, index
 
     if start is None or end is None:
         raise RuntimeError(
@@ -2149,26 +2319,31 @@ def counter_window(rows, t0, t1, bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
     if start[0] >= end[0]:
         raise RuntimeError(
             "both window bounds snap to the same telemetry row ({}): the "
-            "window contains no counter movement".format(start[0]))
+            "window contains no counter movement".format(start[1]))
 
-    for label, requested, chosen in (("start", t0, start[0]),
-                                     ("end", t1, end[0])):
-        gap = _iso_epoch(requested), _iso_epoch(chosen)
-        if None in gap:
-            continue
-        drift = abs(gap[0] - gap[1])
+    for label, requested, req_epoch, chosen in (
+            ("start", t0, t0_epoch, start), ("end", t1, t1_epoch, end)):
+        drift = abs(req_epoch - chosen[0])
         if drift > bound_tolerance_s:
             raise RuntimeError(
                 "window {} snapped to {}, {:.0f}s from the requested {} "
                 "(telemetry gap?). That would measure a different window than "
-                "the one asked for.".format(label, chosen, drift, requested))
+                "the one asked for.".format(
+                    label, chosen[1], drift, requested))
+
+    _refuse_unplaceable(placed, start_index, end_index)
 
     # Seed from the START row: a reset between the start bound and the first
     # in-window row would otherwise go undetected, and that is exactly where a
     # restart tends to land.
-    previous = _counter(start[1], "valid_packets")
-    for stamp, row in rows:
-        if not (start[0] < stamp <= end[0]):
+    previous = _counter(start[2], "valid_packets")
+    for epoch, stamp, row in placed:
+        # Unplaceable rows survive only OUTSIDE the span -- _refuse_unplaceable
+        # has already rejected any inside it -- so skipping them here cannot
+        # hide a reset.
+        if epoch is None:
+            continue
+        if not (start[0] < epoch <= end[0]):
             continue
         value = _counter(row, "valid_packets")
         if value is None:
@@ -2181,10 +2356,10 @@ def counter_window(rows, t0, t1, bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
                     stamp, previous, value))
         previous = value
 
-    result = {"start_row": start[0], "end_row": end[0]}
+    result = {"start_row": start[1], "end_row": end[1]}
     for field in ("valid_packets", "bytes_written", "packets_sent",
                   "packets_dropped"):
-        first, last = _counter(start[1], field), _counter(end[1], field)
+        first, last = _counter(start[2], field), _counter(end[2], field)
         result["delta_" + field] = (
             None if first is None or last is None else last - first)
     return result
@@ -2213,6 +2388,46 @@ def headers_in_window(pairs, start_epoch, end_epoch):
     return {h for epoch, h in pairs if start_epoch <= epoch < end_epoch}
 
 
+def duplicates_in_window(scan, start_epoch, end_epoch):
+    """Count duplicate record occurrences whose trigger time is in the window.
+
+    Counts the same thing the scanners' ``duplicate_count`` does -- occurrences
+    of a raw header beyond its first -- but only for the headers that land in
+    the window being certified. The scan-wide count is a property of everything
+    the unit still RETAINS, so a single past GPS-freeze episode (mj08) blocked
+    every later audit on that unit permanently, with no way out: --since and
+    --recover/--purge are all rejected alongside --audit-loss.
+
+    A duplicate cannot straddle a bound. The trigger time is decoded FROM the
+    header bytes, so every copy of a header decodes to the same instant and all
+    copies land on the same side. Copies whose header is undecodable (bad GPS)
+    are not counted: they are absent from the union whether duplicated or not,
+    and are already reported as the undecodable_* totals.
+    """
+    # Absent key and explicit None are different faults and get different
+    # messages, but neither may read as "no duplicates": that would silently
+    # disarm the blocker. Both refuse as RuntimeError, which run()'s audit
+    # branch already turns into an EXIT_NO_DATA refusal -- a bare subscript
+    # would escape it as an unhandled traceback instead.
+    if "duplicate_headers" not in scan:
+        raise RuntimeError(
+            "this scan result carries no 'duplicate_headers' key, so "
+            "in-window duplicates cannot be counted. A scan producer must "
+            "report the duplicated headers themselves, not duplicate_count.")
+    occurrences = scan["duplicate_headers"]
+    if occurrences is None:
+        raise RuntimeError(
+            "the incremental MJ scanner does not retain which headers were "
+            "duplicated, so in-window duplicates cannot be counted; re-run "
+            "the audit without --mj-cache")
+    count = 0
+    for header in occurrences:
+        epoch = _iso_epoch(decode_gps_time(header))
+        if epoch is not None and start_epoch <= epoch < end_epoch:
+            count += 1
+    return count
+
+
 def boundary_activity(pairs, bound_epoch, edge_seconds):
     """Count records whose trigger time is within +/-edge_seconds of a bound.
 
@@ -2231,8 +2446,8 @@ def build_lost_report(ags, mj, rows, t0, t1,
     """Reconcile parsed-record count against the union actually on disk.
 
     ``ags``/``mj`` are the scan result dicts (not bare header sets): the
-    duplicate and file counts they carry decide whether the union can be
-    trusted at all.
+    duplicate headers and file counts they carry decide whether the union can
+    be trusted at all.
     """
     counters = counter_window(rows, t0, t1, bound_tolerance_s)
 
@@ -2266,8 +2481,8 @@ def build_lost_report(ags, mj, rows, t0, t1,
         written_records = delta_written * BYTES_WRITTEN_SCALE / RECORD_BYTES
         local_drops = int(round(delta_valid - written_records))
 
-    duplicates = int(ags.get("duplicate_count") or 0) + int(
-        mj.get("duplicate_count") or 0)
+    duplicates = (duplicates_in_window(ags, start_epoch, end_epoch)
+                  + duplicates_in_window(mj, start_epoch, end_epoch))
 
     blockers = list(extra_blockers)
     if edge_start or edge_end:
@@ -2279,9 +2494,9 @@ def build_lost_report(ags, mj, rows, t0, t1,
             .format(edge_start, edge_seconds, edge_end))
     if duplicates:
         blockers.append(
-            "{} duplicate header(s) in the scan: records are matched by raw "
-            "header bytes, and duplicates collapse in the union, overstating "
-            "loss.".format(duplicates))
+            "{} duplicate header(s) inside the window: records are matched by "
+            "raw header bytes, and duplicates collapse in the union, "
+            "overstating loss.".format(duplicates))
     if not mj.get("file_count"):
         blockers.append(
             "no MJ .bin files were scanned: the union is empty by "
@@ -2521,6 +2736,27 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     int
         Exit code.
     """
+    if audit_loss:
+        # Drop every shared-state path BEFORE the first write, which is what
+        # makes the "writes no shared state" property below actually hold: the
+        # three write_status() calls on the way to the audit branch ran
+        # unconditionally, so a hand-run audit stamped three heartbeats into
+        # the file the scheduled scrub shares, without holding
+        # hamma-scrub.sh's flock. state_monitor.check_scrub_health() reads a
+        # changing (pid, timestamp, phase) token as "the scrub is making
+        # progress", so those heartbeats mask a real hang -- and
+        # _recover_stuck_scrub() SIGKILLs the process group of whatever PID is
+        # in that file, which would match this run too (_pid_is_scrub() only
+        # checks that the cmdline names hamma_scrub.py).
+        #
+        # mj_cache goes with them: it is a world-writable tmpfs file the timer
+        # also owns, and its cached per-dir header SETS cannot say which header
+        # was duplicated -- which the in-window duplicate blocker needs. The
+        # audit pays a full MJ scan instead; it is hand-run and already
+        # refuses --since, so completeness over speed is the right trade here.
+        # write_status()/write_scan_metrics() are no-ops on a None path.
+        status_file = metrics_file = mj_cache = None
+
     write_status(status_file, "start")
     if dry_run and not recover:
         logger.warning("--dry-run has no effect without --recover")
@@ -2583,8 +2819,25 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info(
                 "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
+    # HAM-164: read only the hourly dirs that can hold a record this
+    # reconciliation will look at. The audit refuses --since (an AGS-retention
+    # cutoff, unrelated to the window, which would truncate the union), but a
+    # WINDOW-derived range cannot truncate anything headers_in_window() keeps
+    # -- so walking all 714 of mj08's dirs to certify one hour was pure waste.
+    # The scheduled scrub is fast for the same reason, not because of the
+    # cache: its deployed `--since auto` leaves it 3-4 dirs (measured mean
+    # 0.54 s over 6,787 runs, cache cold on 82% of them).
+    until_cutoff = None
+    if audit_loss:
+        since_cutoff, until_cutoff = window_dir_range(
+            window_start, window_end, edge_seconds, bound_tolerance)
+        if since_cutoff:
+            logger.info("Audit MJ scan restricted to dirs %s .. %s",
+                        since_cutoff, until_cutoff)
+
     write_status(status_file, "scan_mj")
-    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache)
+    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache,
+                       until=until_cutoff)
 
     # HAM-164 reconciliation. Deliberately ahead of the "no AGS data" bail
     # below: once the scrub has purged confirmed files, an EMPTY AGS is the
@@ -2592,13 +2845,10 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     # Bailing there would make this audit unavailable on exactly the healthy
     # units we most want to certify.
     #
-    # This path deliberately writes NO shared state -- no write_status, no
-    # write_scan_metrics. Both feed state_monitor.check_scrub_health, which
-    # treats a changing (pid, timestamp, phase) token as "the scrub is making
-    # progress". A read-only audit run by hand, concurrently with the 15-minute
-    # timer and without holding hamma-scrub.sh's flock, would defeat hang
-    # detection -- and _recover_stuck_scrub() SIGKILLs the process group of
-    # whatever PID is in that file, which would match this run too.
+    # This path writes NO shared state -- no write_status, no
+    # write_scan_metrics, no MJ-scan cache. That is enforced at the top of
+    # run(), where those paths are set to None; see the comment there for why
+    # it must happen before the first write rather than here.
     if audit_loss:
         try:
             margin = timedelta(days=1)

@@ -248,6 +248,33 @@ class TestScanMjFiles:
         assert len(result["headers"]) == 1  # deduplicated
         assert result["duplicate_count"] == 2
 
+    def test_duplicate_headers_are_reported_by_identity(self, hamma_scrub,
+                                                        tmp_path):
+        """--audit-loss needs WHICH header was duplicated, not just how many:
+        it has to decide whether each one falls inside the window."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        for i in range(3):
+            fname = "mj05_2026-04-10_14-00-0{}-000.bin".format(i)
+            (drive / fname).write_bytes(hdr + rest)
+        result = hamma_scrub.scan_mj_files(str(tmp_path))
+        assert result["duplicate_headers"] == [hdr, hdr]
+        # The invariant build_lost_report relies on.
+        assert len(result["duplicate_headers"]) == result["duplicate_count"]
+
+    def test_incremental_scanner_withholds_duplicate_identity(
+            self, hamma_scrub, tmp_path):
+        """A cached dir stores a header SET, so identity is unrecoverable.
+        None (not []) keeps that from reading as "no duplicates"."""
+        drive = tmp_path / "DATA37" / "2026-04-10T14"
+        drive.mkdir(parents=True)
+        hdr, rest = _make_trigger()
+        (drive / "a.bin").write_bytes(hdr + rest)
+        result = hamma_scrub.scan_mj_files(
+            str(tmp_path), cache_file=str(tmp_path / "c.json"))
+        assert result["duplicate_headers"] is None
+
     def test_permission_error_skips_drive(self, hamma_scrub, tmp_path):
         """Permission error on a drive skips it, continues."""
         drive = tmp_path / "DATA37" / "2026-04-10T14"
@@ -513,6 +540,9 @@ class TestScanAgsFiles:
         assert len(result["entries"]) == 3
         assert len(result["headers"]) == 1
         assert result["duplicate_count"] == 2
+        # Identity, not just a tally -- --audit-loss windows these.
+        assert result["duplicate_headers"] == [bytes(header)] * 2
+        assert len(result["duplicate_headers"]) == result["duplicate_count"]
 
 
 class TestCompareHeaders:
@@ -2935,13 +2965,23 @@ QUIET_T0 = "2026-04-04T01:00:00"
 QUIET_T1 = "2026-04-04T02:00:00"
 
 
-def _scan(headers, duplicate_count=0, file_count=None):
-    """Build a scan-result dict shaped like scan_ags_files/scan_mj_files."""
+def _scan(headers, duplicate_count=None, file_count=None,
+          duplicate_headers=()):
+    """Build a scan-result dict shaped like scan_ags_files/scan_mj_files.
+
+    ``duplicate_headers`` carries the raw header of each duplicate OCCURRENCE,
+    exactly as the scanners report it. ``duplicate_count`` defaults to its
+    length because that is the invariant both scanners hold -- passing them
+    inconsistently is what let the old blocker read a scan-wide tally.
+    """
     headers = set(headers)
+    duplicate_headers = list(duplicate_headers)
     return {
         "headers": headers,
         "entries": [],
-        "duplicate_count": duplicate_count,
+        "duplicate_count": (len(duplicate_headers) if duplicate_count is None
+                            else duplicate_count),
+        "duplicate_headers": duplicate_headers,
         "file_count": len(headers) if file_count is None else file_count,
         "skipped": 0,
         "elapsed": 0.0,
@@ -3003,6 +3043,47 @@ class TestIsoEpoch:
         assert hamma_scrub._iso_epoch("not-a-time") is None
         assert hamma_scrub._iso_epoch("") is None
         assert hamma_scrub._iso_epoch(None) is None
+
+
+class TestPadIsoFraction:
+    """fromisoformat() on 3.7-3.10 (the sensors, Buster) takes ONLY 3 or 6
+    fractional digits. This env is 3.12 and parses anything, so these assert
+    on the normalized STRING -- the only version-independent evidence.
+    """
+
+    @pytest.mark.parametrize("raw,expect", [
+        ("2026-09-10T23:59:18.5", "2026-09-10T23:59:18.500000"),
+        ("2026-09-10T23:59:18.5+00:00", "2026-09-10T23:59:18.500000+00:00"),
+        ("2026-09-10T23:59:18.12", "2026-09-10T23:59:18.120000"),
+        ("2026-09-10T23:59:18.12345", "2026-09-10T23:59:18.123450"),
+        ("2026-09-10T23:59:18.717", "2026-09-10T23:59:18.717000"),
+        ("2026-09-10T23:59:18.717565", "2026-09-10T23:59:18.717565"),
+        # >6 digits is sub-microsecond; datetime cannot hold it either way.
+        ("2026-09-10T23:59:18.1234567+00:00",
+         "2026-09-10T23:59:18.123456+00:00"),
+        # No fractional part, and an offset whose ':' must not be touched.
+        ("2026-09-10T23:59:18", "2026-09-10T23:59:18"),
+        ("2026-09-10T23:59:18+00:00", "2026-09-10T23:59:18+00:00"),
+    ])
+    def test_normalized_to_six_digits(self, hamma_scrub, raw, expect):
+        assert hamma_scrub._pad_iso_fraction(raw) == expect
+
+    @pytest.mark.parametrize("digits", list(range(1, 10)))
+    def test_digit_count_is_always_parseable_on_py37(self, hamma_scrub,
+                                                     digits):
+        """The invariant: whatever the operator types, the string handed to
+        fromisoformat has a fractional run of 0 or 6 -- never 1, 2, 5 or 9."""
+        raw = "2026-09-10T23:59:18." + ("1" * digits) + "+00:00"
+        out = hamma_scrub._pad_iso_fraction(raw)
+        run = out.split(".")[1].split("+")[0]
+        assert len(run) in (3, 6)
+
+    def test_odd_digit_bound_is_the_same_instant_as_padded(self, hamma_scrub):
+        """Same instant whichever form the operator typed. (Passes on 3.12
+        with or without the fix -- 3.12 parses '.5' natively. It is the two
+        tests above that carry the 3.7 evidence.)"""
+        assert (hamma_scrub._iso_epoch("2026-09-10T23:59:18.5+00:00")
+                == hamma_scrub._iso_epoch("2026-09-10T23:59:18.500000+00:00"))
 
 
 class TestNormalizeStamp:
@@ -3249,6 +3330,82 @@ class TestCounterWindow:
         assert out["delta_valid_packets"] == 200
         assert out["delta_packets_dropped"] == 4
 
+    def test_bound_on_an_offset_suffixed_row_includes_that_row(
+            self, hamma_scrub):
+        """Bounds are INSTANTS, not strings.
+
+        brokkr telemetry always carries +00:00; the CLI's own documented
+        --window-start example does not. String-compared, the longer string
+        loses at an equal prefix ('...01:00:00+00:00' <= '...01:00:00' is
+        False), so a bound landing exactly on a row excluded that row and
+        snapped a whole telemetry interval early -- inside the 120 s drift
+        tolerance, so no guard fired and the audit measured a shifted window.
+        """
+        rows = _rows(
+            ("2026-04-04T00:59:00+00:00", 10, 0.0, 0, 0),
+            ("2026-04-04T01:00:00+00:00", 20, 0.0, 0, 0),
+            ("2026-04-04T01:59:00+00:00", 30, 0.0, 0, 0),
+            ("2026-04-04T02:00:00+00:00", 45, 0.0, 0, 0),
+        )
+        out = hamma_scrub.counter_window(rows, QUIET_T0, QUIET_T1)
+        assert out["start_row"] == "2026-04-04T01:00:00+00:00"
+        assert out["end_row"] == "2026-04-04T02:00:00+00:00"
+        assert out["delta_valid_packets"] == 25
+
+    def test_mixed_stamp_forms_order_by_instant(self, hamma_scrub):
+        """A 'Z' row and a naive row are the same instant an hour apart; the
+        lexical order of the two forms must not decide which is first."""
+        rows = _rows(
+            ("2026-04-04T01:00:00Z", 10, 0.0, 0, 0),
+            ("2026-04-04T02:00:00", 40, 0.0, 0, 0),
+        )
+        out = hamma_scrub.counter_window(rows, QUIET_T0, QUIET_T1)
+        assert out["delta_valid_packets"] == 30
+
+    def test_unplaceable_row_inside_the_span_refuses(self, hamma_scrub):
+        """A row we cannot order would also drop out of the reset scan, which
+        is how a real loss becomes a PASS. Refuse -- but only inside the span
+        the reset scan actually examines."""
+        rows = _rows(
+            (QUIET_T0, 0, 0.0, 0, 0),
+            ("2026-04-04T01:3", 5, 0.0, 0, 0),     # torn mid-write row
+            (QUIET_T1, 10, 0.0, 0, 0),
+        )
+        with pytest.raises(RuntimeError, match="unparseable"):
+            hamma_scrub.counter_window(rows, QUIET_T0, QUIET_T1)
+
+    @pytest.mark.parametrize("position", ["before", "after"])
+    def test_unplaceable_row_outside_the_span_is_tolerated(self, hamma_scrub,
+                                                           position):
+        """load_telemetry_rows() reads +/-1 day of files, so a NUL-torn row
+        from a day away is routine. The reset scan never looks at it, so it
+        must not abort a run it could not have influenced."""
+        torn = ("2026-04-04T01:3", 5, 0.0, 0, 0)
+        span = [(QUIET_T0, 0, 0.0, 0, 0), (QUIET_T1, 10, 0.0, 0, 0)]
+        specs = ([torn] + span) if position == "before" else (span + [torn])
+        out = hamma_scrub.counter_window(_rows(*specs), QUIET_T0, QUIET_T1)
+        assert out["delta_valid_packets"] == 10
+        assert out["start_row"] == QUIET_T0
+        assert out["end_row"] == QUIET_T1
+
+    def test_reset_still_detected_with_a_torn_row_outside_the_span(
+            self, hamma_scrub):
+        """Narrowing the refusal must not narrow reset detection."""
+        rows = _rows(
+            ("2026-04-04T01:3", 5, 0.0, 0, 0),     # torn, outside the span
+            (QUIET_T0, 100, 0.0, 0, 0),
+            ("2026-04-04T01:30:00", 40, 0.0, 0, 0),   # AGS restarted
+            (QUIET_T1, 90, 0.0, 0, 0),
+        )
+        with pytest.raises(RuntimeError, match="valid_packets reset"):
+            hamma_scrub.counter_window(rows, QUIET_T0, QUIET_T1)
+
+    def test_unparseable_bound_refuses(self, hamma_scrub):
+        """Previously the drift guard just skipped an unparseable bound."""
+        with pytest.raises(RuntimeError, match="ISO timestamps"):
+            hamma_scrub.counter_window(
+                _simple_rows(5), "not-a-time", QUIET_T1)
+
 
 class TestHeaderTimeHelpers:
     def test_decode_header_times_splits_undecodable(self, hamma_scrub):
@@ -3334,13 +3491,113 @@ class TestBuildLostReport:
 
     def test_duplicate_headers_block_certification(self, hamma_scrub):
         """Duplicates collapse in the union and OVERSTATE loss; the scanners
-        already report this happens in the field with frozen GPS."""
+        already report this happens in the field with frozen GPS.
+
+        49 copies of ONE header is the real shape of a GPS freeze: many
+        distinct records collapsing onto a single set of GPS fields.
+        """
+        dup = _make_gps_header(tow=522847.0)       # in-window (01:13:50)
         report = hamma_scrub.build_lost_report(
-            _scan([]), _scan(self._headers(3), duplicate_count=49),
+            _scan([]), _scan(self._headers(3), duplicate_headers=[dup] * 49),
             _simple_rows(3), QUIET_T0, QUIET_T1)
         assert report["duplicate_headers"] == 49
         assert report["certified"] is False
         assert any("duplicate" in b for b in report["blockers"])
+
+    def test_out_of_window_duplicates_do_not_block(self, hamma_scrub):
+        """The other half of the contract: a duplicate the window excludes.
+
+        mj08's GPS-freeze duplicates sit in retained history. Counting the
+        whole scan blocked every later audit on that unit permanently, even
+        for a window deliberately chosen to avoid the episode -- and --since
+        and --recover/--purge are all rejected alongside --audit-loss, so the
+        operator had no way out.
+        """
+        stale = _make_gps_header(tow=522847.0 - 7200)   # ~23:13, day before
+        report = hamma_scrub.build_lost_report(
+            _scan([]), _scan(self._headers(3), duplicate_headers=[stale] * 49),
+            _simple_rows(3), QUIET_T0, QUIET_T1)
+        assert report["duplicate_headers"] == 0
+        assert report["blockers"] == []
+        assert report["certified"] is True
+
+    def test_ags_side_duplicates_are_window_scoped_too(self, hamma_scrub):
+        """The blocker sums BOTH sides. Scoping only MJ would leave the AGS
+        term unscoped, and nothing that avoids SSH would notice."""
+        stale = _make_gps_header(tow=522847.0 - 7200)   # ~23:13, day before
+        report = hamma_scrub.build_lost_report(
+            _scan([], duplicate_headers=[stale] * 12),
+            _scan(self._headers(3)), _simple_rows(3), QUIET_T0, QUIET_T1)
+        assert report["duplicate_headers"] == 0
+        assert report["certified"] is True
+
+    def test_ags_side_in_window_duplicate_still_blocks(self, hamma_scrub):
+        """...and the AGS term must still be able to block."""
+        dup = _make_gps_header(tow=522847.0)
+        report = hamma_scrub.build_lost_report(
+            _scan([], duplicate_headers=[dup] * 12),
+            _scan(self._headers(3)), _simple_rows(3), QUIET_T0, QUIET_T1)
+        assert report["duplicate_headers"] == 12
+        assert report["certified"] is False
+
+    def test_both_sides_sum_independently(self, hamma_scrub):
+        """A record on both AGS and MJ is not a duplicate; each scanner counts
+        within its own side, so the terms add."""
+        dup = _make_gps_header(tow=522847.0)
+        report = hamma_scrub.build_lost_report(
+            _scan([], duplicate_headers=[dup]),
+            _scan(self._headers(3), duplicate_headers=[dup]),
+            _simple_rows(3), QUIET_T0, QUIET_T1)
+        assert report["duplicate_headers"] == 2
+
+    def test_incremental_scan_refuses_rather_than_reading_zero(
+            self, hamma_scrub):
+        """The cached scanner cannot say WHICH header was duplicated. Reading
+        that as "no duplicates" would silently disarm the blocker."""
+        mj = _scan(self._headers(3))
+        mj["duplicate_headers"] = None
+        with pytest.raises(RuntimeError, match="does not retain"):
+            hamma_scrub.build_lost_report(
+                _scan([]), mj, _simple_rows(3), QUIET_T0, QUIET_T1)
+
+    @pytest.mark.parametrize("side", ["ags", "mj"])
+    def test_scan_without_duplicate_identity_refuses(self, hamma_scrub, side):
+        """A stale producer -- one still on the pre-fix contract -- must get a
+        RuntimeError refusal, not an unhandled KeyError traceback: run()'s
+        audit branch catches only (RuntimeError, ValueError), so a bare
+        subscript would escape the EXIT_NO_DATA path entirely."""
+        scans = {"ags": _scan([]), "mj": _scan(self._headers(3))}
+        del scans[side]["duplicate_headers"]
+        with pytest.raises(RuntimeError, match="no 'duplicate_headers' key"):
+            hamma_scrub.build_lost_report(
+                scans["ags"], scans["mj"], _simple_rows(3),
+                QUIET_T0, QUIET_T1)
+
+    @pytest.mark.parametrize("side", ["ags", "mj"])
+    def test_stale_producer_refusal_is_exit_no_data_not_a_traceback(
+            self, hamma_scrub, tmp_path, side):
+        """The same fault end-to-end through run(): a refusal exit code."""
+        headers = {_make_gps_header(tow=522847.0 + i) for i in range(3)}
+        csv_path = tmp_path / "telemetry_hamma_008_2026-04-04.csv"
+        csv_path.write_text(
+            "time,valid_packets,bytes_written,packets_sent,packets_dropped\n"
+            "{},0,0.0,0,0\n{},3,0.0,0,0\n".format(QUIET_T0, QUIET_T1))
+
+        def stale(headers_arg):
+            scan = _scan(headers_arg)
+            del scan["duplicate_headers"]
+            return scan
+
+        hamma_scrub.scan_ags_files = (
+            lambda *a, **k: stale([]) if side == "ags" else _scan([]))
+        hamma_scrub.scan_mj_files = (
+            lambda *a, **k: stale(headers) if side == "mj"
+            else _scan(headers))
+        rc = hamma_scrub.run(
+            "hamma", "/ags/data", "/media/pi", audit_loss=True,
+            window_start=QUIET_T0, window_end=QUIET_T1,
+            telemetry_dir=str(tmp_path), status_file=None, metrics_file=None)
+        assert rc == hamma_scrub.EXIT_NO_DATA
 
     def test_no_mj_files_blocks_certification(self, hamma_scrub):
         """An unreadable drive (e.g. DATA071, HAM-185) empties the union, so a
@@ -3495,7 +3752,7 @@ class TestAuditLossCli:
         headers = {_make_gps_header(tow=522847.0 + i) for i in range(3)}
         telem = self._patch_scans(hamma_scrub, headers, 3, tmp_path)
         hamma_scrub.scan_mj_files = lambda *a, **k: _scan(
-            headers, duplicate_count=7)
+            headers, duplicate_headers=[_make_gps_header(tow=522847.0)] * 7)
         rc = hamma_scrub.run(
             "hamma", "/ags/data", "/media/pi", audit_loss=True,
             window_start=QUIET_T0, window_end=QUIET_T1,
@@ -3505,14 +3762,51 @@ class TestAuditLossCli:
 
     def test_audit_writes_no_shared_state(self, hamma_scrub, tmp_path):
         """write_status/write_scan_metrics feed state_monitor's hang detector;
-        a hand-run audit must not stamp them."""
-        calls = []
-        hamma_scrub.write_status = lambda *a, **k: calls.append(("status", a))
-        hamma_scrub.write_scan_metrics = (
-            lambda *a, **k: calls.append(("metrics", a)))
+        a hand-run audit must not stamp them.
+
+        Asserted against REAL paths and the REAL writers. The previous version
+        of this test mocked both, then filtered the status calls out of its own
+        assertion -- so it passed while run() stamped three heartbeats -- and
+        it passed status_file=None, which makes write_status() a no-op anyway
+        (see its `if not path: return`). Either flaw alone made it incapable
+        of failing. Files under shared/ so they cannot be mistaken for
+        telemetry, which is globbed out of tmp_path itself.
+        """
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        status = shared / "hamma_scrub_status.json"
+        metrics = shared / "scan_metrics.csv"
         headers = {_make_gps_header(tow=522847.0 + i) for i in range(3)}
-        self._run(hamma_scrub, tmp_path, headers, 3)
-        assert [c for c in calls if c[0] == "metrics"] == []
+        telem = self._patch_scans(hamma_scrub, headers, 3, tmp_path)
+        rc = hamma_scrub.run(
+            "hamma", "/ags/data", "/media/pi", audit_loss=True,
+            window_start=QUIET_T0, window_end=QUIET_T1,
+            telemetry_dir=telem, status_file=str(status),
+            metrics_file=str(metrics))
+        assert rc == hamma_scrub.EXIT_OK          # the audit really ran
+        assert not status.exists()
+        assert not metrics.exists()
+
+    def test_audit_does_not_touch_the_shared_mj_scan_cache(self, hamma_scrub,
+                                                           tmp_path):
+        """The MJ cache is a world-writable tmpfs file the timer also owns,
+        and its cached per-dir header sets cannot say which header was
+        duplicated. The audit must not be handed one."""
+        seen = []
+        headers = {_make_gps_header(tow=522847.0 + i) for i in range(3)}
+        telem = self._patch_scans(hamma_scrub, headers, 3, tmp_path)
+
+        def fake_scan(*args, **kwargs):
+            seen.append(kwargs.get("cache_file"))
+            return _scan(headers)
+
+        hamma_scrub.scan_mj_files = fake_scan
+        hamma_scrub.run(
+            "hamma", "/ags/data", "/media/pi", audit_loss=True,
+            window_start=QUIET_T0, window_end=QUIET_T1,
+            telemetry_dir=telem, status_file=None, metrics_file=None,
+            mj_cache=str(tmp_path / "shared_cache.json"))
+        assert seen == [None]
 
     def test_requires_window_bounds(self, hamma_scrub):
         assert hamma_scrub.run(
@@ -3529,6 +3823,187 @@ class TestAuditLossCli:
             window_start=QUIET_T0, window_end=QUIET_T1,
             status_file=None, metrics_file=None,
             **kwargs) == hamma_scrub.EXIT_NO_DATA
+
+
+class TestAuditScanRestriction:
+    """The window-derived hourly-dir range is an I/O optimization and MUST NOT
+    change the report.
+
+    Over-inclusion is free -- headers_in_window() discards the surplus.
+    Under-inclusion silently shrinks the union and manufactures a false FAIL
+    for someone hunting data loss that never happened, so every test here is
+    about the second direction.
+    """
+
+    def test_range_is_derived_from_window_plus_margin(self, hamma_scrub):
+        assert hamma_scrub.window_dir_range(
+            QUIET_T0, QUIET_T1, 10.0, 120.0) == ("2026-04-03T23",
+                                                 "2026-04-04T03")
+
+    def test_margin_tracks_the_named_guards(self, hamma_scrub):
+        """Widening a guard must widen the range. A magic-number margin would
+        leave the scan under-reading the span the guards now allow."""
+        narrow = hamma_scrub.window_dir_range(QUIET_T0, QUIET_T1, 10.0, 120.0)
+        wide = hamma_scrub.window_dir_range(QUIET_T0, QUIET_T1, 10.0, 7200.0)
+        assert wide[0] < narrow[0]
+        assert wide[1] > narrow[1]
+
+    def test_skew_allowance_is_far_looser_than_the_measurement(self,
+                                                               hamma_scrub):
+        """Measured worst case on mj08 was 3 s; this must not be fitted to it,
+        because the skew widens during the episodes that cause drops."""
+        assert hamma_scrub.DIR_NAME_SKEW_SECONDS >= 600.0
+
+    def test_unparseable_bound_does_not_restrict(self, hamma_scrub):
+        """counter_window() owns bound validation; a full scan reaches the
+        same refusal, just slower. Deriving a range here must not pre-empt
+        it with a narrower or empty one."""
+        assert hamma_scrub.window_dir_range(
+            "nonsense", QUIET_T1) == (None, None)
+        assert hamma_scrub.window_dir_range(
+            QUIET_T0, "nonsense") == (None, None)
+
+    @staticmethod
+    def _tree(tmp_path, placements):
+        for index, (hour, tow) in enumerate(placements):
+            subdir = tmp_path / "DATA37" / hour
+            subdir.mkdir(parents=True, exist_ok=True)
+            header = _make_gps_header(tow=tow)
+            (subdir / "r{}.bin".format(index)).write_bytes(
+                header + b"\x00" * 64)
+        return str(tmp_path)
+
+    # GPS 01:59:40 filed under the 02 dir is the skew case the margin exists
+    # for: in-window, but in a directory the literal bounds would not read.
+    _SPREAD = [
+        ("2026-04-03T23", 515647.0),   # first dir of range; outside window
+        ("2026-04-04T01", 522847.0),   # 01:13:50  in window
+        ("2026-04-04T01", 522848.0),   # 01:13:51  in window
+        ("2026-04-04T01", 522849.0),   # 01:13:52  in window
+        ("2026-04-04T02", 525597.0),   # 01:59:40  in window, FILED LATE
+        ("2026-04-04T03", 530047.0),   # last dir of range; outside window
+        ("2026-04-01T01", 263647.0),   # far outside the range entirely
+    ]
+
+    def _both_reports(self, hamma_scrub, base, t0, t1, rows):
+        """The same report built from a restricted scan and from a full one."""
+        since, until = hamma_scrub.window_dir_range(t0, t1, 10.0, 120.0)
+        assert since is not None             # the restriction really applied
+        restricted = hamma_scrub.scan_mj_files(base, since=since, until=until)
+        full = hamma_scrub.scan_mj_files(base)
+        assert restricted["file_count"] < full["file_count"]
+        build = (lambda mj: hamma_scrub.build_lost_report(
+            _scan([]), mj, rows, t0, t1))
+        return build(restricted), build(full)
+
+    def test_restricted_scan_yields_an_identical_report(self, hamma_scrub,
+                                                        tmp_path):
+        """The whole property, as a direct comparison of the two reports."""
+        base = self._tree(tmp_path, self._SPREAD)
+        restricted, full = self._both_reports(
+            hamma_scrub, base, QUIET_T0, QUIET_T1, _simple_rows(4))
+        assert restricted == full
+        assert restricted["union"] == 4      # the late-filed record counted
+        assert restricted["lost"] == 0
+        assert restricted["certified"] is True
+
+    def test_window_inside_a_single_directory(self, hamma_scrub, tmp_path):
+        """A 10-minute window wholly inside one hourly dir still reads the
+        neighbours, because a record of that window can be filed in them."""
+        base = self._tree(tmp_path, self._SPREAD)
+        t0, t1 = "2026-04-04T01:10:00", "2026-04-04T01:20:00"
+        rows = _rows((t0, 0, 0.0, 0, 0), (t1, 3, 0.0, 0, 0))
+        restricted, full = self._both_reports(hamma_scrub, base, t0, t1, rows)
+        assert restricted == full
+        assert restricted["union"] == 3      # only the 01:13:5x records
+        assert restricted["lost"] == 0
+        assert restricted["certified"] is True
+
+    def test_undecodable_total_is_the_one_field_the_restriction_moves(
+            self, hamma_scrub, tmp_path):
+        """Documented exception to the equivalence property.
+
+        undecodable_mj_total counts bad-GPS headers across whatever the scan
+        covered -- format_lost_report() prints it as "whole scan, not
+        window-scoped" -- so narrowing the scan narrows it. It is advisory
+        only: it never enters the union, never blocks, and cannot move `lost`
+        or `certified`. Asserted here so the change is recorded rather than
+        discovered.
+        """
+        bad = [("2026-04-01T01", 0.0), ("2026-04-01T01", 0.0)]
+        base = self._tree(tmp_path, self._SPREAD)
+        for index, (hour, tow) in enumerate(bad):
+            subdir = tmp_path / "DATA37" / hour
+            subdir.mkdir(parents=True, exist_ok=True)
+            header = _make_gps_header(week=0, tow=tow, subsecond=index)
+            (subdir / "bad{}.bin".format(index)).write_bytes(
+                header + b"\x00" * 64)
+
+        restricted, full = self._both_reports(
+            hamma_scrub, base, QUIET_T0, QUIET_T1, _simple_rows(4))
+        assert restricted["undecodable_mj_total"] == 0
+        assert full["undecodable_mj_total"] == 2
+        # Everything that decides the verdict is still identical.
+        for key in ("union", "lost", "certified", "blockers", "ags_in_window",
+                    "mj_in_window", "duplicate_headers", "edge_records_start",
+                    "edge_records_end", "delta_valid_packets"):
+            assert restricted[key] == full[key]
+
+    def test_late_filed_record_is_not_lost_by_the_restriction(self,
+                                                              hamma_scrub,
+                                                              tmp_path):
+        """The under-inclusion failure, isolated: the ONLY in-window record is
+        filed in the next hour's dir. A literal-bounds range would miss it and
+        report it lost."""
+        base = self._tree(tmp_path, [("2026-04-04T02", 525597.0)])
+        since, until = hamma_scrub.window_dir_range(
+            QUIET_T0, QUIET_T1, 10.0, 120.0)
+        mj = hamma_scrub.scan_mj_files(base, since=since, until=until)
+        report = hamma_scrub.build_lost_report(
+            _scan([]), mj, _simple_rows(1), QUIET_T0, QUIET_T1)
+        assert report["union"] == 1
+        assert report["lost"] == 0
+        assert report["certified"] is True
+
+    def test_run_restricts_the_audit_scan(self, hamma_scrub, tmp_path):
+        """End-to-end: run() must pass the derived range to the scanner."""
+        seen = {}
+        headers = {_make_gps_header(tow=522847.0 + i) for i in range(3)}
+        csv_path = tmp_path / "telemetry_hamma_008_2026-04-04.csv"
+        csv_path.write_text(
+            "time,valid_packets,bytes_written,packets_sent,packets_dropped\n"
+            "{},0,0.0,0,0\n{},3,0.0,0,0\n".format(QUIET_T0, QUIET_T1))
+        hamma_scrub.scan_ags_files = lambda *a, **k: _scan([])
+
+        def fake_scan(*args, **kwargs):
+            seen.update(kwargs)
+            return _scan(headers)
+
+        hamma_scrub.scan_mj_files = fake_scan
+        rc = hamma_scrub.run(
+            "hamma", "/ags/data", "/media/pi", audit_loss=True,
+            window_start=QUIET_T0, window_end=QUIET_T1,
+            telemetry_dir=str(tmp_path), status_file=None, metrics_file=None)
+        assert rc == hamma_scrub.EXIT_OK
+        assert seen["since"] == "2026-04-03T23"
+        assert seen["until"] == "2026-04-04T03"
+        assert seen["cache_file"] is None    # finding 3 still holds
+
+    def test_scheduled_scrub_is_unrestricted_by_default(self, hamma_scrub,
+                                                        tmp_path):
+        """The range is audit-only: a normal --recover run must not grow an
+        upper bound and start skipping the newest dirs."""
+        seen = {}
+        hamma_scrub.scan_ags_files = lambda *a, **k: _scan([])
+
+        def fake_scan(*args, **kwargs):
+            seen.update(kwargs)
+            return _scan([])
+
+        hamma_scrub.scan_mj_files = fake_scan
+        hamma_scrub.run("hamma", "/ags/data", str(tmp_path),
+                        status_file=None, metrics_file=None)
+        assert seen["until"] is None
 
 
 class TestArgparseAbbreviations:
