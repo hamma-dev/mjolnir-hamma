@@ -75,7 +75,7 @@ config_version = 1
         filename_template = "{system_name}{unit_number:02d}.png"
         min_update_time = 30  # seconds
 
-    # Step for noise diagnostics on HAMMA fast-channel data
+    # Step for noise diagnostics on HAMMA fast- and slow-channel data
     [steps.noise_diag]
         _module_path = "noise_diag"
         _class_name = "NoiseDiag"
@@ -83,6 +83,7 @@ config_version = 1
         name = "HAMMA Noise Diagnostic"
         min_update_time = 60          # seconds between samples
         medsize = 200000             # fast-channel pre-trigger baseline samples
+        medsize_slow = 20000         # slow-channel pre-trigger baseline samples
         min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
         output_path = "noise_diag"
         filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
