@@ -79,7 +79,15 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             filename_template=self.filename_template)
         out_file.parent.mkdir(parents=True, exist_ok=True)
         if out_file.exists():
-            self._upgrade_csv_header(out_file)
+            # An unreadable day file (e.g. NUL bytes after power loss, which
+            # Python <= 3.10's csv rejects) must not block the append or the
+            # alert check after it; fall back to a plain append.
+            try:
+                self._upgrade_csv_header(out_file)
+            except (csv.Error, ValueError, OSError) as e:
+                self.logger.warning(
+                    "noise_diag: could not check header of %s (%s: %s); "
+                    "appending without upgrade.", out_file, type(e).__name__, e)
         # A 0-byte file (e.g. power loss right after creation) also needs the
         # header, or every row that day lands headerless.
         new_file = not out_file.exists() or out_file.stat().st_size == 0

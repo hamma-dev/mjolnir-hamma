@@ -329,6 +329,37 @@ def test_write_csv_leaves_unexpected_header_alone(tmp_path):
     step.logger.warning.assert_called()
 
 
+@pytest.mark.parametrize("content, reader_error", [
+    # Undecodable bytes raise UnicodeDecodeError on any Python.
+    (b"\xff\xfe\xfa" * 20, None),
+    # NUL bytes after power loss: Python <= 3.10 (Pi's 3.7/3.9) raises
+    # csv.Error "line contains NUL"; 3.11+ does not, so simulate it.
+    (b"\x00" * 64, "line contains NUL"),
+])
+def test_write_csv_unreadable_header_falls_back_to_append(tmp_path, content, reader_error):
+    """A day file csv can't read must not stop the row from being written;
+    it falls back to a plain append (the pre-upgrade behavior)."""
+    import csv as _csv
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_bytes(content)
+    patches = [patch.object(module, "render_output_filename", return_value=csv_file)]
+    if reader_error:
+        patches.append(patch.object(module.csv, "reader",
+                                    side_effect=_csv.Error(reader_error)))
+    with patches[0]:
+        if reader_error:
+            with patches[1]:
+                step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+        else:
+            step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+    data = csv_file.read_bytes()
+    assert data.startswith(content)
+    assert b"2026-06-23T17:00:00,t1," in data
+    step.logger.warning.assert_called()
+
+
 def test_default_medsize_slow_is_20000():
     module = load_module()
     with patch.dict("sys.modules", {"notifiers": MagicMock()}):
