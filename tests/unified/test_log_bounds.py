@@ -191,3 +191,61 @@ class TestSingleImplementation:
                    "log_bounds_status_rsyslog",
                    "log_bounds_status_cron"):
             assert f"{fn}()" in lib
+
+
+class TestJournaldPersistence:
+    """A cap on a RAM-only journal bounds nothing and loses history (HAM-216).
+
+    mj03 had the drop-in but no /var/log/journal, so the stock Storage=auto ran
+    journald in RAM: SystemMaxUse was inert and every reboot erased the logs,
+    while `apply_log_bounds.sh --check` reported "All bounds present".
+    """
+
+    def test_dropin_pins_persistent_storage(self):
+        conf = (FILES_DIR / "journald-sensor-bounds.conf").read_text()
+        assert "Storage=persistent" in conf, (
+            "Storage=auto silently falls back to RAM when /var/log/journal "
+            "is missing; pin persistent so journald creates it")
+
+    def _status(self, tmp_path, dropin=True, journal_dir=True,
+                fn="log_bounds_status_journald"):
+        dst = tmp_path / "00-sensor-bounds.conf"
+        jdir = tmp_path / "journal"
+        lr = tmp_path / "logrotate-rsyslog"
+        cron = tmp_path / "mjolnir-logrotate"
+        if dropin:
+            dst.write_text("[Journal]\n")
+        if journal_dir:
+            jdir.mkdir()
+        lr.write_text("maxsize 100M\n")
+        cron.write_text("#!/bin/sh\n")
+        script = (
+            f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+            f'LOG_BOUNDS_JOURNALD_DST="{dst}"\n'
+            f'LOG_BOUNDS_JOURNAL_DIR="{jdir}"\n'
+            f'LOG_BOUNDS_RSYSLOG_LR="{lr}"\n'
+            f'LOG_BOUNDS_CRON_DST="{cron}"\n'
+            f'{fn} && echo "RC=0" || echo "RC=1"\n'
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        return result.stdout
+
+    def test_status_present_when_dropin_and_journal_dir_exist(self, tmp_path):
+        assert self._status(tmp_path).startswith("PRESENT")
+
+    def test_status_missing_without_dropin(self, tmp_path):
+        assert self._status(tmp_path, dropin=False).startswith("MISSING")
+
+    def test_status_ram_only_without_journal_dir(self, tmp_path):
+        """The mj03 state must not read as PRESENT."""
+        assert self._status(tmp_path, journal_dir=False).startswith("RAM-ONLY")
+
+    def test_all_present_fails_for_ram_only_journal(self, tmp_path):
+        out = self._status(tmp_path, journal_dir=False,
+                           fn="log_bounds_all_present")
+        assert "RC=1" in out
+
+    def test_all_present_passes_when_everything_is_in_place(self, tmp_path):
+        out = self._status(tmp_path, fn="log_bounds_all_present")
+        assert "RC=0" in out

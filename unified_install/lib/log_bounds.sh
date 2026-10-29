@@ -30,6 +30,8 @@ LOG_BOUNDS_FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../fi
 LOG_BOUNDS_JOURNALD_DIR="/etc/systemd/journald.conf.d"
 LOG_BOUNDS_JOURNALD_DST="$LOG_BOUNDS_JOURNALD_DIR/00-sensor-bounds.conf"
 LOG_BOUNDS_JOURNALD_SRC="journald-sensor-bounds.conf"
+# Persistent journal location. Without it the cap above bounds nothing (HAM-216).
+LOG_BOUNDS_JOURNAL_DIR="/var/log/journal"
 
 LOG_BOUNDS_RSYSLOG_LR="/etc/logrotate.d/rsyslog"
 # Backup MUST live outside /etc/logrotate.d/ -- logrotate reads every file in
@@ -93,8 +95,17 @@ log_bounds_reclaim() {
 
 # --- status (read-only) ------------------------------------------------------
 
+# RAM-ONLY: the drop-in is installed but there is no persistent journal, so
+# journald keeps logs in RAM -- the cap is inert and history dies on reboot.
+# Must not read as PRESENT: that is exactly how mj03 passed --check (HAM-216).
 log_bounds_status_journald() {
-    [[ -f "$LOG_BOUNDS_JOURNALD_DST" ]] && echo "PRESENT" || echo "MISSING"
+    if [[ ! -f "$LOG_BOUNDS_JOURNALD_DST" ]]; then
+        echo "MISSING"
+    elif [[ ! -d "$LOG_BOUNDS_JOURNAL_DIR" ]]; then
+        echo "RAM-ONLY"
+    else
+        echo "PRESENT"
+    fi
 }
 
 log_bounds_status_rsyslog() {
