@@ -104,7 +104,18 @@ FIELDS = [
     "unit", "front_end", "brokkr_mode",
     "threshold_1_mv", "threshold_2_mv", "gain_fast", "gain_slow",
     "mjolnir_hamma", "brokkr", "sindri", "hamma", "notifiers",
+    # How each package is imported (HAM-205): `editable` (from the git checkout,
+    # so the SHA above is what runs), `installed` (a frozen site-packages copy
+    # that shadows the checkout -- the SHA above is NOT what runs), or
+    # `missing`. A frozen notifiers copy is what crashed brokkr in 2026-06 while
+    # every git SHA looked current.
+    "brokkr_install", "sindri_install", "hamma_install", "notifiers_install",
 ]
+
+# The release branch units are expected to track. "behind" in the digest means
+# a unit's mjolnir_hamma SHA is not this branch's head.
+RELEASE_REMOTE = "https://github.com/hamma-dev/mjolnir-hamma.git"
+RELEASE_BRANCH = "0.4.x"
 
 UNREACHABLE = "unreachable"
 UNKNOWN = "unknown"
@@ -154,6 +165,18 @@ echo "brokkr_mode=${M:-default}"
 for repo in mjolnir-hamma brokkr sindri notifiers hamma; do
   KEY=$(echo "$repo" | tr - _)
   echo "$KEY=$(git -C /home/pi/dev/$repo rev-parse --short HEAD 2>/dev/null || echo unknown)"
+done
+# Where each package is actually imported from, by the interpreter that runs it.
+for pair in brokkr:ltgenv notifiers:ltgenv hamma:ltgenv sindri:sindrienv; do
+  PKG=${pair%%:*}; ENV=${pair##*:}
+  F=$(/home/pi/dev/$ENV/bin/python3 -c "import os,$PKG; print(os.path.realpath($PKG.__file__ or ''))" 2>/dev/null)
+  case "$F" in
+    "") I=missing ;;
+    /home/pi/dev/$PKG/*) I=editable ;;
+    */site-packages/*) I=installed ;;
+    *) I=unknown ;;
+  esac
+  echo "${PKG}_install=$I"
 done
 timeout 15 ssh -o ConnectTimeout=5 -o BatchMode=yes hamma cat /ags/scripts/startup 2>/dev/null \
   | sed 's/^/AGS:/' || true
@@ -395,6 +418,10 @@ def diff(previous, current):
         came_back = (str(old.get("front_end", "")) == UNREACHABLE
                      and str(new.get("front_end", "")) != UNREACHABLE)
         for field in FIELDS[1:]:
+            # A column the old snapshot predates is a schema addition, not a
+            # change -- otherwise appending a field reports it for every unit.
+            if field not in old:
+                continue
             if str(old.get(field, "")) != str(new.get(field, "")):
                 if front_changed and field in POWER_DERIVED_FIELDS:
                     continue
@@ -431,6 +458,38 @@ def not_capturing(rows):
             continue
         if row.get("front_end") == "off" or "nosensor" in str(row.get("brokkr_mode", "")):
             out.append((unit, row.get("front_end"), row.get("brokkr_mode")))
+    return out
+
+
+def release_head(branch, remote=RELEASE_REMOTE):
+    """Full SHA at the head of the release branch, or None if it can't be read.
+
+    Read with ls-remote so no checkout is needed on the box the probe runs on.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", remote, "refs/heads/{}".format(branch)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0]
+
+
+def behind_release(rows, unreachable, head):
+    """[(unit, sha)] for reachable units whose mjolnir_hamma is not `head`.
+
+    Units sync to the release branch only when someone rolls a merge out, and
+    nothing did -- the fleet was 8-30 commits behind by 2026-10-28 (HAM-205).
+    Standing, like "not capturing": listed every day until it is resolved.
+    """
+    out = []
+    for unit in sorted(set(rows) - set(unreachable)):
+        sha = str(rows[unit].get("mjolnir_hamma", UNKNOWN))
+        if sha == UNKNOWN or not sha or not head.startswith(sha):
+            out.append((unit, sha))
     return out
 
 
@@ -472,7 +531,7 @@ def changed_since(repo, snapshot_rel, unit, current_state, limit=200):
 
 
 def digest(rows, changes, unreachable, baseline=False, repo=None,
-           snapshot_rel=None, expected=None):
+           snapshot_rel=None, expected=None, release=None):
     probed = len(rows) - len(unreachable)
     if baseline:
         lines = ["fleet probe: baseline established, {} units".format(probed)]
@@ -521,6 +580,21 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
                 since = changed_since(repo, snapshot_rel, unit, (front, mode))
             lines.append("  {}  front_end={}, mode={}{}".format(
                 unit, front, mode, "   since {}".format(since) if since else ""))
+    # Standing too. `release` is (branch, head_sha); head None means it could
+    # not be read, which is said out loud -- "nobody behind" and "couldn't
+    # check" must not look the same.
+    if release is not None:
+        branch, head = release
+        if head is None:
+            lines.append("")
+            lines.append("behind {0}: could not read the {0} head".format(branch))
+        else:
+            behind = behind_release(rows, unreachable, head)
+            if behind:
+                lines.append("")
+                lines.append("behind {} ({}):".format(branch, head[:7]))
+                for unit, sha in behind:
+                    lines.append("  {}  {}".format(unit, sha))
     # Split expected-offline out of the unreachable list. Lumping them together
     # trains people to skim past the line, which is how a genuinely dark unit
     # gets missed -- the whole reason this exists.
@@ -611,6 +685,10 @@ def main():
                         help="directory containing ags.py (for the threshold/gain "
                              "parser). Overrides the search path; also settable "
                              "via $FLEET_PROBE_AGS_PATH")
+    parser.add_argument("--release-branch", default=RELEASE_BRANCH,
+                        help="branch units should track; reachable units whose "
+                             "mjolnir_hamma is not its head are listed in the "
+                             "digest (default: {})".format(RELEASE_BRANCH))
     parser.add_argument("--allow-missing-ags", action="store_true",
                         help="probe even if ags.py cannot be found. Thresholds "
                              "and gains will read 'unknown' for every unit -- "
@@ -688,7 +766,9 @@ def main():
     report = digest(merged, changes, unreachable, baseline=baseline,
                     repo=args.repo if not baseline else None,
                     snapshot_rel=snapshot_rel,
-                    expected=expected_offline(args.repo))
+                    expected=expected_offline(args.repo),
+                    release=(args.release_branch,
+                             release_head(args.release_branch)))
     print(report)
 
     if args.dry_run:

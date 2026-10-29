@@ -642,3 +642,152 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+# --------------------------------------------------------------------------
+# Install-mode fields (HAM-205) -- the git SHA is only what RUNS if the
+# package is imported from the checkout. A frozen site-packages copy shadows
+# it, which is how the 2026-06 notifiers ImportError hid from a git survey.
+# --------------------------------------------------------------------------
+INSTALL_FIELDS = ["brokkr_install", "sindri_install", "hamma_install",
+                  "notifiers_install"]
+
+
+class TestInstallFields:
+    def test_install_fields_are_appended_to_the_schema(self, fp):
+        # Appending is safe; reordering rewrites every snapshot row.
+        assert fp.FIELDS[-len(INSTALL_FIELDS):] == INSTALL_FIELDS
+        assert fp.FIELDS[:12] == list(row(fp, "x").keys())
+
+    def test_probe_parses_install_fields(self, fp):
+        out = ("front_end=on\n"
+               "brokkr_install=installed\n"
+               "sindri_install=editable\n"
+               "hamma_install=installed\n"
+               "notifiers_install=missing\n")
+        run = MagicMock(returncode=0, stdout=out, stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run):
+            r = fp.probe_unit(8)
+        assert r["brokkr_install"] == "installed"
+        assert r["sindri_install"] == "editable"
+        assert r["notifiers_install"] == "missing"
+
+    def test_remote_script_classifies_each_package_by_import_path(self, fp):
+        # sindri runs from its own venv; the rest from ltgenv.
+        for pkg, env in [("brokkr", "ltgenv"), ("notifiers", "ltgenv"),
+                         ("hamma", "ltgenv"), ("sindri", "sindrienv")]:
+            assert "{}:{}".format(pkg, env) in fp.REMOTE
+        for label in ("editable", "installed", "missing"):
+            assert label in fp.REMOTE
+
+    def test_install_mode_change_is_reported(self, fp):
+        prev = {"mjolnir06": dict(row(fp, "mjolnir06"),
+                                  notifiers_install="installed")}
+        cur = {"mjolnir06": dict(row(fp, "mjolnir06"),
+                                 notifiers_install="editable")}
+        assert fp.diff(prev, cur) == [
+            ("mjolnir06", "notifiers_install", "installed", "editable")]
+
+    def test_new_schema_field_is_not_a_change(self, fp):
+        # The first run after upgrading must not report four "changes" per
+        # unit just because the old snapshot predates the columns.
+        prev = {"mjolnir02": row(fp, "mjolnir02")}          # no *_install keys
+        cur = {"mjolnir02": dict(row(fp, "mjolnir02"),
+                                 **{f: "editable" for f in INSTALL_FIELDS})}
+        assert fp.diff(prev, cur) == []
+
+    def test_old_snapshot_without_columns_round_trips(self, fp, tmp_path):
+        path = tmp_path / "fleet-state.csv"
+        path.write_text(",".join(fp.FIELDS[:12]) + "\n"
+                        + ",".join(row(fp, "mjolnir02").values()) + "\n")
+        rows = fp.read_snapshot(str(path))
+        text = fp.render(rows)
+        assert text.splitlines()[0] == ",".join(fp.FIELDS)
+
+
+# --------------------------------------------------------------------------
+# Behind the release head (HAM-205) -- standing, like "not capturing"
+# --------------------------------------------------------------------------
+class TestReleaseHead:
+    def test_reads_head_with_ls_remote(self, fp):
+        out = "52bb35d0123456789abcdef0123456789abcdef0\trefs/heads/0.4.x\n"
+        run = MagicMock(returncode=0, stdout=out, stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run) as call:
+            head = fp.release_head("0.4.x")
+        assert head == "52bb35d0123456789abcdef0123456789abcdef0"
+        cmd = call.call_args[0][0]
+        assert cmd[:2] == ["git", "ls-remote"]
+        assert "refs/heads/0.4.x" in cmd
+
+    def test_failure_returns_none_not_raise(self, fp):
+        with patch.object(fp.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("git", 30)):
+            assert fp.release_head("0.4.x") is None
+        run = MagicMock(returncode=128, stdout="", stderr="fatal")
+        with patch.object(fp.subprocess, "run", return_value=run):
+            assert fp.release_head("0.4.x") is None
+
+
+class TestBehindRelease:
+    HEAD = "52bb35d0123456789abcdef0123456789abcdef0"
+
+    def test_lists_reachable_units_not_at_head(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d"),
+                "mjolnir08": row(fp, "mjolnir08", mh="a6147a1"),
+                "mjolnir05": row(fp, "mjolnir05", mh="0bdbf68")}
+        out = fp.behind_release(rows, ["mjolnir05"], self.HEAD)
+        assert out == [("mjolnir08", "a6147a1")]
+
+    def test_unknown_sha_is_listed(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh=fp.UNKNOWN)}
+        assert fp.behind_release(rows, [], self.HEAD) == [
+            ("mjolnir02", fp.UNKNOWN)]
+
+    def test_digest_section_is_standing(self, fp):
+        rows = {"mjolnir08": row(fp, "mjolnir08", mh="a6147a1")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "behind 0.4.x (52bb35d):" in text
+        assert "mjolnir08  a6147a1" in text
+
+    def test_digest_silent_when_all_at_head(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "behind 0.4.x" not in text
+
+    def test_digest_says_so_when_head_unreadable(self, fp):
+        # Never silently drop the section: "nobody behind" and "couldn't
+        # check" must not look the same.
+        rows = {"mjolnir02": row(fp, "mjolnir02")}
+        text = fp.digest(rows, [], [], baseline=False, release=("0.4.x", None))
+        assert "behind 0.4.x: could not read the 0.4.x head" in text
+
+    def test_digest_without_release_is_unchanged(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="a6147a1")}
+        assert "behind" not in fp.digest(rows, [], [], baseline=False)
+
+
+class TestMainReportsRelease:
+    def _main(self, fp, argv, head):
+        probed = dict(row(fp, "mjolnir08", mh="a6147a1"))
+        with patch.object(fp.sys, "argv", ["fleet_probe.py"] + argv), \
+                patch.object(fp, "parse_startup_state", lambda text: {}), \
+                patch.object(fp, "probe_unit", return_value=probed), \
+                patch.object(fp, "read_snapshot", return_value={}), \
+                patch.object(fp, "release_head", return_value=head) as rh:
+            status = fp.main()
+        return status, rh
+
+    def test_probe_run_reads_the_release_head(self, fp, capsys):
+        head = "52bb35d0123456789abcdef0123456789abcdef0"
+        status, rh = self._main(fp, ["-p", "8", "--dry-run"], head)
+        assert status == 0
+        rh.assert_called_once_with("0.4.x")
+        assert "behind 0.4.x (52bb35d):" in capsys.readouterr().out
+
+    def test_release_branch_is_configurable(self, fp, capsys):
+        _, rh = self._main(fp, ["-p", "8", "--dry-run",
+                                "--release-branch", "0.5.x"], None)
+        rh.assert_called_once_with("0.5.x")
+        assert "behind 0.5.x: could not read" in capsys.readouterr().out
