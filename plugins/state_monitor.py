@@ -218,6 +218,7 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         power_check_interval_s=3600,
         power_check_retry_s=300,
         ping_max=3,
+        ping_stale_cycles=15,
         channel=None,
         key_file=None,
         low_pi_space=5,
@@ -270,6 +271,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         ping_max : int, optional
             The maximum number of consecutive ping errors before we send an error message
             via `method`. Any ping errors are still logged locally.
+        ping_stale_cycles : int, optional
+            Alert once if `ping` reads NA this many consecutive monitor cycles
+            (default 15, same as `hs_stale_cycles`). A single NA is normal -- every
+            brokkr start writes one -- and is skipped, but a ping that never yields
+            a number again would otherwise silence outage detection for good.
+            Reset (and re-armed) by any numeric reading.
         channel : str, optional
             The chat channel in which to post notifications.
         key_file : str or pathlib.Path, optional
@@ -351,6 +358,10 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "expected alert_space < purge_space", alert_space, purge_space)
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
+        # Ping-staleness watchdog, the same shape as the bytes_remaining one.
+        self.ping_stale_cycles = ping_stale_cycles
+        self._ping_stale_count = 0
+        self._ping_stale_alerted = False
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
         # HAM-185 science-write-target check. `_drive_target_count` counts
@@ -1607,6 +1618,8 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # first bad ping -- the very thing the reset exists to prevent.
         if not self._science_ingest_enabled():
             self.bad_ping = 0
+            self._ping_stale_count = 0
+            self._ping_stale_alerted = False
             self.logger.debug(
                 "Science ingest is disabled on this unit -- suppressing "
                 "no-communication alerting (HAM-114)")
@@ -1617,18 +1630,38 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # absence of evidence, not evidence of an outage. Skip without touching
         # the counter, so a genuine streak either side of an NA sample still
         # reaches ping_max rather than being reset by it.
+        #
+        # One NA is normal (every brokkr start writes one). A ping that stays NA
+        # would leave the outage check permanently unable to fire, so a
+        # persistent NA becomes an alert in its own right, as for
+        # bytes_remaining.
         if _is_na(no_comm_now):
+            self._ping_stale_count += 1
+            if (self._ping_stale_count >= self.ping_stale_cycles
+                    and not self._ping_stale_alerted):
+                self._ping_stale_alerted = True
+                return ("Ping telemetry NA for {} cycles -- cannot tell whether "
+                        "the sensor is reachable".format(self._ping_stale_count))
             return None
+        self._ping_stale_count = 0
+        self._ping_stale_alerted = False
 
         # If the ping !=0, then we can't reach the sensor
         if no_comm_now:
             # If any bad ping, increment the counter.
             self.bad_ping += 1
-            if not no_comm_pre:
+            # An NA previous sample (the one written at every brokkr start)
+            # counts as "unknown", not as already-down.
+            if _is_na(no_comm_pre) or not no_comm_pre:
                 # If we pinged fine before, but not now, log it.
                 self.logger.info("Sensor unable to be pinged!")
             # Once we reach the critical value, send an alert and log it.
             if self.bad_ping == self.ping_max:
+                # brokkr's PingInput returns -99 when the ping command itself
+                # raised -- that is this unit's probe failing, not the sensor.
+                if no_comm_now == -99:
+                    return ("Sensor status unknown: the ping probe failed "
+                            "(consecutive failures: {})".format(self.bad_ping))
                 return f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
         else:  # if we can communicate now, reset the counter
             self.bad_ping = 0
