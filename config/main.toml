@@ -112,8 +112,13 @@ config_version = 1
         server_path = '/home/pi/noise_diag'
         update_time = 1800  # seconds
         include = 'noise_hamma*.csv'
-        timeout = 120  # seconds; PROVISIONAL, pending the plot push timeout investigation
         partial_dir = '.rsync-partial'  # resume interrupted transfers
+        # Nested so each layer gives up before the next: ssh (30 s connect,
+        # 45 s dead link) < rsync stall (60 s) < hard kill (300 s). Session
+        # setup alone measured up to ~6.5 s over cellular (AUMMA RTT ~330 ms).
+        ssh_options = '-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes'
+        io_timeout = 60  # seconds
+        timeout = 300  # seconds
 
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
@@ -282,7 +287,7 @@ config_version = 1
     [pipelines.rsync_noise_diag]
         _builder = "pipeline"
         _enabled = true
-        period_s = 60
+        period_s = 600  # a failed push retries at this period
         name = "Rsync noise diagnostic CSVs to server"
         input_steps = [
             "builtins.inputs.current_time",

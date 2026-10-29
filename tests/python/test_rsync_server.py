@@ -122,6 +122,39 @@ def test_partial_dir_precedes_paths(mock_run):
     assert cmd.index("--partial-dir=.rsync-partial") < len(cmd) - 2
 
 
+# --- rsync I/O timeout and ssh options ---
+# Python 3.7.3 (Buster) subprocess.run calls communicate() without a timeout
+# after killing rsync on TimeoutExpired, so it can block until rsync's ssh
+# child exits. rsync and ssh must give up on their own, before `timeout`.
+
+def test_no_io_timeout_by_default(mock_run):
+    cmd, _ = run_rsync(make_step(), mock_run)
+    assert not any(arg.startswith("--timeout") for arg in cmd)
+
+
+def test_io_timeout_is_passed_to_rsync(mock_run):
+    cmd, _ = run_rsync(make_step(io_timeout=60), mock_run)
+    assert "--timeout=60" in cmd
+    assert cmd.index("--timeout=60") < len(cmd) - 2
+
+
+def test_ssh_command_unchanged_by_default(mock_run):
+    cmd, _ = run_rsync(make_step(), mock_run)
+    ssh = cmd[cmd.index("-e") + 1]
+    assert ssh == ("ssh -o StrictHostKeyChecking=no "
+                   "-o UserKnownHostsFile=/dev/null")
+
+
+def test_ssh_options_are_appended(mock_run):
+    cmd, _ = run_rsync(
+        make_step(ssh_options="-o ConnectTimeout=20 -o BatchMode=yes"),
+        mock_run)
+    ssh = cmd[cmd.index("-e") + 1]
+    assert ssh == ("ssh -o StrictHostKeyChecking=no "
+                   "-o UserKnownHostsFile=/dev/null "
+                   "-o ConnectTimeout=20 -o BatchMode=yes")
+
+
 # --- Unchanged command shape ---
 
 def test_source_and_destination(mock_run):
@@ -152,7 +185,18 @@ def test_noise_diag_rsync_step_config(main_config):
     assert step["server_path"] == "/home/pi/noise_diag"
     assert step["update_time"] == 1800
     assert step["partial_dir"] == ".rsync-partial"
-    assert step["timeout"] > 10
+
+
+def test_noise_diag_rsync_timeouts_are_nested(main_config):
+    """ssh gives up before rsync, and rsync before the Python timeout."""
+    step = main_config["steps"]["noise_diag_rsync"]
+    opts = dict(o.split("=", 1) for o in step["ssh_options"].split()
+                if "=" in o)
+    connect = int(opts["ConnectTimeout"])
+    keepalive = (int(opts["ServerAliveInterval"])
+                 * int(opts["ServerAliveCountMax"]))
+    assert opts["BatchMode"] == "yes"
+    assert max(connect, keepalive) < step["io_timeout"] < step["timeout"]
 
 
 def test_noise_diag_rsync_has_its_own_pipeline(main_config):
@@ -164,8 +208,36 @@ def test_noise_diag_rsync_has_its_own_pipeline(main_config):
     assert pipelines["rsync_hamma_realtime"]["output_steps"] == ["hamma_plot_rsync"]
 
 
+def test_noise_diag_rsync_pipeline_period_bounds_retries(main_config):
+    """A failed push retries every period_s; keep that well apart."""
+    pipeline = main_config["pipelines"]["rsync_noise_diag"]
+    step = main_config["steps"]["noise_diag_rsync"]
+    assert pipeline["period_s"] > step["timeout"]
+    assert pipeline["period_s"] < step["update_time"]
+
+
+@pytest.fixture(scope="module")
+def mode_config():
+    tomli = pytest.importorskip("tomli")
+    with open(REPO_ROOT / "config" / "mode.toml", "rb") as f:
+        return tomli.load(f)
+
+
+def test_noise_diag_rsync_disabled_in_test_mode(mode_config):
+    """Test mode writes under ~/brokkr/test, so there is nothing to push."""
+    pipelines = mode_config["test"]["main"]["pipelines"]
+    assert pipelines["rsync_noise_diag"]["_enabled"] is False
+
+
+@pytest.mark.parametrize("mode", ["nosensor", "nosensor_nochargecontroller"])
+def test_noise_diag_rsync_stays_on_with_sensor_off(mode_config, mode):
+    """A unit with its sensor off still pushes the backlog it already has."""
+    pipelines = mode_config[mode]["main"].get("pipelines", {})
+    assert pipelines.get("rsync_noise_diag", {}).get("_enabled", True) is True
+
+
 def test_plot_rsync_keeps_default_timeout(main_config):
     """The existing plot push is not changed by this feature."""
     step = main_config["steps"]["hamma_plot_rsync"]
-    assert "timeout" not in step
-    assert "partial_dir" not in step
+    for key in ("timeout", "partial_dir", "io_timeout", "ssh_options"):
+        assert key not in step

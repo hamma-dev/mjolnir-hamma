@@ -22,6 +22,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
                  username='pi',
                  timeout=10,
                  partial_dir=None,
+                 io_timeout=None,
+                 ssh_options=None,
                  **output_step_kwargs):
         """
         Sync files to a server via rsync.
@@ -49,6 +51,14 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
             is interrupted resumes on the next sync instead of restarting.
             Relative paths are relative to `server_path`. The default is None
             (not used).
+        io_timeout : int, optional
+            Passed to the `--timeout` option of rsync, which exits if no data
+            moves for this many seconds. Set it below `timeout`: on Python
+            3.7.3, `subprocess.run` can block past `timeout` after killing
+            rsync, until rsync's ssh child exits. The default is None (not used).
+        ssh_options : str, optional
+            Extra options appended to the ssh command rsync uses, e.g.
+            "-o ConnectTimeout=30". The default is None (none added).
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -68,6 +78,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         self.include = include
         self.timeout = timeout
         self.partial_dir = partial_dir
+        self.io_timeout = io_timeout
+        self.ssh_options = ssh_options
 
     def execute(self, input_data=None):
         """
@@ -122,12 +134,20 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
     def rsync(self):
         """ Build the command for rsync and run it."""
 
+        ssh = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        if self.ssh_options:
+            ssh = f"{ssh} {self.ssh_options}"
+
         cmd = [
             "rsync",
             "-rltDvz",
             "--omit-dir-times",
-            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            "-e", ssh,
         ]
+
+        # Let rsync give up on a stalled transfer before we have to kill it
+        if self.io_timeout:
+            cmd = cmd + [f"--timeout={self.io_timeout}"]
 
         # Keep interrupted transfers so they resume on the next sync
         if self.partial_dir:
