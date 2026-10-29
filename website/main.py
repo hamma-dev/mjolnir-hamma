@@ -1017,12 +1017,30 @@ def _noise_plot_preprocess(_full_data):
             )
 
 
+def _na_gauge_series():
+    """One NaN at the current time: what a gauge reports with no noise data.
+
+    An EMPTY Series is not "no value" to sindri -- its gauge functions call
+    `.iloc[-1]` and `.last(...).iloc[0]`, which raise on it, and sindri prints
+    a full traceback per gauge per build (HAM-187, every nosensor unit). A
+    single NaN instead flows through as NA (safe_nan -> None), exactly like
+    the charge-controller gauges on a nochargecontroller unit. Index is UTC,
+    tz-naive, matching ingest_noise_data.
+    """
+    now = pd.Timestamp.now(tz="UTC").tz_convert(None)
+    return pd.Series([float("nan")], index=pd.DatetimeIndex([now], name="time"),
+                     dtype="float64")
+
+
 def _noise_gauge_series(column):
-    """Latest noise Series in mV for a dashboard gauge; empty-safe."""
+    """Latest noise Series in mV for a dashboard gauge; NA when there is none."""
     try:
-        return ingest_noise_data(n_days=1)[column] * 1000
+        series = ingest_noise_data(n_days=1)[column] * 1000
     except Exception:
-        return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+        return _na_gauge_series()
+    if series.dropna().empty:
+        return _na_gauge_series()
+    return series
 
 
 # --- Per-sensor noise calibration -------------------------------------------

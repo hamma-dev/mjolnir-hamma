@@ -559,3 +559,78 @@ def test_clamp_threshold_into_range(ns):
 def test_main_py_syntax():
     import py_compile
     py_compile.compile(str(MAIN_PY), doraise=True)
+
+
+# ---------------------------------------------------------------------------
+# HAM-187: gauges on a unit with no noise data must report NA, not raise
+# ---------------------------------------------------------------------------
+# sindri 0.3.x (436bf61) website/generate.py DASHBOARD_DATA_ARGS_DEFAULT: the
+# three values every numeric gauge computes, then safe_nan (non-finite -> None)
+# and, for threshold_type "max", a max() overlay on the third. Copied here to
+# pin the contract the gauge Series must satisfy. On a nosensor unit the
+# noise_diag dir is empty, and an EMPTY Series made `.iloc[-1]` raise -- sindri
+# caught it, but printed a full traceback per gauge per ~60 s build.
+import math  # noqa: E402
+
+_SINDRI_GAUGE_FUNCTIONS = [
+    lambda base_data, data_args: base_data.iloc[-1],
+    lambda base_data, data_args: base_data.last(data_args["delta_period"]).iloc[0],
+    lambda base_data, data_args: max(base_data.last(data_args["threshold_period"])),
+]
+
+
+def _sindri_gauge_values(series):
+    args = {"delta_period": "1H", "threshold_period": "24H"}
+    out = []
+    for fn in _SINDRI_GAUGE_FUNCTIONS:
+        value = fn(series, args)
+        out.append(None if not math.isfinite(value) else value)
+    return out
+
+
+def _with_dir(ns, data_dir):
+    orig = ns["ingest_noise_data"]
+    ns["ingest_noise_data"] = (
+        lambda n_days=None, data_dir=data_dir,
+        glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+        orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
+    return orig
+
+
+@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
+def test_gauge_reports_na_without_noise_data(ns, empty_noise_dir, gauge):
+    orig = _with_dir(ns, empty_noise_dir)
+    try:
+        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
+        series = variable(pd.DataFrame())
+        assert isinstance(series.index, pd.DatetimeIndex)
+        assert series.dtype == "float64"
+        # Must not raise, and every value must degrade to None (NA).
+        assert _sindri_gauge_values(series) == [None, None, None]
+    finally:
+        ns["ingest_noise_data"] = orig
+
+
+@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
+def test_gauge_reports_na_when_loading_fails(ns, gauge):
+    orig = ns["ingest_noise_data"]
+
+    def boom(*args, **kwargs):
+        raise OSError("unreadable noise dir")
+
+    ns["ingest_noise_data"] = boom
+    try:
+        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
+        assert _sindri_gauge_values(variable(pd.DataFrame())) == [None, None, None]
+    finally:
+        ns["ingest_noise_data"] = orig
+
+
+def test_gauge_unchanged_when_noise_data_exists(ns, tmp_noise_dir):
+    orig = _with_dir(ns, tmp_noise_dir)
+    try:
+        variable = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_data"]["variable"]
+        values = _sindri_gauge_values(variable(pd.DataFrame()))
+        assert values[0] is not None and abs(values[0] - 4.5) < 0.01
+    finally:
+        ns["ingest_noise_data"] = orig
