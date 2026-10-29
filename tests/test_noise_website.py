@@ -180,6 +180,9 @@ def test_preprocess_mv_conversion(ns, tmp_noise_dir, monkeypatch):
 
 
 def test_gauge_variable_mv_conversion(ns, tmp_noise_dir, monkeypatch):
+    # Pin "now" just after the sample's last row so it is not stale.
+    monkeypatch.setitem(ns, "_noise_now",
+                        lambda: pd.Timestamp("2026-06-26 14:25:00"))
     orig = ns["ingest_noise_data"]
     ns["ingest_noise_data"] = lambda n_days=None, data_dir=tmp_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=tmp_noise_dir, glob_pattern=glob_pattern)
     try:
@@ -626,7 +629,8 @@ def test_gauge_reports_na_when_loading_fails(ns, gauge):
         ns["ingest_noise_data"] = orig
 
 
-def test_gauge_unchanged_when_noise_data_exists(ns, tmp_noise_dir):
+def test_gauge_unchanged_when_noise_data_exists(ns, tmp_noise_dir, clock):
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("1min"))
     orig = _with_dir(ns, tmp_noise_dir)
     try:
         variable = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_data"]["variable"]
@@ -634,3 +638,57 @@ def test_gauge_unchanged_when_noise_data_exists(ns, tmp_noise_dir):
         assert values[0] is not None and abs(values[0] - 4.5) < 0.01
     finally:
         ns["ingest_noise_data"] = orig
+
+
+# ---------------------------------------------------------------------------
+# HAM-187 follow-up: stale noise data reads as NA on the gauge, not as current
+# ---------------------------------------------------------------------------
+# A unit switched to nosensor keeps its old CSVs (mj43: last row 2026-08-03),
+# so the gauge showed a months-old value as if live. Rows are trigger-driven,
+# but a powered AGS triggers at least every das_set_interval (field: 4 h), so
+# 24 h without a row means the value is not current.
+SAMPLE_LAST_ROW = pd.Timestamp("2026-06-26 14:24:01.123456")
+
+
+@pytest.fixture()
+def clock(ns):
+    orig = ns["_noise_now"]
+
+    def set_now(ts):
+        ns["_noise_now"] = lambda: pd.Timestamp(ts)
+
+    yield set_now
+    ns["_noise_now"] = orig
+
+
+@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
+def test_gauge_reports_na_when_newest_row_is_older_than_24h(
+        ns, tmp_noise_dir, clock, gauge):
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") + pd.Timedelta("1s"))
+    orig = _with_dir(ns, tmp_noise_dir)
+    try:
+        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
+        assert _sindri_gauge_values(variable(pd.DataFrame())) == [None, None, None]
+    finally:
+        ns["ingest_noise_data"] = orig
+
+
+def test_gauge_shows_value_within_24h(ns, tmp_noise_dir, clock):
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") - pd.Timedelta("1s"))
+    orig = _with_dir(ns, tmp_noise_dir)
+    try:
+        variable = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_data"]["variable"]
+        values = _sindri_gauge_values(variable(pd.DataFrame()))
+        assert values[0] is not None and abs(values[0] - 4.5) < 0.01
+    finally:
+        ns["ingest_noise_data"] = orig
+
+
+def test_max_age_is_24h(ns):
+    assert ns["NOISE_GAUGE_MAX_AGE"] == pd.Timedelta("24h")
+
+
+def test_na_series_is_stamped_with_the_clock(ns, clock):
+    clock("2026-10-29 12:00:00")
+    series = ns["_na_gauge_series"]()
+    assert series.index[0] == pd.Timestamp("2026-10-29 12:00:00")

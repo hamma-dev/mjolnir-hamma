@@ -1017,6 +1017,18 @@ def _noise_plot_preprocess(_full_data):
             )
 
 
+# Noise rows are trigger-driven (at most one per 60 s), but a powered AGS
+# triggers at least every das_set_interval (field setting 4 h). So a newest row
+# older than this means the gauge value is not current -- e.g. a unit switched
+# to nosensor keeps its old CSVs (mj43). The 30-day panel still shows history.
+NOISE_GAUGE_MAX_AGE = pd.Timedelta("24h")
+
+
+def _noise_now():
+    """Current time, UTC tz-naive like ingest_noise_data (one place to stub)."""
+    return pd.Timestamp.now(tz="UTC").tz_convert(None)
+
+
 def _na_gauge_series():
     """One NaN at the current time: what a gauge reports with no noise data.
 
@@ -1027,18 +1039,23 @@ def _na_gauge_series():
     the charge-controller gauges on a nochargecontroller unit. Index is UTC,
     tz-naive, matching ingest_noise_data.
     """
-    now = pd.Timestamp.now(tz="UTC").tz_convert(None)
-    return pd.Series([float("nan")], index=pd.DatetimeIndex([now], name="time"),
+    return pd.Series([float("nan")],
+                     index=pd.DatetimeIndex([_noise_now()], name="time"),
                      dtype="float64")
 
 
 def _noise_gauge_series(column):
-    """Latest noise Series in mV for a dashboard gauge; NA when there is none."""
+    """Latest noise Series in mV for a dashboard gauge.
+
+    NA when there is no data, loading fails, or the newest row is older than
+    NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    """
     try:
         series = ingest_noise_data(n_days=1)[column] * 1000
     except Exception:
         return _na_gauge_series()
-    if series.dropna().empty:
+    valid = series.dropna()
+    if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
         return _na_gauge_series()
     return series
 
