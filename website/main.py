@@ -1017,10 +1017,14 @@ def _noise_plot_preprocess(_full_data):
             )
 
 
-# Noise rows are trigger-driven (at most one per 60 s), but a powered AGS
-# triggers at least every das_set_interval (field setting 4 h). So a newest row
-# older than this means the gauge value is not current -- e.g. a unit switched
-# to nosensor keeps its old CSVs (mj43). The 30-day panel still shows history.
+# Noise rows are trigger-driven (at most one per 60 s). With the interval
+# trigger enabled (das_set_mask bit 0) a powered AGS triggers every
+# das_set_interval -- 4 h on most field units, 60-120 s on some (mj02, mj03).
+# The longest healthy gap measured fleet-wide was 13.7 h, from a brokkr restart
+# (noise_diag skips its first trigger) plus a missed heartbeat. So a newest
+# valid row older than this means the gauge value is not current -- e.g. a unit
+# switched to nosensor keeps its old CSVs (mj43). The 30-day panel still shows
+# history. Do not go below ~16 h, or restarts start producing false NAs.
 NOISE_GAUGE_MAX_AGE = pd.Timedelta("24h")
 
 
@@ -1047,17 +1051,21 @@ def _na_gauge_series():
 def _noise_gauge_series(column):
     """Latest noise Series in mV for a dashboard gauge.
 
-    NA when there is no data, loading fails, or the newest row is older than
-    NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    NA when there is no data, anything here fails, or the newest valid row is
+    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    Returns only the valid rows: sindri takes `.iloc[-1]` and a builtin `max()`
+    over the Series, so a NaN last (or first in the window) would otherwise
+    show NA or null the threshold despite fresh data.
     """
     try:
-        series = ingest_noise_data(n_days=1)[column] * 1000
+        valid = (ingest_noise_data(n_days=1)[column] * 1000).dropna()
+        if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
+            return _na_gauge_series()
+        return valid
     except Exception:
+        # Inside the guard on purpose: a failure here must degrade to NA, not
+        # reach sindri as a traceback on every build (HAM-187 all over again).
         return _na_gauge_series()
-    valid = series.dropna()
-    if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
-        return _na_gauge_series()
-    return series
 
 
 # --- Per-sensor noise calibration -------------------------------------------

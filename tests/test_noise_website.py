@@ -565,89 +565,63 @@ def test_main_py_syntax():
 
 
 # ---------------------------------------------------------------------------
-# HAM-187: gauges on a unit with no noise data must report NA, not raise
+# HAM-187: noise gauges report NA -- not a traceback, not a stale value
 # ---------------------------------------------------------------------------
-# sindri 0.3.x (436bf61) website/generate.py DASHBOARD_DATA_ARGS_DEFAULT: the
-# three values every numeric gauge computes, then safe_nan (non-finite -> None)
-# and, for threshold_type "max", a max() overlay on the third. Copied here to
-# pin the contract the gauge Series must satisfy. On a nosensor unit the
-# noise_diag dir is empty, and an EMPTY Series made `.iloc[-1]` raise -- sindri
-# caught it, but printed a full traceback per gauge per ~60 s build.
-import math  # noqa: E402
+# On a nosensor unit noise_diag writes nothing; an EMPTY Series made sindri's
+# gauge code raise (caught, but a full traceback per gauge per ~60 s build). A
+# unit switched to nosensor also keeps its old CSVs (mj43), so the gauge showed
+# a months-old value as current. Every assertion below goes through sindri's
+# REAL get_dashboard_plot_data (vendored verbatim from 436bf61) driven by each
+# gauge's own plot_data, so a config change cannot slip past a hand-copy.
+import datetime as dt  # noqa: E402
+import importlib.util  # noqa: E402
 
-_SINDRI_GAUGE_FUNCTIONS = [
-    lambda base_data, data_args: base_data.iloc[-1],
-    lambda base_data, data_args: base_data.last(data_args["delta_period"]).iloc[0],
-    lambda base_data, data_args: max(base_data.last(data_args["threshold_period"])),
-]
+_SINDRI_SPEC = importlib.util.spec_from_file_location(
+    "sindri_436bf61_gauge",
+    pathlib.Path(__file__).parent / "fixtures" / "sindri_436bf61_gauge.py")
+SINDRI_GAUGE = importlib.util.module_from_spec(_SINDRI_SPEC)
+_SINDRI_SPEC.loader.exec_module(SINDRI_GAUGE)
 
-
-def _sindri_gauge_values(series):
-    args = {"delta_period": "1H", "threshold_period": "24H"}
-    out = []
-    for fn in _SINDRI_GAUGE_FUNCTIONS:
-        value = fn(series, args)
-        out.append(None if not math.isfinite(value) else value)
-    return out
-
-
-def _with_dir(ns, data_dir):
-    orig = ns["ingest_noise_data"]
-    ns["ingest_noise_data"] = (
-        lambda n_days=None, data_dir=data_dir,
-        glob_pattern=ns["NOISE_GLOB_PATTERN"]:
-        orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
-    return orig
-
-
-@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
-def test_gauge_reports_na_without_noise_data(ns, empty_noise_dir, gauge):
-    orig = _with_dir(ns, empty_noise_dir)
-    try:
-        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
-        series = variable(pd.DataFrame())
-        assert isinstance(series.index, pd.DatetimeIndex)
-        assert series.dtype == "float64"
-        # Must not raise, and every value must degrade to None (NA).
-        assert _sindri_gauge_values(series) == [None, None, None]
-    finally:
-        ns["ingest_noise_data"] = orig
-
-
-@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
-def test_gauge_reports_na_when_loading_fails(ns, gauge):
-    orig = ns["ingest_noise_data"]
-
-    def boom(*args, **kwargs):
-        raise OSError("unreadable noise dir")
-
-    ns["ingest_noise_data"] = boom
-    try:
-        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
-        assert _sindri_gauge_values(variable(pd.DataFrame())) == [None, None, None]
-    finally:
-        ns["ingest_noise_data"] = orig
-
-
-def test_gauge_unchanged_when_noise_data_exists(ns, tmp_noise_dir, clock):
-    clock(SAMPLE_LAST_ROW + pd.Timedelta("1min"))
-    orig = _with_dir(ns, tmp_noise_dir)
-    try:
-        variable = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_data"]["variable"]
-        values = _sindri_gauge_values(variable(pd.DataFrame()))
-        assert values[0] is not None and abs(values[0] - 4.5) < 0.01
-    finally:
-        ns["ingest_noise_data"] = orig
-
-
-# ---------------------------------------------------------------------------
-# HAM-187 follow-up: stale noise data reads as NA on the gauge, not as current
-# ---------------------------------------------------------------------------
-# A unit switched to nosensor keeps its old CSVs (mj43: last row 2026-08-03),
-# so the gauge showed a months-old value as if live. Rows are trigger-driven,
-# but a powered AGS triggers at least every das_set_interval (field: 4 h), so
-# 24 h without a row means the value is not current.
+GAUGES = ["noisefloor", "dcoffset"]
 SAMPLE_LAST_ROW = pd.Timestamp("2026-06-26 14:24:01.123456")
+
+
+def _gauge_values(ns, gauge):
+    """[value, delta_ref, threshold] exactly as the deployed sindri computes them."""
+    plot = ns["STATUS_DASHBOARD_PLOTS"][gauge]
+    return list(SINDRI_GAUGE.get_dashboard_plot_data(
+        pd.DataFrame(), plot_type=plot["plot_type"], plot_data=plot["plot_data"]))
+
+
+def _utc_now():
+    return pd.Timestamp(dt.datetime.now(dt.timezone.utc)).tz_convert(None)
+
+
+@pytest.fixture()
+def noise_source(ns):
+    """Point ingest_noise_data at a temp dir or an in-memory frame (volts)."""
+    orig = ns["ingest_noise_data"]
+
+    def use_dir(data_dir):
+        ns["ingest_noise_data"] = (
+            lambda n_days=None, data_dir=data_dir,
+            glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+            orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
+
+    def use_rows(rows):
+        index = pd.DatetimeIndex([t for t, _ in rows], name="time")
+        frame = pd.DataFrame(
+            {"fast_noise": [v for _, v in rows], "fast_offset": [v for _, v in rows]},
+            index=index, dtype="float64")
+        ns["ingest_noise_data"] = lambda n_days=None, **kwargs: frame
+
+    def use_error(error):
+        def boom(*args, **kwargs):
+            raise error
+        ns["ingest_noise_data"] = boom
+
+    yield types.SimpleNamespace(dir=use_dir, rows=use_rows, error=use_error)
+    ns["ingest_noise_data"] = orig
 
 
 @pytest.fixture()
@@ -655,40 +629,114 @@ def clock(ns):
     orig = ns["_noise_now"]
 
     def set_now(ts):
-        ns["_noise_now"] = lambda: pd.Timestamp(ts)
+        ns["_noise_now"] = ts if callable(ts) else (lambda: pd.Timestamp(ts))
 
     yield set_now
     ns["_noise_now"] = orig
 
 
-@pytest.mark.parametrize("gauge", ["noisefloor", "dcoffset"])
-def test_gauge_reports_na_when_newest_row_is_older_than_24h(
-        ns, tmp_noise_dir, clock, gauge):
-    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") + pd.Timedelta("1s"))
-    orig = _with_dir(ns, tmp_noise_dir)
-    try:
-        variable = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"]
-        assert _sindri_gauge_values(variable(pd.DataFrame())) == [None, None, None]
-    finally:
-        ns["ingest_noise_data"] = orig
+# --- no data / load failure -------------------------------------------------
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_gauge_reports_na_without_noise_data(ns, empty_noise_dir, noise_source, gauge):
+    noise_source.dir(empty_noise_dir)
+    series = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"](pd.DataFrame())
+    assert isinstance(series.index, pd.DatetimeIndex) and series.dtype == "float64"
+    assert _gauge_values(ns, gauge) == [None, None, None]
 
 
-def test_gauge_shows_value_within_24h(ns, tmp_noise_dir, clock):
-    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") - pd.Timedelta("1s"))
-    orig = _with_dir(ns, tmp_noise_dir)
-    try:
-        variable = ns["STATUS_DASHBOARD_PLOTS"]["noisefloor"]["plot_data"]["variable"]
-        values = _sindri_gauge_values(variable(pd.DataFrame()))
-        assert values[0] is not None and abs(values[0] - 4.5) < 0.01
-    finally:
-        ns["ingest_noise_data"] = orig
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_gauge_reports_na_when_loading_fails(ns, noise_source, gauge):
+    noise_source.error(OSError("unreadable noise dir"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
 
+
+# --- the real clock (nothing else exercises it) ------------------------------
+
+def test_real_clock_is_utc_and_tz_naive(ns):
+    """A tz-aware or local clock would mis-age every unit (or raise)."""
+    now = ns["_noise_now"]()
+    assert now.tz is None
+    assert abs(now - _utc_now()) < pd.Timedelta("1min")
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_fresh_data_shows_with_the_real_clock(ns, noise_source, gauge):
+    noise_source.rows([(_utc_now() - pd.Timedelta("10min"), 0.0045)])
+    assert _gauge_values(ns, gauge)[0] == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_a_broken_clock_degrades_to_na_not_a_traceback(ns, noise_source, clock, gauge):
+    """The staleness comparison must sit inside the guard (red team M18)."""
+    noise_source.rows([(_utc_now(), 0.0045)])
+    clock(lambda: pd.Timestamp.now(tz="UTC"))     # tz-aware vs naive index
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+# --- staleness: 24 h on the newest VALID row ---------------------------------
 
 def test_max_age_is_24h(ns):
     assert ns["NOISE_GAUGE_MAX_AGE"] == pd.Timedelta("24h")
 
 
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_older_than_24h_reads_na(ns, tmp_noise_dir, noise_source, clock, gauge):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") + pd.Timedelta("1s"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+def test_within_24h_shows_value(ns, tmp_noise_dir, noise_source, clock):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") - pd.Timedelta("1s"))
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+def test_exactly_24h_old_still_counts_as_current(ns, noise_source, clock):
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0045)])
+    clock(t0 + pd.Timedelta("24h"))
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+def test_recent_nan_row_does_not_make_stale_data_current(ns, noise_source, clock):
+    """Age is taken from the newest VALID row, not any row (red team M03/M12)."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0045), (t0 + pd.Timedelta("23h"), float("nan"))])
+    clock(t0 + pd.Timedelta("25h"))
+    assert _gauge_values(ns, "noisefloor") == [None, None, None]
+
+
+def test_fresh_data_with_a_malformed_newest_value_shows_last_valid(ns, noise_source, clock):
+    """The gauge is fed the valid rows, so it agrees with its own age check."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0040), (t0 + pd.Timedelta("10min"), 0.0090),
+                       (t0 + pd.Timedelta("20min"), float("nan"))])
+    clock(t0 + pd.Timedelta("30min"))
+    value, _delta, threshold = _gauge_values(ns, "noisefloor")
+    assert value == pytest.approx(9.0)
+    assert threshold == pytest.approx(9.0)
+
+
+def test_nan_first_in_window_does_not_null_the_threshold(ns, noise_source, clock):
+    """Python's max() with a leading NaN returns NaN; feeding valid rows avoids it."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, float("nan")), (t0 + pd.Timedelta("1min"), 0.0090),
+                       (t0 + pd.Timedelta("2min"), 0.0045)])
+    clock(t0 + pd.Timedelta("3min"))
+    assert _gauge_values(ns, "noisefloor")[2] == pytest.approx(9.0)
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_unit_with_data_is_unchanged(ns, tmp_noise_dir, noise_source, clock, gauge):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("1min"))
+    value = _gauge_values(ns, gauge)[0]
+    expected = 4.5 if gauge == "noisefloor" else 13.0
+    assert value == pytest.approx(expected)
+
+
 def test_na_series_is_stamped_with_the_clock(ns, clock):
     clock("2026-10-29 12:00:00")
-    series = ns["_na_gauge_series"]()
-    assert series.index[0] == pd.Timestamp("2026-10-29 12:00:00")
+    assert ns["_na_gauge_series"]().index[0] == pd.Timestamp("2026-10-29 12:00:00")
