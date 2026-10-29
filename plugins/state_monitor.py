@@ -358,10 +358,28 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
                 "expected alert_space < purge_space", alert_space, purge_space)
         self.ping_max = ping_max
         self.bad_ping = 0  # Track the number of bad pings
+        # Within the current bad-ping streak: how many samples were a real
+        # "unreachable" (not a -99 probe failure), and which page already went.
+        self._streak_unreachable = 0
+        self._comm_alerted = False
+        self._probe_alerted = False
         # Ping-staleness watchdog, the same shape as the bytes_remaining one.
         self.ping_stale_cycles = ping_stale_cycles
         self._ping_stale_count = 0
         self._ping_stale_alerted = False
+        self._enabled_type_warned = False
+        # Both are counts of monitor cycles, so their wall-clock meaning scales
+        # with monitor_interval_s. These values make the check misbehave, so
+        # say so at startup rather than fail silently.
+        if ping_max < 1:
+            self.logger.warning(
+                "state_monitor: ping_max=%s -- no-communication alerting can "
+                "never fire; expected >= 1", ping_max)
+        if ping_stale_cycles < 2:
+            self.logger.warning(
+                "state_monitor: ping_stale_cycles=%s -- every brokkr start "
+                "writes one NA ping, so this alerts on every restart; expected "
+                ">= 2", ping_stale_cycles)
         self.low_pi_space = low_pi_space*1000000000
         self.enable_drive_checks = enable_drive_checks
         # HAM-185 science-write-target check. `_drive_target_count` counts
@@ -1612,12 +1630,12 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # "nosensor" only tracks it by convention and would break silently the
         # day a preset disables ingest without saying so.
         #
-        # This is tested FIRST, ahead of the NA branch below. An NA sample
-        # landing on the cycle a unit goes down must not be able to skip the
-        # reset, or the unit reactivates with a primed counter and pages on its
-        # first bad ping -- the very thing the reset exists to prevent.
+        # This is tested FIRST, ahead of the NA branch below, so an NA sample
+        # cannot skip the reset. In production the mode only changes across a
+        # brokkr restart, which builds a fresh StateMonitor anyway -- the reset
+        # is defensive, kept because the config is re-read every cycle.
         if not self._science_ingest_enabled():
-            self.bad_ping = 0
+            self._reset_ping_streak()
             self._ping_stale_count = 0
             self._ping_stale_alerted = False
             self.logger.debug(
@@ -1631,15 +1649,20 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # the counter, so a genuine streak either side of an NA sample still
         # reaches ping_max rather than being reset by it.
         #
-        # One NA is normal (every brokkr start writes one). A ping that stays NA
-        # would leave the outage check permanently unable to fire, so a
-        # persistent NA becomes an alert in its own right, as for
-        # bytes_remaining.
+        # One NA is normal (every brokkr start writes one, na_on_start).
+        # brokkr's PingInput never returns NA itself (failures are -9/-99), but
+        # if the ping step raises outside read_raw_data, brokkr substitutes NA
+        # values -- so a ping that stays NA is a broken input, and it would
+        # leave the outage check unable to fire. Alert once, as for
+        # bytes_remaining. Counted in cycles: wall-clock = ping_stale_cycles x
+        # monitor_interval_s.
         if _is_na(no_comm_now):
             self._ping_stale_count += 1
             if (self._ping_stale_count >= self.ping_stale_cycles
                     and not self._ping_stale_alerted):
                 self._ping_stale_alerted = True
+                # Bad pings either side of a gap this long are not consecutive.
+                self._reset_ping_streak()
                 return ("Ping telemetry NA for {} cycles -- cannot tell whether "
                         "the sensor is reachable".format(self._ping_stale_count))
             return None
@@ -1650,22 +1673,43 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         if no_comm_now:
             # If any bad ping, increment the counter.
             self.bad_ping += 1
+            # brokkr's PingInput returns -99 when the ping command itself
+            # raised -- that is this unit's probe failing, not the sensor.
+            # Everything else non-zero (ping exit 1/2, -9 timeout) counts as
+            # the sensor being unreachable.
+            if no_comm_now != -99:
+                self._streak_unreachable += 1
             # An NA previous sample (the one written at every brokkr start)
             # counts as "unknown", not as already-down.
             if _is_na(no_comm_pre) or not no_comm_pre:
                 # If we pinged fine before, but not now, log it.
                 self.logger.info("Sensor unable to be pinged!")
-            # Once we reach the critical value, send an alert and log it.
-            if self.bad_ping == self.ping_max:
-                # brokkr's PingInput returns -99 when the ping command itself
-                # raised -- that is this unit's probe failing, not the sensor.
-                if no_comm_now == -99:
-                    return ("Sensor status unknown: the ping probe failed "
-                            "(consecutive failures: {})".format(self.bad_ping))
-                return f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
+            # One streak drives paging, so mixed failures still page. The
+            # message follows the whole streak: probe failures only -> say so;
+            # any real unreachable sample -> no communication. A probe-failure
+            # page must not hide a real outage that starts afterwards, so that
+            # gets its own page once ping_max unreachable samples accumulate.
+            if self.bad_ping >= self.ping_max:
+                if self._streak_unreachable == 0:
+                    if not self._probe_alerted:
+                        self._probe_alerted = True
+                        return ("Sensor status unknown: the ping probe failed "
+                                "(consecutive failures: {})".format(self.bad_ping))
+                elif not self._comm_alerted and (
+                        not self._probe_alerted
+                        or self._streak_unreachable >= self.ping_max):
+                    self._comm_alerted = True
+                    return f"No communication with sensor (consecutive bad pings: {self.bad_ping})"
         else:  # if we can communicate now, reset the counter
-            self.bad_ping = 0
+            self._reset_ping_streak()
         return None
+
+    def _reset_ping_streak(self):
+        """Clear the bad-ping streak and re-arm both of its pages."""
+        self.bad_ping = 0
+        self._streak_unreachable = 0
+        self._comm_alerted = False
+        self._probe_alerted = False
 
     def check_sensor_drive(self, input_data):
         """Two-threshold drain + escalation on the AGS drive (§3.4).
@@ -2184,10 +2228,14 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
         # it as True -- here that direction is the safe one, but only by luck, so
         # say so rather than let a future flip inherit a silent coercion.
         if not isinstance(enabled, bool):
-            self.logger.warning(
-                "science_ingest._enabled is %r (want a bare true/false, not a "
-                "quoted string); treating this unit as capturing so outage "
-                "alerting stays live", enabled)
+            # Once per process: this runs every telemetry cycle, and the value
+            # cannot change until brokkr restarts.
+            if not self._enabled_type_warned:
+                self._enabled_type_warned = True
+                self.logger.warning(
+                    "science_ingest._enabled is %r (want a bare true/false, not "
+                    "a quoted string); treating this unit as capturing so "
+                    "outage alerting stays live", enabled)
             return True
         return enabled
 
