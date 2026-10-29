@@ -20,6 +20,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
                  update_time,
                  include=None,
                  username='pi',
+                 timeout=10,
+                 partial_dir=None,
                  **output_step_kwargs):
         """
         Sync files to a server via rsync.
@@ -40,6 +42,13 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         include : str
             Typically, a pattern of files to be synced. Passed to the `include` option
             of rsync.
+        timeout : float
+            Seconds to let rsync run before it is killed. The default is 10.
+        partial_dir : str, optional
+            Passed to the `--partial-dir` option of rsync, so a transfer that
+            is interrupted resumes on the next sync instead of restarting.
+            Relative paths are relative to `server_path`. The default is None
+            (not used).
         output_step_kwargs : **kwargs, optional
             Keyword arguments to pass to the OutputStep constructor.
 
@@ -57,6 +66,8 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
         self.username = username
         self.update_time = update_time
         self.include = include
+        self.timeout = timeout
+        self.partial_dir = partial_dir
 
     def execute(self, input_data=None):
         """
@@ -111,14 +122,16 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
     def rsync(self):
         """ Build the command for rsync and run it."""
 
-        TIMEOUT = 10  # todo: Find the best value for this and/or make it an arg
-
         cmd = [
             "rsync",
             "-rltDvz",
             "--omit-dir-times",
             "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
         ]
+
+        # Keep interrupted transfers so they resume on the next sync
+        if self.partial_dir:
+            cmd = cmd + [f"--partial-dir={self.partial_dir}"]
 
         # If we only include certain files, put that in there,
         # but be careful with quotes - bash and python syntax is not the same!
@@ -140,7 +153,7 @@ class RsyncServer(brokkr.pipeline.base.OutputStep):
             stderr=subprocess.STDOUT,
             check=False,
             encoding="utf-8",
-            timeout=TIMEOUT,
+            timeout=self.timeout,
         )
         
         if output.returncode:
