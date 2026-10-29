@@ -3,7 +3,7 @@
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -508,3 +508,388 @@ class TestCheckPowerStateDivergence:
         m = _make_monitor(power_check_interval_s=7, power_check_retry_s=2)
         assert m.power_check_interval_s == 7
         assert m.power_check_retry_s == 2
+
+
+# --- HAM-114: no ping alerts when the sensor is intentionally down ---
+
+class TestPingSuppressedWhenIngestDisabled:
+    """check_ping must not page for a sensor the operator deliberately turned off.
+
+    The decision is taken from the RENDERED config (`science_ingest._enabled`),
+    the same semantic check_power_state_divergence uses -- not from the mode
+    name, which only tracks it by convention.
+    """
+
+    def _ping(self, monitor, now, then=0, ingest_enabled=True):
+        cfg = {"pipelines": {"science_ingest": {"_enabled": ingest_enabled}}}
+        monitor._previous_data = {"ping": _dv(then)}
+        with patch.dict("sys.modules", {
+            "brokkr.config.main": MagicMock(CONFIG=cfg),
+        }):
+            return monitor.check_ping({"ping": _dv(now)})
+
+    def test_alerts_at_ping_max_when_ingest_enabled(self):
+        """Unchanged behaviour on a unit that is supposed to be capturing."""
+        m = _make_monitor()
+        msgs = [self._ping(m, now=1, then=1) for _ in range(3)]
+        assert msgs[0] is None and msgs[1] is None
+        assert "No communication with sensor" in msgs[2]
+        assert m.bad_ping == 3
+
+    def test_silent_when_ingest_disabled(self):
+        """nosensor* unit: bad pings are expected and must never page."""
+        m = _make_monitor()
+        # Prime the counter first, so this fails if the reset is removed.
+        self._ping(m, now=1, then=1)
+        self._ping(m, now=1, then=1)
+        assert m.bad_ping == 2
+        for _ in range(10):
+            assert self._ping(m, now=1, then=1, ingest_enabled=False) is None
+        assert m.bad_ping == 0, "counter must not accumulate while suppressed"
+
+    def test_counter_resets_so_next_outage_needs_full_ping_max(self):
+        """A suppressed stretch must not leave a primed counter that pages early.
+
+        In production mode only changes across a brokkr restart, which builds a
+        fresh StateMonitor anyway -- so this reset is defensive, not what fixes
+        HAM-114. It is pinned because the config is re-read on every cycle and
+        nothing guarantees that will stay true.
+        """
+        m = _make_monitor()
+        # Prime the counter first, so this fails if the reset is removed.
+        self._ping(m, now=1, then=1)
+        self._ping(m, now=1, then=1)
+        for _ in range(5):
+            self._ping(m, now=1, then=1, ingest_enabled=False)
+        # ingest enabled again
+        assert self._ping(m, now=1, then=1) is None
+        assert self._ping(m, now=1, then=1) is None
+        assert "No communication" in self._ping(m, now=1, then=1)
+
+    def test_probe_failure_is_not_reported_as_no_communication(self):
+        """-99 means brokkr's ping command itself failed, not the sensor.
+
+        brokkr's PingInput returns ping's exit code, -9 on a timeout, and -99
+        on any other exception (inputs/ping.py). Paging "No communication with
+        sensor" for -99 sends the operator to the wrong layer.
+        """
+        m = _make_monitor()
+        msgs = [self._ping(m, now=-99, then=-99) for _ in range(3)]
+        assert msgs[0] is None and msgs[1] is None
+        assert "ping probe failed" in msgs[2]
+        assert "No communication with sensor" not in msgs[2]
+
+    def test_timeout_still_reads_as_no_communication(self):
+        """-9 (ping timed out) is an unreachable sensor, same as exit code 1."""
+        m = _make_monitor()
+        msgs = [self._ping(m, now=-9, then=-9) for _ in range(3)]
+        assert "No communication with sensor" in msgs[2]
+
+    def test_transition_is_logged_after_an_na_previous_sample(self):
+        """The first bad ping after a start-up NA must still be logged.
+
+        Every brokkr start writes one NA ping row (na_on_start), and bool(nan)
+        is True, so a bare `not no_comm_pre` skipped this log line.
+        """
+        m = _make_monitor()
+        self._ping(m, now=1, then="NA")
+        m.logger.info.assert_any_call("Sensor unable to be pinged!")
+
+    def test_missing_pipelines_key_defaults_to_enabled(self):
+        """A config without the key must keep alerting -- fail toward noise."""
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        with patch.dict("sys.modules", {
+            "brokkr.config.main": MagicMock(CONFIG={}),
+        }):
+            for _ in range(2):
+                m.check_ping({"ping": _dv(1)})
+            msg = m.check_ping({"ping": _dv(1)})
+        assert "No communication with sensor" in msg
+
+    def test_quoted_enabled_string_is_treated_as_capturing(self):
+        """A quoted `_enabled = "false"` must not silently disable alerting.
+
+        Valid TOML, and bare bool() reads it as True. That happens to be the
+        safe direction, but only by luck -- pin it so a future refactor cannot
+        quietly invert it into permanent suppression.
+        """
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        cfg = {"pipelines": {"science_ingest": {"_enabled": "false"}}}
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=cfg)}):
+            for _ in range(2):
+                m.check_ping({"ping": _dv(1)})
+            msg = m.check_ping({"ping": _dv(1)})
+        assert "No communication with sensor" in msg
+
+    def test_config_import_failure_propagates_rather_than_going_silent(self):
+        """A failed config lookup must not be read as "sensor is down".
+
+        The exception escapes to run_checks, which logs it. Note what that
+        costs: no message goes out this cycle and the bad_ping increment is
+        skipped too, so a real concurrent outage is caught at least one cycle
+        late. Accepted over failing closed, which would suppress alerts forever.
+        """
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        with patch.object(MODULE.StateMonitor, "_science_ingest_enabled",
+                          side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                m.check_ping({"ping": _dv(1)})
+        assert m.bad_ping == 0, "the increment is skipped -- documented cost"
+
+    def test_good_ping_resets_counter(self):
+        """Unchanged: a successful ping clears the counter."""
+        m = _make_monitor()
+        self._ping(m, now=1, then=1)
+        self._ping(m, now=1, then=1)
+        assert self._ping(m, now=0, then=1) is None
+        assert m.bad_ping == 0
+
+
+class TestPingNaIsNotABadPing:
+    """NA readings must not masquerade as failures.
+
+    now_then() turns 'NA' into float nan, and bool(nan) is True -- so an NA
+    ping would otherwise be counted as a bad ping and page. This is the trap
+    that makes the 'swap in NullInput' fix silently not work.
+    """
+
+    def test_nan_ping_does_not_increment_or_alert(self):
+        m = _make_monitor()
+        cfg = {"pipelines": {"science_ingest": {"_enabled": True}}}
+        m._previous_data = {"ping": _dv("NA")}
+        with patch.dict("sys.modules", {
+            "brokkr.config.main": MagicMock(CONFIG=cfg),
+        }):
+            for _ in range(5):
+                assert m.check_ping({"ping": _dv("NA")}) is None
+        assert m.bad_ping == 0
+
+    def test_na_while_ingest_disabled_still_resets_the_counter(self):
+        """Powering a unit down mid-outage must clear the primed counter.
+
+        The suppression branch resets `bad_ping` so a unit coming back on needs
+        a fresh full streak. An NA sample landing on the cycle the unit goes
+        down must not be able to skip that reset -- otherwise the unit
+        reactivates already primed and pages on its very first bad ping, the
+        exact scenario the reset exists to prevent.
+        """
+        m = _make_monitor()
+        m._previous_data = {"ping": _dv(1)}
+        enabled = {"pipelines": {"science_ingest": {"_enabled": True}}}
+        disabled = {"pipelines": {"science_ingest": {"_enabled": False}}}
+
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=enabled)}):
+            m.check_ping({"ping": _dv(1)})
+            m.check_ping({"ping": _dv(1)})
+        assert m.bad_ping == 2
+
+        # Operator powers the unit down; telemetry reads NA on that same cycle.
+        m._previous_data = {"ping": _dv("NA")}
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=disabled)}):
+            assert m.check_ping({"ping": _dv("NA")}) is None
+        assert m.bad_ping == 0, "suppression must reset even on an NA sample"
+
+
+class TestPingNaStaleness:
+    """A ping that reads NA forever must not silence outage detection (B2).
+
+    Skipping NA is right for one sample (every brokkr start writes exactly one),
+    but if ping never yields a number again the outage check can never fire.
+    Mirrors the bytes_remaining watchdog (hs_stale_cycles): alert once after
+    `ping_stale_cycles` consecutive NA cycles, re-arm on any numeric reading.
+    """
+
+    def _na(self, monitor, ingest_enabled=True, now="NA"):
+        cfg = {"pipelines": {"science_ingest": {"_enabled": ingest_enabled}}}
+        monitor._previous_data = {"ping": _dv("NA")}
+        with patch.dict("sys.modules", {
+                "brokkr.config.main": MagicMock(CONFIG=cfg)}):
+            return monitor.check_ping({"ping": _dv(now)})
+
+    def test_persistent_na_alerts_once_at_threshold(self):
+        m = _make_monitor(ping_stale_cycles=4)
+        msgs = [self._na(m) for _ in range(6)]
+        assert msgs[:3] == [None, None, None]
+        assert "Ping telemetry NA for 4 cycles" in msgs[3]
+        assert msgs[4] is None and msgs[5] is None, "alert once, not every cycle"
+        assert m.bad_ping == 0, "NA is still not counted as a bad ping"
+
+    def test_default_threshold_matches_hs_stale_cycles(self):
+        m = _make_monitor()
+        assert m.ping_stale_cycles == m.hs_stale_cycles == 15
+
+    def test_numeric_ping_rearms_the_watchdog(self):
+        m = _make_monitor(ping_stale_cycles=2)
+        self._na(m)
+        assert "Ping telemetry NA" in self._na(m)
+        self._na(m, now=0)                      # a real reading comes back
+        assert self._na(m) is None
+        assert "Ping telemetry NA" in self._na(m), "re-armed after a number"
+
+    def test_silent_when_ingest_disabled(self):
+        """A unit that is deliberately off must not page for NA ping either."""
+        m = _make_monitor(ping_stale_cycles=2)
+        for _ in range(5):
+            assert self._na(m, ingest_enabled=False) is None
+
+    def test_disabling_ingest_resets_the_na_streak(self):
+        m = _make_monitor(ping_stale_cycles=3)
+        self._na(m)
+        self._na(m)
+        self._na(m, ingest_enabled=False)
+        assert self._na(m) is None
+        assert self._na(m) is None
+        assert "Ping telemetry NA" in self._na(m)
+
+    def test_nan_does_not_reset_a_real_streak(self):
+        """An NA sample mid-outage must neither page nor wipe the evidence."""
+        m = _make_monitor()
+        cfg = {"pipelines": {"science_ingest": {"_enabled": True}}}
+        with patch.dict("sys.modules", {
+            "brokkr.config.main": MagicMock(CONFIG=cfg),
+        }):
+            m._previous_data = {"ping": _dv(1)}
+            m.check_ping({"ping": _dv(1)})
+            m.check_ping({"ping": _dv(1)})
+            assert m.bad_ping == 2
+            m._previous_data = {"ping": _dv("NA")}
+            assert m.check_ping({"ping": _dv("NA")}) is None
+            assert m.bad_ping == 2
+            m._previous_data = {"ping": _dv(1)}
+            assert "No communication" in m.check_ping({"ping": _dv(1)})
+
+
+def _seq(monitor, values, enabled=True):
+    """Feed ping values through check_ping with now/then bookkeeping."""
+    cfg = {"pipelines": {"science_ingest": {"_enabled": enabled}}}
+    out = []
+    with patch.dict("sys.modules", {
+            "brokkr.config.main": MagicMock(CONFIG=cfg)}):
+        prev = values[0]
+        for value in values:
+            monitor._previous_data = {"ping": _dv(prev)}
+            out.append(monitor.check_ping({"ping": _dv(value)}))
+            prev = value
+    return out
+
+
+class TestPingFailureClasses:
+    """-99 (brokkr's ping command raised) is a probe failure, not an outage.
+
+    One streak counter still drives paging, so mixed failures still page. The
+    wording follows the whole streak, and a real outage that starts during a
+    probe-failure streak must still get its own page (red team, PR #102).
+    """
+
+    def test_outage_after_probe_failure_streak_still_pages(self):
+        m = _make_monitor()
+        msgs = _seq(m, [-99, -99, -99, 1, 1, 1, 1, 1])
+        assert "ping probe failed" in msgs[2]
+        assert "No communication with sensor" in msgs[5]
+        assert [i for i, msg in enumerate(msgs) if msg] == [2, 5]
+
+    def test_unreachable_then_probe_failure_reads_as_no_communication(self):
+        m = _make_monitor()
+        msgs = _seq(m, [1, 1, -99])
+        assert "No communication with sensor" in msgs[2]
+
+    def test_any_unreachable_sample_in_the_streak_reads_as_no_communication(self):
+        m = _make_monitor()
+        msgs = _seq(m, [-99, -99, 1])
+        assert "No communication with sensor" in msgs[2]
+
+    def test_long_probe_failure_streak_pages_once(self):
+        m = _make_monitor()
+        msgs = _seq(m, [-99] * 12)
+        assert sum(1 for msg in msgs if msg) == 1
+
+    def test_alternating_failures_still_page(self):
+        m = _make_monitor()
+        msgs = _seq(m, [1, -99, 1, -99, 1, -99])
+        assert "No communication with sensor" in msgs[2]
+
+    def test_good_ping_rearms_both_messages(self):
+        m = _make_monitor()
+        msgs = _seq(m, [-99, -99, -99, 0, -99, -99, -99])
+        assert "ping probe failed" in msgs[2]
+        assert "ping probe failed" in msgs[6]
+
+    def test_stale_alert_resets_the_bad_ping_streak(self):
+        """A page after a long NA gap must not claim the failures were consecutive."""
+        m = _make_monitor(ping_stale_cycles=4)
+        msgs = _seq(m, [1, 1] + ["NA"] * 4 + [1])
+        assert "Ping telemetry NA" in msgs[5]
+        assert msgs[6] is None
+        assert m.bad_ping == 1
+
+
+class TestPingKnobValidation:
+    def test_ping_max_below_one_warns(self):
+        m = _make_monitor(ping_max=0)
+        assert any("ping_max" in str(c) for c in m.logger.warning.call_args_list)
+
+    def test_ping_stale_cycles_below_two_warns(self):
+        """1 would page on every brokkr start: the first sample is always NA."""
+        m = _make_monitor(ping_stale_cycles=1)
+        assert any("ping_stale_cycles" in str(c)
+                   for c in m.logger.warning.call_args_list)
+
+    def test_defaults_do_not_warn_about_ping(self):
+        m = _make_monitor()
+        assert not any("ping" in str(c) for c in m.logger.warning.call_args_list)
+
+
+class TestScienceIngestEnabledGuard:
+    """Red-team gaps: the non-bool `_enabled` guard must be pinned, not lucky."""
+
+    @pytest.mark.parametrize("value", [0, "", "0", "false"])
+    def test_non_bool_enabled_still_alerts(self, value):
+        # 0 and "" are falsy: without the guard, alerting would be suppressed.
+        m = _make_monitor()
+        msgs = _seq(m, [1, 1, 1], enabled=value)
+        assert "No communication with sensor" in msgs[2]
+
+    def test_non_bool_enabled_warns_once_not_every_cycle(self):
+        m = _make_monitor()
+        _seq(m, [1] * 5, enabled="false")
+        warnings = [c for c in m.logger.warning.call_args_list
+                    if "_enabled" in str(c)]
+        assert len(warnings) == 1
+
+
+class TestPingLogging:
+    def test_transition_logged_after_a_good_ping(self):
+        m = _make_monitor()
+        _seq(m, [0, 1])
+        m.logger.info.assert_any_call("Sensor unable to be pinged!")
+
+    def test_continuing_outage_is_not_relogged(self):
+        m = _make_monitor()
+        _seq(m, [1, 1, 1])
+        assert call("Sensor unable to be pinged!") not in m.logger.info.call_args_list
+
+
+class TestIsNa:
+    @pytest.mark.parametrize("value", [None, "garbage", "NA", float("nan")])
+    def test_non_numeric_is_na(self, value):
+        assert MODULE._is_na(value)
+
+    @pytest.mark.parametrize("value", [0, 1, -99, 2.5])
+    def test_numbers_are_not_na(self, value):
+        assert not MODULE._is_na(value)
+
+
+class TestPingStaleRearmAfterSuppression:
+    def test_suppression_rearms_the_na_alert(self):
+        m = _make_monitor(ping_stale_cycles=2)
+        assert "Ping telemetry NA" in _seq(m, ["NA", "NA"])[1]
+        _seq(m, ["NA"], enabled=False)
+        msgs = _seq(m, ["NA", "NA"])
+        assert msgs[0] is None
+        assert "Ping telemetry NA" in msgs[1]
