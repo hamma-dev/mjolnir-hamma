@@ -1017,12 +1017,55 @@ def _noise_plot_preprocess(_full_data):
             )
 
 
+# Noise rows are trigger-driven (at most one per 60 s). With the interval
+# trigger enabled (das_set_mask bit 0) a powered AGS triggers every
+# das_set_interval -- 4 h on most field units, 60-120 s on some (mj02, mj03).
+# The longest healthy gap measured fleet-wide was 13.7 h, from a brokkr restart
+# (noise_diag skips its first trigger) plus a missed heartbeat. So a newest
+# valid row older than this means the gauge value is not current -- e.g. a unit
+# switched to nosensor keeps its old CSVs (mj43). The 30-day panel still shows
+# history. Do not go below ~16 h, or restarts start producing false NAs.
+NOISE_GAUGE_MAX_AGE = pd.Timedelta("24h")
+
+
+def _noise_now():
+    """Current time, UTC tz-naive like ingest_noise_data (one place to stub)."""
+    return pd.Timestamp.now(tz="UTC").tz_convert(None)
+
+
+def _na_gauge_series():
+    """One NaN at the current time: what a gauge reports with no noise data.
+
+    An EMPTY Series is not "no value" to sindri -- its gauge functions call
+    `.iloc[-1]` and `.last(...).iloc[0]`, which raise on it, and sindri prints
+    a full traceback per gauge per build (HAM-187, every nosensor unit). A
+    single NaN instead flows through as NA (safe_nan -> None), exactly like
+    the charge-controller gauges on a nochargecontroller unit. Index is UTC,
+    tz-naive, matching ingest_noise_data.
+    """
+    return pd.Series([float("nan")],
+                     index=pd.DatetimeIndex([_noise_now()], name="time"),
+                     dtype="float64")
+
+
 def _noise_gauge_series(column):
-    """Latest noise Series in mV for a dashboard gauge; empty-safe."""
+    """Latest noise Series in mV for a dashboard gauge.
+
+    NA when there is no data, anything here fails, or the newest valid row is
+    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    Returns only the valid rows: sindri takes `.iloc[-1]` and a builtin `max()`
+    over the Series, so a NaN last (or first in the window) would otherwise
+    show NA or null the threshold despite fresh data.
+    """
     try:
-        return ingest_noise_data(n_days=1)[column] * 1000
+        valid = (ingest_noise_data(n_days=1)[column] * 1000).dropna()
+        if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
+            return _na_gauge_series()
+        return valid
     except Exception:
-        return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+        # Inside the guard on purpose: a failure here must degrade to NA, not
+        # reach sindri as a traceback on every build (HAM-187 all over again).
+        return _na_gauge_series()
 
 
 # --- Per-sensor noise calibration -------------------------------------------
