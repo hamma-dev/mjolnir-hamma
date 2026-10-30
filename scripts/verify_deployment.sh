@@ -427,7 +427,8 @@ check_log_bounds() {
     lib="${lib_dir:-/home/pi/dev/mjolnir-hamma/unified_install/lib}/log_bounds.sh"
 
     if [[ ! -f "$lib" ]]; then
-        warn "log_bounds.sh not found at $lib -- cannot verify log bounds"
+        # The installer ships this file: without it the checkout is broken.
+        fail "log_bounds.sh not found at $lib -- cannot verify log bounds"
         return 0
     fi
 
@@ -439,8 +440,15 @@ check_log_bounds() {
         return 0
     fi
 
-    fail "Log size bounds incomplete: journald=$(log_bounds_status_journald) rsyslog=$(log_bounds_status_rsyslog) cron=$(log_bounds_status_cron)"
-    info "Remediate with: sudo scripts/apply_log_bounds.sh   (HAM-113, rollout HAM-181)"
+    local journald
+    journald="$(log_bounds_status_journald)"
+    fail "Log size bounds incomplete: journald=$journald rsyslog=$(log_bounds_status_rsyslog) cron=$(log_bounds_status_cron)"
+    # Absolute: this script is run from ~ or from scripts/, so a relative
+    # path fails from either.
+    info "Remediate with: sudo bash ${lib%/unified_install/lib/log_bounds.sh}/scripts/apply_log_bounds.sh   (HAM-113, rollout HAM-181)"
+    if [[ "$journald" == "RAM-ONLY" ]]; then
+        info "If it stays RAM-ONLY after that, look for Storage=volatile in another journald drop-in (HAM-216)"
+    fi
 }
 
 check_server_connection() {

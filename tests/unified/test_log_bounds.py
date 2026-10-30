@@ -384,3 +384,88 @@ class TestVerifyDeploymentWiring:
 
     def test_script_still_parses(self):
         subprocess.run(["bash", "-n", str(self.VERIFY)], check=True)
+
+
+class TestVerifyDeploymentBehaviour:
+    """check_log_bounds, RUN: the real function against a copy of the real
+    library whose paths point into tmp_path, counted the way main() counts.
+
+    The wiring tests above read the script's text, so inverting pass/fail,
+    downgrading the fail to a warning, or moving the call under --full all
+    passed them (red team, 2026-10-30).
+    """
+
+    def _run(self, tmp_path, dropin=True, journal=True, runtime=False,
+             rsyslog=True, cron=True, lib=True):
+        repo = tmp_path / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        script = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        assert script.rstrip().endswith('main "$@"')
+        (repo / "scripts" / "verify_deployment.sh").write_text(
+            script.rstrip()[:-len('main "$@"')])
+        sys_ = tmp_path / "sys"
+        sys_.mkdir()
+        if lib:
+            (repo / "unified_install" / "lib").mkdir(parents=True)
+            (repo / "unified_install" / "lib" / "log_bounds.sh").write_text(
+                (LIB_DIR / "log_bounds.sh").read_text() +
+                '\nLOG_BOUNDS_JOURNALD_DST="{0}/00-sensor-bounds.conf"'
+                '\nLOG_BOUNDS_JOURNAL_DIR="{0}/var-log-journal"'
+                '\nLOG_BOUNDS_RUNTIME_JOURNAL_DIR="{0}/run-log-journal"'
+                '\nLOG_BOUNDS_RSYSLOG_LR="{0}/logrotate-rsyslog"'
+                '\nLOG_BOUNDS_CRON_DST="{0}/mjolnir-logrotate"\n'.format(sys_))
+        if dropin:
+            (sys_ / "00-sensor-bounds.conf").write_text("[Journal]\n")
+        if journal:
+            (sys_ / "var-log-journal").mkdir()
+        if runtime:
+            (sys_ / "run-log-journal").mkdir()
+        (sys_ / "logrotate-rsyslog").write_text(
+            "{\n    maxsize 100M\n}\n" if rsyslog else "{\n}\n")
+        if cron:
+            (sys_ / "mjolnir-logrotate").write_text("#!/bin/sh\n")
+        result = subprocess.run(
+            ["bash", "-c",
+             'source "$1"; check_log_bounds; '
+             'echo "PASS=$PASS_COUNT FAIL=$FAIL_COUNT RC=$?"',
+             "_", str(repo / "scripts" / "verify_deployment.sh")],
+            capture_output=True, text=True, timeout=30)
+        return result.stdout + result.stderr, repo
+
+    def test_all_bounds_present_passes(self, tmp_path):
+        out, _ = self._run(tmp_path)
+        assert "PASS=1 FAIL=0" in out, out
+
+    @pytest.mark.parametrize("kw,token", [
+        ({"dropin": False}, "journald=MISSING"),
+        ({"journal": False}, "journald=RAM-ONLY"),
+        ({"runtime": True}, "journald=RAM-ONLY"),
+        ({"rsyslog": False}, "rsyslog=MISSING"),
+        ({"cron": False}, "cron=MISSING"),
+    ])
+    def test_each_missing_bound_is_one_failure(self, tmp_path, kw, token):
+        out, _ = self._run(tmp_path, **kw)
+        assert "PASS=0 FAIL=1" in out, out
+        assert token in out, out
+
+    def test_remediation_names_the_script_by_absolute_path(self, tmp_path):
+        """verify_deployment.sh is run from ~ or from scripts/; a relative
+        hint fails from either."""
+        out, repo = self._run(tmp_path, dropin=False)
+        assert "sudo bash {}/scripts/apply_log_bounds.sh".format(repo) in out
+
+    def test_ram_only_hint_names_a_volatile_override(self, tmp_path):
+        out, _ = self._run(tmp_path, runtime=True)
+        assert "Storage=volatile" in out, out
+
+    def test_missing_library_is_a_failure(self, tmp_path):
+        """The installer ships log_bounds.sh: without it the checkout is
+        broken, which must not read READY FOR DEPLOYMENT."""
+        out, _ = self._run(tmp_path, lib=False)
+        assert "PASS=0 FAIL=1" in out, out
+
+    def test_called_unconditionally_from_main(self):
+        body = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        main = body[body.index("main() {"):]
+        call = main.index("    check_log_bounds\n")
+        assert "--full" not in main[:call].split("check_ags_data_mount")[-1]
