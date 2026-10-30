@@ -733,7 +733,7 @@ _SINDRI_SPEC = importlib.util.spec_from_file_location(
 SINDRI_GAUGE = importlib.util.module_from_spec(_SINDRI_SPEC)
 _SINDRI_SPEC.loader.exec_module(SINDRI_GAUGE)
 
-GAUGES = ["noisefloor", "dcoffset"]
+GAUGES = ["noisefloor", "dcoffset", "slownoisefloor", "slowdcoffset"]
 SAMPLE_LAST_ROW = pd.Timestamp("2026-06-26 14:24:01.123456")
 
 
@@ -761,8 +761,10 @@ def noise_source(ns):
 
     def use_rows(rows):
         index = pd.DatetimeIndex([t for t, _ in rows], name="time")
+        values = [v for _, v in rows]
         frame = pd.DataFrame(
-            {"fast_noise": [v for _, v in rows], "fast_offset": [v for _, v in rows]},
+            {"fast_noise": values, "fast_offset": values,
+             "slow_noise": values, "slow_offset": values},
             index=index, dtype="float64")
         ns["ingest_noise_data"] = lambda n_days=None, **kwargs: frame
 
@@ -884,8 +886,14 @@ def test_unit_with_data_is_unchanged(ns, tmp_noise_dir, noise_source, clock, gau
     noise_source.dir(tmp_noise_dir)
     clock(SAMPLE_LAST_ROW + pd.Timedelta("1min"))
     value = _gauge_values(ns, gauge)[0]
-    expected = 4.5 if gauge == "noisefloor" else 13.0
-    assert value == pytest.approx(expected)
+    # The sample day file predates the slow columns: slow gauges read NA,
+    # the fast ones are unchanged.
+    expected = {"noisefloor": 4.5, "dcoffset": 13.0,
+                "slownoisefloor": None, "slowdcoffset": None}[gauge]
+    if expected is None:
+        assert value is None
+    else:
+        assert value == pytest.approx(expected)
 
 
 def test_na_series_is_stamped_with_the_clock(ns, clock):
@@ -900,3 +908,85 @@ def test_offset_override_applies_to_the_fast_channel_only(ns):
     assert fn(unit_n=7, overrides=ov, column="fast_offset") == [-50, 50]
     assert fn(unit_n=7, overrides=ov, column="slow_offset",
               default=(-1.0, 1.0)) != [-50, 50]
+
+
+# --- slow gauges: their own column, and a dead slow channel is not current ---
+
+def _frame(ns, rows):
+    """rows: (time, fast_noise, fast_offset, slow_noise, slow_offset), volts."""
+    index = pd.DatetimeIndex([r[0] for r in rows], name="time")
+    frame = pd.DataFrame(
+        [r[1:] for r in rows], index=index, dtype="float64",
+        columns=["fast_noise", "fast_offset", "slow_noise", "slow_offset"])
+    ns["ingest_noise_data"] = lambda n_days=None, **kwargs: frame
+
+
+@pytest.fixture()
+def restore_ingest(ns):
+    orig = ns["ingest_noise_data"]
+    yield
+    ns["ingest_noise_data"] = orig
+
+
+def test_slow_gauges_read_their_own_columns(ns, clock, restore_ingest):
+    t0 = pd.Timestamp("2026-10-01")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0040, -0.025)])
+    clock(t0 + pd.Timedelta("1min"))
+    assert _gauge_values(ns, "slownoisefloor")[0] == pytest.approx(4.0)
+    assert _gauge_values(ns, "slowdcoffset")[0] == pytest.approx(-25.0)
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+    assert _gauge_values(ns, "dcoffset")[0] == pytest.approx(13.0)
+
+
+@pytest.mark.parametrize("gauge", ["slownoisefloor", "slowdcoffset"])
+def test_dead_slow_channel_reads_na_while_fast_is_fresh(
+        ns, clock, restore_ingest, gauge):
+    """Slow failed 2 h ago, fast still reporting: the last good slow value
+    must not read as current for the rest of the 24 h window."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), 0.0045, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize("gauge", ["slownoisefloor", "slowdcoffset"])
+def test_slow_one_blank_row_behind_fast_still_shows(
+        ns, clock, restore_ingest, gauge):
+    """A single blank slow reading within the lag allowance is not a dead
+    channel."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("30min"), 0.0045, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("31min"))
+    assert _gauge_values(ns, gauge)[0] == pytest.approx(9.0)
+
+
+def test_slow_lag_allowance_is_one_hour(ns):
+    assert ns["SLOW_GAUGE_MAX_LAG"] == pd.Timedelta("1h")
+
+
+def test_slow_lag_is_measured_against_the_matching_fast_column(
+        ns, clock, restore_ingest):
+    """slow_offset lags fast_offset, not fast_noise: a blank fast_noise on the
+    newest row must not hide a dead slow offset channel."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), nan, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, "slowdcoffset") == [None, None, None]
+
+
+def test_an_all_blank_newest_row_is_not_a_dead_slow_channel(
+        ns, clock, restore_ingest):
+    """The lag is taken from the newest VALID fast reading."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), nan, nan, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, "slownoisefloor")[0] == pytest.approx(9.0)

@@ -1096,6 +1096,11 @@ def _noise_plot_preprocess(_full_data):
 # switched to nosensor keeps its old CSVs (mj43). The 30-day panel still shows
 # history. Do not go below ~16 h, or restarts start producing false NAs.
 NOISE_GAUGE_MAX_AGE = pd.Timedelta("24h")
+# Slow and fast come from the same triggers, so a slow column that stops
+# while fast keeps reporting means the slow channel has failed. Past this lag
+# behind the newest fast reading, the slow gauges read NA rather than showing
+# the last good slow value as current.
+SLOW_GAUGE_MAX_LAG = pd.Timedelta("1h")
 
 
 def _noise_now():
@@ -1121,8 +1126,10 @@ def _na_gauge_series():
 def _noise_gauge_series(column):
     """Latest noise Series in mV for a dashboard gauge.
 
-    NA when there is no data, anything here fails, or the newest valid row is
-    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    NA when there is no data, anything here fails, the newest valid row is
+    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current),
+    or -- for a slow column -- it lags the newest fast reading by more than
+    SLOW_GAUGE_MAX_LAG (a dead slow channel).
     Returns only the valid rows: sindri takes `.iloc[-1]` and a builtin `max()`
     over the Series, so a NaN last (or first in the window) would otherwise
     show NA or null the threshold despite fresh data.
@@ -1130,9 +1137,15 @@ def _noise_gauge_series(column):
     try:
         # Drop blanks: sindri's max() returns NaN if the first value is NaN,
         # and pre-upgrade rows / triggers without a slow channel are blank.
-        valid = (ingest_noise_data(n_days=1)[column] * 1000).dropna()
+        frame = ingest_noise_data(n_days=1)
+        valid = (frame[column] * 1000).dropna()
         if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
             return _na_gauge_series()
+        if column.startswith("slow_"):
+            fast = frame["fast_" + column[len("slow_"):]].dropna()
+            if (not fast.empty and valid.index.max()
+                    < fast.index.max() - SLOW_GAUGE_MAX_LAG):
+                return _na_gauge_series()
         return valid
     except Exception:
         # Inside the guard on purpose: a failure here must degrade to NA, not

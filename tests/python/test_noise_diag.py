@@ -238,20 +238,24 @@ def test_compute_derives_slow_channel_metrics():
     assert m["slow_noise"] == pytest.approx(0.004)
     assert m["slow_vpp"] == pytest.approx(1.2)
     assert m["slow_snr"] == pytest.approx(1.2 / 0.004)
-    calls = [(c.args[0], c.args[1]) for c in module.diagnostic_data.call_args_list]
+    # c[0] (positional args), not c.args: .args is 3.8+ and the Pis run 3.7.
+    calls = [(c[0][0], c[0][1]) for c in module.diagnostic_data.call_args_list]
     assert calls == [(fast_arr, 200000), (slow_arr, 20000)]
     assert "slow_noise_thresh_ratio" not in m
 
 
-def test_compute_slow_failure_keeps_fast_sample():
-    """An exception on the slow channel leaves slow NaN; fast still recorded."""
+@pytest.mark.parametrize("error", [
+    IndexError("empty slow array"), ValueError("bad slow window"),
+    ZeroDivisionError("x"), RuntimeError("anything else")])
+def test_compute_slow_failure_keeps_fast_sample(error):
+    """Any exception on the slow channel leaves slow NaN; fast still recorded."""
     fast_arr, slow_arr = object(), object()
     module = load_module(volt_fast=fast_arr)
     module.hamma.Header.return_value.read_stream.return_value.volt = slow_arr
 
     def diag(volt, n):
         if volt is slow_arr:
-            raise IndexError("empty slow array")
+            raise error
         return (0.1, 4.7, -4.7, 0.035)
     module.diagnostic_data.side_effect = diag
     step = _slow_step(module)
@@ -260,6 +264,17 @@ def test_compute_slow_failure_keeps_fast_sample():
     for key in _SLOW_KEYS:
         assert math.isnan(m[key])
     step.logger.warning.assert_called()
+
+
+def test_compute_slow_snr_nan_when_slow_noise_zero():
+    fast_arr, slow_arr = object(), object()
+    module = load_module(volt_fast=fast_arr)
+    module.hamma.Header.return_value.read_stream.return_value.volt = slow_arr
+    module.diagnostic_data.side_effect = lambda volt, n: (
+        (0.02, 0.6, -0.6, 0.0) if volt is slow_arr else (0.1, 4.7, -4.7, 0.035))
+    m = _slow_step(module)._compute(make_input())
+    assert math.isnan(m["slow_snr"])
+    assert m["slow_vpp"] == pytest.approx(1.2)
 
 
 def test_compute_slow_nan_without_slow_channel():
@@ -278,6 +293,7 @@ def _csv_step(module, tmp_path):
     step.logger = MagicMock()
     step.output_path = str(tmp_path)
     step.filename_template = "noise_mj02_2026-06-23.csv"
+    step._warned_files = set()
     return step
 
 
@@ -378,6 +394,119 @@ def test_default_medsize_slow_is_20000():
     with patch.dict("sys.modules", {"notifiers": MagicMock()}):
         step = module.NoiseDiag()
     assert step.medsize_slow == 20000
+
+
+def test_medsize_slow_follows_medsize_by_default():
+    """The slow window is the fast one / 10 (the slow channel is every 11th
+    sample, so this keeps both windows on the same pre-trigger span)."""
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag(medsize=100000)
+    assert step.medsize_slow == 10000
+
+
+def test_mismatched_medsize_slow_warns():
+    module = load_module()
+    with patch.dict("sys.modules", {"notifiers": MagicMock()}):
+        step = module.NoiseDiag(medsize=200000, medsize_slow=30000)
+    assert step.medsize_slow == 30000
+    step.logger.warning.assert_called()
+
+
+def test_fleet_config_keeps_slow_window_at_one_tenth():
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover - py < 3.11
+        import tomli as tomllib
+    cfg = tomllib.loads(
+        (PLUGIN_PATH.parent.parent / "config" / "main.toml").read_text())
+    step = cfg["steps"]["noise_diag"]
+    slow = step.get("medsize_slow", step["medsize"] // 10)
+    assert slow * 10 == step["medsize"]
+
+
+OLD_HEADER = ("time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,"
+              "threshold,noise_thresh_ratio")
+
+
+def test_fallback_append_matches_the_files_own_header(tmp_path):
+    """Header readable, body not (NUL tail on the upgrade day): appending
+    12-column rows under the 8-column header would make pandas skip them --
+    fast data included -- for the rest of the day."""
+    import csv as _csv
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_text(OLD_HEADER + "\n2026-06-23T16:59:00,t0,0.1,0.035,9.4,268.5,0.083,0.42\n")
+    real_reader = _csv.reader
+
+    class BodyFails:
+        def __init__(self, f):
+            self._it = real_reader(f)
+            self._n = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._n += 1
+            if self._n > 1:
+                raise _csv.Error("line contains NUL")
+            return next(self._it)
+    with patch.object(module, "render_output_filename", return_value=csv_file), \
+            patch.object(module.csv, "reader", side_effect=BodyFails):
+        step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+    last = csv_file.read_text().strip().splitlines()[-1].split(",")
+    assert len(last) == len(OLD_HEADER.split(","))
+    assert last[:3] == ["2026-06-23T17:00:00", "t1", "0.1"]
+
+
+def test_unexpected_header_warns_once_per_file(tmp_path):
+    """A headerless day file would otherwise log every minute until midnight."""
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_text("2026-06-23T16:59:00,t0,0.1,0.035,9.4,268.5,0.083,0.42\n")
+    with patch.object(module, "render_output_filename", return_value=csv_file):
+        step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+        step._write_csv(_full_metrics(), "2026-06-23T17:01:00")
+    assert step.logger.warning.call_count == 1
+
+
+def test_upgrade_swaps_by_rename(tmp_path):
+    """The rewritten file replaces the old one by rename (atomic on the Pi's
+    ext4), never by copying over it."""
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_text(OLD_HEADER + "\n")
+    real_replace = Path.replace
+    with patch.object(module, "render_output_filename", return_value=csv_file), \
+            patch.object(Path, "replace", autospec=True,
+                         side_effect=real_replace) as replace:
+        step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+    replace.assert_called_once_with(
+        tmp_path / (csv_file.name + ".tmp"), csv_file)
+
+
+def test_alert_still_runs_after_a_fallback_append(tmp_path):
+    """Through execute(): an unreadable day file must not skip the alert."""
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    step.name = "noise_diag"
+    step.min_update_time = 60
+    step._last_run_time = MagicMock()
+    step._last_run_time.value = datetime(2026, 6, 23, 16, 0, 0)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    csv_file.write_bytes(b"\xff\xfe\xfa" * 20)
+    time_dv = MagicMock(); time_dv.value = datetime(2026, 6, 23, 17, 0, 0)
+    with patch.object(module, "render_output_filename", return_value=csv_file), \
+            patch.object(module.NoiseDiag, "_compute",
+                         return_value=_full_metrics()), \
+            patch.object(module.NoiseDiag, "_maybe_alert") as alert:
+        step.execute({"time": time_dv})
+    alert.assert_called_once()
+    assert step._last_run_time is time_dv
 
 
 def _alert_step(module, sustain_s=300, reset_after_under=2):
