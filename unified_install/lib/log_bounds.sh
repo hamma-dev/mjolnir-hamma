@@ -30,6 +30,10 @@ LOG_BOUNDS_FILES_DIR="${FILES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../fi
 LOG_BOUNDS_JOURNALD_DIR="/etc/systemd/journald.conf.d"
 LOG_BOUNDS_JOURNALD_DST="$LOG_BOUNDS_JOURNALD_DIR/00-sensor-bounds.conf"
 LOG_BOUNDS_JOURNALD_SRC="journald-sensor-bounds.conf"
+# Persistent journal location. Without it the cap above bounds nothing (HAM-216).
+LOG_BOUNDS_JOURNAL_DIR="/var/log/journal"
+# Where journald writes while volatile; it removes this after a flush to disk.
+LOG_BOUNDS_RUNTIME_JOURNAL_DIR="/run/log/journal"
 
 LOG_BOUNDS_RSYSLOG_LR="/etc/logrotate.d/rsyslog"
 # Backup MUST live outside /etc/logrotate.d/ -- logrotate reads every file in
@@ -54,7 +58,15 @@ log_bounds_apply_journald() {
     sudo mkdir -p "$LOG_BOUNDS_JOURNALD_DIR"
     sudo cp "$src" "$LOG_BOUNDS_JOURNALD_DST"
     sudo chmod 0644 "$LOG_BOUNDS_JOURNALD_DST"
+    # Make the journal persistent now, as the mj03 hand fix did (HAM-216): a
+    # dir journald makes itself lacks the systemd-journal group/ACLs until the
+    # next boot, and a restart alone leaves this boot's logs in /run. stdout
+    # is the result token, so keep the tools off it; a failure here shows up
+    # as RAM-ONLY in log_bounds_status_journald.
+    sudo mkdir -p "$LOG_BOUNDS_JOURNAL_DIR"
+    sudo systemd-tmpfiles --create --prefix "$LOG_BOUNDS_JOURNAL_DIR" >/dev/null || true
     sudo systemctl restart systemd-journald
+    sudo journalctl --flush >/dev/null || true
     echo "APPLIED"
 }
 
@@ -93,8 +105,19 @@ log_bounds_reclaim() {
 
 # --- status (read-only) ------------------------------------------------------
 
+# RAM-ONLY: the drop-in is installed but journald is writing to RAM -- the cap
+# is inert and history dies on reboot. Must not read as PRESENT: that is
+# exactly how mj03 passed --check (HAM-216). /var/log/journal existing is not
+# enough: a runtime journal in /run means it was never flushed to disk, or
+# Storage=volatile is set elsewhere (the mj41/mj42 AGS state, HAM-208).
 log_bounds_status_journald() {
-    [[ -f "$LOG_BOUNDS_JOURNALD_DST" ]] && echo "PRESENT" || echo "MISSING"
+    if [[ ! -f "$LOG_BOUNDS_JOURNALD_DST" ]]; then
+        echo "MISSING"
+    elif [[ ! -d "$LOG_BOUNDS_JOURNAL_DIR" || -d "$LOG_BOUNDS_RUNTIME_JOURNAL_DIR" ]]; then
+        echo "RAM-ONLY"
+    else
+        echo "PRESENT"
+    fi
 }
 
 log_bounds_status_rsyslog() {

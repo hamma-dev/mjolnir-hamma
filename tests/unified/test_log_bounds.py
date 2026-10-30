@@ -191,3 +191,149 @@ class TestSingleImplementation:
                    "log_bounds_status_rsyslog",
                    "log_bounds_status_cron"):
             assert f"{fn}()" in lib
+
+
+class TestJournaldPersistence:
+    """A cap on a RAM-only journal bounds nothing and loses history (HAM-216).
+
+    mj03 had the drop-in but no /var/log/journal, so the stock Storage=auto ran
+    journald in RAM: SystemMaxUse was inert and every reboot erased the logs,
+    while `apply_log_bounds.sh --check` reported "All bounds present".
+    """
+
+    def test_dropin_pins_persistent_storage(self):
+        """Parse the directive: the comment above it also says Storage=persistent."""
+        section, storage = None, []
+        for line in (FILES_DIR / "journald-sensor-bounds.conf").read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                section = line
+            elif section == "[Journal]" and line.split("=", 1)[0].strip() == "Storage":
+                storage.append(line.split("=", 1)[1].strip())
+        assert storage == ["persistent"], (
+            "Storage=auto silently falls back to RAM when /var/log/journal "
+            "is missing; pin persistent under [Journal]")
+
+    def test_default_journal_locations(self):
+        script = (f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+                  'echo "$LOG_BOUNDS_JOURNAL_DIR $LOG_BOUNDS_RUNTIME_JOURNAL_DIR"\n')
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True, timeout=30).stdout.split()
+        assert out == ["/var/log/journal", "/run/log/journal"]
+
+    def _status(self, tmp_path, dropin=True, journal_dir=True,
+                runtime_dir=False, fn="log_bounds_status_journald"):
+        dst = tmp_path / "00-sensor-bounds.conf"
+        jdir = tmp_path / "journal"
+        rdir = tmp_path / "run-journal"
+        if runtime_dir:
+            rdir.mkdir()
+        lr = tmp_path / "logrotate-rsyslog"
+        cron = tmp_path / "mjolnir-logrotate"
+        if dropin:
+            dst.write_text("[Journal]\n")
+        if journal_dir:
+            jdir.mkdir()
+        lr.write_text("maxsize 100M\n")
+        cron.write_text("#!/bin/sh\n")
+        script = (
+            f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+            f'LOG_BOUNDS_JOURNALD_DST="{dst}"\n'
+            f'LOG_BOUNDS_JOURNAL_DIR="{jdir}"\n'
+            f'LOG_BOUNDS_RUNTIME_JOURNAL_DIR="{rdir}"\n'
+            f'LOG_BOUNDS_RSYSLOG_LR="{lr}"\n'
+            f'LOG_BOUNDS_CRON_DST="{cron}"\n'
+            f'{fn} && echo "RC=0" || echo "RC=1"\n'
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        return result.stdout
+
+    def test_status_present_when_dropin_and_journal_dir_exist(self, tmp_path):
+        assert self._status(tmp_path).startswith("PRESENT")
+
+    def test_status_missing_without_dropin(self, tmp_path):
+        assert self._status(tmp_path, dropin=False).startswith("MISSING")
+
+    def test_status_ram_only_without_journal_dir(self, tmp_path):
+        """The mj03 state must not read as PRESENT."""
+        assert self._status(tmp_path, journal_dir=False).startswith("RAM-ONLY")
+
+    def test_all_present_fails_for_ram_only_journal(self, tmp_path):
+        out = self._status(tmp_path, journal_dir=False,
+                           fn="log_bounds_all_present")
+        assert "RC=1" in out
+
+    def test_all_present_passes_when_everything_is_in_place(self, tmp_path):
+        out = self._status(tmp_path, fn="log_bounds_all_present")
+        assert "RC=0" in out
+
+    def test_status_missing_with_neither_dropin_nor_journal_dir(self, tmp_path):
+        """A fresh unit: RAM-ONLY here would claim the drop-in is installed."""
+        out = self._status(tmp_path, dropin=False, journal_dir=False)
+        assert out.startswith("MISSING")
+
+    def test_status_ram_only_while_a_runtime_journal_exists(self, tmp_path):
+        """/var/log/journal existing is not proof: journald may still be writing
+        to /run (dir made but never flushed, or Storage=volatile elsewhere)."""
+        out = self._status(tmp_path, runtime_dir=True)
+        assert out.startswith("RAM-ONLY")
+
+
+class TestApplyJournaldMakesItPersistent:
+    """The apply path must reproduce the mj03 hand fix (HAM-216): journal dir
+    with the systemd-journal group/ACLs, restart, then flush RAM to disk.
+    A restart alone leaves the current boot's logs in /run (lost at reboot)."""
+
+    def _apply(self, tmp_path, failing=""):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        log = tmp_path / "sudo.log"
+        # Fake sudo: record the command, let the two journal tools chatter on
+        # stdout, and fail for the command named in $FAILING.
+        (bindir / "sudo").write_text(
+            '#!/bin/bash\n'
+            f'echo "$*" >> "{log}"\n'
+            '[[ "$1" == journalctl || "$1" == systemd-tmpfiles ]] && echo "noise from $1"\n'
+            '[[ -n "$FAILING" && "$1" == "$FAILING" ]] && exit 1\n'
+            'exit 0\n')
+        (bindir / "sudo").chmod(0o755)
+        script = (f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+                  'log_bounds_apply_journald; echo "RC=$?"\n')
+        env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                   FAILING=failing)
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True, timeout=30, env=env).stdout
+        return out, log.read_text().splitlines()
+
+    @staticmethod
+    def _index(cmds, needle):
+        hits = [i for i, c in enumerate(cmds) if needle in c]
+        assert hits, f"{needle!r} never run; sudo saw {cmds}"
+        return hits[0]
+
+    def test_result_token_is_clean(self, tmp_path):
+        """apply_log_bounds.sh matches the captured stdout against APPLIED."""
+        out, _ = self._apply(tmp_path)
+        assert out.splitlines() == ["APPLIED", "RC=0"]
+
+    def test_journal_dir_prepared_before_restart(self, tmp_path):
+        _, cmds = self._apply(tmp_path)
+        mk = self._index(cmds, "mkdir -p /var/log/journal")
+        tmpf = self._index(cmds, "systemd-tmpfiles --create --prefix /var/log/journal")
+        restart = self._index(cmds, "systemctl restart systemd-journald")
+        assert mk < tmpf < restart
+
+    def test_flushes_runtime_journal_after_restart(self, tmp_path):
+        _, cmds = self._apply(tmp_path)
+        restart = self._index(cmds, "systemctl restart systemd-journald")
+        flush = self._index(cmds, "journalctl --flush")
+        assert restart < flush
+
+    def test_failed_flush_does_not_abort(self, tmp_path):
+        """The cap is installed regardless; a journal left in RAM is reported
+        as RAM-ONLY by the status check, not hidden by a crash here."""
+        out, _ = self._apply(tmp_path, failing="journalctl")
+        assert out.splitlines() == ["APPLIED", "RC=0"]
