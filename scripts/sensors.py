@@ -1105,6 +1105,24 @@ def need_daemon_reload():
     return out.strip() == "yes"
 
 
+def manager_environment():
+    """systemd's manager environment (`systemctl show-environment`), or None.
+
+    DefaultEnvironment= and `systemctl set-environment` reach every service
+    but are not in `show -p Environment`, so a BROKKR_MODE there is invisible
+    until mode.conf stops overriding it.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "show-environment"],
+            capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return None
+    return result.stdout
+
+
 def systemctl_show_mode():
     """systemd's loaded ExecStart and Environment for brokkr, or None."""
     try:
@@ -1180,6 +1198,20 @@ def systemd_preflight(current):
                 "before reloading by hand."
                 .format(BROKKR_SERVICE, BROKKR_SERVICE),
                 "brokkr unit has a pending daemon-reload")
+    manager = manager_environment()
+    if manager is None:
+        return ("  [ERROR] Could not read systemd's manager environment "
+                "(systemctl show-environment).\n"
+                "          Refusing to toggle.",
+                "systemd could not be queried")
+    if any(line.startswith("BROKKR_MODE=") for line in manager.split("\n")):
+        return ("  [ERROR] BROKKR_MODE is set in systemd's manager "
+                "environment (DefaultEnvironment=\n"
+                "          or systemctl set-environment). It reaches brokkr "
+                "whenever mode.conf\n"
+                "          does not override it. Refusing to toggle; unset it "
+                "by hand.",
+                "BROKKR_MODE is in systemd's manager environment")
     loaded = effective_unit_mode()
     if loaded is None:
         return ("  [ERROR] Could not read the mode systemd has loaded for {}."
@@ -1196,6 +1228,43 @@ def systemd_preflight(current):
                     loaded, DROPIN_PATH, current, BROKKR_SERVICE),
                 "systemd's loaded mode differs from mode.conf")
     return None
+
+
+def restore_mode_conf(plan):
+    """Put mode.conf back as it was, reload, and check systemd agrees.
+
+    Called when systemd disagrees with the mode just written. Leaving the new
+    bytes would make mode.conf disagree with what systemd runs, and every
+    later toggle -- the emergency --off included -- would refuse. Returns
+    True if systemd is back on the original mode.
+    """
+    original = plan.get("original")
+    if original is None:
+        rc = remove_dropin()
+    else:
+        rc = write_dropin(original, plan["current"])
+    if rc == 0:
+        rc = daemon_reload()
+    if rc == 0 and effective_unit_mode() == plan["current"]:
+        print("  [OK] Restored {}; systemd is back on mode {}".format(
+            DROPIN_PATH, plan["current"]))
+        return True
+    print("  [ERROR] Could not restore {} to its original state.\n"
+          "          Fix it by hand before the next toggle: systemctl cat {}"
+          .format(DROPIN_PATH, BROKKR_SERVICE))
+    return False
+
+
+def cut_sensor_power(pin, active_high):
+    """De-energize the sensor and touch nothing else. Returns the relay rc.
+
+    A refused --off still cuts power (PB, 2026-10-30): the mode is left
+    alone, but at low battery the sensor's ~1 A has to go.
+    """
+    print("  [INFO] Mode left alone; cutting sensor power anyway.")
+    return toggle_relay(
+        relay_on=compute_relay_flag(sensor_on=False, active_high=active_high),
+        pin=pin)
 
 
 # Exit code for "toggled, but systemd will run brokkr in another mode than
@@ -1287,6 +1356,8 @@ def plan_mode(sensor_on, path=None):
         current -- the mode in force now
         mode    -- the target mode
         content -- the bytes to write, for "write"
+        original -- mode.conf's bytes before the change (None: no file), so
+                    a post-reload mismatch can put them back
         reason  -- the operator-facing text, for "refuse"
         summary -- one short line of it, for the notification
     """
@@ -1320,7 +1391,8 @@ def plan_mode(sensor_on, path=None):
     existing = detail["content"]
     target = target_mode(current, sensor_on=sensor_on)
     if target == current:
-        return {"kind": "noop", "current": current, "mode": current}
+        return {"kind": "noop", "current": current, "mode": current,
+                "original": existing}
 
     if target == MODE_DEFAULT:
         remainder = collapse_content(existing, detail["sites"])
@@ -1331,16 +1403,17 @@ def plan_mode(sensor_on, path=None):
             # failure routes here. Every one of them returns "refuse" and
             # leaves the file alone, because answering a check we could not
             # satisfy with `rm -f` turns a parse failure into data loss.
-            return {"kind": "delete", "current": current, "mode": target}
+            return {"kind": "delete", "current": current, "mode": target,
+                    "original": existing}
         return {"kind": "write", "current": current, "mode": target,
-                "content": remainder}
+                "content": remainder, "original": existing}
 
     # The written mode is proven after daemon-reload, against what systemd
     # will actually run (check_effective_mode). The text-level re-checks that
     # stood here could not fire on any input -- 8,738 plans in the red team.
     content = render_dropin(target, detail["form"], existing)
     return {"kind": "write", "current": current, "mode": target,
-            "content": content}
+            "content": content, "original": existing}
 
 
 def apply_mode(sensor_on, plan=None):
@@ -1404,8 +1477,19 @@ def write_dropin(content=None, mode=None):
         return rc
     # A first-time mode.conf can come back empty after a power cut -- most
     # likely at low battery -- unless the rename is on disk.
-    run_command(["sync"], "Flushed the drop-in to disk")
+    flush_dropin_dir()
     return 0
+
+
+def flush_dropin_dir():
+    """sync the drop-in's filesystem only, bounded.
+
+    A plain `sync` also flushes the USB data sticks, unbounded, while brokkr
+    is stopped.
+    """
+    run_command(
+        ["timeout", "30", "sync", "-f", os.path.dirname(DROPIN_PATH)],
+        "Flushed the drop-in to disk")
 
 
 def remove_dropin():
@@ -1418,15 +1502,19 @@ def remove_dropin():
     turned it into data loss. Deleting is never a way to satisfy a
     post-condition.
     """
-    return run_command(
+    rc = run_command(
         ["sudo", "rm", "-f", DROPIN_PATH],
         "Removed mode drop-in (default)")
+    if rc == 0:
+        flush_dropin_dir()
+    return rc
 
 
 def sensor_off(pin, active_high, plan=None):
     """Execute the sensor off sequence.
 
-    1. Decide and verify the mode change (refuses here, before anything moves)
+    1. Decide and verify the mode change. A refusal changes no mode and
+       stops nothing, but still cuts sensor power (cut_sensor_power)
     2. Stop brokkr and sindri
     3. Toggle relay to power off sensor
     4. Archive today's telemetry CSV
@@ -1449,7 +1537,7 @@ def sensor_off(pin, active_high, plan=None):
         plan = plan_mode(sensor_on=False)
     if plan["kind"] == "refuse":
         print(plan["reason"])
-        return 1
+        return cut_sensor_power(pin, active_high) or 1
 
     rc = stop_brokkr()
     if rc != 0:
@@ -1472,10 +1560,12 @@ def sensor_off(pin, active_high, plan=None):
     if rc != 0:
         return rc
 
-    # The relay is already off: carry on, so brokkr still reports.
+    # The relay is already off: put mode.conf back, and carry on so brokkr
+    # still reports (in the mode it had, as a refused --off would leave it).
     verify_rc, actual = check_effective_mode(plan["mode"])
     if verify_rc:
         plan["mismatch"] = (actual, plan["mode"])
+        plan["restored"] = restore_mode_conf(plan)
 
     rc = start_brokkr()
     if rc != 0:
@@ -1493,7 +1583,8 @@ def sensor_on(pin, active_high, plan=None):
     3. Archive today's telemetry CSV
     4. Apply the mode plan
     5. Reload systemd, and check systemd now agrees on the mode
-    6. Toggle relay to power on sensor -- skipped if systemd disagrees
+    6. Toggle relay to power on sensor -- skipped if systemd disagrees, in
+       which case mode.conf is restored instead
     7. Start brokkr in default mode, then sindri
 
     Returns
@@ -1528,10 +1619,12 @@ def sensor_on(pin, active_high, plan=None):
     verify_rc, actual = check_effective_mode(plan["mode"])
     if verify_rc:
         # --on is not the emergency direction. On a mode this script got
-        # wrong, leaving the sensor unpowered is the safe failure; brokkr is
-        # still started so the unit keeps reporting.
+        # wrong, not powering the sensor is the safe failure; mode.conf goes
+        # back and brokkr is still started so the unit keeps reporting. The
+        # relay is not commanded at all, so the sensor stays as it was.
         plan["mismatch"] = (actual, plan["mode"])
-        print("  [ERROR] Leaving the sensor relay OFF.")
+        plan["restored"] = restore_mode_conf(plan)
+        print("  [ERROR] Sensor power was not changed.")
     else:
         relay_on = compute_relay_flag(sensor_on=True,
                                       active_high=active_high)
@@ -1705,22 +1798,24 @@ def run(argv=None, config_path=None, main_toml_path=None):
         print("--- DRY RUN: Turn sensor {} ---".format(action))
         print("Config: pin={}, active_high={}".format(
             config["pin"], config["active_high"]))
+        # The SAME plan the real run would execute, decided FIRST as the real
+        # run decides it, so the two cannot drift apart on which cases refuse
+        # or on what gets written.
+        plan = plan_mode(sensor_on=args.sensor_on)
+        if plan["kind"] == "refuse":
+            print("REFUSE: {}".format(plan["summary"]))
+            print(plan["reason"])
+            if not args.sensor_on:
+                print("Would cut sensor power only (mode left alone):")
+                print("  {} --pin {} {}".format(
+                    RELAY_SCRIPT, config["pin"], relay_flag))
+            return 1
         print("Would run:")
         print("  sudo systemctl stop {}".format(BROKKR_SERVICE))
         if not args.sensor_on:
             print("  {} --pin {} {}".format(
                 RELAY_SCRIPT, config["pin"], relay_flag))
         print("  Archive telemetry CSV")
-        # The SAME plan the real run would execute, so the two cannot drift
-        # apart on which cases refuse or on what gets written. Stop where the
-        # real run would stop: printing the rest of the sequence after a
-        # REFUSE showed an operator a run that completes, for a case that
-        # hard-fails.
-        plan = plan_mode(sensor_on=args.sensor_on)
-        if plan["kind"] == "refuse":
-            print("  REFUSE: {}".format(plan["summary"]))
-            print(plan["reason"])
-            return 1
         print("  Mode: {} -> {}".format(plan["current"], plan["mode"]))
         if plan["kind"] == "noop":
             print("  (no drop-in change)")
@@ -1762,10 +1857,18 @@ def run(argv=None, config_path=None, main_toml_path=None):
     plan = plan_mode(sensor_on=args.sensor_on)
     if plan["kind"] == "refuse":
         print(plan["reason"])
+        rc = 1
+        reason = "REFUSED: {}".format(plan["summary"])
+        if not args.sensor_on:
+            cut_rc = cut_sensor_power(config["pin"], config["active_high"])
+            if cut_rc:
+                rc = cut_rc
+                reason += "; sensor power cut FAILED (rc={})".format(cut_rc)
+            else:
+                reason += "; sensor power CUT, brokkr mode unchanged"
         send_notification(sender, build_message(
-            sensor_name, site, action, success=False, rc=1,
-            reason="REFUSED: {}".format(plan["summary"])))
-        return 1
+            sensor_name, site, action, success=False, rc=rc, reason=reason))
+        return rc
 
     # Execute
     if args.sensor_on:
@@ -1778,10 +1881,15 @@ def run(argv=None, config_path=None, main_toml_path=None):
     reason = None
     if plan.get("mismatch"):
         actual, expected = plan["mismatch"]
-        reason = ("relay {}; but systemd will start brokkr in mode '{}', "
-                  "not '{}'".format(
-                      "left OFF" if args.sensor_on else "OFF",
-                      actual, expected))
+        reason = "{}; systemd would have started brokkr in mode '{}', " \
+                 "not '{}'; ".format(
+                     "sensor power not changed" if args.sensor_on
+                     else "sensor power OFF", actual, expected)
+        if plan.get("restored"):
+            reason += "mode.conf restored, brokkr left in mode '{}'".format(
+                plan["current"])
+        else:
+            reason += "mode.conf restore FAILED -- fix it by hand"
     msg = build_message(
         sensor_name, site, action,
         success=(rc == 0),

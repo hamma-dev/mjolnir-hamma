@@ -38,6 +38,10 @@ def isolate_from_host(module, host_dir):
     """
     module._real_systemd_preflight = module.systemd_preflight
     module._real_systemctl_show_mode = module.systemctl_show_mode
+    dropin_dir = host_dir / "brokkr-hamma-default.service.d"
+    module.DROPIN_DIR = str(dropin_dir)
+    module.DROPIN_PATH = str(dropin_dir / "mode.conf")
+    module.DROPIN_TMP_PATH = str(dropin_dir / module.DROPIN_TMP_NAME)
     module.UNIT_FILE_PATH = str(host_dir / "absent.service")
     module.EXTRA_DROPIN_DIRS = [str(host_dir / "absent.d")]
     module.LOCAL_MODE_TOML = str(host_dir / "absent-mode.toml")
@@ -317,7 +321,7 @@ class TestDropin:
         mock_result = MagicMock(returncode=0)
         with patch("subprocess.run", return_value=mock_result) as mock_run:
             sensors.remove_dropin()
-        cmd = mock_run.call_args[0][0]
+        cmd = mock_run.call_args_list[0][0][0]
         assert cmd == ["sudo", "rm", "-f", sensors.DROPIN_PATH]
 
 
@@ -1634,7 +1638,9 @@ class TestCollapseStripsEveryForm:
 
 
 class TestEveryRefusalHappensBeforeAnythingMoves:
-    """Refuse empty-handed: no service stopped, no relay moved.
+    """Refuse empty-handed: no service stopped, no mode changed. The one
+    exception is a refused --off, which still cuts sensor power and nothing
+    else (PB, 2026-10-30).
 
     apply_mode ran at step 4 of the off sequence, after brokkr and sindri
     were stopped and the relay de-energized. A refusal there leaves the unit
@@ -1686,11 +1692,15 @@ class TestEveryRefusalHappensBeforeAnythingMoves:
 
         assert rc != 0
         for name, mock in [("stop_brokkr", stop_b), ("stop_sindri", stop_s),
-                           ("toggle_relay", relay),
                            ("archive_telemetry_csv", archive),
                            ("daemon_reload", reload_),
                            ("start_brokkr", start_b)]:
             assert not mock.called, "{} ran before the refusal".format(name)
+        if flag == "--off":
+            relay.assert_called_once_with(
+                relay_on=sensors.compute_relay_flag(False, False), pin=17)
+        else:
+            relay.assert_not_called()
         assert dropin.read_text() == existing
 
     @pytest.mark.parametrize("entry", ["sensor_on", "sensor_off"])
@@ -1705,7 +1715,10 @@ class TestEveryRefusalHappensBeforeAnythingMoves:
             rc = getattr(sensors, entry)(pin=17, active_high=False)
         assert rc != 0
         stop_b.assert_not_called()
-        relay.assert_not_called()
+        if entry == "sensor_off":
+            relay.assert_called_once_with(relay_on=True, pin=17)
+        else:
+            relay.assert_not_called()
 
     def test_a_refusal_still_reaches_the_notification_path(self, sensors,
                                                            tmp_path):
@@ -1759,6 +1772,8 @@ class TestInvariantsOverEveryDropinShape:
         ("semi", "; was: ExecStart=/x --mode nosensor start\n"),
         ("other", "TimeoutStopSec=90\n"),
         ("other2", "Restart=always\n"),
+        ("unit", "[Unit]\n"),
+        ("install", "[Install]\n"),
     ]
 
     def _shapes(self):
@@ -1827,7 +1842,7 @@ class TestInvariantsOverEveryDropinShape:
                 if _orphan_reset(content):
                     assert _orphan_reset(existing), (
                         "introduced a bare ExecStart= reset: " + where)
-        assert checked > 1500, "swept only {} shapes".format(checked)
+        assert checked > 2500, "swept only {} shapes".format(checked)
 
 
 class TestWritesPreserveEverythingButTheMode:
@@ -1940,6 +1955,16 @@ class TestParserMatchesSystemd:
         content = header + "\nEnvironment=BROKKR_MODE=nosensor\n"
         assert sensors.parse_mode(content)[0] == sensors.MODE_UNKNOWN
 
+    @pytest.mark.parametrize("content", [
+        "[Unit]\nDescription=x\n[Service]\nRestartSec=30\n[Install]\n"
+        "WantedBy=multi-user.target\n",
+        "[Unit]\nDescription=x\n[Install]\nWantedBy=multi-user.target\n",
+    ])
+    def test_mode_is_added_inside_service(self, sensors, content):
+        out = sensors.add_mode_line(content, "nosensor")
+        assert oracle.effective_mode(out) == "nosensor", out
+        assert sensors.parse_mode(out)[0] == "nosensor"
+
     def test_mode_is_never_added_under_a_miscased_header(self, sensors):
         out = sensors.add_mode_line("[service]\nRestartSec=30\n", "nosensor")
         assert "[Service]\nEnvironment=BROKKR_MODE=nosensor" in out
@@ -2034,6 +2059,8 @@ class _Placements:
             patch.object(sensors, "DROPIN_PATH", str(self.dropin)),
             patch.object(sensors, "need_daemon_reload",
                          return_value=reload_pending),
+            patch.object(sensors, "manager_environment",
+                         return_value="LANG=C\nPATH=/usr/bin\n"),
             patch.object(sensors, "systemd_preflight",
                          sensors._real_systemd_preflight),
             patch.object(sensors, "effective_unit_mode",
@@ -2180,6 +2207,27 @@ class TestModeSourcesOutsideTheDropin:
         assert on["kind"] == "write" and on["mode"] == "nochargecontroller"
         assert off["kind"] == "noop"
 
+    @pytest.mark.parametrize("content,expected", [
+        ("[Service]\nExecStart=\nExecStart=/x\n", True),
+        ("[Unit]\nExecStart=\nExecStart=/x\n", False),
+        ("[Service]\nExecStart=\n", False),
+        ("[Service]\nExecStart=/x\nExecStart=\n", False),
+    ])
+    def test_overrides_execstart(self, sensors, content, expected):
+        assert sensors.overrides_execstart(content) is expected
+
+    def test_execstart_skip_is_for_the_unit_file_only(
+            self, sensors, tmp_path):
+        """mode.conf's override makes the UNIT FILE's --mode dead -- not a
+        --mode in another drop-in, which may sort after it."""
+        mode = "nosensor_nochargecontroller"
+        dropin = "[Service]\nExecStart=\n" + EXEC_LINE.format(mode) + "\n"
+        plan = _Placements(
+            sensors, tmp_path,
+            other_dropin="[Service]\nExecStart=\n" + EXEC_LINE.format(mode)
+            + "\n").plan(sensor_on=True, dropin=dropin)
+        assert plan["kind"] == "refuse"
+
     def test_unit_file_mode_without_an_execstart_override_still_refuses(
             self, sensors, tmp_path):
         unit = "[Service]\n" + EXEC_LINE.format("nochargecontroller") + "\n"
@@ -2258,12 +2306,109 @@ class TestModeSourcesOutsideTheDropin:
                    for d in dirs)
 
 
+SVC = "brokkr-hamma-default.service"
+REAL_SHOW = (
+    "ExecStart={{ path=/home/pi/dev/ltgenv/bin/python3 ; argv[]=/home/pi/dev/"
+    "ltgenv/bin/python3 -m brokkr --system hamma {flag}start ; ignore_errors="
+    "no ; start_time=[Thu 2026-10-29 10:00:01 CDT] ; stop_time=[n/a] ; "
+    "pid=812 ; code=(null) ; status=0/0 }}\nEnvironment={env}\n")
+
+
+class TestRealSystemdChain:
+    """plan_mode -> systemd_preflight -> the systemctl queries, with ONLY
+    subprocess faked -- and the exact argv each query must use."""
+
+    def _plan(self, tmp_path, dropin, show, pending="no", unit=None,
+              manager="LANG=en_GB.UTF-8\nPATH=/usr/bin\n", sensor_on=False):
+        module = load_sensors()
+        d = tmp_path / "d"
+        d.mkdir()
+        if dropin is not None:
+            (d / "mode.conf").write_text(dropin)
+        u = tmp_path / "unit.service"
+        u.write_text(unit or "[Service]\nExecStart=/home/pi/dev/ltgenv/bin/"
+                     "python3 -m brokkr --system hamma start\n")
+        seen = []
+
+        def run(cmd, **kwargs):
+            seen.append(cmd)
+            if cmd == ["systemctl", "show", "-p", "NeedDaemonReload",
+                       "--value", SVC]:
+                return MagicMock(returncode=0, stdout=pending + "\n")
+            if cmd == ["systemctl", "show", "-p", "ExecStart", "-p",
+                       "Environment", SVC]:
+                return MagicMock(returncode=0, stdout=show)
+            if cmd == ["systemctl", "show-environment"]:
+                return MagicMock(returncode=0, stdout=manager)
+            raise AssertionError("unexpected command {!r}".format(cmd))
+        with patch.object(module, "DROPIN_PATH", str(d / "mode.conf")), \
+             patch.object(module, "UNIT_FILE_PATH", str(u)), \
+             patch.object(module, "EXTRA_DROPIN_DIRS", [str(tmp_path / "x.d")]), \
+             patch.object(module, "LOCAL_MODE_TOML", str(tmp_path / "x.toml")), \
+             patch("subprocess.run", side_effect=run):
+            plan = module.plan_mode(sensor_on=sensor_on)
+        return plan, seen
+
+    def test_environment_form_writes(self, tmp_path):
+        plan, seen = self._plan(
+            tmp_path, "[Service]\nEnvironment=BROKKR_MODE=nochargecontroller\n",
+            REAL_SHOW.format(flag="", env="BROKKR_MODE=nochargecontroller"))
+        assert plan["kind"] == "write", plan
+        assert plan["mode"] == "nosensor_nochargecontroller"
+        assert len(seen) == 3
+
+    def test_mj06_execstart_override_writes(self, tmp_path):
+        mode = "nochargecontroller"
+        plan, _ = self._plan(
+            tmp_path, "[Service]\nExecStart=\n" + EXEC_LINE.format(mode),
+            REAL_SHOW.format(flag="--mode {} ".format(mode), env=""),
+            unit="[Service]\n" + EXEC_LINE.format(mode) + "\n")
+        assert plan["kind"] == "write", plan
+        assert plan["mode"] == "nosensor_nochargecontroller"
+
+    @pytest.mark.parametrize("env", ["LANG=C", ""])
+    def test_no_dropin_writes(self, tmp_path, env):
+        plan, _ = self._plan(tmp_path, None, REAL_SHOW.format(flag="", env=env))
+        assert plan["kind"] == "write" and plan["mode"] == "nosensor", plan
+
+    def test_loaded_mode_mismatch_refuses(self, tmp_path):
+        plan, _ = self._plan(tmp_path, None, REAL_SHOW.format(
+            flag="", env="BROKKR_MODE=nosensor"))
+        assert plan["kind"] == "refuse" and "differs" in plan["summary"]
+
+    def test_pending_reload_refuses(self, tmp_path):
+        plan, _ = self._plan(tmp_path, None, REAL_SHOW.format(flag="", env=""),
+                             pending="yes")
+        assert plan["kind"] == "refuse" and "pending" in plan["summary"]
+
+    def test_unit_not_loaded_refuses(self, tmp_path):
+        plan, _ = self._plan(tmp_path, None, "Environment=\n")
+        assert plan["kind"] == "refuse"
+
+    def test_manager_environment_mode_refuses(self, tmp_path):
+        """systemctl set-environment / DefaultEnvironment= reach the service
+        but are not in `show -p Environment`: invisible until mode.conf is
+        removed, and then they win."""
+        plan, _ = self._plan(
+            tmp_path, "[Service]\nEnvironment=BROKKR_MODE=nosensor\n",
+            REAL_SHOW.format(flag="", env="BROKKR_MODE=nosensor"),
+            manager="LANG=C\nBROKKR_MODE=nochargecontroller\n", sensor_on=True)
+        assert plan["kind"] == "refuse"
+        assert "manager environment" in plan["reason"]
+
+    def test_unreadable_manager_environment_refuses(self, tmp_path):
+        module = load_sensors()
+        with patch("subprocess.run", return_value=MagicMock(
+                returncode=1, stdout="")):
+            assert module.manager_environment() is None
+
+
 class TestSystemdQueries:
     """The real need_daemon_reload / systemctl_show_mode, faked subprocess."""
 
     @pytest.mark.parametrize("rc,out,expected", [
         (0, "yes\n", True), (0, "no\n", False), (1, "", None),
-        (0, "", None),
+        (0, "", None), (1, "no\n", None), (0, "NeedDaemonReload=no\n", None),
     ])
     def test_need_daemon_reload(self, rc, out, expected):
         module = load_sensors()
@@ -2318,8 +2463,9 @@ class TestEffectiveModeAfterReload:
                                       "Environment=BROKKR_MODE=x\n",
                                       "ExecStart=\nEnvironment=\n"])
     def test_unreadable_view_is_none(self, sensors, show):
+        module = load_sensors()  # the real systemctl_show_mode, for None
         with patch("subprocess.run", side_effect=OSError("no systemctl")):
-            assert sensors.effective_unit_mode(show) is None
+            assert module.effective_unit_mode(show) is None
 
     @pytest.mark.parametrize("flag,env,expected", [
         ("", "BROKKR_MODE=nosensor BROKKR_MODE=nochargecontroller",
@@ -2331,6 +2477,10 @@ class TestEffectiveModeAfterReload:
             self, sensors, flag, env, expected):
         show = SHOW_TEMPLATE.format(flag=flag, env=env)
         assert sensors.effective_unit_mode(show) == expected
+
+    def test_only_the_exact_variable_counts(self, sensors):
+        show = SHOW_TEMPLATE.format(flag="", env="NOT_BROKKR_MODE=nosensor")
+        assert sensors.effective_unit_mode(show) == "default"
 
     def test_environment_line_before_execstart(self, sensors):
         show = SHOW_TEMPLATE.format(flag="", env="BROKKR_MODE=nosensor")
@@ -2408,10 +2558,10 @@ class TestEffectiveModeAfterReload:
         assert rc == 0
         assert "relay" in calls
 
-    def test_on_mismatch_leaves_the_relay_off_but_starts_brokkr(
-            self, sensors):
+    def test_on_mismatch_leaves_sensor_power_alone_but_starts_brokkr(
+            self, sensors, capsys):
         """--on is not the emergency direction: on a mode the script got
-        wrong, leaving the sensor unpowered is the safe failure."""
+        wrong, not powering the sensor is the safe failure."""
         rc, calls, plan = self._on(sensors, SHOW_TEMPLATE.format(
             flag="--mode nosensor_nochargecontroller ", env=""))
         assert rc == sensors.RC_MODE_MISMATCH
@@ -2419,6 +2569,9 @@ class TestEffectiveModeAfterReload:
         assert calls[-2:] == ["start", "si"]
         assert plan["mismatch"] == ("nosensor_nochargecontroller",
                                     "nochargecontroller")
+        out = capsys.readouterr().out
+        assert "sensor power was not changed" in out.lower()
+        assert "relay off" not in out.lower()
 
     def test_off_mismatch_is_recorded_on_the_plan(self, sensors):
         plan = {"kind": "write", "current": "default", "mode": "nosensor",
@@ -2436,6 +2589,96 @@ class TestEffectiveModeAfterReload:
             rc = sensors.sensor_off(pin=17, active_high=True, plan=plan)
         assert rc == sensors.RC_MODE_MISMATCH
         assert plan["mismatch"] == ("default", "nosensor")
+
+    def _mismatch(self, sensors, sensor_on, original, show_after_restore):
+        """Run a sequence whose post-reload check fails, recording calls."""
+        calls = []
+        shows = [SHOW_TEMPLATE.format(flag="--mode default ", env=""),
+                 show_after_restore]
+        plan = {"kind": "write", "current": "nochargecontroller",
+                "mode": "nosensor_nochargecontroller" if not sensor_on
+                else "nochargecontroller",
+                "content": "new", "original": original}
+        if sensor_on:
+            plan["current"] = "nosensor_nochargecontroller"
+
+        def track(name, rc=0):
+            def fn(*args, **kwargs):
+                calls.append((name,) + args)
+                return rc
+            return fn
+        with patch.object(sensors, "stop_brokkr", side_effect=track("stop")), \
+             patch.object(sensors, "stop_sindri", side_effect=track("ss")), \
+             patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
+             patch.object(sensors, "archive_telemetry_csv"), \
+             patch.object(sensors, "apply_mode", side_effect=track("mode")), \
+             patch.object(sensors, "write_dropin", side_effect=track("restore")), \
+             patch.object(sensors, "remove_dropin", side_effect=track("unlink")), \
+             patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
+             patch.object(sensors, "systemctl_show_mode",
+                          side_effect=lambda: shows.pop(0)), \
+             patch.object(sensors, "start_brokkr", side_effect=track("start")), \
+             patch.object(sensors, "start_sindri", side_effect=track("si")):
+            fn = sensors.sensor_on if sensor_on else sensors.sensor_off
+            rc = fn(pin=17, active_high=True, plan=plan)
+        return rc, [c[0] for c in calls], calls, plan
+
+    @pytest.mark.parametrize("sensor_on", [True, False])
+    def test_mismatch_restores_the_original_mode_conf(
+            self, sensors, sensor_on):
+        """Otherwise mode.conf now disagrees with what systemd runs, and
+        every later toggle -- the emergency --off included -- refuses."""
+        current = ("nosensor_nochargecontroller" if sensor_on
+                   else "nochargecontroller")
+        rc, names, calls, plan = self._mismatch(
+            sensors, sensor_on, "ORIGINAL BYTES",
+            SHOW_TEMPLATE.format(flag="--mode {} ".format(current), env=""))
+        assert rc == sensors.RC_MODE_MISMATCH
+        i = names.index("restore")
+        assert calls[i][1] == "ORIGINAL BYTES"
+        assert names[i - 1] == "reload" and names[i + 1] == "reload"
+        assert names[-2:] == ["start", "si"]
+        assert plan["restored"] is True
+
+    def test_mismatch_with_no_original_file_removes_ours(self, sensors):
+        rc, names, _, plan = self._mismatch(
+            sensors, False, None,
+            SHOW_TEMPLATE.format(flag="--mode nochargecontroller ", env=""))
+        assert "unlink" in names and "restore" not in names
+        assert plan["restored"] is True
+
+    def test_a_failed_restore_is_reported(self, sensors, capsys):
+        rc, names, _, plan = self._mismatch(
+            sensors, False, "ORIGINAL BYTES",
+            SHOW_TEMPLATE.format(flag="--mode default ", env=""))
+        assert rc == sensors.RC_MODE_MISMATCH
+        assert plan["restored"] is False
+        assert "could not restore" in capsys.readouterr().out.lower()
+        assert names[-2:] == ["start", "si"]
+
+    def test_mismatch_notification_wording(self, sensors, tmp_path):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = true\n")
+        sent = []
+        for sensor_on in (True, False):
+            sender = MagicMock()
+
+            def fake(pin, active_high, plan):
+                plan["mismatch"] = ("default", "nosensor")
+                plan["restored"] = True
+                return sensors.RC_MODE_MISMATCH
+            with patch.object(sensors, "build_sender", return_value=sender), \
+                 patch.object(sensors, "sensor_on", side_effect=fake), \
+                 patch.object(sensors, "sensor_off", side_effect=fake):
+                sensors.run(["--on" if sensor_on else "--off"],
+                            config_path=str(unit),
+                            main_toml_path=str(tmp_path / "main.toml"))
+            sent.append(sender.send.call_args[0][0])
+        on, off = sent
+        assert "mode 'default', not 'nosensor'" in on
+        assert "sensor power not changed" in on
+        assert "sensor power OFF" in off
+        assert "mode.conf restored" in on and "mode.conf restored" in off
 
     def test_mismatch_notification_names_both_modes(self, sensors, tmp_path):
         unit = tmp_path / "unit.toml"
@@ -2455,6 +2698,97 @@ class TestEffectiveModeAfterReload:
         assert "'default'" in message and "'nosensor'" in message
 
 
+class TestRefusedOffStillCutsPower:
+    """A refused --off still de-energizes the sensor (PB, 2026-10-30): the
+    mode is left alone, but at low battery the power has to go."""
+
+    def _run(self, sensors, tmp_path, argv, active_high=True):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = {}\n".format(
+            "true" if active_high else "false"))
+        sender = MagicMock()
+        refuse = {"kind": "refuse", "current": "default", "mode": None,
+                  "reason": "  [ERROR] nope", "summary": "the summary"}
+        with patch.object(sensors, "plan_mode", return_value=refuse), \
+             patch.object(sensors, "build_sender", return_value=sender), \
+             patch.object(sensors, "toggle_relay", return_value=0) as relay, \
+             patch.object(sensors, "stop_brokkr", return_value=0) as stop, \
+             patch.object(sensors, "apply_mode", return_value=0) as mode:
+            rc = sensors.run(argv, config_path=str(unit),
+                             main_toml_path=str(tmp_path / "main.toml"))
+        return rc, relay, stop, mode, sender
+
+    @pytest.mark.parametrize("active_high", [True, False])
+    def test_refused_off_cuts_power_only(self, sensors, tmp_path,
+                                         active_high):
+        rc, relay, stop, mode, sender = self._run(
+            sensors, tmp_path, ["--off"], active_high)
+        assert rc == 1
+        relay.assert_called_once_with(
+            relay_on=sensors.compute_relay_flag(False, active_high), pin=17)
+        stop.assert_not_called()
+        mode.assert_not_called()
+        message = sender.send.call_args[0][0]
+        assert "REFUSED: the summary" in message
+        assert "sensor power CUT" in message
+
+    def test_refused_on_touches_nothing(self, sensors, tmp_path):
+        rc, relay, stop, mode, sender = self._run(sensors, tmp_path, ["--on"])
+        assert rc == 1
+        relay.assert_not_called()
+        stop.assert_not_called()
+        assert "REFUSED: the summary" in sender.send.call_args[0][0]
+
+    def test_failed_power_cut_is_reported(self, sensors, tmp_path):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = true\n")
+        sender = MagicMock()
+        refuse = {"kind": "refuse", "current": "default", "mode": None,
+                  "reason": "x", "summary": "s"}
+        with patch.object(sensors, "plan_mode", return_value=refuse), \
+             patch.object(sensors, "build_sender", return_value=sender), \
+             patch.object(sensors, "toggle_relay", return_value=7):
+            rc = sensors.run(["--off"], config_path=str(unit),
+                             main_toml_path=str(tmp_path / "main.toml"))
+        assert rc == 7
+        assert "power cut FAILED" in sender.send.call_args[0][0]
+
+    def test_sensor_off_called_directly_also_cuts_power(self, sensors):
+        refuse = {"kind": "refuse", "current": "default", "mode": None,
+                  "reason": "x", "summary": "s"}
+        with patch.object(sensors, "toggle_relay", return_value=0) as relay, \
+             patch.object(sensors, "stop_brokkr", return_value=0) as stop:
+            rc = sensors.sensor_off(pin=17, active_high=True, plan=refuse)
+        assert rc == 1
+        relay.assert_called_once_with(relay_on=False, pin=17)
+        stop.assert_not_called()
+
+    def test_dry_run_refusal_shows_only_the_power_cut(
+            self, sensors, tmp_path, capsys):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = true\n")
+        refuse = {"kind": "refuse", "current": "default", "mode": None,
+                  "reason": "  [ERROR] nope", "summary": "s"}
+        with patch.object(sensors, "plan_mode", return_value=refuse):
+            rc = sensors.run(["--off", "--dry-run"], config_path=str(unit))
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "systemctl stop" not in out
+        assert "would cut sensor power" in out.lower()
+        assert "relay.py --pin 17 --off" in out
+
+    def test_dry_run_on_refusal_lists_no_steps(self, sensors, tmp_path,
+                                               capsys):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = true\n")
+        refuse = {"kind": "refuse", "current": "default", "mode": None,
+                  "reason": "  [ERROR] nope", "summary": "s"}
+        with patch.object(sensors, "plan_mode", return_value=refuse):
+            sensors.run(["--on", "--dry-run"], config_path=str(unit))
+        out = capsys.readouterr().out
+        assert "systemctl stop" not in out and "relay.py" not in out
+
+
 class TestDryRunShowsTheWholeSequence:
 
     def test_dry_run_lists_temp_write_rename_and_mode_check(
@@ -2468,6 +2802,38 @@ class TestDryRunShowsTheWholeSequence:
         assert rc == 0
         assert "tee" in out and "mv -f" in out
         assert "systemctl show" in out
+
+
+class TestDryRunDetails:
+
+    def _dry(self, sensors, tmp_path, flag, dropin=None):
+        unit = tmp_path / "unit.toml"
+        unit.write_text("[relay]\npin = 17\nactive_high = true\n")
+        path = tmp_path / "mode.conf"
+        if dropin is not None:
+            path.write_text(dropin)
+        with patch.object(sensors, "DROPIN_PATH", str(path)):
+            return sensors.run([flag, "--dry-run"], config_path=str(unit))
+
+    def test_on_says_the_relay_waits_for_the_mode_check(
+            self, sensors, tmp_path, capsys):
+        self._dry(sensors, tmp_path, "--on",
+                  "[Service]\nEnvironment=BROKKR_MODE=nosensor\n")
+        assert "(relay stays OFF if not)" in capsys.readouterr().out
+
+    def test_delete_lists_no_temp_write(self, sensors, tmp_path, capsys):
+        self._dry(sensors, tmp_path, "--on",
+                  "[Service]\nEnvironment=BROKKR_MODE=nosensor\n")
+        out = capsys.readouterr().out
+        assert "sudo rm -f" in out and "sudo tee" not in out
+
+    def test_off_cuts_power_before_the_archive(self, sensors, tmp_path,
+                                               capsys):
+        self._dry(sensors, tmp_path, "--off")
+        out = capsys.readouterr().out
+        relay = out.index("relay.py --pin 17 --off")
+        assert out.index("systemctl stop") < relay < out.index(
+            "Archive telemetry CSV")
 
 
 class TestAtomicDropinWrite:
@@ -2484,7 +2850,7 @@ class TestAtomicDropinWrite:
             ["sudo", "mkdir", "-p", sensors.DROPIN_DIR],
             ["sudo", "tee", sensors.DROPIN_TMP_PATH],
             ["sudo", "mv", "-f", sensors.DROPIN_TMP_PATH, sensors.DROPIN_PATH],
-            ["sync"],
+            ["timeout", "30", "sync", "-f", sensors.DROPIN_DIR],
         ]
         assert mock_run.call_args_list[1][1]["input"] == "[Service]\nX=1\n"
 
@@ -2506,7 +2872,23 @@ class TestAtomicDropinWrite:
                 returncode=0, stderr="")) as mock_run:
             sensors.write_dropin("[Service]\nX=1\n", "nosensor")
         cmds = [c[0][0] for c in mock_run.call_args_list]
-        assert cmds[-1] == ["sync"]
+        # Only the drop-in's filesystem, with a bound: a plain `sync`
+        # flushes the USB data sticks too, while brokkr is stopped.
+        assert cmds[-1] == ["timeout", "30", "sync", "-f", sensors.DROPIN_DIR]
+
+    def test_delete_is_flushed_too(self, sensors):
+        with patch("subprocess.run", return_value=MagicMock(
+                returncode=0, stderr="")) as mock_run:
+            assert sensors.remove_dropin() == 0
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        assert cmds == [["sudo", "rm", "-f", sensors.DROPIN_PATH],
+                        ["timeout", "30", "sync", "-f", sensors.DROPIN_DIR]]
+
+    def test_failed_mkdir_writes_nothing(self, sensors):
+        with patch("subprocess.run", return_value=MagicMock(
+                returncode=1, stderr="x")) as mock_run:
+            assert sensors.write_dropin("[Service]\nX=1\n", "nosensor") != 0
+        assert len(mock_run.call_args_list) == 1
 
     def test_failed_temp_write_leaves_live_file_alone(self, sensors):
         def fake(cmd, **kwargs):

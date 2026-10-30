@@ -115,7 +115,8 @@ leave the file exactly as it was, when:
 | The mode is outside the two-axis model (`test`, `realtime`, `sindri02x`, anything new) | `--on` would compute `default` and discard whatever the operator set |
 | A mode is named **outside `mode.conf`**: the unit file's own `Environment=`, or its `ExecStart=` when `mode.conf` does not reset and replace it (mj06's is replaced, so it is not refused); another drop-in for the unit, including one beside `mode.conf`; or a top-level `mode =` in either `mode.toml` (mj05) | A `mode.conf` write may lose to it, and removing `mode.conf` would bring it back into force |
 | systemd has a **pending daemon-reload** for brokkr's unit (mj54, 2026-10-29), or cannot be asked | The script's own reload would activate somebody else's unreviewed edit too |
-| The mode systemd has **loaded** (`systemctl show`) differs from what `mode.conf` reads as | The mode comes from a source this script does not edit; this catches any drop-in location or environment it does not list |
+| The mode systemd has **loaded** (`systemctl show`) differs from what `mode.conf` reads as | The mode comes from a source this script does not edit; this catches any drop-in location it does not list |
+| `BROKKR_MODE` is in systemd's **manager environment** (`DefaultEnvironment=`, `systemctl set-environment`) | It reaches brokkr whenever `mode.conf` does not override it, and `show -p Environment` does not include it |
 | The mode is named outside `[Service]` (case-sensitive: `[service]` is an unknown section to systemd), or the drop-in has an empty `Environment=` reset or an `EnvironmentFile=` | systemd ignores the first; the reset wipes the mode above it; the file can set `BROKKR_MODE` unseen |
 | The drop-in cannot be read or decoded | Unreadable is not the same as absent |
 
@@ -126,25 +127,36 @@ blank lines never continue and are skipped inside a continuation, and only an
 unescaped `\` at the very end of the raw line continues (`\ ` with a trailing
 space does not).
 
-**Every refusal happens before any service is stopped and before the relay moves**,
-so a refused run changes nothing. That is not free on `--off`: a refused `--off`
-leaves the sensor **powered** (about 1.4 A, against 0.36 A off), which matters at
-low battery — fix the cause promptly. The refusal goes to the same chat channel as
-the on/off notifications, with its reason, because a message printed to a
-tunnelled stdout is a silent no-op from the operator's side.
+**Every refusal happens before any service is stopped or any mode is changed.** A
+refused `--on` touches nothing. A refused `--off` **still cuts sensor power** — one
+relay command, nothing else — because at low battery the sensor's ~1 A has to go
+(decided 2026-10-30). brokkr is left running in its current mode; if that mode is
+not a `nosensor` one, brokkr will retry the dead sensor and log the failures
+(bounded by the HAM-113 log caps) until the refusal is fixed and `--off` re-run.
+The refusal goes to the same chat channel as the on/off notifications, with its
+reason and whether the power cut worked, because a message printed to a tunnelled
+stdout is a silent no-op from the operator's side.
 
 That guarantee covers **refusals only**. A failure *after* the services have
 stopped — a `sudo`, write or `daemon-reload` error — stops the sequence there and
 does not restart brokkr (see [Error Handling](#error-handling)).
 
 `mode.conf` is written to a temp file in the same directory, renamed into place and
-`sync`ed, so a failed write (e.g. a full SD card) never leaves a truncated drop-in.
+flushed (`sync -f` on that filesystem only, bounded at 30 s), so a failed write
+(e.g. a full SD card) never leaves a truncated drop-in; a delete is flushed too.
 After the `daemon-reload`, the script asks systemd (`systemctl show -p ExecStart
--p Environment`) which mode it will start brokkr in. On a mismatch the run exits
-**3** (not 1) and the chat notice names both modes. brokkr is **still started** — a
-stopped brokkr sends no telemetry and no alerts — but on `--on` the relay is
-**left off**: powering the sensor on a mode the script got wrong is not the safe
-failure. On `--off` the relay has already moved by then.
+-p Environment`) which mode it will start brokkr in. On a mismatch:
+
+- `mode.conf` is **put back** as it was and systemd reloaded again — otherwise
+  `mode.conf` would disagree with what systemd runs and every later toggle,
+  including an emergency `--off`, would refuse;
+- on `--on` the relay is **not commanded**, so sensor power is unchanged — powering
+  the sensor on a mode the script got wrong is not the safe failure; on `--off`
+  the relay has already moved, so the sensor is off;
+- brokkr is **still started** (a stopped brokkr sends no telemetry and no alerts),
+  in its original mode;
+- the run exits **3** (not 1) and the chat notice names both modes, the sensor
+  power state, and whether the restore worked.
 
 **When `--on`/`--off` refuses** (from the VPS, `mjol_array.py` prints the unit's
 output, including every offending line). Recovery depends on what refused:

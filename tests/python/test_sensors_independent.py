@@ -59,6 +59,10 @@ def isolate_from_host(module, host_dir):
     """
     module._real_systemd_preflight = module.systemd_preflight
     module._real_systemctl_show_mode = module.systemctl_show_mode
+    dropin_dir = host_dir / "brokkr-hamma-default.service.d"
+    module.DROPIN_DIR = str(dropin_dir)
+    module.DROPIN_PATH = str(dropin_dir / "mode.conf")
+    module.DROPIN_TMP_PATH = str(dropin_dir / module.DROPIN_TMP_NAME)
     module.UNIT_FILE_PATH = str(host_dir / "absent.service")
     module.EXTRA_DROPIN_DIRS = [str(host_dir / "absent.d")]
     module.LOCAL_MODE_TOML = str(host_dir / "absent-mode.toml")
@@ -211,7 +215,8 @@ MODE_FLAG_RE = re.compile(r"--mode\b(?:[=\s]+(\S+))?")
 
 
 def _effective_lines(text):
-    """Yield the lines systemd would act on: no blanks, no comments.
+    """Yield the [Service] lines systemd would act on: no blanks, no
+    comments, no section headers, nothing from another section.
 
     systemd takes BOTH `#` and `;` as comment introducers.
 
@@ -225,11 +230,19 @@ def _effective_lines(text):
     str
         Each significant line, stripped.
     """
+    section = None
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         if stripped[0] in "#;":
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            # systemd matches section names case-sensitively and ignores
+            # every assignment outside [Service] for these keys.
+            section = stripped
+            continue
+        if section != "[Service]":
             continue
         yield stripped
 
@@ -1174,7 +1187,8 @@ class TestStickyAxisSurvivesBothTransitions:
 # --- Spec clause 11: refuse before touching anything -----------------
 
 class TestRefusalHappensBeforeAnythingIsTouched:
-    """sensors.py is the emergency power tool: fail empty-handed.
+    """sensors.py is the emergency power tool: fail empty-handed -- except
+    that a refused --off still cuts sensor power, and only that.
 
     A refusal after brokkr is stopped, or after the relay has moved,
     leaves the unit down with its mode still wrong -- the operator ran
@@ -1202,8 +1216,15 @@ class TestRefusalHappensBeforeAnythingIsTouched:
             rc = sensors.run([flag], config_path=unit,
                              main_toml_path=main)
         assert rc != 0, "{} was not refused".format(label)
-        assert harness.calls == [], (
-            "commands ran before the refusal: {}".format(harness.calls))
+        if flag == "--on":
+            assert harness.calls == [], (
+                "commands ran before the refusal: {}".format(harness.calls))
+        else:
+            # A refused --off still cuts sensor power -- that one relay
+            # command and nothing else (PB, 2026-10-30).
+            assert len(harness.calls) == 1, harness.calls
+            via, cmd = harness.calls[0]
+            assert cmd[0].endswith("relay.py") and "--pin" in cmd, cmd
         assert harness.read_back() == content, (
             "the drop-in changed despite the refusal")
 
