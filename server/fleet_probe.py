@@ -104,11 +104,14 @@ FIELDS = [
     "unit", "front_end", "brokkr_mode",
     "threshold_1_mv", "threshold_2_mv", "gain_fast", "gain_slow",
     "mjolnir_hamma", "brokkr", "sindri", "hamma", "notifiers",
-    # How each package is imported (HAM-205): `editable` (from the git checkout,
-    # so the SHA above is what runs), `installed` (a frozen site-packages copy
-    # that shadows the checkout -- the SHA above is NOT what runs), or
-    # `missing`. A frozen notifiers copy is what crashed brokkr in 2026-06 while
-    # every git SHA looked current.
+    # How each package is imported (HAM-205/227): `editable` (from the git
+    # checkout, so the SHA above is what runs), `installed` (a frozen
+    # site-packages copy that shadows the checkout -- the SHA above is NOT
+    # what runs), `missing` (not importable at all), or `broken` (importable
+    # by name but raises on import). A frozen notifiers copy that raised on
+    # import is what crashed brokkr in 2026-06 while every git SHA looked
+    # current; a bare `2>/dev/null` with an empty $F reported that case as
+    # `missing`, hiding the real cause.
     "brokkr_install", "sindri_install", "hamma_install", "notifiers_install",
 ]
 
@@ -120,6 +123,12 @@ RELEASE_BRANCH = "0.4.x"
 UNREACHABLE = "unreachable"
 UNKNOWN = "unknown"
 
+# Per-unit facts read every run for the digest's "not at <branch> head"
+# section only -- never written to the snapshot. They describe what's on
+# disk AT PROBE TIME, which is exactly what CONFIGURATION, not TELEMETRY
+# (above) says to keep out of FIELDS.
+RELEASE_EXTRA_FIELDS = ["mjolnir_hamma_branch", "mjolnir_hamma_dirty"]
+
 # Fields read from the AGS startup file, which is only reachable while the front
 # end is powered. When front_end flips they go blank (off) or populate (on) as a
 # mechanical consequence, not an independent config change -- so the digest
@@ -129,6 +138,55 @@ UNKNOWN = "unknown"
 # adjustment and is always reported.
 POWER_DERIVED_FIELDS = frozenset(
     {"threshold_1_mv", "threshold_2_mv", "gain_fast", "gain_slow"})
+
+# Classifier for one package's import mode (HAM-205/227): `editable` (from
+# the git checkout -- the SHA above is what runs), `installed` (a frozen
+# site-packages copy that shadows the checkout -- the SHA above is NOT what
+# runs), `missing` (not importable at all), or `broken` (importable by name
+# but raises on import -- the notifiers crash of 2026-06, which a bare
+# `2>/dev/null` with an empty $F reported as `missing`, hiding the real
+# cause). `{pkg}` is filled with bash's `$PKG` for the real run; tests fill
+# it with a literal package name so this is runnable directly under
+# `python3 -c` against controlled modules, not just checked by substring
+# match against REMOTE.
+INSTALL_CLASSIFIER_PY = r"""
+import importlib.util as _u, os, sys
+spec = _u.find_spec('{pkg}')
+if spec is None:
+    print('missing')
+else:
+    try:
+        mod = __import__('{pkg}')
+    except Exception:
+        print('broken')
+    else:
+        print(os.path.realpath(getattr(mod, '__file__', '') or ''))
+"""
+
+# Turns the classifier's printed value ($F) into one of missing/broken/
+# editable/installed/unknown, by where the real file sits. Kept apart from
+# the python call so the path-prefix matching can be driven directly, with a
+# crafted $F and $PKG, without a real venv on PATH.
+CLASSIFY_INSTALL_MODE_SH = r'''
+case "$F" in
+  missing|broken) I=$F ;;
+  /home/pi/dev/$PKG/*) I=editable ;;
+  */site-packages/*) I=installed ;;
+  *) I=unknown ;;
+esac
+'''
+
+# Where each package is actually imported from, by the interpreter that runs
+# it. `timeout 15` bounds each interpreter call so one hang can't eat the
+# whole 90s per-unit probe budget.
+INSTALL_PROBE = r'''
+for pair in brokkr:ltgenv notifiers:ltgenv hamma:ltgenv sindri:sindrienv; do
+  PKG=${pair%%:*}; ENV=${pair##*:}
+  F=$(timeout 15 /home/pi/dev/$ENV/bin/python3 -c "''' + INSTALL_CLASSIFIER_PY.format(pkg="$PKG") + r'''" 2>/dev/null)
+''' + CLASSIFY_INSTALL_MODE_SH + r'''
+  echo "${PKG}_install=$I"
+done
+'''
 
 # One ssh per unit. Every lookup is `|| echo unknown` so a single missing piece
 # degrades that field instead of losing the whole unit.
@@ -166,18 +224,17 @@ for repo in mjolnir-hamma brokkr sindri notifiers hamma; do
   KEY=$(echo "$repo" | tr - _)
   echo "$KEY=$(git -C /home/pi/dev/$repo rev-parse --short HEAD 2>/dev/null || echo unknown)"
 done
-# Where each package is actually imported from, by the interpreter that runs it.
-for pair in brokkr:ltgenv notifiers:ltgenv hamma:ltgenv sindri:sindrienv; do
-  PKG=${pair%%:*}; ENV=${pair##*:}
-  F=$(/home/pi/dev/$ENV/bin/python3 -c "import os,$PKG; print(os.path.realpath($PKG.__file__ or ''))" 2>/dev/null)
-  case "$F" in
-    "") I=missing ;;
-    /home/pi/dev/$PKG/*) I=editable ;;
-    */site-packages/*) I=installed ;;
-    *) I=unknown ;;
-  esac
-  echo "${PKG}_install=$I"
-done
+# Branch and working-tree cleanliness of the mjolnir-hamma checkout, for the
+# digest's "not at <branch> head" section only -- NOT snapshot fields (see
+# RELEASE_EXTRA_FIELDS). One more `git` call on an ssh session already open
+# to read the SHA above, so it costs no extra round trip.
+echo "mjolnir_hamma_branch=$(git -C /home/pi/dev/mjolnir-hamma rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C /home/pi/dev/mjolnir-hamma status --porcelain 2>/dev/null)" ]; then
+  echo "mjolnir_hamma_dirty=dirty"
+else
+  echo "mjolnir_hamma_dirty=clean"
+fi
+''' + INSTALL_PROBE + r'''
 timeout 15 ssh -o ConnectTimeout=5 -o BatchMode=yes hamma cat /ags/scripts/startup 2>/dev/null \
   | sed 's/^/AGS:/' || true
 '''
@@ -192,6 +249,8 @@ def ssh_cmd(port):
 def probe_unit(number, timeout=90):
     """Return a row dict for one unit. Never raises; unreachable is a value."""
     row = {f: UNKNOWN for f in FIELDS}
+    for field in RELEASE_EXTRA_FIELDS:
+        row[field] = UNKNOWN
     row["unit"] = "mjolnir{:02d}".format(number)
     try:
         result = subprocess.run(
@@ -258,6 +317,10 @@ PENDING_UNCHECKED = "- [ ] "
 # not just the overflow. Measured: 18 units x 3 items is ~6.2 kB against a
 # 4 kB ceiling, which one array-wide recovery would reach.
 PENDING_DIGEST_MAX = 20
+
+# Same reasoning, different section: a fleet-wide release rollout can push
+# the "not at <branch> head" list past the chat sender's limit too.
+BEHIND_DIGEST_MAX = 10
 
 
 def _is_pending_heading(line):
@@ -341,6 +404,18 @@ def read_snapshot(path):
         return {}
     with open(path) as handle:
         return {r["unit"]: r for r in csv.DictReader(handle)}
+
+
+def added_fields(previous, fields):
+    """New columns `fields` has that the existing snapshot's rows don't.
+
+    Empty when there is no previous snapshot at all -- that's a baseline, not
+    a schema change -- or when the schema already matches.
+    """
+    if not previous:
+        return []
+    sample = next(iter(previous.values()))
+    return [f for f in fields if f not in sample]
 
 
 def render(rows):
@@ -478,18 +553,27 @@ def release_head(branch, remote=RELEASE_REMOTE):
     return result.stdout.split()[0]
 
 
-def behind_release(rows, unreachable, head):
-    """[(unit, sha)] for reachable units whose mjolnir_hamma is not `head`.
+def behind_release(rows, probed, unreachable, head):
+    """[(unit, sha, branch, dirty)] for units of `probed` not at `head`.
+
+    `probed` is the set of units actually contacted THIS run, not every unit
+    the snapshot has ever seen -- a `--ports`/`--array` subset run must not
+    report units it never touched. `branch` and `dirty` come from
+    RELEASE_EXTRA_FIELDS and read UNKNOWN when a unit's row predates them or
+    its own git calls failed; both are digest-only, never snapshot fields.
 
     Units sync to the release branch only when someone rolls a merge out, and
     nothing did -- the fleet was 8-30 commits behind by 2026-10-28 (HAM-205).
     Standing, like "not capturing": listed every day until it is resolved.
     """
     out = []
-    for unit in sorted(set(rows) - set(unreachable)):
-        sha = str(rows[unit].get("mjolnir_hamma", UNKNOWN))
+    for unit in sorted(set(probed) - set(unreachable)):
+        row = rows.get(unit, {})
+        sha = str(row.get("mjolnir_hamma", UNKNOWN))
         if sha == UNKNOWN or not sha or not head.startswith(sha):
-            out.append((unit, sha))
+            branch = row.get("mjolnir_hamma_branch", UNKNOWN)
+            dirty = row.get("mjolnir_hamma_dirty", UNKNOWN)
+            out.append((unit, sha, branch, dirty))
     return out
 
 
@@ -531,12 +615,15 @@ def changed_since(repo, snapshot_rel, unit, current_state, limit=200):
 
 
 def digest(rows, changes, unreachable, baseline=False, repo=None,
-           snapshot_rel=None, expected=None, release=None):
-    probed = len(rows) - len(unreachable)
+           snapshot_rel=None, expected=None, release=None, probed=None):
+    probed_units = set(probed) if probed is not None else set(rows)
+    probed_count = len(rows) - len(unreachable)
     if baseline:
-        lines = ["fleet probe: baseline established, {} units".format(probed)]
+        lines = ["fleet probe: baseline established, {} units".format(
+            probed_count)]
     else:
-        lines = ["fleet probe: {} units, {} change(s)".format(probed, len(changes))]
+        lines = ["fleet probe: {} units, {} change(s)".format(
+            probed_count, len(changes))]
         if changes:
             lines.append("")
             for unit, field, old, new in changes:
@@ -587,14 +674,24 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
         branch, head = release
         if head is None:
             lines.append("")
-            lines.append("behind {0}: could not read the {0} head".format(branch))
+            lines.append("not at {0} head: could not read the {0} head".format(
+                branch))
         else:
-            behind = behind_release(rows, unreachable, head)
+            behind = behind_release(rows, probed_units, unreachable, head)
             if behind:
                 lines.append("")
-                lines.append("behind {} ({}):".format(branch, head[:7]))
-                for unit, sha in behind:
-                    lines.append("  {}  {}".format(unit, sha))
+                lines.append("not at {} head ({}):".format(branch, head[:7]))
+                for unit, sha, branch_name, dirty in behind[:BEHIND_DIGEST_MAX]:
+                    extra = []
+                    if branch_name not in (UNKNOWN, ""):
+                        extra.append("branch={}".format(branch_name))
+                    if dirty not in (UNKNOWN, ""):
+                        extra.append(dirty)
+                    suffix = "  " + ", ".join(extra) if extra else ""
+                    lines.append("  {}  {}{}".format(unit, sha, suffix))
+                if len(behind) > BEHIND_DIGEST_MAX:
+                    lines.append("  ... and {} more".format(
+                        len(behind) - BEHIND_DIGEST_MAX))
     # Split expected-offline out of the unreachable list. Lumping them together
     # trains people to skim past the line, which is how a genuinely dark unit
     # gets missed -- the whole reason this exists.
@@ -768,7 +865,8 @@ def main():
                     snapshot_rel=snapshot_rel,
                     expected=expected_offline(args.repo),
                     release=(args.release_branch,
-                             release_head(args.release_branch)))
+                             release_head(args.release_branch)),
+                    probed=set(current))
     print(report)
 
     if args.dry_run:
@@ -776,10 +874,19 @@ def main():
         print(text, file=sys.stderr)
         return 0
 
+    # A column FIELDS has that the existing snapshot's rows don't is a schema
+    # upgrade, not a per-unit change -- diff() already skips it (see "A column
+    # the old snapshot predates" above). Left unhandled, that upgrade never
+    # reaches disk: no field changed, baseline is False, so the old header --
+    # and the new columns with it -- persists forever.
+    schema_added = [] if baseline else added_fields(previous, FIELDS)
+
     # Write-if-changed: an identical snapshot must leave no trace at all, so that
-    # `git log` on it stays a clean list of real state changes.
+    # `git log` on it stays a clean list of real state changes. A schema-only
+    # upgrade is an exception to "identical" by construction -- the header
+    # changed even though no field's value did -- so it still writes.
     wrote = False
-    if baseline or changes:
+    if baseline or changes or schema_added:
         directory = os.path.dirname(snapshot)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -789,9 +896,13 @@ def main():
 
     status = 0
     if wrote and args.commit:
-        summary = ("state: fleet baseline" if baseline else
-                   "state: {}".format(", ".join(
-                       sorted({u for u, _, _, _ in changes}))))
+        if baseline:
+            summary = "state: fleet baseline"
+        elif changes:
+            summary = "state: {}".format(", ".join(
+                sorted({u for u, _, _, _ in changes})))
+        else:
+            summary = "state: schema +{}".format(",".join(schema_added))
         ok, detail = commit_snapshot(args.repo, snapshot_rel, summary)
         print("commit: {}".format(detail), file=sys.stderr)
         if not ok:
