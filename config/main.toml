@@ -175,7 +175,7 @@ config_version = 1
         method = "quantize"  # 'lossless' or 'quantize' (smaller; sizes are data-dependent)
         step = 8  # Quantization step. Sets RMSE (2:<1, 4:~2, 8:~4);
                   # output size is DATA-DEPENDENT, not fixed. mj03 field
-                  # data ran 10-40% per record at step 8 (HAM-220), not
+                  # data ran 5-51% per record at step 8 (HAM-220), not
                   # the ~7% once quoted here.
         quiet_start = 8   # 8 AM UTC — after overnight storms
         quiet_end = 0     # Midnight UTC — wide window for compression
