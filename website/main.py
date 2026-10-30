@@ -31,8 +31,18 @@ SENSOR_NUMBERS = [
     5,
     6,
     7,
+    8,
+    9,
     ]
 SENSORS = [f"hamma{sensor_number}" for sensor_number in SENSOR_NUMBERS]
+
+# PAMMA sensors (50-56)
+PAMMA_SENSOR_NUMBERS = [50, 51, 52, 53, 54, 55, 56]
+PAMMA_SENSORS = [f"hamma{sensor_number}" for sensor_number in PAMMA_SENSOR_NUMBERS]
+
+# AUMMA sensors (41-43)
+AUMMA_SENSOR_NUMBERS = [41, 42, 43]
+AUMMA_SENSORS = [f"hamma{sensor_number}" for sensor_number in AUMMA_SENSOR_NUMBERS]
 
 STATUS_UPDATE_INTERVAL_SECONDS = 10
 STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 10
@@ -261,7 +271,7 @@ DATA_DIR_CLIENT = Path.home() / "brokkr" / "hamma" / "telemetry"
 GLOB_PATTERN_CLIENT = "telemetry_hamma_???_????-??-??.csv"
 
 DATA_DIR_SERVER = Path("/") / "var" / "www" / "hamma.dev" / "public_html"
-UNIT_DIRS_SERVER = [Path(sensor) for sensor in SENSORS]
+UNIT_DIRS_SERVER = [Path(sensor) for sensor in SENSORS + PAMMA_SENSORS + AUMMA_SENSORS]
 DATA_SUBDIR_SERVER = Path("daily")
 GLOB_PATTERN_SERVER = "hamma*_????-??-??.csv"
 
@@ -1036,7 +1046,7 @@ DAILY_TABLE_ARGS = {
 # --- Unit overview page ---
 
 OVERVIEW_SUBPLOT_KEYS = [
-    "weblatency", "sourcelatency", "datalatency",
+    "sourcelatency", "datalatency",
     "battvoltage", "ledstate", "loadpower",
     "sensoruptime", "triggerrate", "triggersremaining",
     ]
@@ -1047,45 +1057,83 @@ OVERVIEW_COORDS = itertools.product(
 
 SOURCE_PLOTS = {**STATUS_DASHBOARD_PLOTS}
 SOURCE_PLOTS["sourcelatency"] = copy.deepcopy(SOURCE_PLOTS["weblatency"])
-OVERVIEW_SUBPLOTS = {
-    plot_key: {
-        **preprocess_subplot_params(
-            plot=SOURCE_PLOTS[plot_key], subplot_params={}),
-        "subplot_title": SOURCE_PLOTS[plot_key]["plot_metadata"].get(
-            "plot_title", ""),
-        "subplot_titlesize": 10,
-        "subplot_row": row,
-        "subplot_column": column,
-        "plot_mode": "number+delta",
-        }
-    for plot_key, (row, column) in zip(OVERVIEW_SUBPLOT_KEYS, OVERVIEW_COORDS)}
-OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"] = (
-    OVERVIEW_SUBPLOTS["weblatency"]["plot_update_code"].replace(
-        "_status", "_overview"))
-OVERVIEW_SUBPLOTS["weblatency"]["subplot_title"] = "Site Latency"
 
-OVERVIEW_DASHBOARD_PLOTS = {}
-for sensor in SENSORS:
-    overview_subplots_sensor = copy.deepcopy(OVERVIEW_SUBPLOTS)
-    overview_subplots_sensor["sourcelatency"]["plot_update_code"] = (
-        f"data['value'] = (new Date() - lastUpdateSources_overview.{sensor}) / (1000);\n"
-        + GAUGE_PLOT_UPDATE_CODE_COLOR)
-    OVERVIEW_DASHBOARD_PLOTS[sensor] = {
-        "plot_type": "numeric",
-        "plot_data": {
-            "unit_id": sensor,
-            },
-        "plot_metadata": {
-            "plot_title": sensor.upper(),
-            "card_url": sensor,
-            },
-        "plot_params": {
-            "subplot_rows": OVERVIEW_ROWS,
-            "subplot_columns": OVERVIEW_COLUMNS,
-            "subplots": overview_subplots_sensor,
-            },
-        "fast_update": False,
+
+def create_overview_dashboard(sensors, rows, columns):
+    """Create overview dashboard plots for a group of sensors."""
+    coords = itertools.product(range(rows), range(columns))
+    overview_subplots = {
+        plot_key: {
+            **preprocess_subplot_params(
+                plot=SOURCE_PLOTS[plot_key], subplot_params={}),
+            "subplot_title": SOURCE_PLOTS[plot_key]["plot_metadata"].get(
+                "plot_title", ""),
+            "subplot_titlesize": 10,
+            "subplot_row": row,
+            "subplot_column": column,
+            "plot_mode": "number+delta",
         }
+        for plot_key, (row, column) in zip(OVERVIEW_SUBPLOT_KEYS, coords)}
+    overview_plots = {}
+    for sensor in sensors:
+        overview_subplots_sensor = copy.deepcopy(overview_subplots)
+        overview_subplots_sensor["sourcelatency"]["plot_update_code"] = (
+            f"data['value'] = (new Date() - lastUpdateSources_overview.{sensor}) / (1000);\n"
+            + GAUGE_PLOT_UPDATE_CODE_COLOR)
+        overview_plots[sensor] = {
+            "plot_type": "numeric",
+            "plot_data": {"unit_id": sensor},
+            "plot_metadata": {
+                "plot_title": sensor.upper(),
+                "card_url": f"/{sensor}",
+            },
+            "plot_params": {
+                "subplot_rows": rows,
+                "subplot_columns": columns,
+                "subplots": overview_subplots_sensor,
+            },
+            "fast_update": False,
+        }
+    return overview_plots
+
+
+# Standalone Site Latency widget extracted from the per-sensor tiles.
+# Appears once at the top of every overview page (HAMMA / PAMMA / AUMMA).
+SITE_LATENCY_PLOT = copy.deepcopy(SOURCE_PLOTS["weblatency"])
+SITE_LATENCY_PLOT["plot_metadata"]["plot_title"] = "Site Latency"
+SITE_LATENCY_PLOT["plot_params"]["plot_mode"] = "number+delta"
+SITE_LATENCY_PLOT["plot_params"]["plot_update_code"] = (
+    SITE_LATENCY_PLOT["plot_params"]["plot_update_code"]
+    .replace("_status", "_sitelatency"))
+
+
+# Standalone page block — its own <section> above the sensor grid.
+SITE_LATENCY_METADATA = {
+    "section_title": "",
+    "section_description": "",
+    "section_nav_label": "",
+    }
+
+SITE_LATENCY_ARGS = {
+    "data_args": {"dashboard_plots": {"sitelatency": SITE_LATENCY_PLOT}},
+    "layout_map": LAYOUT_MAP,
+    "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SERVER_SECONDS,
+    "update_interval_fast_seconds": STATUS_UPDATE_INTERVAL_FAST_SECONDS,
+    }
+
+SITE_LATENCY_PAGE_BLOCK = {
+    "sitelatency": {
+        "type": "dashboard",
+        "metadata": SITE_LATENCY_METADATA,
+        "args": SITE_LATENCY_ARGS,
+        },
+    }
+
+
+# HAMMA Overview Dashboard (sensors 1-9) - 4x3 grid
+OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
+    SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
 
 
 OVERVIEW_DASHBOARD_METADATA = {
@@ -1109,6 +1157,82 @@ OVERVIEW_DASHBOARD_ARGS = {
     "update_interval_seconds": STATUS_UPDATE_INTERVAL_SERVER_SECONDS,
     "update_interval_fast_seconds": (
         STATUS_UPDATE_INTERVAL_FAST_SECONDS),
+    }
+
+
+# --- PAMMA Overview Dashboard (sensors 50-56) - 3x3 grid ---
+
+PAMMA_ROWS = 3
+PAMMA_COLUMNS = 3
+PAMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
+    PAMMA_SENSORS, PAMMA_ROWS, PAMMA_COLUMNS)
+
+PAMMA_OVERVIEW_DASHBOARD_METADATA = {
+    "section_title": "PAMMA Sensor Overview Dashboard",
+    "section_description": (
+        "Live status of all PAMMA sensors (50-56), "
+        f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
+        " Click a sensor for detailed information."),
+    "section_nav_label": "Overview",
+    }
+
+PAMMA_OVERVIEW_DASHBOARD_DATA_ARGS = {
+    "dashboard_plots": PAMMA_OVERVIEW_DASHBOARD_PLOTS,
+    }
+
+PAMMA_OVERVIEW_DASHBOARD_ARGS = {
+    "data_args": PAMMA_OVERVIEW_DASHBOARD_DATA_ARGS,
+    "layout_map": LAYOUT_MAP,
+    "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SERVER_SECONDS,
+    "update_interval_fast_seconds": STATUS_UPDATE_INTERVAL_FAST_SECONDS,
+    }
+
+PAMMA_OVERVIEW_PAGE_BLOCKS = {
+    "overview": {
+        "type": "dashboard",
+        "metadata": PAMMA_OVERVIEW_DASHBOARD_METADATA,
+        "args": PAMMA_OVERVIEW_DASHBOARD_ARGS,
+        },
+    **SITE_LATENCY_PAGE_BLOCK,
+    }
+
+
+# --- AUMMA Overview Dashboard (sensors 41-43) - 4x3 grid ---
+
+AUMMA_ROWS = 3
+AUMMA_COLUMNS = 3
+AUMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
+    AUMMA_SENSORS, AUMMA_ROWS, AUMMA_COLUMNS)
+
+AUMMA_OVERVIEW_DASHBOARD_METADATA = {
+    "section_title": "AUMMA Sensor Overview Dashboard",
+    "section_description": (
+        "Live status of all AUMMA sensors (41-43), "
+        f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
+        " Click a sensor for detailed information."),
+    "section_nav_label": "Overview",
+    }
+
+AUMMA_OVERVIEW_DASHBOARD_DATA_ARGS = {
+    "dashboard_plots": AUMMA_OVERVIEW_DASHBOARD_PLOTS,
+    }
+
+AUMMA_OVERVIEW_DASHBOARD_ARGS = {
+    "data_args": AUMMA_OVERVIEW_DASHBOARD_DATA_ARGS,
+    "layout_map": LAYOUT_MAP,
+    "color_map": COLOR_TABLE_MAP,
+    "update_interval_seconds": STATUS_UPDATE_INTERVAL_SERVER_SECONDS,
+    "update_interval_fast_seconds": STATUS_UPDATE_INTERVAL_FAST_SECONDS,
+    }
+
+AUMMA_OVERVIEW_PAGE_BLOCKS = {
+    "overview": {
+        "type": "dashboard",
+        "metadata": AUMMA_OVERVIEW_DASHBOARD_METADATA,
+        "args": AUMMA_OVERVIEW_DASHBOARD_ARGS,
+        },
+    **SITE_LATENCY_PAGE_BLOCK,
     }
 
 
@@ -1182,6 +1306,7 @@ OVERVIEW_PAGE_BLOCKS = {
         "metadata": OVERVIEW_DASHBOARD_METADATA,
         "args": OVERVIEW_DASHBOARD_ARGS,
         },
+    **SITE_LATENCY_PAGE_BLOCK,
     }
 
 
@@ -1214,6 +1339,14 @@ CONTENT_PAGES_SERVER = {
     "": {
         "type": "singlepage",
         "blocks": OVERVIEW_PAGE_BLOCKS,
+        },
+    "pamma": {
+        "type": "singlepage",
+        "blocks": PAMMA_OVERVIEW_PAGE_BLOCKS,
+        },
+    "aumma": {
+        "type": "singlepage",
+        "blocks": AUMMA_OVERVIEW_PAGE_BLOCKS,
         },
     }
 
