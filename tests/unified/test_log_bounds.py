@@ -7,6 +7,7 @@ dry-run manifest operations, and the fleet-remediation script's --check mode.
 """
 
 import os
+import re
 import json
 import subprocess
 from pathlib import Path
@@ -337,3 +338,137 @@ class TestApplyJournaldMakesItPersistent:
         as RAM-ONLY by the status check, not hidden by a crash here."""
         out, _ = self._apply(tmp_path, failing="journalctl")
         assert out.splitlines() == ["APPLIED", "RC=0"]
+
+
+class TestVerifyDeploymentWiring:
+    """HAM-181: verify_deployment.sh must report on the log bounds.
+
+    Without this, a unit whose bounds were never applied -- or were applied by
+    hand under a non-canonical filename, as mj02 was -- verifies clean, and the
+    only signal is the SD card filling months later (HAM-112/HAM-113).
+    """
+
+    VERIFY = REPO_ROOT / "scripts" / "verify_deployment.sh"
+
+    def test_check_function_is_defined(self):
+        assert "check_log_bounds()" in self.VERIFY.read_text(), \
+            "verify_deployment.sh needs a check_log_bounds function"
+
+    def test_check_is_called_from_main(self):
+        body = self.VERIFY.read_text()
+        main = body[body.index("main() {"):]
+        assert "check_log_bounds" in main, \
+            "check_log_bounds must run as part of main(), not just be defined"
+
+    def test_check_reuses_the_shared_library(self):
+        # HAM-181's own point: the bounds logic was de-duplicated into
+        # log_bounds.sh precisely so a second copy could not drift from it.
+        body = self.VERIFY.read_text()
+        assert "log_bounds.sh" in body, "must source unified_install/lib/log_bounds.sh"
+        assert "log_bounds_all_present" in body, \
+            "must call log_bounds_all_present rather than re-deriving the paths"
+
+    def test_check_does_not_hardcode_the_paths(self):
+        body = self.VERIFY.read_text()
+        section = body[body.index("check_log_bounds()"):]
+        section = section[:section.index("\n}\n")]
+        assert "journald.conf.d" not in section, \
+            "paths belong to log_bounds.sh; duplicating them is what HAM-181 fixed"
+
+    def test_failure_message_names_the_ticket(self):
+        # Matches the gpiozero check, which names HAM-84 so the operator can
+        # find the context without grepping Jira.
+        body = self.VERIFY.read_text()
+        section = body[body.index("check_log_bounds()"):]
+        section = section[:section.index("\n}\n")]
+        assert "HAM-113" in section or "HAM-181" in section
+
+    def test_script_still_parses(self):
+        subprocess.run(["bash", "-n", str(self.VERIFY)], check=True)
+
+
+class TestVerifyDeploymentBehaviour:
+    """check_log_bounds, RUN: the real function against a copy of the real
+    library whose paths point into tmp_path, counted the way main() counts.
+
+    The wiring tests above read the script's text, so inverting pass/fail,
+    downgrading the fail to a warning, or moving the call under --full all
+    passed them (red team, 2026-10-30).
+    """
+
+    def _run(self, tmp_path, dropin=True, journal=True, runtime=False,
+             rsyslog=True, cron=True, lib=True):
+        repo = tmp_path / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        script = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        assert script.rstrip().endswith('main "$@"')
+        (repo / "scripts" / "verify_deployment.sh").write_text(
+            script.rstrip()[:-len('main "$@"')])
+        sys_ = tmp_path / "sys"
+        sys_.mkdir()
+        if lib:
+            (repo / "unified_install" / "lib").mkdir(parents=True)
+            (repo / "unified_install" / "lib" / "log_bounds.sh").write_text(
+                (LIB_DIR / "log_bounds.sh").read_text() +
+                '\nLOG_BOUNDS_JOURNALD_DST="{0}/00-sensor-bounds.conf"'
+                '\nLOG_BOUNDS_JOURNAL_DIR="{0}/var-log-journal"'
+                '\nLOG_BOUNDS_RUNTIME_JOURNAL_DIR="{0}/run-log-journal"'
+                '\nLOG_BOUNDS_RSYSLOG_LR="{0}/logrotate-rsyslog"'
+                '\nLOG_BOUNDS_CRON_DST="{0}/mjolnir-logrotate"\n'.format(sys_))
+        if dropin:
+            (sys_ / "00-sensor-bounds.conf").write_text("[Journal]\n")
+        if journal:
+            (sys_ / "var-log-journal").mkdir()
+        if runtime:
+            (sys_ / "run-log-journal").mkdir()
+        (sys_ / "logrotate-rsyslog").write_text(
+            "{\n    maxsize 100M\n}\n" if rsyslog else "{\n}\n")
+        if cron:
+            (sys_ / "mjolnir-logrotate").write_text("#!/bin/sh\n")
+        result = subprocess.run(
+            ["bash", "-c",
+             'source "$1"; check_log_bounds; '
+             'echo "PASS=$PASS_COUNT FAIL=$FAIL_COUNT RC=$?"',
+             "_", str(repo / "scripts" / "verify_deployment.sh")],
+            capture_output=True, text=True, timeout=30)
+        return result.stdout + result.stderr, repo
+
+    def test_all_bounds_present_passes(self, tmp_path):
+        out, _ = self._run(tmp_path)
+        assert "PASS=1 FAIL=0" in out, out
+
+    @pytest.mark.parametrize("kw,token", [
+        ({"dropin": False}, "journald=MISSING"),
+        ({"journal": False}, "journald=RAM-ONLY"),
+        ({"runtime": True}, "journald=RAM-ONLY"),
+        ({"rsyslog": False}, "rsyslog=MISSING"),
+        ({"cron": False}, "cron=MISSING"),
+    ])
+    def test_each_missing_bound_is_one_failure(self, tmp_path, kw, token):
+        out, _ = self._run(tmp_path, **kw)
+        assert "PASS=0 FAIL=1" in out, out
+        assert token in out, out
+
+    def test_remediation_names_the_script_by_absolute_path(self, tmp_path):
+        """verify_deployment.sh is run from ~ or from scripts/; a relative
+        hint fails from either."""
+        out, repo = self._run(tmp_path, dropin=False)
+        assert "sudo bash {}/scripts/apply_log_bounds.sh".format(repo) in out
+
+    def test_ram_only_hint_names_a_volatile_override(self, tmp_path):
+        out, _ = self._run(tmp_path, runtime=True)
+        assert "Storage=volatile" in out, out
+
+    def test_missing_library_is_a_failure(self, tmp_path):
+        """The installer ships log_bounds.sh: without it the checkout is
+        broken, which must not read READY FOR DEPLOYMENT."""
+        out, _ = self._run(tmp_path, lib=False)
+        assert "PASS=0 FAIL=1" in out, out
+
+    def test_called_unconditionally_from_main(self):
+        """At main()'s own indent, not inside `if $full_check` or any other
+        block (a substring match let an 8-space-indented call through)."""
+        body = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        main = body[body.index("main() {"):]
+        assert re.search(r"^    check_log_bounds\n", main, re.M), \
+            "check_log_bounds must be called at main()'s top level"
