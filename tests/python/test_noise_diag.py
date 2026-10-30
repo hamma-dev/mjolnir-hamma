@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import math
 from datetime import datetime, timedelta
@@ -265,11 +266,7 @@ def test_compute_slow_nan_without_slow_channel():
     """Missing slow channel -> slow columns NaN, fast sample still recorded."""
     module = load_module()
     module.hamma.Header.return_value.read_stream.return_value.volt = None
-    step = module.NoiseDiag.__new__(module.NoiseDiag)
-    step.medsize = 200000
-    step.medsize_slow = 20000
-    step.min_pretrigger_ms = 50
-    step.logger = MagicMock()
+    step = _slow_step(module)
     m = step._compute(make_input())
     assert m["fast_noise"] == pytest.approx(0.035)
     for key in _SLOW_KEYS:
@@ -344,19 +341,35 @@ def test_write_csv_unreadable_header_falls_back_to_append(tmp_path, content, rea
     step = _csv_step(module, tmp_path)
     csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
     csv_file.write_bytes(content)
-    patches = [patch.object(module, "render_output_filename", return_value=csv_file)]
-    if reader_error:
-        patches.append(patch.object(module.csv, "reader",
-                                    side_effect=_csv.Error(reader_error)))
-    with patches[0]:
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(module, "render_output_filename", return_value=csv_file))
         if reader_error:
-            with patches[1]:
-                step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
-        else:
-            step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+            stack.enter_context(patch.object(
+                module.csv, "reader", side_effect=_csv.Error(reader_error)))
+        step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
     data = csv_file.read_bytes()
     assert data.startswith(content)
     assert b"2026-06-23T17:00:00,t1," in data
+    step.logger.warning.assert_called()
+
+
+def test_write_csv_failed_upgrade_removes_temp_file(tmp_path):
+    """If the header rewrite fails (e.g. SD card full), the .tmp file is
+    removed, the original file is untouched, and the row is still appended."""
+    module = load_module()
+    step = _csv_step(module, tmp_path)
+    csv_file = tmp_path / "noise_mj02_2026-06-23.csv"
+    original = ("time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio\n"
+                "2026-06-23T16:59:00,t0,0.1,0.035,9.4,268.5,0.083,0.42\n")
+    csv_file.write_text(original)
+    with patch.object(module, "render_output_filename", return_value=csv_file), \
+            patch.object(module.os, "fsync", side_effect=OSError(28, "No space left on device")):
+        step._write_csv(_full_metrics(), "2026-06-23T17:00:00")
+    assert not (tmp_path / (csv_file.name + ".tmp")).exists()
+    text = csv_file.read_text()
+    assert text.startswith(original)
+    assert "2026-06-23T17:00:00,t1," in text
     step.logger.warning.assert_called()
 
 

@@ -1213,7 +1213,10 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
         pass
 
     try:
-        offset_mv = ingest_noise_data(n_days=n_days)["fast_offset"].dropna() * 1000
+        # The slow plot shares this axis, so size it to contain both channels.
+        noise = ingest_noise_data(n_days=n_days)
+        offset_mv = pd.concat(
+            [noise["fast_offset"], noise["slow_offset"]]).dropna() * 1000
         if offset_mv.empty:
             return list(default)
         magnitude = max(abs(float(offset_mv.min())),
@@ -1226,7 +1229,8 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
 
 
 def get_noise_floor_max_mv(n_days=None, default=0.0):
-    """Max observed fast-channel noise floor (mV) over the window; default if none.
+    """Max observed fast- or slow-channel noise floor (mV) over the window;
+    default if none.
 
     Used to extend the noise-floor axis so a noise floor above threshold stays
     visible. Never raises.
@@ -1234,7 +1238,10 @@ def get_noise_floor_max_mv(n_days=None, default=0.0):
     if n_days is None:
         n_days = NOISE_PLOT_DAYS
     try:
-        noise_mv = ingest_noise_data(n_days=n_days)["fast_noise"].dropna() * 1000
+        # The slow plot shares this axis, so size it to contain both channels.
+        noise = ingest_noise_data(n_days=n_days)
+        noise_mv = pd.concat(
+            [noise["fast_noise"], noise["slow_noise"]]).dropna() * 1000
         if noise_mv.empty:
             return default
         peak = float(noise_mv.max())

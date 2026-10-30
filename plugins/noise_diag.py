@@ -114,15 +114,23 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         with open(out_file, newline="") as f:
             rows = list(csv.reader(f))
         tmp_file = out_file.with_name(out_file.name + ".tmp")
-        with open(tmp_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(self.CSV_COLUMNS)
-            for row in rows[1:]:
-                by_name = dict(zip(old_header, row))
-                writer.writerow([by_name.get(c, "") for c in self.CSV_COLUMNS])
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_file.replace(out_file)
+        try:
+            with open(tmp_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.CSV_COLUMNS)
+                for row in rows[1:]:
+                    by_name = dict(zip(old_header, row))
+                    writer.writerow([by_name.get(c, "") for c in self.CSV_COLUMNS])
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.replace(out_file)
+        except BaseException:
+            # e.g. SD card full mid-rewrite: don't leave the temp file behind.
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+            raise
         self.logger.info("noise_diag: upgraded CSV header of %s.", out_file)
 
     def _channel_metrics(self, volt, medsize):

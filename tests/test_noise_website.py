@@ -660,6 +660,31 @@ def test_wiring_slow_axes_follow_fast_with_data(tmp_path, monkeypatch):
     assert params["range"] == [0, 62.5]
 
 
+def test_wiring_shared_axes_contain_slow_data(tmp_path, monkeypatch):
+    """Shared fast/slow axes are sized from both channels, so slow values
+    larger than any fast value stay on the plot (review: jcburchfield)."""
+    noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
+    noise_dir.mkdir(parents=True)
+    # fast offset max 13 mV, slow offset -25 mV; fast noise 4.5 mV, slow 90 mV;
+    # threshold 50 mV -> 1.25*50 = 62.5 would clip the 90 mV slow noise.
+    csv = SLOW_CSV_CONTENT.replace(",0.0040,0.1,10.0", ",0.090,0.1,10.0")
+    (noise_dir / "noise_hamma02_2026-06-27.csv").write_text(csv)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _install_stubs()
+    ns2 = {}
+    exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
+
+    lm = ns2["LAYOUT_MAP"]
+    assert lm["slow_noise"]["range"] == [0, 99.0]      # 90 mV * 1.1
+    assert lm["fast_noise"]["range"] == [0, 99.0]      # shared
+    assert abs(lm["slow_offset"]["range"][1] - 27.5) < 0.01   # |-25| * 1.1
+    assert lm["slow_offset"] == lm["fast_offset"]
+    params = ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
+    assert params["range"] == [0, 99.0]
+    # Threshold band still sits at the fast-channel threshold.
+    assert ns2["NOISE_COLOR_TABLE_MAP"]["fast_noise"][0] == [50.0]
+
+
 # ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
