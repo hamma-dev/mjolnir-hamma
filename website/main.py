@@ -1672,6 +1672,17 @@ SITE_LATENCY_PAGE_BLOCK = {
     }
 
 
+# Each array's overview links its latest status page (the description field
+# is Markdown).
+STATUS_PAGE_URL = "https://www.hamma.dev/latest/{}_status.html"
+
+
+def status_page_link(array):
+    """' See the [latest <ARRAY> status page](<url>).' for a description."""
+    return " See the [latest {} status page]({}).".format(
+        array.upper(), STATUS_PAGE_URL.format(array))
+
+
 # HAMMA Overview Dashboard (sensors 1-9) - 4x3 grid
 OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
     SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
@@ -1683,6 +1694,7 @@ OVERVIEW_DASHBOARD_METADATA = {
         "Live status of all HAMMA sensors, "
         f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
         " Click a sensor for detailed information."
+        + status_page_link("hamma")
         ),
     "section_nav_label": "Overview",
     }
@@ -1713,7 +1725,8 @@ PAMMA_OVERVIEW_DASHBOARD_METADATA = {
     "section_description": (
         "Live status of all PAMMA sensors (50-56), "
         f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
-        " Click a sensor for detailed information."),
+        " Click a sensor for detailed information."
+        + status_page_link("pamma")),
     "section_nav_label": "Overview",
     }
 
@@ -1751,7 +1764,8 @@ AUMMA_OVERVIEW_DASHBOARD_METADATA = {
     "section_description": (
         "Live status of all AUMMA sensors (41-43), "
         f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
-        " Click a sensor for detailed information."),
+        " Click a sensor for detailed information."
+        + status_page_link("aumma")),
     "section_nav_label": "Overview",
     }
 
