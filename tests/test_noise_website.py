@@ -589,18 +589,25 @@ def test_slow_subplots_and_names(ns):
     assert "slow_noise_thresh_ratio" not in ns["NOISE_CSV_COLUMNS"]
 
 
-def test_slow_axes_match_fast(ns):
-    """For now the slow channel reuses the fast-channel axes and gauge ranges."""
+def test_slow_axes_fall_back_to_fast_without_slow_data(ns):
+    """No slow data yet: the slow axes borrow the fast ranges (independent
+    copies), so the plots are not empty or degenerate."""
     lm = ns["LAYOUT_MAP"]
-    assert lm["slow_noise"] == lm["fast_noise"]
-    assert lm["slow_offset"] == lm["fast_offset"]
-    assert lm["slow_noise"] is not lm["fast_noise"]  # independent copies
+    assert lm["slow_noise"]["range"] == lm["fast_noise"]["range"]
+    assert lm["slow_offset"]["range"] == lm["fast_offset"]["range"]
+    assert lm["slow_noise"] is not lm["fast_noise"]
     plots = ns["STATUS_DASHBOARD_PLOTS"]
-    slow, fast = plots["slownoisefloor"]["plot_params"], plots["noisefloor"]["plot_params"]
-    assert slow["range"] == fast["range"]
-    assert slow["dtick"] == fast["dtick"]
-    assert plots["slowdcoffset"]["plot_params"]["range"] == plots["dcoffset"]["plot_params"]["range"]
-    assert plots["slowdcoffset"]["plot_params"]["steps"] == plots["dcoffset"]["plot_params"]["steps"]
+    assert (plots["slownoisefloor"]["plot_params"]["range"]
+            == lm["slow_noise"]["range"])
+
+
+def test_slow_offset_gauge_has_no_fast_zones(ns):
+    """The fast +-200 mV green/red zones mean nothing known for the slow
+    channel (PB, 2026-10-30): no zones until there is data to set them."""
+    plots = ns["STATUS_DASHBOARD_PLOTS"]
+    assert plots["slowdcoffset"]["plot_params"]["steps"] is None
+    assert plots["slowdcoffset"]["plot_params"]["range"] == ns["OFFSET_GAUGE_RANGE"]
+    assert plots["dcoffset"]["plot_params"]["steps"] is not None
 
 
 def test_slow_noise_has_no_threshold_band(ns):
@@ -650,8 +657,8 @@ def test_slow_gauge_series_drops_leading_blank(ns, tmp_path, monkeypatch):
     assert abs(series.iloc[-1] - 3.0) < 0.01
 
 
-def test_wiring_slow_axes_follow_fast_with_data(tmp_path, monkeypatch):
-    """E2E: with data present, slow axes still mirror the fast-derived axes."""
+def test_wiring_slow_axes_are_sized_from_slow_data(tmp_path, monkeypatch):
+    """E2E: each channel's axes come from its own data (PB, 2026-10-30)."""
     noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
     noise_dir.mkdir(parents=True)
     (noise_dir / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
@@ -660,16 +667,21 @@ def test_wiring_slow_axes_follow_fast_with_data(tmp_path, monkeypatch):
     ns2 = {}
     exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
 
-    assert ns2["LAYOUT_MAP"]["fast_noise"]["range"] == [0, 62.5]
-    assert ns2["LAYOUT_MAP"]["slow_noise"]["range"] == [0, 62.5]
-    assert ns2["LAYOUT_MAP"]["slow_offset"] == ns2["LAYOUT_MAP"]["fast_offset"]
+    lm = ns2["LAYOUT_MAP"]
+    # fast: threshold 50 mV -> [0, 1.25*50]; offsets 12-13 mV -> +-14.3
+    assert lm["fast_noise"]["range"] == [0, 62.5]
+    assert abs(lm["fast_offset"]["range"][1] - 14.3) < 0.01
+    # slow: noise peak 4.0 mV -> [0, 4.4]; offsets -25/+20 mV -> +-27.5
+    assert abs(lm["slow_noise"]["range"][1] - 4.4) < 0.01
+    assert lm["slow_noise"]["range"][0] == 0
+    assert abs(lm["slow_offset"]["range"][1] - 27.5) < 0.01
     params = ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
-    assert params["range"] == [0, 62.5]
+    assert params["range"] == lm["slow_noise"]["range"]
 
 
-def test_wiring_shared_axes_contain_slow_data(tmp_path, monkeypatch):
-    """Shared fast/slow axes are sized from both channels, so slow values
-    larger than any fast value stay on the plot (review: jcburchfield)."""
+def test_wiring_large_slow_noise_does_not_widen_fast(tmp_path, monkeypatch):
+    """A slow channel running far above the fast one stays on its own plot
+    and leaves the fast (alarm) gauge and axes alone (PB, 2026-10-30)."""
     noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
     noise_dir.mkdir(parents=True)
     # fast offset max 13 mV, slow offset -25 mV; fast noise 4.5 mV, slow 90 mV;
@@ -682,12 +694,14 @@ def test_wiring_shared_axes_contain_slow_data(tmp_path, monkeypatch):
     exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
 
     lm = ns2["LAYOUT_MAP"]
+    plots = ns2["STATUS_DASHBOARD_PLOTS"]
     assert lm["slow_noise"]["range"] == [0, 99.0]      # 90 mV * 1.1
-    assert lm["fast_noise"]["range"] == [0, 99.0]      # shared
+    assert plots["slownoisefloor"]["plot_params"]["range"] == [0, 99.0]
     assert abs(lm["slow_offset"]["range"][1] - 27.5) < 0.01   # |-25| * 1.1
-    assert lm["slow_offset"] == lm["fast_offset"]
-    params = ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
-    assert params["range"] == [0, 99.0]
+    # The fast channel is sized from fast data alone.
+    assert lm["fast_noise"]["range"] == [0, 62.5]
+    assert plots["noisefloor"]["plot_params"]["range"] == [0, 62.5]
+    assert abs(lm["fast_offset"]["range"][1] - 14.3) < 0.01
     # Threshold band still sits at the fast-channel threshold.
     assert ns2["NOISE_COLOR_TABLE_MAP"]["fast_noise"][0] == [50.0]
 
@@ -877,3 +891,12 @@ def test_unit_with_data_is_unchanged(ns, tmp_noise_dir, noise_source, clock, gau
 def test_na_series_is_stamped_with_the_clock(ns, clock):
     clock("2026-10-29 12:00:00")
     assert ns["_na_gauge_series"]().index[0] == pd.Timestamp("2026-10-29 12:00:00")
+
+
+def test_offset_override_applies_to_the_fast_channel_only(ns):
+    """offset_range is a fast-channel calibration; the slow axis ignores it."""
+    ov = {7: {"offset_range": [-50, 50]}}
+    fn = ns["get_noise_offset_range_mv"]
+    assert fn(unit_n=7, overrides=ov, column="fast_offset") == [-50, 50]
+    assert fn(unit_n=7, overrides=ov, column="slow_offset",
+              default=(-1.0, 1.0)) != [-50, 50]

@@ -1235,10 +1235,13 @@ def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=N
 
 
 def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
-                              unit_n=None, overrides=None):
-    """Symmetric padded DC-offset axis range (mV) from the offset data.
+                              unit_n=None, overrides=None,
+                              column="fast_offset"):
+    """Symmetric padded DC-offset axis range (mV) from one channel's offsets.
 
-    offset_range override wins; empty/NaN/error -> list(default). Never raises.
+    offset_range override wins (it is a fast-channel calibration, so it is
+    applied only for "fast_offset"); empty/NaN/error -> list(default). Never
+    raises.
     """
     if n_days is None:
         n_days = NOISE_PLOT_DAYS
@@ -1247,19 +1250,19 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
     if unit_n is None:
         unit_n = UNIT_N
 
-    try:
-        unit_override = overrides.get(unit_n, {})
-        ov_range = _valid_range(unit_override.get("offset_range"))
-        if ov_range is not None:
-            return ov_range
-    except Exception:
-        pass
+    if column == "fast_offset":
+        try:
+            unit_override = overrides.get(unit_n, {})
+            ov_range = _valid_range(unit_override.get("offset_range"))
+            if ov_range is not None:
+                return ov_range
+        except Exception:
+            pass
 
     try:
-        # The slow plot shares this axis, so size it to contain both channels.
-        noise = ingest_noise_data(n_days=n_days)
-        offset_mv = pd.concat(
-            [noise["fast_offset"], noise["slow_offset"]]).dropna() * 1000
+        # Each channel's axis comes from its own data, so a slow channel
+        # running large never rescales the fast plot (PB, 2026-10-30).
+        offset_mv = ingest_noise_data(n_days=n_days)[column].dropna() * 1000
         if offset_mv.empty:
             return list(default)
         magnitude = max(abs(float(offset_mv.min())),
@@ -1271,9 +1274,9 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
         return list(default)
 
 
-def get_noise_floor_max_mv(n_days=None, default=0.0):
-    """Max observed fast- or slow-channel noise floor (mV) over the window;
-    default if none.
+def get_noise_floor_max_mv(n_days=None, default=0.0, column="fast_noise"):
+    """Max observed noise floor (mV) of one channel over the window; default
+    if none.
 
     Used to extend the noise-floor axis so a noise floor above threshold stays
     visible. Never raises.
@@ -1281,10 +1284,7 @@ def get_noise_floor_max_mv(n_days=None, default=0.0):
     if n_days is None:
         n_days = NOISE_PLOT_DAYS
     try:
-        # The slow plot shares this axis, so size it to contain both channels.
-        noise = ingest_noise_data(n_days=n_days)
-        noise_mv = pd.concat(
-            [noise["fast_noise"], noise["slow_noise"]]).dropna() * 1000
+        noise_mv = ingest_noise_data(n_days=n_days)[column].dropna() * 1000
         if noise_mv.empty:
             return default
         peak = float(noise_mv.max())
@@ -1333,21 +1333,41 @@ STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
     })
 
 # --- Apply slow-channel axes ------------------------------------------------
-# For now the slow channel reuses the fast-channel axes and gauge ranges. No
-# threshold band or marker: the AGS trigger threshold does not apply to slow.
-LAYOUT_MAP["slow_noise"] = dict(LAYOUT_MAP["fast_noise"])
-LAYOUT_MAP["slow_offset"] = dict(LAYOUT_MAP["fast_offset"])
+# The slow channel is sized from its own data, so a slow channel running far
+# above the fast one never squashes the fast (alarm) gauge (PB, 2026-10-30).
+# Without slow data yet, it borrows the fast ranges rather than drawing an
+# empty axis. No threshold band or marker: the AGS trigger threshold does not
+# apply to slow.
+_SLOW_NOISE_PEAK = get_noise_floor_max_mv(column="slow_noise")
+_SLOW_NOISE_RANGE = ([0, round(_SLOW_NOISE_PEAK * 1.1, 10)]
+                     if _SLOW_NOISE_PEAK > 0
+                     else list(_NOISE_CFG["noise_range"]))
+_SLOW_NOISE_DTICK = _nice_dtick(_SLOW_NOISE_RANGE[1] - _SLOW_NOISE_RANGE[0])
+LAYOUT_MAP["slow_noise"] = {
+    "dtick": _SLOW_NOISE_DTICK,
+    "range": list(_SLOW_NOISE_RANGE),
+    "suffix": " mV",
+    }
+
+_SLOW_OFFSET_RANGE = get_noise_offset_range_mv(
+    column="slow_offset", default=tuple(_OFFSET_RANGE))
+LAYOUT_MAP["slow_offset"] = {
+    "dtick": _nice_dtick(_SLOW_OFFSET_RANGE[1] - _SLOW_OFFSET_RANGE[0]),
+    "range": list(_SLOW_OFFSET_RANGE),
+    "suffix": " mV",
+    }
 
 STATUS_DASHBOARD_PLOTS["slownoisefloor"]["plot_params"].update({
-    "range": list(_NOISE_CFG["noise_range"]),
-    "dtick": _NOISE_CFG["noise_dtick"],
+    "range": list(_SLOW_NOISE_RANGE),
+    "dtick": _SLOW_NOISE_DTICK,
     })
 
+# No green/red zones: the fast +-OFFSET_GREEN_RED_MV limits are not known to
+# mean anything for the slow channel (PB, 2026-10-30).
 STATUS_DASHBOARD_PLOTS["slowdcoffset"]["plot_params"].update({
     "range": list(OFFSET_GAUGE_RANGE),
     "dtick": 100,
-    "steps": [[-OFFSET_GREEN_RED_MV, OFFSET_GREEN_RED_MV],
-              ["red", "green", "red"]],
+    "steps": None,
     })
 
 # Green-below / red-above fill split at the per-Pi threshold on the fast_noise
