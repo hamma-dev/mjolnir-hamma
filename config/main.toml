@@ -110,6 +110,36 @@ config_version = 1
         update_time = 120  # seconds
         include = '*.png'
 
+    # Step to rsync the noise_diag CSVs to the server (flat dir, files are per-unit)
+    [steps.noise_diag_rsync]
+        _preset = "rsync_server.outputs.plugin"
+        name = "Rsync noise diagnostic CSVs"
+        server = "hamma.dev"  # also in autossh
+        local_path = 'noise_diag'  # same as steps.noise_diag.output_path
+        server_path = '/home/pi/noise_diag'
+        # Every 30 min. Just under 3 x period_s, so tick jitter on the 600 s
+        # grid cannot flip the cadence between 30 and 40 min.
+        update_time = 1790  # seconds
+        include = 'noise_hamma*.csv'
+        partial_dir = '.rsync-partial'  # resume interrupted transfers
+        # Nested so each layer gives up before the next: ssh (30 s connect,
+        # 45 s dead link) < rsync stall (60 s) < hard kill (300 s). Session
+        # setup alone measured up to ~6.5 s over cellular (AUMMA RTT ~330 ms).
+        # rsync's --timeout does not cover a stall before its handshake, so the
+        # hard kill is the real bound -- and it only is one with
+        # kill_process_group (Py 3.7.3 otherwise waits for rsync's ssh child).
+        ssh_options = '-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes'
+        io_timeout = 60  # seconds
+        timeout = 300  # seconds
+        kill_process_group = true
+        retry_on_failure = true  # any failed push retries on the next period
+        # Random phase + 0-60 s delay per push, so units restarted together do
+        # not all hit the VPS's sshd (and its ~240 MB free RAM) in one second.
+        jitter_s = 60
+        # No ssh at all when there is nothing new to send -- sensor-off units
+        # push their backlog once, then go quiet.
+        skip_if_unchanged = true
+
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
         _preset = "builtins.outputs.csv_file"
@@ -273,6 +303,22 @@ config_version = 1
         ]
         output_steps = [
             "hamma_plot_rsync",
+        ]
+
+    # Run rsync of the noise diagnostic CSVs to the HAMMA server.
+    # Kept separate from the plot push so a slow transfer can't delay it.
+    [pipelines.rsync_noise_diag]
+        _builder = "pipeline"
+        _enabled = true
+        period_s = 600  # retry cadence after a failed push (retry_on_failure)
+        name = "Rsync noise diagnostic CSVs to server"
+        input_steps = [
+            "builtins.inputs.current_time",
+        ]
+        process_steps = [
+        ]
+        output_steps = [
+            "noise_diag_rsync",
         ]
 
     # AGS science data header decode and write
