@@ -225,9 +225,9 @@ class StateMonitor(brokkr.pipeline.base.OutputStep):
             The method of how we're going to send notifications. If `None`, then
             we'll only log them.
         power_delim : numeric, optional
-            The delimiter between normal power and low power.
-            If power falls below this value, it is considered low
-            and a notification will be generated.
+            Load power threshold in WATTS (adc_vl_f * adc_il_f). One
+            notification is generated when power falls from >= this value to
+            below it. The fleet sets it in config/main.toml.
         purge_space : numeric, optional
             GB free on the AGS drive below which to run the scrub proactively
             (level-triggered, every scrub_cooldown_s). No alert -- this is the
