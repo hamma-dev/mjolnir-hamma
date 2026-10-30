@@ -135,7 +135,10 @@ not a `nosensor` one, brokkr will retry the dead sensor and log the failures
 (bounded by the HAM-113 log caps) until the refusal is fixed and `--off` re-run.
 The refusal goes to the same chat channel as the on/off notifications, with its
 reason and whether the power cut worked, because a message printed to a tunnelled
-stdout is a silent no-op from the operator's side.
+stdout is a silent no-op from the operator's side. Exit codes: 1 = refused (on
+`--off`, power cut OK); **4** = refused and the power cut failed too (relay.py
+errored, is missing, or hung past 60 s); 3 = toggled, but systemd disagreed on the
+mode afterwards.
 
 That guarantee covers **refusals only**. A failure *after* the services have
 stopped — a `sudo`, write or `daemon-reload` error — stops the sequence there and
@@ -154,7 +157,8 @@ After the `daemon-reload`, the script asks systemd (`systemctl show -p ExecStart
   the sensor on a mode the script got wrong is not the safe failure; on `--off`
   the relay has already moved, so the sensor is off;
 - brokkr is **still started** (a stopped brokkr sends no telemetry and no alerts),
-  in its original mode;
+  in its original mode if the restore worked — if it did not, in whatever mode
+  systemd now has, and the notice says the restore FAILED;
 - the run exits **3** (not 1) and the chat notice names both modes, the sensor
   power state, and whether the restore worked.
 

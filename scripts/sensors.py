@@ -473,7 +473,7 @@ def archive_telemetry_csv(telemetry_dir=None):
             os.path.basename(csv_path), os.path.basename(bak_path)))
 
 
-def run_command(cmd, description, stdin_data=None):
+def run_command(cmd, description, stdin_data=None, timeout=None):
     """Run a subprocess command with status output.
 
     Parameters
@@ -484,6 +484,9 @@ def run_command(cmd, description, stdin_data=None):
         Human-readable description of the step.
     stdin_data : str, optional
         Data to pass to stdin.
+    timeout : float, optional
+        Seconds before the command is killed (subprocess.TimeoutExpired is
+        raised). Default None: no limit.
 
     Returns
     -------
@@ -497,7 +500,7 @@ def run_command(cmd, description, stdin_data=None):
         kwargs["stdout"] = subprocess.DEVNULL
         kwargs["stderr"] = subprocess.PIPE
 
-    result = subprocess.run(cmd, **kwargs)
+    result = subprocess.run(cmd, timeout=timeout, **kwargs)
     if result.returncode == 0:
         print("[OK] {}".format(description))
     else:
@@ -541,7 +544,7 @@ def daemon_reload():
         "Reloaded systemd daemon")
 
 
-def toggle_relay(relay_on, pin):
+def toggle_relay(relay_on, pin, timeout=None):
     """Toggle the sensor relay via relay.py.
 
     Parameters
@@ -555,7 +558,7 @@ def toggle_relay(relay_on, pin):
     description = "Relay {} (pin {})".format(
         "on (energized)" if relay_on else "off (de-energized)", pin)
     return run_command(
-        [RELAY_SCRIPT, "--pin", str(pin), flag], description)
+        [RELAY_SCRIPT, "--pin", str(pin), flag], description, timeout=timeout)
 
 
 def _is_comment(line):
@@ -1233,38 +1236,72 @@ def systemd_preflight(current):
 def restore_mode_conf(plan):
     """Put mode.conf back as it was, reload, and check systemd agrees.
 
-    Called when systemd disagrees with the mode just written. Leaving the new
+    Called when systemd disagrees with the mode just written. The content is
+    restored line-for-line as read (text mode, so CRLF comes back as LF --
+    the same directives, not the same bytes). Leaving the new
     bytes would make mode.conf disagree with what systemd runs, and every
     later toggle -- the emergency --off included -- would refuse. Returns
     True if systemd is back on the original mode.
     """
-    original = plan.get("original")
+    # KeyError rather than a default: a plan without the key must never
+    # turn into a delete of a file that should have been put back.
+    original = plan["original"]
     if original is None:
         rc = remove_dropin()
     else:
         rc = write_dropin(original, plan["current"])
     if rc == 0:
         rc = daemon_reload()
-    if rc == 0 and effective_unit_mode() == plan["current"]:
-        print("  [OK] Restored {}; systemd is back on mode {}".format(
-            DROPIN_PATH, plan["current"]))
+    if rc != 0:
+        print("  [ERROR] Could not restore {} to its original state.\n"
+              "          Fix it by hand before the next toggle: "
+              "systemctl cat {}"
+              .format(DROPIN_PATH, BROKKR_SERVICE))
+        return False
+    actual = effective_unit_mode()
+    if actual is None:
+        print("  [WARN] Restored {}, but could not confirm systemd's mode."
+              .format(DROPIN_PATH))
         return True
-    print("  [ERROR] Could not restore {} to its original state.\n"
-          "          Fix it by hand before the next toggle: systemctl cat {}"
-          .format(DROPIN_PATH, BROKKR_SERVICE))
-    return False
+    if actual != plan["current"]:
+        print("  [ERROR] Could not restore the mode: {} is back, but systemd "
+              "reports '{}', not '{}'.\n"
+              "          Fix it by hand before the next toggle: "
+              "systemctl cat {}"
+              .format(DROPIN_PATH, actual, plan["current"], BROKKR_SERVICE))
+        return False
+    print("  [OK] Restored {}; systemd is back on mode {}".format(
+        DROPIN_PATH, plan["current"]))
+    return True
+
+
+RELAY_TIMEOUT = 60
+# Exit code for "refused, and the power cut failed too" -- distinct from a
+# refusal whose cut worked (1).
+RC_CUT_FAILED = 4
 
 
 def cut_sensor_power(pin, active_high):
-    """De-energize the sensor and touch nothing else. Returns the relay rc.
+    """De-energize the sensor and touch nothing else.
+
+    Returns 0, or RC_CUT_FAILED if the relay command failed, crashed or
+    hung.
 
     A refused --off still cuts power (PB, 2026-10-30): the mode is left
     alone, but at low battery the sensor's ~1 A has to go.
     """
     print("  [INFO] Mode left alone; cutting sensor power anyway.")
-    return toggle_relay(
-        relay_on=compute_relay_flag(sensor_on=False, active_high=active_high),
-        pin=pin)
+    try:
+        rc = toggle_relay(
+            relay_on=compute_relay_flag(sensor_on=False,
+                                        active_high=active_high),
+            pin=pin, timeout=RELAY_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # The refusal notice is sent after this: a missing or hung relay.py
+        # must not swallow it.
+        print("  [FAIL] Relay off (pin {}): {}".format(pin, error))
+        return RC_CUT_FAILED
+    return RC_CUT_FAILED if rc else 0
 
 
 # Exit code for "toggled, but systemd will run brokkr in another mode than
@@ -1829,13 +1866,15 @@ def run(argv=None, config_path=None, main_toml_path=None):
         if plan["kind"] == "write":
             tmp_path = os.path.join(os.path.dirname(DROPIN_PATH),
                                     DROPIN_TMP_NAME)
-            print("    via sudo tee {0}, sudo mv -f {0} {1}, sync".format(
-                tmp_path, DROPIN_PATH))
+            print("    via sudo tee {0}, sudo mv -f {0} {1}, "
+                  "timeout 30 sync -f".format(tmp_path, DROPIN_PATH))
         print("  sudo systemctl daemon-reload")
         print("  Check systemctl show -p ExecStart -p Environment {} "
               "reports mode {}{}".format(
                   BROKKR_SERVICE, plan["mode"],
-                  " (relay stays OFF if not)" if args.sensor_on else ""))
+                  " (if not: relay not commanded, mode.conf restored)"
+                  if args.sensor_on else
+                  " (if not: mode.conf restored)"))
         if args.sensor_on:
             print("  {} --pin {} {}".format(
                 RELAY_SCRIPT, config["pin"], relay_flag))
@@ -1863,7 +1902,7 @@ def run(argv=None, config_path=None, main_toml_path=None):
             cut_rc = cut_sensor_power(config["pin"], config["active_high"])
             if cut_rc:
                 rc = cut_rc
-                reason += "; sensor power cut FAILED (rc={})".format(cut_rc)
+                reason += "; sensor power cut FAILED"
             else:
                 reason += "; sensor power CUT, brokkr mode unchanged"
         send_notification(sender, build_message(
@@ -1889,6 +1928,7 @@ def run(argv=None, config_path=None, main_toml_path=None):
             reason += "mode.conf restored, brokkr left in mode '{}'".format(
                 plan["current"])
         else:
+            reason = reason.replace("would have started", "started")
             reason += "mode.conf restore FAILED -- fix it by hand"
     msg = build_message(
         sensor_name, site, action,
