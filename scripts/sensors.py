@@ -28,7 +28,9 @@ import tomli
 
 # --- Constants ---
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath: run through a symlink, abspath would put the repo's
+# config/ (and so config/mode.toml) somewhere it is not.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 SYSTEM_UNIT_TOML = os.path.join(REPO_ROOT, "config", "unit.toml")
 SYSTEM_MAIN_TOML = os.path.join(REPO_ROOT, "config", "main.toml")
@@ -49,10 +51,22 @@ DROPIN_TMP_PATH = os.path.join(DROPIN_DIR, DROPIN_TMP_NAME)
 # Every other place brokkr's mode can be set. None of them is ours to edit, so
 # a mode named in any of them refuses the toggle (see outside_mode_sources).
 UNIT_FILE_PATH = "/etc/systemd/system/{}".format(BROKKR_SERVICE)
+# Every drop-in directory systemd 241 reads for this unit, other than
+# mode.conf's own (scanned separately): each unit search path, for the full
+# name and for its dash prefixes (brokkr-.service.d, brokkr-hamma-.service.d).
+# A mode set anywhere else is still caught before anything moves, by
+# comparing with what systemd has loaded (systemd_preflight).
+UNIT_SEARCH_PATHS = [
+    "/etc/systemd/system.control", "/run/systemd/system.control",
+    "/run/systemd/transient", "/etc/systemd/system", "/run/systemd/system",
+    "/usr/local/lib/systemd/system", "/usr/lib/systemd/system",
+    "/lib/systemd/system",
+]
+DROPIN_NAMES = [BROKKR_SERVICE, "brokkr-.service", "brokkr-hamma-.service"]
 EXTRA_DROPIN_DIRS = [
-    "/run/systemd/system/{}.d".format(BROKKR_SERVICE),
-    "/usr/lib/systemd/system/{}.d".format(BROKKR_SERVICE),
-    "/lib/systemd/system/{}.d".format(BROKKR_SERVICE),
+    os.path.join(base, name + ".d")
+    for base in UNIT_SEARCH_PATHS for name in DROPIN_NAMES
+    if os.path.join(base, name + ".d") != DROPIN_DIR
 ]
 LOCAL_MODE_TOML = os.path.expanduser("~/.config/brokkr/hamma/mode.toml")
 SYSTEM_MODE_TOML = os.path.join(REPO_ROOT, "config", "mode.toml")
@@ -128,6 +142,9 @@ RE_REAL_EXECSTART = re.compile(r"^\s*ExecStart\s*=\s*\S")
 # line exists precisely to clear the unit's original before the override sets
 # a new one, so on its own it stops the unit from starting at all.
 RE_BARE_RESET = re.compile(r"^\s*ExecStart\s*=\s*$")
+# systemd matches section names case-SENSITIVELY: `[service]` is an unknown
+# section, and everything under it is ignored.
+SERVICE_SECTION = "[Service]"
 RE_SECTION = re.compile(r"^\s*\[[^\]]*\]\s*$")
 # An empty Environment= resets the whole list: everything assigned above it,
 # in this file or the unit, is gone -- and a line added above it would be too.
@@ -546,10 +563,18 @@ def _is_comment(line):
     return bool(stripped) and stripped[0] in COMMENT_PREFIXES
 
 
+def _raw(line):
+    return line[:-1] if line.endswith("\r") else line
+
+
 def _continues(line):
-    """True if `line` ends in an UNescaped backslash: an odd-length run."""
-    stripped = line.rstrip()
-    return (len(stripped) - len(stripped.rstrip("\\"))) % 2 == 1
+    """True if `line` ends in an UNescaped backslash: an odd-length run.
+
+    Tested on the raw line, as systemd does: `\\ ` (backslash, space) ends
+    the line, because the space clears the escape.
+    """
+    raw = _raw(line)
+    return (len(raw) - len(raw.rstrip("\\"))) % 2 == 1
 
 
 def logical_lines(content):
@@ -561,10 +586,11 @@ def logical_lines(content):
     physical line by physical line can see half a directive and parse it as
     whole.
 
-    Mirrors systemd 241's conf-parser: a comment line is dropped BEFORE any
-    continuation handling, so a comment never continues (and one inside a
-    continuation is skipped), and only an odd run of trailing backslashes
-    continues -- `\\\\` is an escaped backslash that ends the line.
+    Mirrors systemd 241's conf-parser: a comment or blank line is dropped
+    BEFORE any continuation handling, so a comment never continues and both
+    are skipped inside a continuation; and only an odd run of trailing
+    backslashes on the raw line continues -- `\\\\` is an escaped
+    backslash, and `\\ ` a backslash followed by a space; both end it.
     """
     out = []
     lines = (content or "").split("\n")
@@ -578,10 +604,10 @@ def logical_lines(content):
         parts = [lines[index]]
         while _continues(parts[-1]) and index + 1 < len(lines):
             index += 1
-            if _is_comment(lines[index]):
+            if _is_comment(lines[index]) or not lines[index].strip():
                 continue
             parts.append(lines[index])
-        text = " ".join(part.rstrip()[:-1] if _continues(part) else part
+        text = " ".join(_raw(part)[:-1] if _continues(part) else part
                         for part in parts)
         out.append((text, start, index - start + 1))
         index += 1
@@ -611,10 +637,10 @@ def scan_modes(content):
         if not stripped or stripped[0] in COMMENT_PREFIXES:
             continue
         if RE_SECTION.match(stripped):
-            section = stripped.lower()
+            section = stripped
             continue
         lineno = start + 1
-        in_service = section == "[service]"
+        in_service = section == SERVICE_SECTION
         if in_service and RE_ENV_RESET.match(text):
             problems.append((lineno, stripped,
                              "an empty Environment= resets the environment, "
@@ -941,7 +967,7 @@ def add_mode_line(content, mode):
     directive = "Environment=BROKKR_MODE={}".format(mode)
     lines = content.split("\n")
     for index, line in enumerate(lines):
-        if line.strip().lower() == "[service]":
+        if line.strip() == SERVICE_SECTION:
             lines.insert(index + 1, directive)
             return "\n".join(lines)
     # No [Service] section to extend. Append one rather than restructure
@@ -989,16 +1015,44 @@ def mode_toml_selection(path):
     return None if mode is None else str(mode)
 
 
-def outside_mode_sources():
+def overrides_execstart(content):
+    """True if `content` resets ExecStart= in [Service] and then sets one.
+
+    A drop-in like that replaces the unit file's command line outright, so
+    a `--mode` there is dead text (mj06).
+    """
+    reset = False
+    section = None
+    for text, _, _ in logical_lines(content):
+        stripped = text.strip()
+        if RE_SECTION.match(stripped):
+            section = stripped
+        elif section == SERVICE_SECTION:
+            if RE_BARE_RESET.match(text):
+                reset = True
+            elif reset and RE_REAL_EXECSTART.match(text):
+                return True
+    return False
+
+
+def outside_mode_sources(dropin_content=None):
     """Every place outside mode.conf that names a brokkr mode.
 
     Returns a list of (path, why). Checked: the unit file, every other
-    drop-in for the unit, and both mode.toml levels. A file that is absent
-    names nothing; one that cannot be read is reported, never assumed clean.
+    drop-in for the unit (including any beside mode.conf), and both
+    mode.toml levels. A file that is absent names nothing; one that cannot be
+    read is reported, never assumed clean.
+
+    The unit file's own ExecStart `--mode` is skipped when `dropin_content`
+    (mode.conf) overrides ExecStart: it never runs, and no write here can
+    bring it back -- a write edits the override in place, and a delete only
+    ever removes an Environment=-only file.
     """
     found = []
     files = [UNIT_FILE_PATH]
-    for directory in [DROPIN_DIR] + list(EXTRA_DROPIN_DIRS):
+    skip_unit_execstart = overrides_execstart(dropin_content or "")
+    for directory in ([os.path.dirname(DROPIN_PATH)]
+                      + list(EXTRA_DROPIN_DIRS)):
         files.extend(sorted(glob_module.glob(
             os.path.join(directory, "*.conf"))))
     for path in files:
@@ -1012,6 +1066,8 @@ def outside_mode_sources():
             found.append((path, "could not be read ({})".format(error)))
             continue
         sites, problems = scan_modes(content)
+        if path == UNIT_FILE_PATH and skip_unit_execstart:
+            sites = [site for site in sites if site["form"] != "execstart"]
         if sites:
             found.append((path, "sets the mode: {}".format(sites[-1]["text"])))
         elif problems:
@@ -1028,6 +1084,9 @@ def outside_mode_sources():
     return found
 
 
+SYSTEMCTL_TIMEOUT = 30
+
+
 def need_daemon_reload():
     """True if systemd has unloaded changes to brokkr's unit.
 
@@ -1037,10 +1096,12 @@ def need_daemon_reload():
         result = subprocess.run(
             ["systemctl", "show", "-p", "NeedDaemonReload", "--value",
              BROKKR_SERVICE],
-            capture_output=True, text=True)
-    except OSError:
+            capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     out = result.stdout if isinstance(result.stdout, str) else ""
+    if result.returncode != 0 or out.strip() not in ("yes", "no"):
+        return None
     return out.strip() == "yes"
 
 
@@ -1050,8 +1111,8 @@ def systemctl_show_mode():
         result = subprocess.run(
             ["systemctl", "show", "-p", "ExecStart", "-p", "Environment",
              BROKKR_SERVICE],
-            capture_output=True, text=True)
-    except OSError:
+            capture_output=True, text=True, timeout=SYSTEMCTL_TIMEOUT)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0 or not isinstance(result.stdout, str):
         return None
@@ -1088,31 +1149,82 @@ def effective_unit_mode(show=None):
     mode = MODE_DEFAULT
     for token in environment.split():
         if token.startswith("BROKKR_MODE="):
-            mode = token.split("=", 1)[1] or MODE_DEFAULT
+            # An empty value still overrides mode.toml in brokkr (only None
+            # is skipped), and what it then runs is not known: unknown.
+            mode = token.split("=", 1)[1] or None
     return mode
 
 
-def check_effective_mode(expected):
-    """After daemon-reload: does systemd agree on the mode? 0 if so.
+def systemd_preflight(current):
+    """Why systemd's loaded state rules out a toggle, or None if it doesn't.
 
-    An unverifiable view warns but passes -- the pre-flight already refused
-    every case this script knows to be unsafe.
+    Returns (reason, summary). Two questions, asked before anything moves:
+    is a daemon-reload pending (ours would activate somebody else's edit),
+    and does the mode systemd has loaded match what mode.conf reads as? A
+    mismatch means the model is wrong -- a source this script does not know
+    about -- and an unanswerable question is a refusal too.
+    """
+    pending = need_daemon_reload()
+    if pending is None:
+        return ("  [ERROR] Could not ask systemd whether {} has a pending "
+                "daemon-reload.\n"
+                "          Refusing to toggle. Check: systemctl show -p "
+                "NeedDaemonReload {}".format(BROKKR_SERVICE, BROKKR_SERVICE),
+                "systemd could not be queried")
+    if pending:
+        return ("  [ERROR] systemd has unloaded changes to {} (daemon-reload "
+                "pending).\n"
+                "          Refusing to toggle -- this script's own "
+                "daemon-reload would\n"
+                "          activate them too. Review `systemctl cat {}` "
+                "before reloading by hand."
+                .format(BROKKR_SERVICE, BROKKR_SERVICE),
+                "brokkr unit has a pending daemon-reload")
+    loaded = effective_unit_mode()
+    if loaded is None:
+        return ("  [ERROR] Could not read the mode systemd has loaded for {}."
+                "\n          Refusing to toggle. Check: systemctl show -p "
+                "ExecStart -p Environment {}".format(
+                    BROKKR_SERVICE, BROKKR_SERVICE),
+                "systemd's loaded mode could not be read")
+    if loaded != current:
+        return ("  [ERROR] systemd has brokkr loaded in mode '{}', but {} "
+                "reads as '{}'.\n"
+                "          Refusing to toggle -- the mode is coming from "
+                "somewhere this script\n"
+                "          does not edit. Inspect: systemctl cat {}".format(
+                    loaded, DROPIN_PATH, current, BROKKR_SERVICE),
+                "systemd's loaded mode differs from mode.conf")
+    return None
+
+
+# Exit code for "toggled, but systemd will run brokkr in another mode than
+# planned" -- distinct from a hard failure, so the notice can say which.
+RC_MODE_MISMATCH = 3
+
+
+def check_effective_mode(expected):
+    """After daemon-reload: does systemd agree on the mode?
+
+    Returns (rc, actual): rc 0 if it agrees or cannot be asked (the
+    pre-flight already compared systemd's view before anything moved), else
+    RC_MODE_MISMATCH.
     """
     actual = effective_unit_mode()
     if actual is None:
         print("  [WARN] Could not verify the mode systemd will start brokkr "
               "in. Check: systemctl show -p ExecStart -p Environment {}"
               .format(BROKKR_SERVICE))
-        return 0
+        return 0, None
     if actual != expected:
         print("  [ERROR] systemd will start brokkr in mode '{}', not '{}'.\n"
               "          Starting it anyway (a stopped brokkr sends no "
               "telemetry or alerts).\n"
               "          Inspect: systemctl cat {}".format(
                   actual, expected, BROKKR_SERVICE))
-        return 1
+        return RC_MODE_MISMATCH, actual
     print("  [OK] systemd will start brokkr in mode {}".format(actual))
-    return 0
+    return 0, actual
 
 
 def refuse_reason(mode, detail=None):
@@ -1186,7 +1298,7 @@ def plan_mode(sensor_on, path=None):
                 "reason": reason,
                 "summary": "mode drop-in cannot be rewritten"}
 
-    outside = outside_mode_sources()
+    outside = outside_mode_sources(detail["content"])
     if outside:
         lines = ["  [ERROR] brokkr's mode is also named outside {}.".format(
             DROPIN_PATH),
@@ -1200,17 +1312,10 @@ def plan_mode(sensor_on, path=None):
                 "reason": "\n".join(lines),
                 "summary": "mode is also set outside mode.conf"}
 
-    if need_daemon_reload():
+    refusal = systemd_preflight(current)
+    if refusal is not None:
         return {"kind": "refuse", "current": current, "mode": None,
-                "reason": (
-                    "  [ERROR] systemd has unloaded changes to {} (daemon-"
-                    "reload pending).\n"
-                    "          Refusing to toggle -- this script's own daemon-"
-                    "reload would\n"
-                    "          activate them too. Review `systemctl cat {}`, "
-                    "then reload by hand."
-                    .format(BROKKR_SERVICE, BROKKR_SERVICE)),
-                "summary": "brokkr unit has a pending daemon-reload"}
+                "reason": refusal[0], "summary": refusal[1]}
 
     existing = detail["content"]
     target = target_mode(current, sensor_on=sensor_on)
@@ -1292,9 +1397,15 @@ def write_dropin(content=None, mode=None):
         run_command(["sudo", "rm", "-f", tmp_path],
                     "Removed the partial temp file")
         return rc
-    return run_command(
+    rc = run_command(
         ["sudo", "mv", "-f", tmp_path, DROPIN_PATH],
         "Installed mode drop-in ({})".format(mode or NOSENSOR_TOKEN))
+    if rc != 0:
+        return rc
+    # A first-time mode.conf can come back empty after a power cut -- most
+    # likely at low battery -- unless the rename is on disk.
+    run_command(["sync"], "Flushed the drop-in to disk")
+    return 0
 
 
 def remove_dropin():
@@ -1361,7 +1472,10 @@ def sensor_off(pin, active_high, plan=None):
     if rc != 0:
         return rc
 
-    verify_rc = check_effective_mode(plan["mode"])
+    # The relay is already off: carry on, so brokkr still reports.
+    verify_rc, actual = check_effective_mode(plan["mode"])
+    if verify_rc:
+        plan["mismatch"] = (actual, plan["mode"])
 
     rc = start_brokkr()
     if rc != 0:
@@ -1379,7 +1493,7 @@ def sensor_on(pin, active_high, plan=None):
     3. Archive today's telemetry CSV
     4. Apply the mode plan
     5. Reload systemd, and check systemd now agrees on the mode
-    6. Toggle relay to power on sensor
+    6. Toggle relay to power on sensor -- skipped if systemd disagrees
     7. Start brokkr in default mode, then sindri
 
     Returns
@@ -1411,12 +1525,19 @@ def sensor_on(pin, active_high, plan=None):
     if rc != 0:
         return rc
 
-    verify_rc = check_effective_mode(plan["mode"])
-
-    relay_on = compute_relay_flag(sensor_on=True, active_high=active_high)
-    rc = toggle_relay(relay_on=relay_on, pin=pin)
-    if rc != 0:
-        return rc
+    verify_rc, actual = check_effective_mode(plan["mode"])
+    if verify_rc:
+        # --on is not the emergency direction. On a mode this script got
+        # wrong, leaving the sensor unpowered is the safe failure; brokkr is
+        # still started so the unit keeps reporting.
+        plan["mismatch"] = (actual, plan["mode"])
+        print("  [ERROR] Leaving the sensor relay OFF.")
+    else:
+        relay_on = compute_relay_flag(sensor_on=True,
+                                      active_high=active_high)
+        rc = toggle_relay(relay_on=relay_on, pin=pin)
+        if rc != 0:
+            return rc
 
     rc = start_brokkr()
     if rc != 0:
@@ -1610,7 +1731,16 @@ def run(argv=None, config_path=None, main_toml_path=None):
                   "(other directives present)".format(DROPIN_PATH))
         else:
             print("  Write {} ({} mode)".format(DROPIN_PATH, plan["mode"]))
+        if plan["kind"] == "write":
+            tmp_path = os.path.join(os.path.dirname(DROPIN_PATH),
+                                    DROPIN_TMP_NAME)
+            print("    via sudo tee {0}, sudo mv -f {0} {1}, sync".format(
+                tmp_path, DROPIN_PATH))
         print("  sudo systemctl daemon-reload")
+        print("  Check systemctl show -p ExecStart -p Environment {} "
+              "reports mode {}{}".format(
+                  BROKKR_SERVICE, plan["mode"],
+                  " (relay stays OFF if not)" if args.sensor_on else ""))
         if args.sensor_on:
             print("  {} --pin {} {}".format(
                 RELAY_SCRIPT, config["pin"], relay_flag))
@@ -1645,10 +1775,18 @@ def run(argv=None, config_path=None, main_toml_path=None):
         rc = sensor_off(pin=config["pin"], active_high=config["active_high"],
                         plan=plan)
 
+    reason = None
+    if plan.get("mismatch"):
+        actual, expected = plan["mismatch"]
+        reason = ("relay {}; but systemd will start brokkr in mode '{}', "
+                  "not '{}'".format(
+                      "left OFF" if args.sensor_on else "OFF",
+                      actual, expected))
     msg = build_message(
         sensor_name, site, action,
         success=(rc == 0),
-        rc=rc if rc != 0 else None)
+        rc=rc if rc != 0 else None,
+        reason=reason)
     send_notification(sender, msg)
     return rc
 

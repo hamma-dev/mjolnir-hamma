@@ -49,10 +49,28 @@ def load_sensors():
     return module
 
 
+def isolate_from_host(module, host_dir):
+    """Point every probe of the live unit away from this machine.
+
+    plan_mode() reads the unit file, other drop-ins and mode.toml, and asks
+    systemd about the loaded unit. On a Pi, a systemd CI box or a dev box
+    with brokkr installed those answers would leak into every test, so they
+    are pinned here; tests that exercise a probe use the saved _real_*.
+    """
+    module._real_systemd_preflight = module.systemd_preflight
+    module._real_systemctl_show_mode = module.systemctl_show_mode
+    module.UNIT_FILE_PATH = str(host_dir / "absent.service")
+    module.EXTRA_DROPIN_DIRS = [str(host_dir / "absent.d")]
+    module.LOCAL_MODE_TOML = str(host_dir / "absent-mode.toml")
+    module.systemd_preflight = lambda current: None
+    module.systemctl_show_mode = lambda: None
+    return module
+
+
 @pytest.fixture
-def sensors():
-    """Provide the sensors module."""
-    return load_sensors()
+def sensors(tmp_path_factory):
+    """Provide the sensors module, isolated from this machine's systemd."""
+    return isolate_from_host(load_sensors(), tmp_path_factory.mktemp("host"))
 
 
 # --- Shared tests whose fixtures the independent spec changed ---
