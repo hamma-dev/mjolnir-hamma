@@ -179,8 +179,11 @@ config_version = 1
         output_subdir = "compressed"  # Archives stored in each drive's compressed/ subdir
         min_age_days = 1  # Only compress files older than 1 day
         delete_originals = false  # Originals are ground truth; .hmc for transfer only
-        method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
-        step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
+        method = "quantize"  # 'lossless' or 'quantize' (smaller; sizes are data-dependent)
+        step = 8  # Quantization step. Sets RMSE (2:<1, 4:~2, 8:~4);
+                  # output size is DATA-DEPENDENT, not fixed. mj03 field
+                  # data ran 5-51% per record at step 8 (HAM-220), not
+                  # the ~7% once quoted here.
         quiet_start = 8   # 8 AM UTC — after overnight storms
         quiet_end = 0     # Midnight UTC — wide window for compression
 
