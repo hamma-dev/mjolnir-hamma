@@ -83,6 +83,8 @@ VARIABLE_NAME_MAP = {
     "triggers_remaining": "Triggers Left",
     "fast_noise": "Fast Noise Floor",
     "fast_offset": "DC Offset",
+    "slow_noise": "Slow Noise Floor",
+    "slow_offset": "Slow DC Offset",
     }
 
 
@@ -731,6 +733,66 @@ STATUS_DASHBOARD_PLOTS = {
             },
         "fast_update": False,
         },
+    "slownoisefloor": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("slow_noise"),
+            },
+        "plot_metadata": {
+            "plot_title": "Slow Noise Floor",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "green",
+            "increasing_color": "red",
+            "dtick": 20,
+            "range": [0, 100],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
+    "slowdcoffset": {
+        "plot_type": "numeric",
+        "plot_data": {
+            "delta_period": "1H",
+            "threshold_period": "24H",
+            "threshold_type": "max",
+            "variable": lambda full_data: _noise_gauge_series("slow_offset"),
+            },
+        "plot_metadata": {
+            "plot_title": "Slow DC Offset",
+            "plot_description": "",
+            },
+        "plot_params": {
+            "plot_fgcolor": THEME_FG_COLOR,
+            "gauge_value": "NaN",
+            "plot_mode": "gauge+number+delta",
+            "delta_reference": "NaN",
+            "decreasing_color": "blue",
+            "increasing_color": "orange",
+            "dtick": 200,
+            "range": [0, 1000],
+            "steps": None,
+            "threshold_thickness": 0.75,
+            "threshold_value": 0,
+            "number_color": THEME_FG_COLOR,
+            "suffix": " mV",
+            "plot_update_code": GAUGE_PLOT_UPDATE_CODE,
+            },
+        "fast_update": False,
+        },
     }
 
 STATUS_DASHBOARD_METADATA = {
@@ -948,17 +1010,19 @@ HISTORY_PLOT_ARGS = {
     }
 
 
-# --- Noise panel (fast-channel noise floor + DC offset) ---
+# --- Noise panel (fast- and slow-channel noise floor + DC offset) ---
 
 NOISE_DATA_DIR = Path.home() / "brokkr" / "hamma" / "noise_diag"
 NOISE_GLOB_PATTERN = "noise_hamma??_????-??-??.csv"
 NOISE_CSV_COLUMNS = [
     "time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
     "fast_snr", "threshold", "noise_thresh_ratio",
+    "slow_offset", "slow_noise", "slow_vpp", "slow_snr",
     ]
 NOISE_NUMERIC_COLUMNS = [
     "fast_offset", "fast_noise", "fast_vpp",
     "fast_snr", "threshold", "noise_thresh_ratio",
+    "slow_offset", "slow_noise", "slow_vpp", "slow_snr",
     ]
 NOISE_PLOT_DAYS = 30
 DEFAULT_NOISE_THRESHOLD_MV = 80.0  # fleet-typical AGS threshold; fallback only
@@ -966,7 +1030,10 @@ DEFAULT_NOISE_THRESHOLD_MV = 80.0  # fleet-typical AGS threshold; fallback only
 NOISE_PLOT_SUBPLOTS = {
     "fast_noise": {},
     "fast_offset": {},
+    "slow_noise": {},
+    "slow_offset": {},
     }
+NOISE_MV_COLUMNS = ("fast_noise", "fast_offset", "slow_noise", "slow_offset")
 
 
 def ingest_noise_data(n_days=None, data_dir=NOISE_DATA_DIR,
@@ -990,6 +1057,9 @@ def ingest_noise_data(n_days=None, data_dir=NOISE_DATA_DIR,
         if col in raw.columns:
             # A malformed numeric value becomes NaN (plots as a gap) silently.
             raw[col] = pd.to_numeric(raw[col], errors="coerce").astype("float64")
+        else:
+            # CSVs written before slow-channel tracking lack the slow columns.
+            raw[col] = pd.Series(float("nan"), index=raw.index, dtype="float64")
     return raw
 
 
@@ -1007,7 +1077,7 @@ def _noise_plot_preprocess(_full_data):
     """Self-load noise (ignores telemetry full_data); V->mV. NEVER raises."""
     try:
         noise = ingest_noise_data(n_days=NOISE_PLOT_DAYS).copy()
-        for column in ("fast_noise", "fast_offset"):
+        for column in NOISE_MV_COLUMNS:
             noise[column] = noise[column] * 1000
         return noise
     except Exception:
@@ -1026,6 +1096,11 @@ def _noise_plot_preprocess(_full_data):
 # switched to nosensor keeps its old CSVs (mj43). The 30-day panel still shows
 # history. Do not go below ~16 h, or restarts start producing false NAs.
 NOISE_GAUGE_MAX_AGE = pd.Timedelta("24h")
+# Slow and fast come from the same triggers, so a slow column that stops
+# while fast keeps reporting means the slow channel has failed. Past this lag
+# behind the newest fast reading, the slow gauges read NA rather than showing
+# the last good slow value as current.
+SLOW_GAUGE_MAX_LAG = pd.Timedelta("1h")
 
 
 def _noise_now():
@@ -1051,16 +1126,26 @@ def _na_gauge_series():
 def _noise_gauge_series(column):
     """Latest noise Series in mV for a dashboard gauge.
 
-    NA when there is no data, anything here fails, or the newest valid row is
-    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current).
+    NA when there is no data, anything here fails, the newest valid row is
+    older than NOISE_GAUGE_MAX_AGE (a stale value must not read as current),
+    or -- for a slow column -- it lags the newest fast reading by more than
+    SLOW_GAUGE_MAX_LAG (a dead slow channel).
     Returns only the valid rows: sindri takes `.iloc[-1]` and a builtin `max()`
     over the Series, so a NaN last (or first in the window) would otherwise
     show NA or null the threshold despite fresh data.
     """
     try:
-        valid = (ingest_noise_data(n_days=1)[column] * 1000).dropna()
+        # Drop blanks: sindri's max() returns NaN if the first value is NaN,
+        # and pre-upgrade rows / triggers without a slow channel are blank.
+        frame = ingest_noise_data(n_days=1)
+        valid = (frame[column] * 1000).dropna()
         if valid.empty or valid.index.max() < _noise_now() - NOISE_GAUGE_MAX_AGE:
             return _na_gauge_series()
+        if column.startswith("slow_"):
+            fast = frame["fast_" + column[len("slow_"):]].dropna()
+            if (not fast.empty and valid.index.max()
+                    < fast.index.max() - SLOW_GAUGE_MAX_LAG):
+                return _na_gauge_series()
         return valid
     except Exception:
         # Inside the guard on purpose: a failure here must degrade to NA, not
@@ -1163,10 +1248,13 @@ def _resolve_noise_config(unit_n, threshold_mv, observed_max_mv=0.0, overrides=N
 
 
 def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
-                              unit_n=None, overrides=None):
-    """Symmetric padded DC-offset axis range (mV) from the offset data.
+                              unit_n=None, overrides=None,
+                              column="fast_offset"):
+    """Symmetric padded DC-offset axis range (mV) from one channel's offsets.
 
-    offset_range override wins; empty/NaN/error -> list(default). Never raises.
+    offset_range override wins (it is a fast-channel calibration, so it is
+    applied only for "fast_offset"); empty/NaN/error -> list(default). Never
+    raises.
     """
     if n_days is None:
         n_days = NOISE_PLOT_DAYS
@@ -1175,16 +1263,19 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
     if unit_n is None:
         unit_n = UNIT_N
 
-    try:
-        unit_override = overrides.get(unit_n, {})
-        ov_range = _valid_range(unit_override.get("offset_range"))
-        if ov_range is not None:
-            return ov_range
-    except Exception:
-        pass
+    if column == "fast_offset":
+        try:
+            unit_override = overrides.get(unit_n, {})
+            ov_range = _valid_range(unit_override.get("offset_range"))
+            if ov_range is not None:
+                return ov_range
+        except Exception:
+            pass
 
     try:
-        offset_mv = ingest_noise_data(n_days=n_days)["fast_offset"].dropna() * 1000
+        # Each channel's axis comes from its own data, so a slow channel
+        # running large never rescales the fast plot (PB, 2026-10-30).
+        offset_mv = ingest_noise_data(n_days=n_days)[column].dropna() * 1000
         if offset_mv.empty:
             return list(default)
         magnitude = max(abs(float(offset_mv.min())),
@@ -1196,8 +1287,9 @@ def get_noise_offset_range_mv(n_days=None, default=(-300.0, 300.0),
         return list(default)
 
 
-def get_noise_floor_max_mv(n_days=None, default=0.0):
-    """Max observed fast-channel noise floor (mV) over the window; default if none.
+def get_noise_floor_max_mv(n_days=None, default=0.0, column="fast_noise"):
+    """Max observed noise floor (mV) of one channel over the window; default
+    if none.
 
     Used to extend the noise-floor axis so a noise floor above threshold stays
     visible. Never raises.
@@ -1205,7 +1297,7 @@ def get_noise_floor_max_mv(n_days=None, default=0.0):
     if n_days is None:
         n_days = NOISE_PLOT_DAYS
     try:
-        noise_mv = ingest_noise_data(n_days=n_days)["fast_noise"].dropna() * 1000
+        noise_mv = ingest_noise_data(n_days=n_days)[column].dropna() * 1000
         if noise_mv.empty:
             return default
         peak = float(noise_mv.max())
@@ -1253,6 +1345,44 @@ STATUS_DASHBOARD_PLOTS["dcoffset"]["plot_params"].update({
               ["red", "green", "red"]],
     })
 
+# --- Apply slow-channel axes ------------------------------------------------
+# The slow channel is sized from its own data, so a slow channel running far
+# above the fast one never squashes the fast (alarm) gauge (PB, 2026-10-30).
+# Without slow data yet, it borrows the fast ranges rather than drawing an
+# empty axis. No threshold band or marker: the AGS trigger threshold does not
+# apply to slow.
+_SLOW_NOISE_PEAK = get_noise_floor_max_mv(column="slow_noise")
+_SLOW_NOISE_RANGE = ([0, round(_SLOW_NOISE_PEAK * 1.1, 10)]
+                     if _SLOW_NOISE_PEAK > 0
+                     else list(_NOISE_CFG["noise_range"]))
+_SLOW_NOISE_DTICK = _nice_dtick(_SLOW_NOISE_RANGE[1] - _SLOW_NOISE_RANGE[0])
+LAYOUT_MAP["slow_noise"] = {
+    "dtick": _SLOW_NOISE_DTICK,
+    "range": list(_SLOW_NOISE_RANGE),
+    "suffix": " mV",
+    }
+
+_SLOW_OFFSET_RANGE = get_noise_offset_range_mv(
+    column="slow_offset", default=tuple(_OFFSET_RANGE))
+LAYOUT_MAP["slow_offset"] = {
+    "dtick": _nice_dtick(_SLOW_OFFSET_RANGE[1] - _SLOW_OFFSET_RANGE[0]),
+    "range": list(_SLOW_OFFSET_RANGE),
+    "suffix": " mV",
+    }
+
+STATUS_DASHBOARD_PLOTS["slownoisefloor"]["plot_params"].update({
+    "range": list(_SLOW_NOISE_RANGE),
+    "dtick": _SLOW_NOISE_DTICK,
+    })
+
+# No green/red zones: the fast +-OFFSET_GREEN_RED_MV limits are not known to
+# mean anything for the slow channel (PB, 2026-10-30).
+STATUS_DASHBOARD_PLOTS["slowdcoffset"]["plot_params"].update({
+    "range": list(OFFSET_GAUGE_RANGE),
+    "dtick": 100,
+    "steps": None,
+    })
+
 # Green-below / red-above fill split at the per-Pi threshold on the fast_noise
 # time-series. Rendered faint via the inherited shape_opacity (0.2).
 NOISE_COLOR_TABLE_MAP = {
@@ -1263,10 +1393,10 @@ NOISE_COLOR_TABLE_MAP = {
 NOISE_PLOT_METADATA = {
     "section_title": "Noise Floor",
     "section_description": (
-        "Fast-channel noise floor and DC offset (mV) per trigger, last "
+        "Fast- and slow-channel noise floor and DC offset (mV) per trigger, last "
         f"{NOISE_PLOT_DAYS} days, updated every "
         f"{STATUS_UPDATE_INTERVAL_SLOW_SECONDS} s. The shaded band marks the "
-        "AGS trigger threshold (green below, red above)."
+        "AGS trigger threshold on the fast noise floor (green below, red above)."
         "\n\nHover to view values and click/drag to zoom in/out."),
     "section_nav_label": "Noise",
     "button_content": "",
@@ -1284,7 +1414,7 @@ NOISE_PLOT_DATA_ARGS = {
     }
 
 NOISE_PLOT_CONTENT_ARGS = dict(HISTORY_PLOT_CONTENT_ARGS)
-NOISE_PLOT_CONTENT_ARGS["plot_height"] = 512
+NOISE_PLOT_CONTENT_ARGS["plot_height"] = 1024
 
 NOISE_PLOT_ARGS = {
     "data_args": NOISE_PLOT_DATA_ARGS,
