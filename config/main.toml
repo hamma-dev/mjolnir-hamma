@@ -51,7 +51,13 @@ config_version = 1
 
     [steps.state_monitor]
         _preset = "state_monitor.outputs.plugin"
-        power_delim = 15  # delimiter between normal power and low power
+        power_delim = 15  # W (adc_vl_f * adc_il_f), not volts. Alerts ONCE
+                          # when load power falls from >= this to below it.
+                          # A powered unit draws ~17 W (~12.4 V x ~1.4 A), so
+                          # the margin is thin: a unit that trips on ordinary
+                          # dips overrides it locally (mj03 runs 12 W). Per-unit
+                          # overrides belong in that unit's
+                          # ~/.config/brokkr/hamma/main.toml, not here.
         purge_space = 200  # GB free on the AGS drive below which to drain proactively (level-triggered, no alert)
         alert_space = 75   # GB free below which to alert: falling despite the auto-scrub (purge losing)
         scrub_cooldown_s = 300  # min seconds between level-triggered scrub launches while below purge_space (more responsive than the 15-min timer)
