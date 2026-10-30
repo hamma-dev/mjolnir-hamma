@@ -54,8 +54,8 @@ config_version = 1
         power_delim = 15  # W (adc_vl_f * adc_il_f), not volts. Alerts ONCE
                           # when load power falls from >= this to below it.
                           # A powered unit draws ~17 W (~12.4 V x ~1.4 A), so
-                          # the margin is thin: units that trip on ordinary
-                          # dips override it locally (mj03 runs 12 W). Per-unit
+                          # the margin is thin: a unit that trips on ordinary
+                          # dips overrides it locally (mj03 runs 12 W). Per-unit
                           # overrides belong in that unit's
                           # ~/.config/brokkr/hamma/main.toml, not here.
         purge_space = 200  # GB free on the AGS drive below which to drain proactively (level-triggered, no alert)
