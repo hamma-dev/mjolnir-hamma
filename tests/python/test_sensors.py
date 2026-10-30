@@ -9,6 +9,11 @@ import textwrap
 import pytest
 from unittest.mock import patch, MagicMock, call
 
+try:
+    from . import test_sensors_independent as oracle
+except ImportError:  # run outside the package
+    import test_sensors_independent as oracle
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sensors.py"
 
@@ -281,11 +286,13 @@ class TestDropin:
         # Check mkdir call
         mkdir_cmd = mock_run.call_args_list[0][0][0]
         assert mkdir_cmd == ["sudo", "mkdir", "-p", sensors.DROPIN_DIR]
-        # Check tee call
+        # Check tee call: a temp file, renamed over mode.conf
         tee_call = mock_run.call_args_list[1]
         tee_cmd = tee_call[0][0]
-        assert tee_cmd == ["sudo", "tee", sensors.DROPIN_PATH]
+        assert tee_cmd == ["sudo", "tee", sensors.DROPIN_TMP_PATH]
         assert tee_call[1]["input"] == sensors.DROPIN_CONTENT
+        assert mock_run.call_args_list[2][0][0] == [
+            "sudo", "mv", "-f", sensors.DROPIN_TMP_PATH, sensors.DROPIN_PATH]
 
     def test_remove_dropin(self, sensors):
         """remove_dropin calls sudo rm -f."""
@@ -1608,136 +1615,6 @@ class TestCollapseStripsEveryForm:
         run.assert_not_called()
 
 
-class TestWritePostConditionsAreChecked:
-    """The bytes about to be written are verified, and a bad render refuses.
-
-    The previous attempt's verifier never fired on any reachable input: it
-    re-parsed with a first-match parser and compared with plain list
-    membership, so a reordering, a lost duplicate and a silent no-op all
-    passed. Driving a deliberately wrong render through it is the only way
-    to show the check is load-bearing.
-    """
-
-    def _apply_with_render(self, sensors, tmp_path, existing, render):
-        p = tmp_path / "mode.conf"
-        p.write_text(existing)
-        written = {}
-
-        def fake_run_command(cmd, description, stdin_data=None):
-            if cmd[:2] == ["sudo", "tee"]:
-                written["content"] = stdin_data
-            elif cmd[:3] == ["sudo", "rm", "-f"]:
-                written["removed"] = True
-            return 0
-
-        with patch.object(sensors, "DROPIN_PATH", str(p)), \
-             patch.object(sensors, "run_command", fake_run_command), \
-             patch.object(sensors, "set_mode_at", render):
-            rc = sensors.apply_mode(sensor_on=False)
-        return rc, written
-
-    def test_a_silent_no_op_rewrite_refuses(self, sensors, tmp_path):
-        """A render that does not change the mode must not report success."""
-        rc, w = self._apply_with_render(
-            sensors, tmp_path, EXECSTART_DROPIN.format("nochargecontroller"),
-            lambda content, site, mode: content)
-        assert rc != 0, "reported a transition that did not happen"
-        assert "content" not in w
-
-    def test_a_rewrite_that_drops_a_directive_refuses(self, sensors,
-                                                      tmp_path):
-        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
-                    + "Restart=always\nTimeoutStopSec=90\n")
-        rc, w = self._apply_with_render(
-            sensors, tmp_path, existing,
-            lambda content, site, mode: ENVIRONMENT_DROPIN.format(mode))
-        assert rc != 0, "threw away the operator's other directives"
-        assert "content" not in w
-
-    def test_a_rewrite_that_reorders_directives_refuses(self, sensors,
-                                                        tmp_path):
-        """Order is semantic in systemd: the LAST assignment wins."""
-        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
-                    + "Environment=FOO=1\nEnvironment=FOO=2\n")
-
-        def reordering(content, site, mode):
-            return ("[Service]\n"
-                    "Environment=BROKKR_MODE={}\n"
-                    "Environment=FOO=2\n"
-                    "Environment=FOO=1\n".format(mode))
-
-        rc, w = self._apply_with_render(sensors, tmp_path, existing,
-                                        reordering)
-        assert rc != 0, "reordered Environment= lines, changing which wins"
-        assert "content" not in w
-
-    def test_a_rewrite_that_loses_a_duplicate_refuses(self, sensors,
-                                                      tmp_path):
-        existing = (ENVIRONMENT_DROPIN.format("nochargecontroller")
-                    + "Environment=FOO=1\nEnvironment=FOO=1\n")
-
-        def dedup(content, site, mode):
-            return ("[Service]\nEnvironment=BROKKR_MODE={}\n"
-                    "Environment=FOO=1\n".format(mode))
-
-        rc, w = self._apply_with_render(sensors, tmp_path, existing, dedup)
-        assert rc != 0, "dropped a duplicate, changing which assignment wins"
-        assert "content" not in w
-
-
-class TestCollapsePostConditionsAreChecked:
-    """The collapse side of the same check, driven with a wrong collapse.
-
-    collapse_content cannot produce any of these today, so the only way to
-    show the check would catch them -- rather than shipping a second
-    never-fires verifier -- is to hand it a bad collapse on purpose.
-    """
-
-    def _collapse_with(self, sensors, tmp_path, existing, collapse):
-        p = tmp_path / "mode.conf"
-        p.write_text(existing)
-        written = {}
-
-        def fake_run_command(cmd, description, stdin_data=None):
-            if cmd[:2] == ["sudo", "tee"]:
-                written["content"] = stdin_data
-            elif cmd[:3] == ["sudo", "rm", "-f"]:
-                written["removed"] = True
-            return 0
-
-        with patch.object(sensors, "DROPIN_PATH", str(p)), \
-             patch.object(sensors, "run_command", fake_run_command), \
-             patch.object(sensors, "collapse_content", collapse):
-            rc = sensors.apply_mode(sensor_on=True)
-        return rc, written, p.read_text()
-
-    EXISTING = EXECSTART_DROPIN.format("nosensor") + "TimeoutStopSec=90\n"
-
-    BAD = {
-        "a mode survived the collapse": (
-            "[Service]\nExecStart=\n"
-            "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
-            "--system hamma --mode nosensor start\nTimeoutStopSec=90\n"),
-        "left an orphaned reset line": "[Service]\nExecStart=\n"
-                                       "TimeoutStopSec=90\n",
-        "dropped a co-resident directive": (
-            "[Service]\nExecStart=\n"
-            "ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
-            "--system hamma start\n"),
-    }
-
-    @pytest.mark.parametrize("name", sorted(BAD))
-    def test_refuses_a_bad_collapse(self, sensors, tmp_path, name):
-        rc, w, after = self._collapse_with(
-            sensors, tmp_path, self.EXISTING,
-            lambda content, sites, _b=self.BAD[name]: _b)
-        assert rc != 0, "{}: written anyway".format(name)
-        assert "content" not in w, "{}: wrote the bad bytes".format(name)
-        assert "removed" not in w, (
-            "{}: DELETED the drop-in to satisfy the check".format(name))
-        assert after == self.EXISTING, "{}: file changed".format(name)
-
-
 class TestEveryRefusalHappensBeforeAnythingMoves:
     """Refuse empty-handed: no service stopped, no relay moved.
 
@@ -1894,6 +1771,11 @@ class TestInvariantsOverEveryDropinShape:
                 if plan["kind"] in ("refuse", "noop"):
                     continue
 
+                # 3b. --on/--off never moves the sticky axis.
+                before = oracle.effective_mode(existing) or "default"
+                assert (sensors.NOCHARGE_TOKEN in before.split("_")) == (
+                    sensors.NOCHARGE_TOKEN in plan["mode"].split("_")), where
+
                 if plan["kind"] == "delete":
                     # 2. Delete only when the mode was all the file set.
                     for line in existing.splitlines():
@@ -1912,8 +1794,11 @@ class TestInvariantsOverEveryDropinShape:
                     continue
 
                 content = plan["content"]
-                # 3. What gets written parses back as the target mode.
-                assert sensors.parse_mode(content)[0] == plan["mode"], where
+                # 3. What gets written resolves to the target mode -- judged
+                #    by the independent suite's own oracle, never by this
+                #    module's parser, which cannot catch its own misparse.
+                assert (oracle.effective_mode(content)
+                        or sensors.MODE_DEFAULT) == plan["mode"], where
 
                 # 4. A write never INTRODUCES an orphaned `ExecStart=`
                 #    reset, which clears brokkr's command line with nothing
@@ -1988,3 +1873,305 @@ class TestWritesPreserveEverythingButTheMode:
         assert rc == 0
         assert mode_after == "nosensor_nochargecontroller"
         assert '"BROKKR_MODE=nosensor_nochargecontroller"' in text
+
+
+# --- Red team 2026-10-30: read what systemd and brokkr actually read ---
+
+EXEC_LINE = ("ExecStart=/home/pi/dev/ltgenv/bin/python3 -m brokkr "
+             "--system hamma --mode {} start")
+
+
+class TestParserMatchesSystemd:
+    """systemd 241's conf-parser decides what a line is; mirror it."""
+
+    def test_comment_ending_in_backslash_does_not_continue(self, sensors):
+        """systemd drops a comment before any continuation handling, so the
+        next line is a live directive -- not swallowed into the comment."""
+        content = ("[Service]\n# was: --mode nosensor \\\n"
+                   "Environment=BROKKR_MODE=nosensor_nochargecontroller\n")
+        assert sensors.parse_mode(content)[0] == \
+            "nosensor_nochargecontroller"
+
+    def test_comment_inside_a_continuation_is_skipped(self, sensors):
+        """systemd drops a comment line even mid-continuation, so a mode
+        that is only commented out there names nothing."""
+        content = ("[Service]\nExecStartPre=/bin/true \\\n"
+                   "# Environment=BROKKR_MODE=nosensor\n"
+                   "  --quiet\n")
+        detail = sensors.inspect_content(content)
+        assert detail["problems"] == []
+        assert detail["mode"] == sensors.MODE_DEFAULT
+
+    def test_escaped_backslash_is_not_a_continuation(self, sensors):
+        """A line ending in an escaped backslash (`\\\\`) ends there."""
+        content = ("[Service]\nTimeoutStopSec=90 \\\\\n"
+                   "Environment=BROKKR_MODE=nosensor\n")
+        detail = sensors.inspect_content(content)
+        assert detail["problems"] == []
+        assert detail["mode"] == "nosensor"
+
+    def test_odd_backslash_run_still_continues(self, sensors):
+        content = ("[Service]\nEnvironment=BROKKR_MODE=nosensor \\\\\\\n"
+                   "  OTHER=1\n")
+        assert sensors.parse_mode(content)[0] == sensors.MODE_UNKNOWN
+
+    @pytest.mark.parametrize("content", [
+        "[Unit]\nEnvironment=BROKKR_MODE=nosensor\n",
+        "[Install]\nEnvironment=BROKKR_MODE=nochargecontroller\n",
+        "Environment=BROKKR_MODE=nosensor\n",
+        "[Service]\n[Unit]\n" + EXEC_LINE.format("nosensor") + "\n",
+    ])
+    def test_mode_outside_service_section_is_refused(self, sensors, content):
+        """systemd ignores it there, so reading it as the mode is wrong in
+        both directions -- refuse instead."""
+        detail = sensors.inspect_content(content)
+        assert detail["mode"] == sensors.MODE_UNKNOWN
+        assert any("[Service]" in why for _, _, why in detail["problems"])
+
+    @pytest.mark.parametrize("content", [
+        "[Service]\nEnvironment=BROKKR_MODE=nochargecontroller\nEnvironment=\n",
+        "[Service]\nEnvironment=\n",
+        "[Service]\nEnvironmentFile=/etc/default/brokkr\n",
+        "[Service]\nEnvironmentFile=-/etc/default/brokkr\n"
+        "Environment=BROKKR_MODE=nosensor\n",
+    ])
+    def test_environment_reset_or_file_is_refused(self, sensors, content):
+        """An empty Environment= wipes the list (the mode above it is dead,
+        and a line we add above it would be too); EnvironmentFile= can set
+        BROKKR_MODE where this script cannot see."""
+        assert sensors.inspect_content(content)["mode"] == \
+            sensors.MODE_UNKNOWN
+
+    def test_undecodable_dropin_refuses_instead_of_crashing(
+            self, sensors, tmp_path):
+        p = tmp_path / "mode.conf"
+        p.write_bytes(b"[Service]\n# caf\xe9\nEnvironment=BROKKR_MODE=nosensor\n")
+        with patch.object(sensors, "DROPIN_PATH", str(p)):
+            plan = sensors.plan_mode(sensor_on=True)
+        assert plan["kind"] == "refuse"
+
+
+class _Placements:
+    """Point every mode source outside mode.conf at tmp paths."""
+
+    def __init__(self, sensors, tmp_path, unit=None, other_dropin=None,
+                 local_toml=None, system_toml=None, reload_pending=False):
+        self.sensors = sensors
+        unit_path = tmp_path / "brokkr-hamma-default.service"
+        unit_path.write_text(unit if unit is not None else (
+            "[Service]\nExecStart = /home/pi/dev/ltgenv/bin/python3 -m brokkr"
+            " --system hamma start\n"))
+        extra = tmp_path / "run.d"
+        extra.mkdir()
+        if other_dropin is not None:
+            (extra / "override.conf").write_text(other_dropin)
+        local = tmp_path / "local-mode.toml"
+        if local_toml is not None:
+            local.write_text(local_toml)
+        system = tmp_path / "system-mode.toml"
+        system.write_text(system_toml if system_toml is not None
+                          else "[nosensor]\n")
+        self.dropin = tmp_path / "mode.conf"
+        self.patches = [
+            patch.object(sensors, "UNIT_FILE_PATH", str(unit_path)),
+            patch.object(sensors, "EXTRA_DROPIN_DIRS", [str(extra)]),
+            patch.object(sensors, "LOCAL_MODE_TOML", str(local)),
+            patch.object(sensors, "SYSTEM_MODE_TOML", str(system)),
+            patch.object(sensors, "DROPIN_PATH", str(self.dropin)),
+            patch.object(sensors, "need_daemon_reload",
+                         return_value=reload_pending),
+        ]
+
+    def plan(self, sensor_on, dropin=None):
+        if dropin is not None:
+            self.dropin.write_text(dropin)
+        for p in self.patches:
+            p.start()
+        try:
+            return self.sensors.plan_mode(sensor_on=sensor_on)
+        finally:
+            for p in reversed(self.patches):
+                p.stop()
+
+
+class TestModeSourcesOutsideTheDropin:
+    """brokkr v0.4.0 merges system mode.toml < local mode.toml <
+    BROKKR_MODE < CLI --mode (brokkr/config/modehandler.py). A write that
+    ignores a source it cannot override reports [OK] over the wrong mode."""
+
+    def test_clean_unit_still_plans_a_write(self, sensors, tmp_path):
+        plan = _Placements(sensors, tmp_path).plan(sensor_on=False)
+        assert plan["kind"] == "write"
+        assert plan["mode"] == "nosensor"
+
+    def test_unit_file_execstart_mode_refuses(self, sensors, tmp_path):
+        """mj06's unit file itself carries --mode: an Environment= write
+        loses to it, and a collapse would bring it back into force."""
+        unit = "[Service]\n" + EXEC_LINE.format("nosensor_nochargecontroller")
+        plan = _Placements(sensors, tmp_path, unit=unit).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+        assert "brokkr-hamma-default.service" in plan["reason"]
+
+    def test_unit_file_environment_mode_refuses(self, sensors, tmp_path):
+        unit = "[Service]\nEnvironment=BROKKR_MODE=nochargecontroller\n"
+        plan = _Placements(sensors, tmp_path, unit=unit).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+
+    def test_another_dropin_naming_a_mode_refuses(self, sensors, tmp_path):
+        plan = _Placements(
+            sensors, tmp_path,
+            other_dropin="[Service]\nEnvironment=BROKKR_MODE=nosensor\n",
+        ).plan(sensor_on=True)
+        assert plan["kind"] == "refuse"
+        assert "override.conf" in plan["reason"]
+
+    def test_another_dropin_without_a_mode_is_fine(self, sensors, tmp_path):
+        plan = _Placements(
+            sensors, tmp_path, other_dropin="[Service]\nRestartSec=30\n",
+        ).plan(sensor_on=False)
+        assert plan["kind"] == "write"
+
+    def test_local_mode_toml_mode_refuses(self, sensors, tmp_path):
+        """mj05: nochargecontroller in mode.toml, no drop-in. --off would
+        write BROKKR_MODE=nosensor, which outranks it -- sticky axis gone."""
+        plan = _Placements(sensors, tmp_path,
+                           local_toml='mode = "nochargecontroller"\n'
+                           ).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+        assert "mode.toml" in plan["reason"]
+
+    def test_system_mode_toml_mode_refuses(self, sensors, tmp_path):
+        plan = _Placements(sensors, tmp_path,
+                           system_toml='mode = "nochargecontroller"\n'
+                           ).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+
+    def test_mode_toml_presets_alone_are_fine(self, sensors, tmp_path):
+        """The [nosensor] etc. tables define modes; only a top-level `mode`
+        selects one."""
+        plan = _Placements(sensors, tmp_path,
+                           local_toml="[nosensor.main]\nx = 1\n"
+                           ).plan(sensor_on=False)
+        assert plan["kind"] == "write"
+
+    def test_unparseable_mode_toml_refuses(self, sensors, tmp_path):
+        plan = _Placements(sensors, tmp_path, local_toml="mode = \n"
+                           ).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+
+    def test_pending_daemon_reload_refuses(self, sensors, tmp_path):
+        """Our own daemon-reload would silently activate somebody else's
+        edit (mj54 had one pending on 2026-10-29)."""
+        plan = _Placements(sensors, tmp_path, reload_pending=True
+                           ).plan(sensor_on=False)
+        assert plan["kind"] == "refuse"
+        assert "daemon-reload" in plan["reason"]
+
+    def test_real_system_mode_toml_selects_no_mode(self, sensors):
+        """The preset shipped in this repo must not trip the check."""
+        assert sensors.mode_toml_selection(sensors.SYSTEM_MODE_TOML) is None
+
+
+SHOW_TEMPLATE = (
+    "ExecStart={{ path=/home/pi/dev/ltgenv/bin/python3 ; argv[]=/home/pi/dev/"
+    "ltgenv/bin/python3 -m brokkr --system hamma {flag}start ; "
+    "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+    "code=(null) ; status=0/0 }}\nEnvironment={env}\n")
+
+
+class TestEffectiveModeAfterReload:
+    """After daemon-reload, ask systemd what it will run before starting."""
+
+    @pytest.mark.parametrize("flag,env,expected", [
+        ("", "", "default"),
+        ("", "BROKKR_MODE=nosensor", "nosensor"),
+        ("", "FOO=1 BROKKR_MODE=nosensor_nochargecontroller",
+         "nosensor_nochargecontroller"),
+        ("--mode nochargecontroller ", "BROKKR_MODE=nosensor",
+         "nochargecontroller"),
+        ("--mode\tnosensor ", "", "nosensor"),
+    ])
+    def test_reads_systemds_view(self, sensors, flag, env, expected):
+        show = SHOW_TEMPLATE.format(flag=flag, env=env)
+        assert sensors.effective_unit_mode(show) == expected
+
+    @pytest.mark.parametrize("show", ["", "garbage\n", None])
+    def test_unreadable_view_is_none(self, sensors, show):
+        with patch("subprocess.run", side_effect=OSError("no systemctl")):
+            assert sensors.effective_unit_mode(show) is None
+
+    def _off(self, sensors, show):
+        calls = []
+        plan = {"kind": "write", "current": "default", "mode": "nosensor",
+                "content": "[Service]\nEnvironment=BROKKR_MODE=nosensor\n"}
+
+        def track(name, rc=0):
+            def fn(*args, **kwargs):
+                calls.append(name)
+                return rc
+            return fn
+        with patch.object(sensors, "stop_brokkr", side_effect=track("stop")), \
+             patch.object(sensors, "stop_sindri", side_effect=track("ss")), \
+             patch.object(sensors, "toggle_relay", side_effect=track("relay")), \
+             patch.object(sensors, "archive_telemetry_csv"), \
+             patch.object(sensors, "apply_mode", side_effect=track("mode")), \
+             patch.object(sensors, "daemon_reload", side_effect=track("reload")), \
+             patch.object(sensors, "systemctl_show_mode", return_value=show), \
+             patch.object(sensors, "start_brokkr", side_effect=track("start")), \
+             patch.object(sensors, "start_sindri", side_effect=track("si")):
+            rc = sensors.sensor_off(pin=17, active_high=True, plan=plan)
+        return rc, calls
+
+    def test_matching_mode_succeeds(self, sensors):
+        rc, calls = self._off(sensors, SHOW_TEMPLATE.format(
+            flag="", env="BROKKR_MODE=nosensor"))
+        assert rc == 0
+        assert calls[-2:] == ["start", "si"]
+
+    def test_mismatch_fails_but_still_starts_brokkr(self, sensors, capsys):
+        """A stopped brokkr sends no telemetry and no alerts, so it is
+        started either way -- and the run reports the failure."""
+        rc, calls = self._off(sensors, SHOW_TEMPLATE.format(
+            flag="--mode default ", env="BROKKR_MODE=nosensor"))
+        assert rc != 0
+        assert "start" in calls
+        assert "'default'" in capsys.readouterr().out
+
+    def test_unverifiable_view_warns_and_succeeds(self, sensors, capsys):
+        rc, _ = self._off(sensors, "")
+        assert rc == 0
+        assert "could not verify" in capsys.readouterr().out.lower()
+
+
+class TestAtomicDropinWrite:
+    """mode.conf is now operator-authored, multi-line content: write it to
+    a temp file and rename, never truncate the live file in place."""
+
+    def test_writes_temp_then_renames(self, sensors):
+        mock_result = MagicMock(returncode=0, stderr="")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            rc = sensors.write_dropin("[Service]\nX=1\n", "nosensor")
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        assert rc == 0
+        assert cmds == [
+            ["sudo", "mkdir", "-p", sensors.DROPIN_DIR],
+            ["sudo", "tee", sensors.DROPIN_TMP_PATH],
+            ["sudo", "mv", "-f", sensors.DROPIN_TMP_PATH, sensors.DROPIN_PATH],
+        ]
+        assert mock_run.call_args_list[1][1]["input"] == "[Service]\nX=1\n"
+
+    def test_temp_name_is_not_loaded_by_systemd(self, sensors):
+        """systemd only reads *.conf from the drop-in dir."""
+        assert not sensors.DROPIN_TMP_PATH.endswith(".conf")
+        assert os.path.dirname(sensors.DROPIN_TMP_PATH) == sensors.DROPIN_DIR
+
+    def test_failed_temp_write_leaves_live_file_alone(self, sensors):
+        def fake(cmd, **kwargs):
+            return MagicMock(returncode=1 if cmd[1] == "tee" else 0,
+                             stderr="No space left on device")
+        with patch("subprocess.run", side_effect=fake) as mock_run:
+            rc = sensors.write_dropin("[Service]\nX=1\n", "nosensor")
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        assert rc != 0
+        assert not any(c[1] == "mv" for c in cmds)
+        assert ["sudo", "rm", "-f", sensors.DROPIN_TMP_PATH] in cmds

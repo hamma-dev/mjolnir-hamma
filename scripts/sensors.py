@@ -41,6 +41,21 @@ BROKKR_SERVICE = "brokkr-hamma-default.service"
 SINDRI_SERVICE = "sindri-hamma-client.service"
 DROPIN_DIR = "/etc/systemd/system/{}.d".format(BROKKR_SERVICE)
 DROPIN_PATH = os.path.join(DROPIN_DIR, "mode.conf")
+# Written first and renamed over mode.conf, so a failed write never leaves a
+# truncated drop-in. systemd only loads *.conf, so it never reads this name.
+DROPIN_TMP_NAME = ".mode.conf.tmp"
+DROPIN_TMP_PATH = os.path.join(DROPIN_DIR, DROPIN_TMP_NAME)
+
+# Every other place brokkr's mode can be set. None of them is ours to edit, so
+# a mode named in any of them refuses the toggle (see outside_mode_sources).
+UNIT_FILE_PATH = "/etc/systemd/system/{}".format(BROKKR_SERVICE)
+EXTRA_DROPIN_DIRS = [
+    "/run/systemd/system/{}.d".format(BROKKR_SERVICE),
+    "/usr/lib/systemd/system/{}.d".format(BROKKR_SERVICE),
+    "/lib/systemd/system/{}.d".format(BROKKR_SERVICE),
+]
+LOCAL_MODE_TOML = os.path.expanduser("~/.config/brokkr/hamma/mode.toml")
+SYSTEM_MODE_TOML = os.path.join(REPO_ROOT, "config", "mode.toml")
 
 # Brokkr modes are a single string key, NOT composable on the command line
 # (--mode nosensor,nochargecontroller raises KeyError). But the key encodes two
@@ -58,22 +73,22 @@ DROPIN_PATH = os.path.join(DROPIN_DIR, "mode.conf")
 # Treating the file as a boolean (present => nosensor) misreports the mode and
 # destroys the nochargecontroller half on any unit using it.
 #
-# The two forms are NOT equal in force. brokkr resolves its mode as
+# The two forms are NOT equal in force. brokkr v0.4.0 merges its mode levels
+# in this order, later winning (brokkr/config/modehandler.py):
 #
-#     CLI --mode  >  BROKKR_MODE in the environment  >  mode.toml
+#     config/mode.toml  <  ~/.config/brokkr/hamma/mode.toml
+#                       <  BROKKR_MODE in the environment  <  CLI --mode
 #
-# (server/fleet_probe.py's mode probe; docs/sensors-usage.md "four
-# placements"). So on a drop-in holding both, the ExecStart override wins and
-# the Environment= line is dead text. Reading the Environment= form first --
+# So on a drop-in holding both forms, the ExecStart override wins and the
+# Environment= line is dead text. Reading the Environment= form first --
 # which is what this script did -- reports the LOSER, and then every decision
 # downstream is made about a mode that is not in force.
 #
-# There are FOUR placements and this file can see only two of them: the
-# drop-in's Environment= and its ExecStart=. The unit's own ExecStart= and
-# ~/.config/brokkr/hamma/mode.toml are invisible here. That is why a write
-# only ever EDITS what is in the drop-in and never reconstructs it: an axis
-# set elsewhere is not ours to move, and claiming otherwise is how mj05
-# (mode.toml) got reported as `default`.
+# This script only ever edits mode.conf. A mode named anywhere else -- the
+# unit file's own ExecStart=/Environment=, another drop-in, either mode.toml
+# -- is a source a mode.conf write may not override, or that a collapse would
+# bring back into force; mj05 (mode.toml) is the live example. So the toggle
+# refuses rather than report [OK] over a mode it did not set.
 MODE_DEFAULT = "default"
 MODE_UNKNOWN = "unknown"
 NOSENSOR_TOKEN = "nosensor"
@@ -114,6 +129,11 @@ RE_REAL_EXECSTART = re.compile(r"^\s*ExecStart\s*=\s*\S")
 # a new one, so on its own it stops the unit from starting at all.
 RE_BARE_RESET = re.compile(r"^\s*ExecStart\s*=\s*$")
 RE_SECTION = re.compile(r"^\s*\[[^\]]*\]\s*$")
+# An empty Environment= resets the whole list: everything assigned above it,
+# in this file or the unit, is gone -- and a line added above it would be too.
+RE_ENV_RESET = re.compile(r"^\s*Environment\s*=\s*$")
+# Can set BROKKR_MODE from a file this script never reads.
+RE_ENV_FILE = re.compile(r"^\s*EnvironmentFile\s*=")
 # `--mode` as its own word. `--mode=x` matches too, deliberately: it names a
 # mode in a shape this script cannot rewrite, so it must be seen and refused
 # rather than missed.
@@ -521,6 +541,17 @@ def toggle_relay(relay_on, pin):
         [RELAY_SCRIPT, "--pin", str(pin), flag], description)
 
 
+def _is_comment(line):
+    stripped = line.strip()
+    return bool(stripped) and stripped[0] in COMMENT_PREFIXES
+
+
+def _continues(line):
+    """True if `line` ends in an UNescaped backslash: an odd-length run."""
+    stripped = line.rstrip()
+    return (len(stripped) - len(stripped.rstrip("\\"))) % 2 == 1
+
+
 def logical_lines(content):
     """Split `content` into systemd logical lines.
 
@@ -529,21 +560,29 @@ def logical_lines(content):
     backslash continues a directive onto the next line, so a scan that works
     physical line by physical line can see half a directive and parse it as
     whole.
+
+    Mirrors systemd 241's conf-parser: a comment line is dropped BEFORE any
+    continuation handling, so a comment never continues (and one inside a
+    continuation is skipped), and only an odd run of trailing backslashes
+    continues -- `\\\\` is an escaped backslash that ends the line.
     """
     out = []
     lines = (content or "").split("\n")
     index = 0
     while index < len(lines):
         start = index
-        parts = [lines[index]]
-        while (lines[index].rstrip().endswith("\\")
-               and index + 1 < len(lines)):
+        if _is_comment(lines[index]) or not _continues(lines[index]):
+            out.append((lines[index], start, 1))
             index += 1
+            continue
+        parts = [lines[index]]
+        while _continues(parts[-1]) and index + 1 < len(lines):
+            index += 1
+            if _is_comment(lines[index]):
+                continue
             parts.append(lines[index])
-        if len(parts) == 1:
-            text = parts[0]
-        else:
-            text = " ".join(part.rstrip().rstrip("\\") for part in parts)
+        text = " ".join(part.rstrip()[:-1] if _continues(part) else part
+                        for part in parts)
         out.append((text, start, index - start + 1))
         index += 1
     return out
@@ -566,16 +605,37 @@ def scan_modes(content):
     """
     sites = []
     problems = []
+    section = None
     for text, start, span in logical_lines(content):
         stripped = text.strip()
         if not stripped or stripped[0] in COMMENT_PREFIXES:
+            continue
+        if RE_SECTION.match(stripped):
+            section = stripped.lower()
+            continue
+        lineno = start + 1
+        in_service = section == "[service]"
+        if in_service and RE_ENV_RESET.match(text):
+            problems.append((lineno, stripped,
+                             "an empty Environment= resets the environment, "
+                             "so the mode in force cannot be proven"))
+            continue
+        if in_service and RE_ENV_FILE.match(text):
+            problems.append((lineno, stripped,
+                             "EnvironmentFile= can set BROKKR_MODE where this "
+                             "script cannot see"))
             continue
         env_tokens = RE_BROKKR_MODE.findall(text)
         flag_tokens = RE_MODE_TOKEN.findall(text)
         if not env_tokens and not flag_tokens:
             continue
-        lineno = start + 1
-        if span > 1:
+        if not in_service:
+            # systemd ignores it outside [Service]. Reading it as the mode
+            # misreports in one direction and edits dead text in the other.
+            problems.append((lineno, stripped,
+                             "the mode is named outside [Service], where "
+                             "systemd ignores it"))
+        elif span > 1:
             problems.append((lineno, stripped,
                              "the mode is on a continued line"))
         elif env_tokens and flag_tokens:
@@ -689,9 +749,11 @@ def read_mode_detail(path=None):
         detail.update({"content": None, "readable": True})
         return detail
     try:
-        with open(path) as file:
+        with open(path, encoding="utf-8") as file:
             content = file.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError too: one stray byte used to crash the run before
+        # it could notify.
         # Absent and unreadable are different facts. Reporting a live
         # override as "default" would have apply_mode treat it as absent.
         return {"mode": MODE_UNKNOWN, "form": None, "site": None,
@@ -883,7 +945,7 @@ def add_mode_line(content, mode):
             lines.insert(index + 1, directive)
             return "\n".join(lines)
     # No [Service] section to extend. Append one rather than restructure
-    # what is there; verify_write() allows exactly this one added header.
+    # what is there.
     separator = "" if content.endswith("\n") else "\n"
     return "{}{}[Service]\n{}\n".format(content, separator, directive)
 
@@ -910,73 +972,147 @@ def render_dropin(mode, form=None, existing=None):
     return ENVIRONMENT_DROPIN_TEMPLATE.format(mode)
 
 
-def _untouched(what):
-    """The tail every post-condition refusal ends with."""
-    return ("          {}\n"
-            "          The drop-in was NOT changed. Inspect it by hand: {}"
-            .format(what, DROPIN_PATH))
+def mode_toml_selection(path):
+    """The mode a brokkr mode.toml selects, or None if it selects none.
 
-
-def verify_write(content, target, existing):
-    """Why these bytes must not be written, or None if they are correct.
-
-    Checking our own output is what turns "the rewrite silently did not
-    take" from a confident [OK] over a wrong file into a refusal that leaves
-    the file alone. It has to re-scan with the real scanner and compare
-    ordered directives, or it passes everything: the previous attempt
-    re-parsed with a first-match parser and compared with list membership,
-    and so never fired on any input.
+    Only a top-level `mode` key selects one; the [nosensor] etc. tables just
+    define modes. Raises ValueError if the file is there but unreadable.
     """
-    detail = inspect_content(content)
-    if detail["problems"]:
-        return ("  [ERROR] Refusing to write: the rewrite produced a mode "
-                "it cannot read back\n"
-                + _untouched("({}).".format(detail["problems"][0][2])))
-    if len(detail["sites"]) != 1:
-        return ("  [ERROR] Refusing to write: the rewrite would leave {} "
-                "mode declarations,\n".format(len(detail["sites"]))
-                + _untouched("and exactly one is correct."))
-    if detail["mode"] != target:
-        return ("  [ERROR] Refusing to write: the rewrite produced mode "
-                "'{}', not '{}'.\n".format(detail["mode"], target)
-                + _untouched("The mode change did not take."))
-    lost, gained = directive_delta(existing, content)
-    gained = [line for line in gained if line.lower() != "[service]"]
-    if lost or gained:
-        return ("  [ERROR] Refusing to write: the rewrite would change more "
-                "than the mode\n"
-                + _untouched("(dropped {!r}, added {!r}).".format(
-                    lost[:2], gained[:2])))
-    return None
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as file:
+            data = tomli.load(file)
+    except (OSError, tomli.TOMLDecodeError) as error:
+        raise ValueError(str(error))
+    mode = data.get("mode")
+    return None if mode is None else str(mode)
 
 
-def verify_collapse(remainder, existing):
-    """Why this collapsed file must not be written, or None if it is correct.
+def outside_mode_sources():
+    """Every place outside mode.conf that names a brokkr mode.
 
-    A collapse has to leave a file that is both mode-free AND startable. A
-    mode token we could not strip must never be answered by deleting the
-    file: that turns a parse failure into data loss.
+    Returns a list of (path, why). Checked: the unit file, every other
+    drop-in for the unit, and both mode.toml levels. A file that is absent
+    names nothing; one that cannot be read is reported, never assumed clean.
     """
-    detail = inspect_content(remainder)
-    if detail["problems"] or detail["sites"]:
-        return ("  [ERROR] Refusing to write: a mode declaration survived "
-                "the collapse,\n"
-                + _untouched("so 'default' would be a false report."))
-    if any(RE_BARE_RESET.match(line) for line in remainder.split("\n")) \
-            and not any(RE_REAL_EXECSTART.match(line)
-                        for line in remainder.split("\n")):
-        return ("  [ERROR] Refusing to write: that would leave a bare "
-                "'ExecStart=' reset\n"
-                + _untouched("with nothing to replace it, and brokkr would "
-                             "not start."))
-    lost, gained = directive_delta(existing, remainder)
-    lost = [line for line in lost if not RE_BARE_RESET.match(line)]
-    if lost or gained:
-        return ("  [ERROR] Refusing to write: the collapse would change more "
-                "than the mode\n"
-                + _untouched("(dropped {!r}, added {!r}).".format(
-                    lost[:2], gained[:2])))
-    return None
+    found = []
+    files = [UNIT_FILE_PATH]
+    for directory in [DROPIN_DIR] + list(EXTRA_DROPIN_DIRS):
+        files.extend(sorted(glob_module.glob(
+            os.path.join(directory, "*.conf"))))
+    for path in files:
+        if (not os.path.isfile(path)
+                or os.path.abspath(path) == os.path.abspath(DROPIN_PATH)):
+            continue
+        try:
+            with open(path, encoding="utf-8") as file:
+                content = file.read()
+        except (OSError, UnicodeDecodeError) as error:
+            found.append((path, "could not be read ({})".format(error)))
+            continue
+        sites, problems = scan_modes(content)
+        if sites:
+            found.append((path, "sets the mode: {}".format(sites[-1]["text"])))
+        elif problems:
+            found.append((path, "{}: {}".format(problems[0][2],
+                                                problems[0][1])))
+    for path in (SYSTEM_MODE_TOML, LOCAL_MODE_TOML):
+        try:
+            mode = mode_toml_selection(path)
+        except ValueError as error:
+            found.append((path, "could not be parsed ({})".format(error)))
+            continue
+        if mode is not None:
+            found.append((path, "selects mode = {!r}".format(mode)))
+    return found
+
+
+def need_daemon_reload():
+    """True if systemd has unloaded changes to brokkr's unit.
+
+    None if that cannot be determined (no systemctl).
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "NeedDaemonReload", "--value",
+             BROKKR_SERVICE],
+            capture_output=True, text=True)
+    except OSError:
+        return None
+    out = result.stdout if isinstance(result.stdout, str) else ""
+    return out.strip() == "yes"
+
+
+def systemctl_show_mode():
+    """systemd's loaded ExecStart and Environment for brokkr, or None."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "ExecStart", "-p", "Environment",
+             BROKKR_SERVICE],
+            capture_output=True, text=True)
+    except OSError:
+        return None
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return None
+    return result.stdout
+
+
+RE_SHOW_ARGV = re.compile(r"argv\[\]=(.*?) ;")
+RE_MODE_FLAG_EQ = re.compile(r"(?<![\w-])--mode=(\S+)")
+
+
+def effective_unit_mode(show=None):
+    """The mode systemd will start brokkr in, from `systemctl show`.
+
+    Returns None when that cannot be determined. mode.toml is not in this
+    view; plan_mode() has already refused if either level selects a mode.
+    """
+    if show is None:
+        show = systemctl_show_mode()
+    if not show or "ExecStart=" not in show:
+        return None
+    execstart, environment = "", ""
+    for line in show.split("\n"):
+        if line.startswith("ExecStart="):
+            execstart = line
+        elif line.startswith("Environment="):
+            environment = line[len("Environment="):]
+    argv = RE_SHOW_ARGV.search(execstart)
+    if not argv:
+        return None
+    flag = (RE_MODE_FLAG_SET.search(argv.group(1))
+            or RE_MODE_FLAG_EQ.search(argv.group(1)))
+    if flag:
+        return flag.group(flag.lastindex)
+    mode = MODE_DEFAULT
+    for token in environment.split():
+        if token.startswith("BROKKR_MODE="):
+            mode = token.split("=", 1)[1] or MODE_DEFAULT
+    return mode
+
+
+def check_effective_mode(expected):
+    """After daemon-reload: does systemd agree on the mode? 0 if so.
+
+    An unverifiable view warns but passes -- the pre-flight already refused
+    every case this script knows to be unsafe.
+    """
+    actual = effective_unit_mode()
+    if actual is None:
+        print("  [WARN] Could not verify the mode systemd will start brokkr "
+              "in. Check: systemctl show -p ExecStart -p Environment {}"
+              .format(BROKKR_SERVICE))
+        return 0
+    if actual != expected:
+        print("  [ERROR] systemd will start brokkr in mode '{}', not '{}'.\n"
+              "          Starting it anyway (a stopped brokkr sends no "
+              "telemetry or alerts).\n"
+              "          Inspect: systemctl cat {}".format(
+                  actual, expected, BROKKR_SERVICE))
+        return 1
+    print("  [OK] systemd will start brokkr in mode {}".format(actual))
+    return 0
 
 
 def refuse_reason(mode, detail=None):
@@ -1050,6 +1186,32 @@ def plan_mode(sensor_on, path=None):
                 "reason": reason,
                 "summary": "mode drop-in cannot be rewritten"}
 
+    outside = outside_mode_sources()
+    if outside:
+        lines = ["  [ERROR] brokkr's mode is also named outside {}.".format(
+            DROPIN_PATH),
+            "          Refusing to toggle -- a mode.conf write may not "
+            "override these, and",
+            "          removing mode.conf would bring them back into force. "
+            "Fix them by hand:"]
+        lines.extend("            {}: {}".format(path, why)
+                     for path, why in outside)
+        return {"kind": "refuse", "current": current, "mode": None,
+                "reason": "\n".join(lines),
+                "summary": "mode is also set outside mode.conf"}
+
+    if need_daemon_reload():
+        return {"kind": "refuse", "current": current, "mode": None,
+                "reason": (
+                    "  [ERROR] systemd has unloaded changes to {} (daemon-"
+                    "reload pending).\n"
+                    "          Refusing to toggle -- this script's own daemon-"
+                    "reload would\n"
+                    "          activate them too. Review `systemctl cat {}`, "
+                    "then reload by hand."
+                    .format(BROKKR_SERVICE, BROKKR_SERVICE)),
+                "summary": "brokkr unit has a pending daemon-reload"}
+
     existing = detail["content"]
     target = target_mode(current, sensor_on=sensor_on)
     if target == current:
@@ -1065,20 +1227,13 @@ def plan_mode(sensor_on, path=None):
             # leaves the file alone, because answering a check we could not
             # satisfy with `rm -f` turns a parse failure into data loss.
             return {"kind": "delete", "current": current, "mode": target}
-        reason = verify_collapse(remainder, existing)
-        if reason is not None:
-            return {"kind": "refuse", "current": current, "mode": target,
-                    "reason": reason,
-                    "summary": "mode drop-in cannot be collapsed"}
         return {"kind": "write", "current": current, "mode": target,
                 "content": remainder}
 
+    # The written mode is proven after daemon-reload, against what systemd
+    # will actually run (check_effective_mode). The text-level re-checks that
+    # stood here could not fire on any input -- 8,738 plans in the red team.
     content = render_dropin(target, detail["form"], existing)
-    reason = verify_write(content, target, existing)
-    if reason is not None:
-        return {"kind": "refuse", "current": current, "mode": target,
-                "reason": reason,
-                "summary": "mode drop-in rewrite could not be verified"}
     return {"kind": "write", "current": current, "mode": target,
             "content": content}
 
@@ -1124,10 +1279,22 @@ def write_dropin(content=None, mode=None):
         "Created drop-in directory")
     if rc != 0:
         return rc
-    return run_command(
-        ["sudo", "tee", DROPIN_PATH],
-        "Wrote mode drop-in ({})".format(mode or NOSENSOR_TOKEN),
+    # Temp file + rename: `tee` truncates first, so writing the live file in
+    # place could leave it half-written (e.g. a full SD card, HAM-112). Same
+    # directory, so the mv is a rename(2).
+    tmp_path = os.path.join(os.path.dirname(DROPIN_PATH), DROPIN_TMP_NAME)
+    rc = run_command(
+        ["sudo", "tee", tmp_path],
+        "Wrote mode drop-in ({}) to a temp file".format(
+            mode or NOSENSOR_TOKEN),
         stdin_data=content)
+    if rc != 0:
+        run_command(["sudo", "rm", "-f", tmp_path],
+                    "Removed the partial temp file")
+        return rc
+    return run_command(
+        ["sudo", "mv", "-f", tmp_path, DROPIN_PATH],
+        "Installed mode drop-in ({})".format(mode or NOSENSOR_TOKEN))
 
 
 def remove_dropin():
@@ -1153,7 +1320,7 @@ def sensor_off(pin, active_high, plan=None):
     3. Toggle relay to power off sensor
     4. Archive today's telemetry CSV
     5. Apply the mode plan
-    6. Reload systemd
+    6. Reload systemd, and check systemd now agrees on the mode
     7. Start brokkr in nosensor mode, then sindri
 
     `plan` is the pre-flight from run(); it is computed here if absent so the
@@ -1194,12 +1361,14 @@ def sensor_off(pin, active_high, plan=None):
     if rc != 0:
         return rc
 
+    verify_rc = check_effective_mode(plan["mode"])
+
     rc = start_brokkr()
     if rc != 0:
         return rc
 
     start_sindri()
-    return 0
+    return verify_rc
 
 
 def sensor_on(pin, active_high, plan=None):
@@ -1209,7 +1378,7 @@ def sensor_on(pin, active_high, plan=None):
     2. Stop brokkr and sindri
     3. Archive today's telemetry CSV
     4. Apply the mode plan
-    5. Reload systemd
+    5. Reload systemd, and check systemd now agrees on the mode
     6. Toggle relay to power on sensor
     7. Start brokkr in default mode, then sindri
 
@@ -1242,6 +1411,8 @@ def sensor_on(pin, active_high, plan=None):
     if rc != 0:
         return rc
 
+    verify_rc = check_effective_mode(plan["mode"])
+
     relay_on = compute_relay_flag(sensor_on=True, active_high=active_high)
     rc = toggle_relay(relay_on=relay_on, pin=pin)
     if rc != 0:
@@ -1252,7 +1423,7 @@ def sensor_on(pin, active_high, plan=None):
         return rc
 
     start_sindri()
-    return 0
+    return verify_rc
 
 
 def sensor_status(config):

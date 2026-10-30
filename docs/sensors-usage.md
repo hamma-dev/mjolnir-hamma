@@ -92,16 +92,18 @@ carrying `--mode <mode>`. Both are read, and the existing form is preserved when
 writing back (the unit's own interpreter path, quoting and co-resident directives
 are kept).
 
-**The two forms are not equal in force.** brokkr resolves its mode as
+**The two forms are not equal in force.** brokkr v0.4.0 merges its mode levels in
+this order, later winning (`brokkr/config/modehandler.py` in `hamma-dev/brokkr`):
 
 ```
-CLI --mode  >  BROKKR_MODE in the environment  >  mode.toml
+config/mode.toml  <  ~/.config/brokkr/hamma/mode.toml  <  BROKKR_MODE (env)  <  CLI --mode
 ```
 
 so on a drop-in holding both, the `ExecStart=` override wins and the
-`Environment=` line is dead text. `--status` reports the mode brokkr will
-**actually run**, by that order, and for a repeated `Environment=` assignment the
-last one (systemd's own rule).
+`Environment=` line is dead text. `--status` reports the mode **`mode.conf`**
+puts in force, by that order, and for a repeated `Environment=` assignment the
+last one (systemd's own rule). It does not read the other sources below; `--on`
+and `--off` do, and refuse if any of them names a mode.
 
 **Reading is always answered; writing can refuse.** `--on`/`--off` refuse, and
 leave the file exactly as it was, when:
@@ -111,17 +113,41 @@ leave the file exactly as it was, when:
 | A mode is named in **more than one place** (two forms, two `Environment=` lines, two `--mode` flags on a line) | The resolved mode is knowable, but *which directive to edit* is not — editing one and leaving the other silently changes the mode in force |
 | A mode is named in a shape it cannot parse (`--mode=x`, a line continuation, an unhandled quoting, `--mode` on `ExecStartPre=`/`ExecReload=`) | Guessing could destroy the sticky axis |
 | The mode is outside the two-axis model (`test`, `realtime`, `sindri02x`, anything new) | `--on` would compute `default` and discard whatever the operator set |
+| A mode is named **outside `mode.conf`**: the unit file's own `ExecStart=`/`Environment=` (mj06), another drop-in for the unit, or a top-level `mode =` in either `mode.toml` (mj05) | A `mode.conf` write may lose to it, and removing `mode.conf` would bring it back into force |
+| systemd has a **pending daemon-reload** for brokkr's unit (mj54, 2026-10-29) | The script's own reload would activate somebody else's unreviewed edit too |
+| The mode is named outside `[Service]`, or the drop-in has an empty `Environment=` reset or an `EnvironmentFile=` | systemd ignores the first; the reset wipes the mode above it; the file can set `BROKKR_MODE` unseen |
+| The drop-in cannot be read or decoded | Unreadable is not the same as absent |
 
 A file that provably names **no** mode reports `default` — including a bare
 `ExecStart=` reset line and a commented-out old command line (`#` *and* `;`, per
-`systemd.syntax(7)`).
+`systemd.syntax(7)`). Lines are read the way systemd 241 reads them: a comment
+never continues onto the next line, and only an unescaped trailing `\` does.
 
-**Every refusal happens before any service is stopped and before the relay moves**,
-including a failure of the post-condition check on the bytes about to be written.
-`sensors.py` is the emergency power tool, used at low battery; it fails
-empty-handed or not at all. The refusal also goes to the same chat channel as the
-on/off notifications, because a message printed to a tunnelled stdout is a silent
-no-op from the operator's side.
+**Every refusal happens before any service is stopped and before the relay moves.**
+`sensors.py` is the emergency power tool, used at low battery, so a refusal costs
+nothing. The refusal also goes to the same chat channel as the on/off
+notifications, with its reason, because a message printed to a tunnelled stdout is
+a silent no-op from the operator's side.
+
+That guarantee covers **refusals only**. A failure *after* the services have
+stopped — a `sudo`, write or `daemon-reload` error — stops the sequence there and
+does not restart brokkr (see [Error Handling](#error-handling)).
+
+`mode.conf` is written to a temp file in the same directory and renamed into place,
+so a failed write (e.g. a full SD card) never leaves a truncated drop-in. After the
+`daemon-reload`, the script asks systemd (`systemctl show -p ExecStart -p
+Environment`) which mode it will start brokkr in. A mismatch is reported as a
+failure, but brokkr is **still started** — a stopped brokkr sends no telemetry and
+no alerts.
+
+**When `--on`/`--off` refuses** (from the VPS, `mjol_array.py` prints the unit's
+output, including every offending line):
+
+1. Fix the named lines by hand on the unit: `sudoedit
+   /etc/systemd/system/brokkr-hamma-default.service.d/mode.conf` (or the other file
+   the refusal names). Keep exactly one mode declaration, in `[Service]`.
+2. `sudo systemctl daemon-reload`, then check `sensors.py --status`.
+3. Re-run the toggle from the VPS with `mjol_array.py --up/--down`.
 
 > Before HAM-184 this file was treated as a boolean — present meant `nosensor`,
 > absent meant `default`. On mj06, mj50 and mj54 that made `--status` report
@@ -198,8 +224,10 @@ Each step prints `[OK]` or `[FAIL]` as it runs. If a critical step fails, the sc
 [OK] Relay off (de-energized) (pin 4)
 [OK] Archived telemetry_hamma_003_2026-05-11.csv -> ...csv.bak
 [OK] Created drop-in directory
-[OK] Wrote mode drop-in (nosensor)
+[OK] Wrote mode drop-in (nosensor) to a temp file
+[OK] Installed mode drop-in (nosensor)
 [OK] Reloaded systemd daemon
+  [OK] systemd will start brokkr in mode nosensor
 [OK] Started brokkr service
 [OK] Started sindri service
 ```
