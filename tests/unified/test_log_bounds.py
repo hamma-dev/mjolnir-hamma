@@ -7,6 +7,7 @@ dry-run manifest operations, and the fleet-remediation script's --check mode.
 """
 
 import os
+import re
 import json
 import subprocess
 from pathlib import Path
@@ -465,7 +466,9 @@ class TestVerifyDeploymentBehaviour:
         assert "PASS=0 FAIL=1" in out, out
 
     def test_called_unconditionally_from_main(self):
+        """At main()'s own indent, not inside `if $full_check` or any other
+        block (a substring match let an 8-space-indented call through)."""
         body = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
         main = body[body.index("main() {"):]
-        call = main.index("    check_log_bounds\n")
-        assert "--full" not in main[:call].split("check_ags_data_mount")[-1]
+        assert re.search(r"^    check_log_bounds\n", main, re.M), \
+            "check_log_bounds must be called at main()'s top level"
