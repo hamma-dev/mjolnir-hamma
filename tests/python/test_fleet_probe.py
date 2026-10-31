@@ -642,3 +642,30 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+class TestPendingRespectsWhatWasActuallyProbed:
+    """A scoped run (-a/-p) probes a subset. Units that were never probed are
+    not in `unreachable` either, so "rows minus unreachable" counted them as
+    reachable and dumped their pending items into the digest -- 46 items on a
+    3-unit `-a aumma` run, hitting the truncation cap. Hand-running the probe
+    scoped is exactly how an operator uses it.
+    """
+
+    def test_a_scoped_run_ignores_units_it_did_not_probe(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir09",
+                      "## Pending\n\n- [ ] Something for mj09\n")
+        rows = {"mjolnir41": row(fp, "mjolnir41"),
+                "mjolnir09": row(fp, "mjolnir09")}
+        # only aumma was probed; mjolnir09 was never contacted
+        text = fp.digest(rows, [], [], repo=str(tmp_path),
+                         probed_units={"mjolnir41"})
+        assert "Something for mj09" not in text, \
+            "a unit that was never probed must not be treated as reachable"
+
+    def test_an_unscoped_run_still_shows_everything_reachable(self, fp, tmp_path):
+        write_profile(tmp_path, "pamma", "mjolnir09",
+                      "## Pending\n\n- [ ] Something for mj09\n")
+        rows = {"mjolnir09": row(fp, "mjolnir09")}
+        text = fp.digest(rows, [], [], repo=str(tmp_path))
+        assert "Something for mj09" in text
