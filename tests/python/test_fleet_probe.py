@@ -6,8 +6,10 @@ stdout parser is tested without ssh.
 """
 
 import importlib.util
+import os
 import pathlib
 import subprocess
+import sys
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -642,3 +644,394 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+# --------------------------------------------------------------------------
+# Install-mode fields (HAM-205) -- the git SHA is only what RUNS if the
+# package is imported from the checkout. A frozen site-packages copy shadows
+# it, which is how the 2026-06 notifiers ImportError hid from a git survey.
+# --------------------------------------------------------------------------
+INSTALL_FIELDS = ["brokkr_install", "sindri_install", "hamma_install",
+                  "notifiers_install"]
+
+
+class TestInstallFields:
+    def test_install_fields_are_appended_to_the_schema(self, fp):
+        # Appending is safe; reordering rewrites every snapshot row.
+        assert fp.FIELDS[-len(INSTALL_FIELDS):] == INSTALL_FIELDS
+        assert fp.FIELDS[:12] == list(row(fp, "x").keys())
+
+    def test_probe_parses_install_fields(self, fp):
+        out = ("front_end=on\n"
+               "brokkr_install=installed\n"
+               "sindri_install=editable\n"
+               "hamma_install=installed\n"
+               "notifiers_install=missing\n")
+        run = MagicMock(returncode=0, stdout=out, stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run):
+            r = fp.probe_unit(8)
+        assert r["brokkr_install"] == "installed"
+        assert r["sindri_install"] == "editable"
+        assert r["notifiers_install"] == "missing"
+
+    def test_remote_script_classifies_each_package_by_import_path(self, fp):
+        # sindri runs from its own venv; the rest from ltgenv.
+        for pkg, env in [("brokkr", "ltgenv"), ("notifiers", "ltgenv"),
+                         ("hamma", "ltgenv"), ("sindri", "sindrienv")]:
+            assert "{}:{}".format(pkg, env) in fp.REMOTE
+        for label in ("editable", "installed", "missing", "broken"):
+            assert label in fp.REMOTE
+
+    def test_remote_interpreter_calls_are_timeout_bounded(self, fp):
+        # One `timeout 15` inside the per-package loop body (HAM-227) -- it
+        # runs once per package at runtime, so a hung interpreter can't eat
+        # the whole 90s per-unit probe budget.
+        assert "timeout 15 /home/pi/dev/$ENV/bin/python3" in fp.INSTALL_PROBE
+
+    def test_install_mode_change_is_reported(self, fp):
+        prev = {"mjolnir06": dict(row(fp, "mjolnir06"),
+                                  notifiers_install="installed")}
+        cur = {"mjolnir06": dict(row(fp, "mjolnir06"),
+                                 notifiers_install="editable")}
+        assert fp.diff(prev, cur) == [
+            ("mjolnir06", "notifiers_install", "installed", "editable")]
+
+    def test_new_schema_field_is_not_a_change(self, fp):
+        # The first run after upgrading must not report four "changes" per
+        # unit just because the old snapshot predates the columns.
+        prev = {"mjolnir02": row(fp, "mjolnir02")}          # no *_install keys
+        cur = {"mjolnir02": dict(row(fp, "mjolnir02"),
+                                 **{f: "editable" for f in INSTALL_FIELDS})}
+        assert fp.diff(prev, cur) == []
+
+    def test_old_snapshot_without_columns_round_trips(self, fp, tmp_path):
+        path = tmp_path / "fleet-state.csv"
+        path.write_text(",".join(fp.FIELDS[:12]) + "\n"
+                        + ",".join(row(fp, "mjolnir02").values()) + "\n")
+        rows = fp.read_snapshot(str(path))
+        text = fp.render(rows)
+        assert text.splitlines()[0] == ",".join(fp.FIELDS)
+
+
+# --------------------------------------------------------------------------
+# The import classifier (HAM-227) -- a package that is installed but fails
+# to import must be `broken`, not `missing`. Run the embedded python itself
+# under a real interpreter, against controlled modules, rather than check
+# REMOTE by substring: that is how the notifiers crash case went unnoticed.
+# --------------------------------------------------------------------------
+class TestInstallClassifierPy:
+    def _run(self, fp, pkg, env=None):
+        src = fp.INSTALL_CLASSIFIER_PY.format(pkg=pkg)
+        result = subprocess.run([sys.executable, "-c", src],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=env, universal_newlines=True, timeout=15)
+        return result.stdout.strip()
+
+    def test_missing_package_prints_missing(self, fp):
+        assert self._run(fp, "definitely_not_a_real_pkg_xyz") == "missing"
+
+    def test_package_that_raises_on_import_prints_broken(self, fp, tmp_path):
+        # The notifiers-2026-06 case: find_spec() succeeds (it's on disk and
+        # importable by name) but the module body raises.
+        pkg_dir = tmp_path / "brokenpkg"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text("raise RuntimeError('boom')\n")
+        env = dict(os.environ, PYTHONPATH=str(tmp_path))
+        assert self._run(fp, "brokenpkg", env=env) == "broken"
+
+    def test_importable_package_prints_its_realpath(self, fp, tmp_path):
+        pkg_dir = tmp_path / "goodpkg"
+        pkg_dir.mkdir()
+        init = pkg_dir / "__init__.py"
+        init.write_text("")
+        env = dict(os.environ, PYTHONPATH=str(tmp_path))
+        assert self._run(fp, "goodpkg", env=env) == os.path.realpath(str(init))
+
+    def test_realpath_resolves_a_symlinked_checkout(self, fp, tmp_path):
+        # A dropped realpath() would report the symlink target's own path
+        # instead of the real location, which can look like a different
+        # install mode than the one that actually runs.
+        real_pkg = tmp_path / "actual" / "goodpkg"
+        real_pkg.mkdir(parents=True)
+        (real_pkg / "__init__.py").write_text("")
+        linked = tmp_path / "linked"
+        linked.mkdir()
+        (linked / "goodpkg").symlink_to(real_pkg)
+        env = dict(os.environ, PYTHONPATH=str(linked))
+        assert self._run(fp, "goodpkg", env=env) == os.path.realpath(
+            str(real_pkg / "__init__.py"))
+
+
+# --------------------------------------------------------------------------
+# The install-mode case statement (HAM-227) -- exercised directly under bash
+# with a crafted $F/$PKG, so a broadened glob or a swapped branch is caught
+# even though no real venv is on PATH.
+# --------------------------------------------------------------------------
+class TestClassifyInstallModeSh:
+    def _classify(self, fp, pkg, f_value):
+        script = ("PKG='{}'\nF='{}'\n".format(pkg, f_value)
+                  + fp.CLASSIFY_INSTALL_MODE_SH + "echo \"$I\"\n")
+        result = subprocess.run(["bash", "-c", script], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, universal_newlines=True,
+                                timeout=15)
+        return result.stdout.strip()
+
+    def test_checkout_path_is_editable(self, fp):
+        assert self._classify(
+            fp, "sindri", "/home/pi/dev/sindri/sindri/__init__.py") == "editable"
+
+    def test_similarly_named_sibling_checkout_is_not_editable(self, fp):
+        # Guards against a broadened glob (e.g. "/home/pi/dev/$PKG*" instead
+        # of "/home/pi/dev/$PKG/*"), which would also match this sibling.
+        assert self._classify(
+            fp, "sindri", "/home/pi/dev/sindri-old/foo.py") == "unknown"
+
+    def test_site_packages_path_is_installed_not_editable(self, fp):
+        assert self._classify(
+            fp, "sindri",
+            "/home/pi/dev/sindrienv/lib/python3.7/site-packages/sindri/"
+            "__init__.py") == "installed"
+
+    def test_missing_and_broken_pass_through_unchanged(self, fp):
+        assert self._classify(fp, "sindri", "missing") == "missing"
+        assert self._classify(fp, "sindri", "broken") == "broken"
+
+
+# --------------------------------------------------------------------------
+# Behind the release head (HAM-205) -- standing, like "not capturing"
+# --------------------------------------------------------------------------
+class TestReleaseHead:
+    def test_reads_head_with_ls_remote(self, fp):
+        out = "52bb35d0123456789abcdef0123456789abcdef0\trefs/heads/0.4.x\n"
+        run = MagicMock(returncode=0, stdout=out, stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run) as call:
+            head = fp.release_head("0.4.x")
+        assert head == "52bb35d0123456789abcdef0123456789abcdef0"
+        cmd = call.call_args[0][0]
+        assert cmd[:2] == ["git", "ls-remote"]
+        assert "refs/heads/0.4.x" in cmd
+
+    def test_failure_returns_none_not_raise(self, fp):
+        with patch.object(fp.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("git", 30)):
+            assert fp.release_head("0.4.x") is None
+        run = MagicMock(returncode=128, stdout="", stderr="fatal")
+        with patch.object(fp.subprocess, "run", return_value=run):
+            assert fp.release_head("0.4.x") is None
+
+    def test_a_typo_branch_name_returncode_0_empty_stdout_is_none(self, fp):
+        # ls-remote on a branch that doesn't exist exits 0 with nothing on
+        # stdout -- not a nonzero return. Both must read as "can't check".
+        run = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run):
+            assert fp.release_head("0.4.xx-typo") is None
+
+    def test_release_remote_constant_is_the_mjolnir_hamma_repo(self, fp):
+        # Pins the literal so a mutated RELEASE_REMOTE value is caught, not
+        # just that *some* string gets passed through.
+        assert fp.RELEASE_REMOTE == "https://github.com/hamma-dev/mjolnir-hamma.git"
+
+    def test_default_remote_is_the_module_constant(self, fp):
+        run = MagicMock(returncode=0, stdout="abc\trefs/heads/0.4.x\n", stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run) as call:
+            fp.release_head("0.4.x")
+        cmd = call.call_args[0][0]
+        assert cmd[2] == "https://github.com/hamma-dev/mjolnir-hamma.git"
+
+    def test_ls_remote_has_a_timeout(self, fp):
+        run = MagicMock(returncode=0, stdout="abc\trefs/heads/0.4.x\n", stderr="")
+        with patch.object(fp.subprocess, "run", return_value=run) as call:
+            fp.release_head("0.4.x")
+        assert call.call_args.kwargs.get("timeout") == 30
+
+
+class TestBehindRelease:
+    HEAD = "52bb35d0123456789abcdef0123456789abcdef0"
+
+    def test_lists_reachable_units_not_at_head(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d"),
+                "mjolnir08": row(fp, "mjolnir08", mh="a6147a1"),
+                "mjolnir05": row(fp, "mjolnir05", mh="0bdbf68")}
+        out = fp.behind_release(rows, set(rows), ["mjolnir05"], self.HEAD)
+        assert out == [("mjolnir08", "a6147a1", fp.UNKNOWN, fp.UNKNOWN)]
+
+    def test_unknown_sha_is_listed(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh=fp.UNKNOWN)}
+        assert fp.behind_release(rows, set(rows), [], self.HEAD) == [
+            ("mjolnir02", fp.UNKNOWN, fp.UNKNOWN, fp.UNKNOWN)]
+
+    def test_blank_sha_is_listed_not_treated_as_at_head(self, fp):
+        # A blank CSV cell must not be read as "starts with everything".
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="")}
+        out = fp.behind_release(rows, set(rows), [], self.HEAD)
+        assert out == [("mjolnir02", "", fp.UNKNOWN, fp.UNKNOWN)]
+
+    def test_restricted_to_the_probed_set_not_all_known_rows(self, fp):
+        # A --ports/--array subset run must not report units it never
+        # touched this run, even though they're still in the merged rows.
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d"),
+                "mjolnir08": row(fp, "mjolnir08", mh="a6147a1")}
+        out = fp.behind_release(rows, {"mjolnir02"}, [], self.HEAD)
+        assert out == []
+
+    def test_branch_and_dirty_are_carried_through(self, fp):
+        r = dict(row(fp, "mjolnir08", mh="a6147a1"),
+                 mjolnir_hamma_branch="feature/x", mjolnir_hamma_dirty="dirty")
+        rows = {"mjolnir08": r}
+        out = fp.behind_release(rows, set(rows), [], self.HEAD)
+        assert out == [("mjolnir08", "a6147a1", "feature/x", "dirty")]
+
+    def test_digest_section_is_standing(self, fp):
+        rows = {"mjolnir08": row(fp, "mjolnir08", mh="a6147a1")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "not at 0.4.x head (52bb35d):" in text
+        assert "mjolnir08  a6147a1" in text
+
+    def test_digest_includes_branch_and_dirty_when_known(self, fp):
+        r = dict(row(fp, "mjolnir08", mh="a6147a1"),
+                 mjolnir_hamma_branch="0.3.x", mjolnir_hamma_dirty="dirty")
+        rows = {"mjolnir08": r}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "branch=0.3.x" in text
+        assert "dirty" in text
+
+    def test_digest_silent_when_all_at_head(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "not at 0.4.x head" not in text
+
+    def test_digest_says_so_when_head_unreadable(self, fp):
+        # Never silently drop the section: "nobody behind" and "couldn't
+        # check" must not look the same.
+        rows = {"mjolnir02": row(fp, "mjolnir02")}
+        text = fp.digest(rows, [], [], baseline=False, release=("0.4.x", None))
+        assert "not at 0.4.x head: could not read the 0.4.x head" in text
+
+    def test_digest_without_release_is_unchanged(self, fp):
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh="a6147a1")}
+        assert "not at" not in fp.digest(rows, [], [], baseline=False)
+
+    def test_digest_caps_a_long_list(self, fp):
+        # Mirrors PENDING_DIGEST_MAX's reasoning: an over-long digest is
+        # REJECTED, not truncated, by the chat sender.
+        rows = {"mjolnir{:02d}".format(n): row(fp, "mjolnir{:02d}".format(n),
+                                               mh="a6147a1")
+               for n in range(15)}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        body = [ln for ln in text.splitlines() if ln.startswith("  mjolnir")]
+        assert len(body) == fp.BEHIND_DIGEST_MAX
+        assert "... and 5 more" in text
+
+
+class TestMainReportsRelease:
+    def _main(self, fp, argv, head):
+        probed = dict(row(fp, "mjolnir08", mh="a6147a1"))
+        with patch.object(fp.sys, "argv", ["fleet_probe.py"] + argv), \
+                patch.object(fp, "parse_startup_state", lambda text: {}), \
+                patch.object(fp, "probe_unit", return_value=probed), \
+                patch.object(fp, "read_snapshot", return_value={}), \
+                patch.object(fp, "release_head", return_value=head) as rh:
+            status = fp.main()
+        return status, rh
+
+    def test_probe_run_reads_the_release_head(self, fp, capsys):
+        head = "52bb35d0123456789abcdef0123456789abcdef0"
+        status, rh = self._main(fp, ["-p", "8", "--dry-run"], head)
+        assert status == 0
+        rh.assert_called_once_with("0.4.x")
+        assert "not at 0.4.x head (52bb35d):" in capsys.readouterr().out
+
+    def test_release_branch_is_configurable(self, fp, capsys):
+        _, rh = self._main(fp, ["-p", "8", "--dry-run",
+                                "--release-branch", "0.5.x"], None)
+        rh.assert_called_once_with("0.5.x")
+        assert "not at 0.5.x head: could not read" in capsys.readouterr().out
+
+    def test_subset_run_does_not_report_units_it_never_probed(self, fp, tmp_path,
+                                                               capsys):
+        # A --ports run must restrict "not at head" to units THIS run
+        # actually contacted, not every unit the snapshot has ever known.
+        head = "52bb35d0123456789abcdef0123456789abcdef0"
+        snap = tmp_path / "fleet-state.csv"
+        snap.write_text(fp.render(
+            {"mjolnir02": row(fp, "mjolnir02", mh="a6147a1")}))
+        probed = dict(row(fp, "mjolnir08", mh="a6147a1"))
+        argv = ["fleet_probe.py", "-p", "8", "--dry-run",
+               "--snapshot", str(snap)]
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "parse_startup_state", lambda text: {}), \
+                patch.object(fp, "probe_unit", return_value=probed), \
+                patch.object(fp, "release_head", return_value=head):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "mjolnir08" in out       # probed this run, and behind
+        assert "mjolnir02" not in out   # known from the snapshot, not probed
+
+
+# --------------------------------------------------------------------------
+# Schema migration through main() (HAM-227) -- an old 12-column snapshot
+# must pick up the *_install columns even when nothing else changed. Before
+# the fix, diff() correctly skips them (they're a schema addition, not a
+# change) but main() only writes when `baseline or changes`, so the old
+# header -- and therefore the new fields -- never reached disk.
+# --------------------------------------------------------------------------
+class TestSchemaMigrationThroughMain:
+    def test_upgrade_then_a_real_flip_reports_exactly_that_change(
+            self, fp, tmp_path, capsys):
+        snap = tmp_path / "fleet-state.csv"
+        old_row = row(fp, "mjolnir08")                     # 12-column row
+        snap.write_text(",".join(fp.FIELDS[:12]) + "\n"
+                        + ",".join(old_row.values()) + "\n")
+
+        probed = dict(old_row, **{f: "installed" for f in INSTALL_FIELDS})
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=probed), \
+                patch.object(fp, "release_head", return_value=None):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "1 units, 0 change(s)" in out          # no spurious lines
+        for field in INSTALL_FIELDS:
+            assert field not in out
+        header = snap.read_text().splitlines()[0]
+        assert header == ",".join(fp.FIELDS)           # schema reached disk
+
+        # Second run: flip one install field -> exactly that change reported.
+        flipped = dict(probed, notifiers_install="editable")
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=flipped), \
+                patch.object(fp, "release_head", return_value=None):
+            status2 = fp.main()
+        assert status2 == 0
+        out2 = capsys.readouterr().out
+        assert "1 units, 1 change(s)" in out2
+        assert "mjolnir08  notifiers_install installed -> editable" in out2
+
+    def test_schema_only_write_uses_a_schema_commit_message(self, fp, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        snapshot_rel = os.path.join("state", "fleet-state.csv")
+        (repo / "state").mkdir()
+        old_row = row(fp, "mjolnir08")
+        (repo / snapshot_rel).write_text(
+            ",".join(fp.FIELDS[:12]) + "\n" + ",".join(old_row.values()) + "\n")
+
+        probed = dict(old_row, **{f: "installed" for f in INSTALL_FIELDS})
+        argv = ["fleet_probe.py", "-p", "8", "--repo", str(repo), "--commit"]
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=probed), \
+                patch.object(fp, "release_head", return_value=None), \
+                patch.object(fp, "commit_snapshot",
+                             return_value=(True, "ok")) as commit:
+            status = fp.main()
+        assert status == 0
+        message = commit.call_args[0][2]
+        assert message.startswith("state: schema +")
+        for field in INSTALL_FIELDS:
+            assert field in message
