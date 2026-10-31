@@ -381,10 +381,24 @@ def diff(previous, current):
         if old is None:
             changes.append((unit, "*", "-", "first seen"))
             continue
-        # A power transition drags the AGS-derived fields with it; report the
-        # front_end flip alone rather than the six-line cascade it causes.
-        front_changed = (str(old.get("front_end", ""))
-                         != str(new.get("front_end", "")))
+        # The AGS-derived fields are only READABLE while the front end is
+        # powered, so any movement in them across an unpowered state is a
+        # mechanical consequence, not a configuration change. Suppress them
+        # whenever either side reads "off".
+        #
+        # This deliberately does NOT key on "front_end changed", which is what
+        # it used to do. The write-hook (mjol_array --log-repo) records the new
+        # front_end into the snapshot as part of making the change, so by the
+        # time the probe measures, front_end already MATCHES -- and keying on
+        # the flip meant the suppression switched itself off exactly when the
+        # hook was doing its job, turning one logged --down into four
+        # threshold/gain "adjustments" nobody made.
+        #
+        # Scope matters here: "off" specifically, not "not on". A `no_relay`
+        # unit is powered and carries genuine values (mj05 at 78.0 mV, mj54 at
+        # 498.0), so real changes there must still surface.
+        powered_down = "off" in (str(old.get("front_end", "")),
+                                 str(new.get("front_end", "")))
         # Same shape, different cause: a unit that was never successfully probed
         # is stored as unreachable with every field UNKNOWN (merge() only writes
         # that row when there is no prior one). The first time it answers, all
@@ -396,7 +410,18 @@ def diff(previous, current):
                      and str(new.get("front_end", "")) != UNREACHABLE)
         for field in FIELDS[1:]:
             if str(old.get(field, "")) != str(new.get(field, "")):
-                if front_changed and field in POWER_DERIVED_FIELDS:
+                if field in POWER_DERIVED_FIELDS and (
+                        powered_down
+                        or str(old.get(field, "")) == UNKNOWN):
+                    # The second arm covers the other direction of the same
+                    # mechanical event: these fields read UNKNOWN while the
+                    # front end was down, so their first successful read is a
+                    # baseline being established, not an adjustment. There is
+                    # no old value to have changed FROM. This is the same
+                    # argument came_back makes below, which suppresses exactly
+                    # the fields that were genuinely UNKNOWN -- and it is what
+                    # makes a hook-logged --up quiet, since the hook has
+                    # already written front_end=on so neither side reads "off".
                     continue
                 # Suppress only the fields that were genuinely unknown. If a
                 # field somehow carried a real old value and changed, that is a
@@ -544,25 +569,108 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     return "\n".join(lines)
 
 
+# Every git call the probe makes goes through here. Two things must hold on all
+# of them, and holding them in one place is the only way to keep that true:
+#   stdin=DEVNULL  -- an https remote with no cached credential otherwise makes
+#     git sit on "Username for 'https://github.com':", eating the operator's
+#     keystrokes for the full timeout. This runs behind an emergency
+#     `mjol_array --down`; it must never wait on a human.
+#   GIT_TERMINAL_PROMPT=0 -- same failure from git's side, made explicit.
+def _git(repo, args, timeout):
+    return subprocess.run(
+        ["git", "-C", repo] + args,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, timeout=timeout,
+        stdin=subprocess.DEVNULL,
+        env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+# A push rejection worth retrying is a non-fast-forward: someone else pushed
+# first. A `remote rejected` is a server-side decline (pre-receive hook,
+# protected branch) which can NEVER succeed on retry -- and the pointless
+# `pull --rebase` it used to trigger is precisely what wedges a diverged clone.
+def _is_non_fast_forward(detail):
+    low = detail.lower()
+    if "remote rejected" in low:
+        return False
+    return ("! [rejected]" in low or "fetch first" in low
+            or "non-fast-forward" in low)
+
+
 def commit_snapshot(repo, snapshot_rel, message):
-    """Commit and push the snapshot. Returns (ok, detail)."""
+    """Commit and push the snapshot. Returns (ok, detail).
+
+    HAM-189 finding #5: fleet-state.csv has no locking. Two concurrent
+    writers on the same clone -- another `mjol_array --log-repo` run, or
+    this probe's own daily `--commit` cron overlapping one -- can race, and
+    a non-fast-forward push rejection is swallowed above (correctly: a git
+    failure here must never fail the caller) but was previously never
+    repaired, so that clone's logging silently degrades to a permanent
+    no-op until someone happens to notice.
+
+    Deliberately NOT building real locking for this -- a lock file/flock
+    over ssh-mounted or laptop-local clones is itself a new failure mode
+    (stale locks, cross-host semantics) for a resource written to at most a
+    few times a day. Cheapest responsible mitigation: on a push rejection
+    that LOOKS like a collision (git says "rejected"), retry ONCE --
+    `git pull --rebase` then push again -- which resolves the common single
+    -collision case for free. This does not cover every race (two pushes
+    landing inside the same retry window still lose one) and does not
+    retry a second time, so a genuinely wedged clone (rebase conflict, or a
+    second collision) is reported via the returned detail string, not
+    silently retried forever. That message is the whole mitigation for the
+    residual case: something an operator (or the caller printing `detail`)
+    can actually see and act on, which is strictly better than the
+    permanent silent no-op this replaces.
+    """
     try:
-        add = subprocess.run(["git", "-C", repo, "add", "--", snapshot_rel],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             universal_newlines=True, timeout=60)
+        add = _git(repo, ["add", "--", snapshot_rel], 60)
         if add.returncode != 0:
             return False, add.stdout.strip()
-        commit = subprocess.run(["git", "-C", repo, "commit", "-m", message],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                universal_newlines=True, timeout=60)
+        commit = _git(repo, ["commit", "-m", message, "--", snapshot_rel], 60)
         if commit.returncode != 0:
             return False, commit.stdout.strip()
-        push = subprocess.run(["git", "-C", repo, "push", "origin", "HEAD"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              universal_newlines=True, timeout=120)
-        if push.returncode != 0:
-            return False, push.stdout.strip()
-        return True, "committed and pushed"
+
+        push = _git(repo, ["push", "origin", "HEAD:refs/heads/main"], 120)
+        if push.returncode == 0:
+            return True, "committed and pushed"
+
+        detail = push.stdout.strip()
+        if not _is_non_fast_forward(detail):
+            # Some other push failure (auth, network, no remote, ...) --
+            # retrying blindly would not help and would just mask the real
+            # error behind a slower one.
+            return False, detail
+
+        # Looks like a non-fast-forward rejection: another writer pushed to
+        # this clone's remote since we last fetched. Try the cheap fix once.
+        rebase = _git(repo, ["pull", "--rebase", "origin", "HEAD"], 120)
+        if rebase.returncode != 0:
+            # ABORT IT. Left in place, the clone sits mid-rebase with conflict
+            # markers inside fleet-state.csv -- and read_snapshot() is a bare
+            # csv.DictReader, so the next run parses "<<<<<<< HEAD" as a unit,
+            # render()s it back out and commits it as data, silently discarding
+            # the other writer's value. That is worse than the silent no-op
+            # this retry was written to replace.
+            abort = _git(repo, ["rebase", "--abort"], 60)
+            abort_note = ("" if abort.returncode == 0 else
+                          "; AND `git rebase --abort` failed ({}) -- this "
+                          "clone is mid-rebase and must be fixed by hand "
+                          "before it is used again".format(
+                              abort.stdout.strip()))
+            return False, (
+                "push rejected ({}); retry rebase also failed ({}) -- this "
+                "clone needs manual attention (conflicting local state); "
+                "logging from it will silently keep failing until someone "
+                "fixes it{}".format(detail, rebase.stdout.strip(), abort_note))
+
+        retry = _git(repo, ["push", "origin", "HEAD:refs/heads/main"], 120)
+        if retry.returncode != 0:
+            return False, (
+                "push rejected ({}); rebased and retried once but the "
+                "retry also failed ({}) -- this clone needs manual "
+                "attention".format(detail, retry.stdout.strip()))
+        return True, "committed and pushed (after one rebase retry)"
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
 
