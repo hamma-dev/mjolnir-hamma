@@ -642,3 +642,411 @@ class TestPendingParserHardening:
         write_profile(tmp_path, "mjolnir-lab", "mjolnir05", "## Pending\n- [ ] lab\n")
         write_profile(tmp_path, "hamma", "mjolnir05", "## Pending\n- [ ] hamma\n")
         assert fp.pending_items(str(tmp_path), "mjolnir05") == ["hamma"]
+
+
+# --------------------------------------------------------------------------
+# Publishing the snapshot: pull before the write, and fail loudly
+# --------------------------------------------------------------------------
+
+# Policy (decided 2026-10-31): the probe only ever fast-forwards. It never
+# rebases or merges unattended. When it cannot publish it keeps the day's
+# snapshot as a local commit and says so in the digest, with a recovery command
+# a human (as monitor) can paste. Every test here uses real git; none mocks it.
+
+@pytest.fixture(autouse=True)
+def _isolated_git(monkeypatch, tmp_path):
+    """Keep the developer's own git config (pull.ff, init.defaultBranch, hooks)
+    out of the tests, so they behave as on the VPS's bare config."""
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def _git(repo, *args, check=True):
+    """Run git in `repo`; raise on failure so a broken fixture is obvious."""
+    done = subprocess.run(("git", "-C", str(repo)) + args,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True, timeout=60)
+    if check:
+        assert done.returncode == 0, done.stdout
+    return done.stdout
+
+
+@pytest.fixture
+def clone_pair(tmp_path):
+    """A bare 'origin' plus a clone, as the VPS has, plus a second clone
+    ('work') standing in for humans committing to sensor-log.
+
+    Avoids `init -b` (git >= 2.28) so the fixture also runs on git 2.25.
+    Returns (clone, work, snapshot_rel).
+    """
+    origin, work, clone = (tmp_path / "origin.git", tmp_path / "work",
+                           tmp_path / "clone")
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(tmp_path, "init", "-q", str(work))
+    _git(work, "symbolic-ref", "HEAD", "refs/heads/main")
+    for repo in (work,):
+        _git(repo, "config", "user.email", "human@test")
+        _git(repo, "config", "user.name", "human")
+    _git(work, "remote", "add", "origin", str(origin))
+    (work / "README").write_text("sensor-log\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "seed")
+    _git(work, "push", "-q", "origin", "main")
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "config", "user.email", "probe@test")
+    _git(clone, "config", "user.name", "probe")
+    return clone, work, pathlib.Path("state") / "fleet-state.csv"
+
+
+def _human_commit(work, name="other.txt", text="human edit\n"):
+    """A sensor-log commit made somewhere other than the probe's clone."""
+    _git(work, "pull", "-q", "--ff-only", "origin", "main")
+    path = work / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "a human commit")
+    _git(work, "push", "-q", "origin", "main")
+
+
+def _head(repo, ref="HEAD"):
+    return _git(repo, "rev-parse", ref).strip()
+
+
+def _origin(clone):
+    return clone.parent / "origin.git"
+
+
+def _published(clone, rel):
+    """The snapshot as GitHub would show it."""
+    return _git(_origin(clone), "show", "main:" + str(rel), check=False)
+
+
+def _run_main(fp, clone, extra=(), front_end="on", pull=None):
+    """Run fp.main() against `clone` with one fake unit (mjolnir02). Only the
+    fleet and chat are faked; git is real. Returns (rc, digest text)."""
+    argv = (["fleet_probe", "--allow-missing-ags", "-p", "2",
+             "--repo", str(clone)] + list(extra))
+    sent = {}
+    patches = [patch.object(fp, "parse_startup_state", None),
+               patch.object(fp, "load_ags_parser", return_value=(None, None)),
+               patch.object(fp, "probe_unit",
+                            lambda n: row(fp, "mjolnir{:02d}".format(n),
+                                          front_end=front_end)),
+               patch.object(fp, "send_digest",
+                            lambda text, key_file, channel:
+                                sent.__setitem__("text", text)),
+               patch.object(fp.sys, "argv", argv)]
+    if pull is not None:
+        patches.append(patch.object(fp, "pull_snapshot", pull))
+    for p in patches:
+        p.start()
+    try:
+        rc = fp.main()
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    return rc, sent.get("text", "")
+
+
+PUBLISH = ["--commit", "--notify"]
+
+
+def _strand_a_commit(fp, clone, rel):
+    """Day 1 publishes a baseline; day 2's state change is committed but its
+    push fails (origin unreachable), leaving one commit stranded locally."""
+    assert _run_main(fp, clone, PUBLISH)[0] == 0
+    url = _git(clone, "remote", "get-url", "origin").strip()
+    _git(clone, "remote", "set-url", "origin", url + "-gone")
+    rc, _ = _run_main(fp, clone, PUBLISH, front_end="off")
+    _git(clone, "remote", "set-url", "origin", url)
+    assert rc != 0
+    assert "front_end" in _git(clone, "show", "HEAD:" + str(rel))
+
+
+class TestPublishingTheNormalDay:
+
+    def test_a_human_commit_then_a_change_publishes(self, fp, clone_pair):
+        """The case that used to fail: sensor-log took a human commit, then
+        the probe saw a change. It must fast-forward, commit and push."""
+        clone, work, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _human_commit(work)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert _head(_origin(clone), "main") == _head(clone)
+        assert "mjolnir02,off," in _published(clone, rel)
+        assert "PUBLISH" not in text.upper().split("\n", 1)[0], text
+
+    def test_an_unchanged_day_leaves_no_commit(self, fp, clone_pair):
+        clone, _, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        before = _head(clone)
+        rc, _ = _run_main(fp, clone, PUBLISH)
+        assert rc == 0
+        assert _head(clone) == before
+
+    def test_only_the_snapshot_is_committed(self, fp, clone_pair):
+        """`git commit -m` without a path swept a pre-staged file into the
+        'state:' commit and pushed it."""
+        clone, _, rel = clone_pair
+        (clone / "secret.txt").write_text("not for the record\n")
+        _git(clone, "add", "secret.txt")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        tree = _git(clone, "ls-tree", "-r", "--name-only", "HEAD")
+        assert str(rel) in tree
+        assert "secret.txt" not in tree, "a staged file rode along: " + tree
+
+    def test_the_pull_happens_before_the_baseline_is_read(
+            self, fp, clone_pair):
+        """A pull after read_snapshot() would diff against a baseline it had
+        just made stale."""
+        clone, _, _ = clone_pair
+        order = []
+        real_pull, real_read = fp.pull_snapshot, fp.read_snapshot
+
+        def spy_pull(repo):
+            order.append("pull")
+            return real_pull(repo)
+
+        def spy_read(path):
+            order.append("read")
+            return real_read(path)
+
+        with patch.object(fp, "read_snapshot", spy_read):
+            _run_main(fp, clone, PUBLISH, pull=spy_pull)
+        assert order[:2] == ["pull", "read"], order
+
+    def test_problems_reach_the_log_even_without_the_digest(
+            self, fp, clone_pair, capsys):
+        """If the chat send fails, the cron log is all that is left."""
+        clone, _, _ = clone_pair
+        _git(clone, "checkout", "-q", "-b", "foo")
+        _run_main(fp, clone, ["--commit"])
+        err = capsys.readouterr().err
+        assert "not on main" in err and "exit status 1" in err, err
+
+    def test_untracked_files_in_the_clone_are_not_staged(
+            self, fp, clone_pair):
+        clone, _, _ = clone_pair
+        (clone / "scratch.txt").write_text("someone's notes\n")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        assert _git(clone, "status", "--porcelain", "scratch.txt").startswith(
+            "??"), "the probe staged a file it does not own"
+
+    def test_exit_status_is_logged(self, fp, clone_pair, capsys):
+        """Cron's log drops $?; the run must say how it ended itself."""
+        clone, _, _ = clone_pair
+        _run_main(fp, clone, PUBLISH)
+        assert "exit status 0" in capsys.readouterr().err
+
+
+class TestFastForwardOnly:
+
+    def test_pull_never_merges_even_where_git_defaults_to_merge(
+            self, fp, clone_pair):
+        """git 2.25 (the VPS) merges on a plain `git pull` of a diverged
+        clone; pull.rebase=false reproduces that on newer git."""
+        clone, work, rel = clone_pair
+        _git(clone, "config", "pull.rebase", "false")
+        _human_commit(work)
+        (clone / "local.txt").write_text("local\n")
+        _git(clone, "add", "local.txt")
+        _git(clone, "commit", "-q", "-m", "local")
+        before = _head(clone)
+        ok, detail = fp.pull_snapshot(str(clone))
+        assert not ok, "a diverged clone was reconciled: " + detail
+        assert _head(clone) == before
+        assert not (clone / "other.txt").exists()
+
+    def test_pull_failure_from_an_exception_is_a_value(self, fp, tmp_path):
+        """A timeout must not escape: the digest is the liveness signal."""
+        with patch.object(fp.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("git", 1)):
+            ok, detail = fp.pull_snapshot(str(tmp_path))
+        assert not ok and detail
+
+    def test_without_commit_the_clone_history_is_not_moved(
+            self, fp, clone_pair):
+        clone, work, _ = clone_pair
+        _human_commit(work)
+        before = _head(clone)
+        _run_main(fp, clone)
+        assert _head(clone) == before
+
+    def test_dry_run_does_not_pull(self, fp, clone_pair):
+        clone, work, _ = clone_pair
+        _human_commit(work)
+        before = _head(clone)
+        _run_main(fp, clone, ["--commit", "--dry-run"])
+        assert _head(clone) == before
+
+
+class TestNothingStaysUnpublishedSilently:
+
+    def test_a_refused_pull_commits_locally_and_says_so(self, fp, clone_pair):
+        """Skipping the write dropped the day from history. Commit locally,
+        push nothing, exit non-zero, and put the banner FIRST."""
+        clone, work, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        _human_commit(work)                  # now the clone has diverged
+        origin_before = _head(_origin(clone), "main")
+        local_before = _head(clone)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="on")
+        assert rc != 0
+        assert _head(clone, "HEAD~1") == local_before, "day not committed"
+        assert _head(_origin(clone), "main") == origin_before, "pushed"
+        assert text.startswith("*** THE FLEET RECORD IS NOT BEING PUBLISHED")
+        assert "not on GitHub: 2" in text, text
+        assert "push FAILED" not in text, "pushed after a refused pull"
+
+    def test_a_stranded_commit_is_pushed_on_a_quiet_day(self, fp, clone_pair):
+        """A transient push failure, then a day with no changes: nothing was
+        written, so nothing was pushed -- exit 0 and no banner, for weeks."""
+        clone, _, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert _head(_origin(clone), "main") == _head(clone)
+        assert "mjolnir02,off," in _published(clone, rel)
+
+    def test_an_uncommitted_snapshot_is_committed_next_run(
+            self, fp, clone_pair):
+        """A failed commit (or a hand run without --commit) leaves the new
+        state in the working tree. The next run sees no change against that
+        file, so deciding by 'changes' never committed it."""
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _run_main(fp, clone, front_end="off")            # hand run, no commit
+        assert _git(clone, "status", "--porcelain", "--", str(rel)).strip()
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert "mjolnir02,off," in _published(clone, rel)
+        assert not _git(clone, "status", "--porcelain", "--", str(rel)).strip()
+
+    def test_a_failed_commit_is_reported_then_recovered(self, fp, clone_pair):
+        """A stale index.lock makes the commit fail. That must reach the
+        digest, and the next run must commit what was left behind."""
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        lock = clone / ".git" / "index.lock"
+        lock.write_text("")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc != 0
+        assert "commit FAILED" in text, text
+        lock.unlink()
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert "mjolnir02,off," in _published(clone, rel)
+
+    def test_a_lost_push_race_is_reported(self, fp, clone_pair):
+        """Origin moves between the pull and the push: the commit stays local
+        and the rejection reaches the digest."""
+        clone, work, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        real_pull = fp.pull_snapshot
+
+        def pull_then_race(repo):
+            result = real_pull(repo)
+            _human_commit(work, "raced.txt")
+            return result
+
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off",
+                             pull=pull_then_race)
+        assert rc != 0
+        assert "push FAILED" in text, text
+        assert "mjolnir02,off," in _git(clone, "show", "HEAD:" + str(rel))
+        assert "not on GitHub: 1" in text, text
+
+    def test_a_refused_pull_with_nothing_pending_is_not_misreported(
+            self, fp, clone_pair):
+        """Origin unreachable on a quiet day: nothing is unpublished, so the
+        digest must not claim the state is missing from GitHub."""
+        clone, _, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        url = _git(clone, "remote", "get-url", "origin").strip()
+        _git(clone, "remote", "set-url", "origin", url + "-gone")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        assert "NOT BEING PUBLISHED" not in text, text
+        assert "could not refresh" in text.lower(), text
+
+
+class TestRecovery:
+
+    def test_the_recovery_hint_actually_recovers(self, fp, clone_pair,
+                                                 tmp_path):
+        """Run the pasted command from another directory; origin must then
+        hold everything the clone had stacked."""
+        clone, work, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        _human_commit(work)
+        _, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        hint = [l for l in text.splitlines() if "Recover" in l]
+        assert len(hint) == 1, text
+        assert "monitor" in hint[0]
+        assert "rebase --abort" in text, "no way out of a conflicted rebase"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        done = subprocess.run(hint[0].split(": ", 1)[1], shell=True,
+                              cwd=str(elsewhere), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=60)
+        assert done.returncode == 0, done.stdout
+        assert _head(_origin(clone), "main") == _head(clone)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        assert rc == 0, text
+
+    def _conflicted_recover(self, clone, work, rel, fp):
+        """A human edits the snapshot itself; RECOVER then stops mid-rebase."""
+        _strand_a_commit(fp, clone, rel)
+        _human_commit(work, str(rel), "unit,front_end\nmjolnir02,hand\n")
+        done = subprocess.run(
+            fp.RECOVER.format(repo=clone), shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=60)
+        assert done.returncode != 0, "expected a conflict: " + done.stdout
+
+    def test_a_clone_mid_rebase_is_not_written_or_committed(
+            self, fp, clone_pair):
+        """The next run used to parse conflict markers as units, commit them
+        inside the rebase, and repeat a RECOVER that could no longer work."""
+        clone, work, rel = clone_pair
+        self._conflicted_recover(clone, work, rel, fp)
+        head, on_disk = _head(clone), (clone / rel).read_text()
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        assert rc != 0
+        assert _head(clone) == head, "committed into an in-progress rebase"
+        assert (clone / rel).read_text() == on_disk, "wrote over a conflict"
+        assert "middle of a rebase" in text and "by hand" in text, text
+        assert "Recover (as monitor)" not in text, "offered a dead RECOVER"
+        assert "<<<<" not in text, "conflict markers reached the digest"
+
+    def test_a_clone_off_main_is_not_published_elsewhere(
+            self, fp, clone_pair):
+        """`push origin HEAD` from another branch created that branch on
+        GitHub and reported success; main never got the snapshot."""
+        clone, _, _ = clone_pair
+        _git(clone, "checkout", "-q", "-b", "foo")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        branches = _git(_origin(clone), "branch", "--list")
+        assert "foo" not in branches, branches
+        assert "main" in text and "by hand" in text, text
+
+
+class TestReadSnapshotIsDefensive:
+
+    def test_rows_that_are_not_units_are_ignored(self, fp, tmp_path):
+        snap = tmp_path / "fleet-state.csv"
+        snap.write_text(fp.render({"mjolnir02": row(fp, "mjolnir02")})
+                        + "<<<<<<< HEAD\n=======\n>>>>>>> abc\n")
+        assert set(fp.read_snapshot(str(snap))) == {"mjolnir02"}
+
+    def test_a_file_without_a_unit_column_is_empty_not_a_crash(
+            self, fp, tmp_path):
+        snap = tmp_path / "fleet-state.csv"
+        snap.write_text("name,state\nx,y\n")
+        assert fp.read_snapshot(str(snap)) == {}
