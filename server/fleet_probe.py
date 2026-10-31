@@ -544,6 +544,11 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     return "\n".join(lines)
 
 
+# Pasted by a human; both commands carry -C so it works from any directory.
+RECOVER = ("git -C {repo} pull --rebase origin main"
+           " && git -C {repo} push origin main")
+
+
 def pull_snapshot(repo):
     """Fast-forward the snapshot clone. Returns (ok, detail).
 
@@ -554,10 +559,10 @@ def pull_snapshot(repo):
     banner on log.hamma.dev cannot detect it either -- write-if-changed means
     real commit gaps already run to three weeks, far past STATE_STALE_DAYS.
 
-    `--ff-only`, deliberately, not `--rebase`: nothing watches this clone, so a
-    conflicted working tree on the VPS would be worse than a loud refusal. A
-    refusal means local commits are stacked up from earlier rejected pushes,
-    which a human resolves with `pull --rebase` and one push.
+    `--ff-only`, deliberately, not `--rebase` (decided 2026-10-31): nothing
+    watches this clone, so history is never rewritten unattended. A refusal
+    means local commits are stacked up from an earlier rejected push, which a
+    human resolves with `pull --rebase` and one push (see RECOVER).
     """
     try:
         pull = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
@@ -572,8 +577,8 @@ def pull_snapshot(repo):
         return False, str(error)
 
 
-def commit_snapshot(repo, snapshot_rel, message):
-    """Commit and push the snapshot. Returns (ok, detail)."""
+def commit_snapshot(repo, snapshot_rel, message, push=True):
+    """Commit and, if `push`, push the snapshot. Returns (ok, detail)."""
     try:
         add = subprocess.run(["git", "-C", repo, "add", "--", snapshot_rel],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -585,11 +590,13 @@ def commit_snapshot(repo, snapshot_rel, message):
                                 universal_newlines=True, timeout=60)
         if commit.returncode != 0:
             return False, commit.stdout.strip()
-        push = subprocess.run(["git", "-C", repo, "push", "origin", "HEAD"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              universal_newlines=True, timeout=120)
-        if push.returncode != 0:
-            return False, push.stdout.strip()
+        if not push:
+            return True, "committed locally; NOT pushed"
+        pushed = subprocess.run(["git", "-C", repo, "push", "origin", "HEAD"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                universal_newlines=True, timeout=120)
+        if pushed.returncode != 0:
+            return False, pushed.stdout.strip()
         return True, "committed and pushed"
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
@@ -711,7 +718,7 @@ def main():
     # ~27 minutes. A failure here is recorded, not raised: the digest still has
     # to go out, because a wedged clone and a dead probe must not look alike.
     repo_problems = []
-    if args.repo and not args.dry_run:
+    if args.commit and not args.dry_run:
         pulled, detail = pull_snapshot(args.repo)
         print("pull: {}".format(detail), file=sys.stderr)
         if not pulled:
@@ -739,34 +746,31 @@ def main():
 
     # Write-if-changed: an identical snapshot must leave no trace at all, so that
     # `git log` on it stays a clean list of real state changes.
-    status = 0
-    if repo_problems:
-        # Do not write or commit onto a baseline we could not refresh: it would
-        # diverge further, and the written file becomes the next run's
-        # baseline, so the change would be lost from the history entirely.
-        status = 1
-        print("SKIPPED write and commit: {}".format("; ".join(repo_problems)),
-              file=sys.stderr)
-    else:
-        wrote = False
-        if baseline or changes:
-            directory = os.path.dirname(snapshot)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(snapshot, "w") as handle:
-                handle.write(text)
-            wrote = True
+    # When the pull was refused, still write and commit -- locally only. The
+    # probe is the only writer of state/, so its own last commit is the right
+    # baseline; skipping the write would drop the day from history. The stacked
+    # commits publish when a human runs RECOVER.
+    status = 1 if repo_problems else 0
+    wrote = False
+    if baseline or changes:
+        directory = os.path.dirname(snapshot)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(snapshot, "w") as handle:
+            handle.write(text)
+        wrote = True
 
-        if wrote and args.commit:
-            summary = ("state: fleet baseline" if baseline else
-                       "state: {}".format(", ".join(
-                           sorted({u for u, _, _, _ in changes}))))
-            ok, detail = commit_snapshot(args.repo, snapshot_rel, summary)
-            print("commit: {}".format(detail), file=sys.stderr)
-            if not ok:
-                repo_problems.append(
-                    "snapshot commit/push FAILED: {}".format(detail))
-                status = 1
+    if wrote and args.commit:
+        summary = ("state: fleet baseline" if baseline else
+                   "state: {}".format(", ".join(
+                       sorted({u for u, _, _, _ in changes}))))
+        ok, detail = commit_snapshot(args.repo, snapshot_rel, summary,
+                                     push=not repo_problems)
+        print("commit: {}".format(detail), file=sys.stderr)
+        if not ok:
+            repo_problems.append(
+                "snapshot commit/push FAILED: {}".format(detail))
+            status = 1
 
     # Notify even when nothing changed -- the digest IS the liveness signal. A
     # silent probe and a dead probe must not look the same.
@@ -779,9 +783,9 @@ def main():
             outgoing = (
                 "*** THE FLEET RECORD IS NOT BEING PUBLISHED ***\n"
                 + "".join("  - {}\n".format(p) for p in repo_problems)
-                + "  The state below was measured but is NOT in git.\n"
-                + "  Recover: git -C {} pull --rebase origin main"
-                  " && git push\n\n".format(args.repo)
+                + "  The state below is NOT on GitHub (log.hamma.dev).\n"
+                + "  Recover (as monitor): {}\n\n".format(
+                    RECOVER.format(repo=args.repo))
                 + report)
         try:
             send_digest(outgoing, args.key_file, args.channel)
