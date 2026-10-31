@@ -644,12 +644,23 @@ def _brief(output):
     sure you have the correct access rights", hiding a key or timeout error.
     """
     noise = ("hint:", "From ", " * branch", "To ")
-    lines = [line.strip() for line in (output or "").splitlines()
-             if line.strip() and not line.startswith(noise)
-             and "FETCH_HEAD" not in line]
-    causes = [line for line in lines
-              if line.startswith(("fatal:", "error:", "ssh:", "!"))]
-    return " / ".join(causes[:2] or lines[-2:]) or "(no output)"
+    raw = [line for line in (output or "").splitlines()
+           if line.strip() and not line.startswith(noise)
+           and "FETCH_HEAD" not in line]
+    causes, after_error = [], 0
+    for line in raw:
+        text = line.strip()
+        if line.startswith("\t") and after_error:
+            causes.append(text)              # the files an error: names
+            after_error -= 1
+        elif (text.startswith(("fatal:", "error:", "ssh:", "!"))
+              or "Permission denied" in text):
+            causes.append(text)
+            after_error = 3 if text.startswith("error:") else 0
+        else:
+            after_error = 0
+    lines = [line.strip() for line in raw]
+    return " / ".join(causes[:5] or lines[-2:]) or "(no output)"
 
 
 def pull_snapshot(repo):
@@ -677,12 +688,39 @@ def pull_snapshot(repo):
         return False, str(error), False
 
 
+def _snapshot_path(snapshot_rel):
+    """The snapshot path as git prints it ('./state/x' would never match)."""
+    return os.path.normpath(snapshot_rel).replace(os.sep, "/")
+
+
 def dirty_tracked(repo, snapshot_rel):
     """Tracked files other than the snapshot with uncommitted changes."""
-    status = _git(repo, "status", "--porcelain", "-uno")
-    paths = [line[3:].split(" -> ")[-1] for line in status.stdout.splitlines()
-             if line.strip()]
-    return [path for path in paths if path != snapshot_rel]
+    status = _git(repo, "status", "--porcelain", "-z", "-uno")
+    entries = status.stdout.split("\0")
+    paths, skip = [], False
+    for entry in entries:
+        if skip or len(entry) < 4:
+            skip = False
+            continue
+        paths.append(entry[3:])
+        skip = entry[0] in "RC"              # -z: the rename source follows
+    return [path for path in paths if path != _snapshot_path(snapshot_rel)]
+
+
+def incoming_changes(repo):
+    """(changed, added) paths between HEAD and origin/main's trees."""
+    changed = _git(repo, "diff", "--name-only", "-z", "HEAD",
+                   "origin/" + BRANCH)
+    added = _git(repo, "diff", "--name-only", "-z", "--diff-filter=A",
+                 "HEAD", "origin/" + BRANCH)
+    return (set(filter(None, changed.stdout.split("\0"))),
+            set(filter(None, added.stdout.split("\0"))))
+
+
+def untracked_files(repo):
+    """Untracked, non-ignored files in the clone."""
+    listed = _git(repo, "ls-files", "-z", "--others", "--exclude-standard")
+    return set(filter(None, listed.stdout.split("\0")))
 
 
 def snapshot_uncommitted(repo, snapshot_rel):
@@ -734,12 +772,26 @@ def commit_summary(repo, snapshot_rel):
     return "state: {}".format(", ".join(sorted(units)))
 
 
-def published_snapshot(repo, snapshot_rel):
-    """The snapshot as origin/main has it (GitHub), or {}."""
-    shown = _git(repo, "show", "origin/{}:{}".format(BRANCH, snapshot_rel))
+def published_snapshot(repo, snapshot_rel, ref="origin/" + BRANCH):
+    """The snapshot as `ref` has it (default: GitHub's), or {}."""
+    shown = _git(repo, "show", "{}:{}".format(ref, snapshot_rel))
     if shown.returncode != 0:
         return {}
     return parse_snapshot(io.StringIO(shown.stdout))
+
+
+def last_readable_snapshot(repo, snapshot_rel):
+    """The newest readable committed snapshot (HEAD, then origin/main)."""
+    if not repo:
+        return {}
+    for ref in ("HEAD", "origin/" + BRANCH):
+        try:
+            rows = published_snapshot(repo, snapshot_rel, ref)
+        except SnapshotUnreadable:
+            continue
+        if rows:
+            return rows
+    return {}
 
 
 def unpushed(repo):
@@ -783,6 +835,9 @@ def commit_snapshot(repo, snapshot_rel, message):
         add = _git(repo, "add", "--", snapshot_rel)
         if add.returncode != 0:
             return False, _brief(add.stdout)
+        if _git(repo, "diff", "--cached", "--quiet", "--",
+                snapshot_rel).returncode == 0:
+            return True, "nothing to commit"
         # Path-scoped: anything else already staged in the clone stays out.
         commit = _git(repo, "commit", "-q", "-m", message, "--", snapshot_rel)
         if commit.returncode != 0:
@@ -794,10 +849,10 @@ def commit_snapshot(repo, snapshot_rel, message):
 
 def new_publish_state(repo, snapshot_rel):
     """What prepare_clone() / publish_snapshot() found, for the banner."""
-    return {"repo": repo, "rel": snapshot_rel, "checked": False,
-            "blocker": None, "pulled": False, "fetched": False,
-            "commit_failed": False, "untracked": None, "ahead": None,
-            "problems": []}
+    return {"repo": repo, "rel": _snapshot_path(snapshot_rel),
+            "checked": False, "blocker": None, "pulled": False,
+            "fetched": False, "commit_failed": False, "untracked": None,
+            "ahead": None, "dirty": [], "problems": []}
 
 
 def prepare_clone(repo, snapshot_rel):
@@ -815,13 +870,21 @@ def prepare_clone(repo, snapshot_rel):
         print("pull: {}".format(detail), file=sys.stderr)
         state.update(pulled=pulled, fetched=fetched)
         if not pulled and fetched:
-            # A hand edit to a file origin then changed refuses the
-            # fast-forward every day, and RECOVER refuses it too.
-            dirty = dirty_tracked(repo, snapshot_rel)
-            if dirty:
-                blocker = ("holding uncommitted edits ({}) that block the "
-                           "fast-forward".format(", ".join(dirty)),
-                           ["git -C {} stash".format(repo)])
+            # A hand edit to a file origin changed, or an untracked file
+            # where origin adds one, refuses the fast-forward every day, and
+            # RECOVER refuses it too. Unrelated edits are not the cause (a
+            # divergence is), but they still stop RECOVER: the banner sets
+            # them aside first, without dropping the day.
+            state["dirty"] = dirty_tracked(repo, state["rel"])
+            changed, added = incoming_changes(repo)
+            in_the_way = sorted((set(state["dirty"]) & changed)
+                                | (untracked_files(repo) & added))
+            if in_the_way:
+                blocker = ("holding uncommitted or untracked files ({}) that "
+                           "block the fast-forward".format(
+                               ", ".join(in_the_way)),
+                           ["git -C {} stash --include-untracked".format(
+                               repo)])
         if not pulled and not blocker:
             state["problems"].append(
                 "could not refresh the sensor-log clone: {}".format(detail))
@@ -839,6 +902,8 @@ def publish_snapshot(state):
     Commits the snapshot if it differs from HEAD, checks git can see it, and
     pushes whatever origin/main lacks (only if the fast-forward succeeded).
     """
+    if not state["checked"]:
+        raise ValueError("publish_snapshot() needs a prepare_clone() state")
     repo, rel = state["repo"], state["rel"]
     if state["blocker"]:
         return state
@@ -876,8 +941,13 @@ def publish_banner(state):
     recover = RECOVER.format(repo=repo)
     unpublished = (state["blocker"] or ahead != 0 or state["commit_failed"]
                    or state["untracked"])
-    lines = ["*** THE FLEET RECORD IS NOT BEING PUBLISHED ***" if unpublished
-             else "*** COULD NOT REFRESH THE SENSOR-LOG CLONE ***"]
+    if unpublished:
+        heading = "*** THE FLEET RECORD IS NOT BEING PUBLISHED ***"
+    elif not state["fetched"]:
+        heading = "*** COULD NOT REFRESH THE SENSOR-LOG CLONE ***"
+    else:
+        heading = "*** FLEET RECORD PROBLEM ***"
+    lines = [heading]
     lines += ["  - {}".format(p) for p in problems]
     if state["blocker"]:
         lines.append("  Fix by hand, as monitor, and only if nobody is "
@@ -912,6 +982,11 @@ def publish_banner(state):
             lines.append("  GitHub was unreachable; the next run retries on "
                          "its own. If it keeps failing:")
         lines.append("  Recover (as monitor):")
+        if state["dirty"]:
+            lines.append("  (uncommitted edits to {} would stop it; they "
+                         "are set aside first)".format(
+                             ", ".join(state["dirty"])))
+            lines.append("    $ git -C {} stash".format(repo))
         lines.append("    $ {}".format(recover))
         lines.append("  If that stops on a conflict, back out with: "
                      "git -C {} rebase --abort".format(repo))
@@ -1054,13 +1129,26 @@ def main():
 
     # A blocked clone's working file is not the record (it may hold conflict
     # markers or another branch's state), so diff against what GitHub has.
+    unreadable = False
     try:
         previous = (published_snapshot(args.repo, snapshot_rel)
                     if publish["blocker"] else read_snapshot(snapshot))
     except SnapshotUnreadable as error:
-        previous = {}
-        repo_problems.append("the snapshot is unreadable ({}); treated as "
-                             "empty and rewritten".format(error))
+        if publish["blocker"]:
+            previous = {}
+            repo_problems.append("GitHub's snapshot is unreadable ({}); "
+                                 "today's digest has no baseline".format(error))
+        else:
+            # Treating it as empty let merge() drop every unit it could not
+            # re-probe; the last committed copy keeps their last-known state.
+            unreadable = True
+            previous = last_readable_snapshot(args.repo, snapshot_rel)
+            repo_problems.append(
+                "the snapshot file was unreadable ({}); {}, and it is "
+                "rewritten from today's probe".format(
+                    error, "diffed against the last committed copy"
+                    if previous else "no readable copy in git, so treated "
+                    "as empty"))
     baseline = not previous
     changes = diff(previous, current)
     merged = merge(previous, current)
@@ -1087,7 +1175,7 @@ def main():
     # baseline; skipping the write would drop the day from history. The stacked
     # commits publish when a human runs RECOVER. A blocked clone (mid-rebase,
     # off main) is not touched at all.
-    if not publish["blocker"] and (baseline or changes):
+    if not publish["blocker"] and (baseline or changes or unreadable):
         directory = os.path.dirname(snapshot)
         if directory:
             os.makedirs(directory, exist_ok=True)

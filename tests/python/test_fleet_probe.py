@@ -1429,12 +1429,10 @@ class TestRobustness:
         clone, _, rel = clone_pair
         assert _run_main(fp, clone, PUBLISH)[0] == 0
         before = (clone / rel).read_text()
-        real_replace = fp.os.replace
         with patch.object(fp.os, "replace", side_effect=OSError("crash")):
             with pytest.raises(OSError):
                 _run_main(fp, clone, PUBLISH, front_end="off")
         assert (clone / rel).read_text() == before
-        assert real_replace
 
     def test_a_narrowed_fetch_refspec_still_refreshes_origin_main(
             self, fp, clone_pair):
@@ -1493,3 +1491,197 @@ def test_field_report_on_an_unreadable_snapshot_fails_cleanly(fp, tmp_path,
                                        str(snap), "--field", "front_end"]):
         assert fp.main() == 1
     assert "unreadable" in capsys.readouterr().err
+
+
+
+class TestRoundFive:
+    """Findings of the red team on 924571a."""
+
+    def test_an_untracked_file_in_the_way_blocks_with_a_working_fix(
+            self, fp, clone_pair, tmp_path):
+        """Origin adds a file the clone has untracked: --ff-only refuses, and
+        RECOVER failed too ('untracked working tree files would be
+        overwritten'). status -uno never saw it."""
+        clone, work, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "deployments").mkdir()
+        (clone / "deployments" / "mj02.md").write_text("local notes\n")
+        _human_commit(work, "deployments/mj02.md", "from origin\n")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc != 0
+        assert "deployments/mj02.md" in text, text
+        _run_steps(_fix_steps(text), tmp_path)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert "local notes" in _git(clone, "stash", "show", "-p",
+                                     "--include-untracked", check=False) \
+            or "local notes" in _git(clone, "show", "stash@{0}^3:"
+                                     "deployments/mj02.md", check=False)
+
+    def test_an_unrelated_edit_on_a_diverged_clone_keeps_the_day(
+            self, fp, clone_pair, tmp_path):
+        """Divergence refused the fast-forward, not the edit. The day is
+        committed locally; the edit is set aside only because RECOVER (a
+        rebase) refuses unstaged changes."""
+        clone, work, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        _human_commit(work)
+        (clone / "README").write_text("edited by hand\n")
+        head = _head(clone)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="on")
+        assert rc != 0
+        assert _head(clone, "HEAD~1") == head, "the day was dropped"
+        assert "block the fast-forward" not in text, "wrong cause: " + text
+        steps = _fix_steps(text)
+        assert steps[0].endswith("stash") and steps[-1] == \
+            fp.RECOVER.format(repo=clone), steps
+        _run_steps(steps, tmp_path)
+        assert _run_main(fp, clone, PUBLISH, front_end="on")[0] == 0
+
+    def test_a_network_failure_with_a_dirty_file_is_not_a_blocker(
+            self, fp, clone_pair):
+        clone, _, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "README").write_text("edited by hand\n")
+        url = _git(clone, "remote", "get-url", "origin").strip()
+        _git(clone, "remote", "set-url", "origin", url + "-gone")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        assert text.startswith("*** COULD NOT REFRESH"), text
+        assert "stash" not in text and "by hand" not in text, text
+
+    def test_an_unreadable_working_snapshot_keeps_last_known_state(
+            self, fp, clone_pair):
+        """previous = {} let merge() drop everything it could not re-probe:
+        an unreachable unit was published as unreachable,unknown,..."""
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH, front_end="off")[0] == 0
+        (clone / rel).write_text("unit,front_end\nmjolnir02," + "x" * 200000
+                                 + "\n")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        assert rc != 0 and "unreadable" in text, text
+        assert "baseline" not in text, text
+        assert text.startswith("*** FLEET RECORD PROBLEM ***"), text
+        assert "mjolnir02,off," in _published(clone, rel)
+
+    def test_unreadable_while_blocked_does_not_claim_a_rewrite(
+            self, fp, clone_pair):
+        clone, work, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _human_commit(work, str(rel), "unit,front_end\nmjolnir02,"
+                      + "x" * 200000 + "\n")
+        _git(clone, "fetch", "-q", "origin")
+        _git(clone, "checkout", "-q", "-b", "side")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        assert "rewritten" not in text, text
+        assert "unreadable" in text, text
+
+    def test_brief_keeps_the_key_error_and_the_blocking_files(self, fp):
+        key = ("git@github.com: Permission denied (publickey).\n"
+               "fatal: Could not read from remote repository.\n\n"
+               "Please make sure you have the correct access rights\n")
+        assert "Permission denied (publickey)" in fp._brief(key)
+        merge = ("Updating a..b\n"
+                 "error: Your local changes to the following files would be "
+                 "overwritten by merge:\n\tdeployments/mj02.md\n"
+                 "Please commit your changes or stash them before you merge.\n"
+                 "Aborting\n")
+        assert "deployments/mj02.md" in fp._brief(merge), fp._brief(merge)
+
+    def test_commit_snapshot_with_nothing_to_commit_is_not_a_failure(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        ok, detail = fp.commit_snapshot(str(clone), str(rel), "state: x")
+        assert ok and "nothing" in detail, detail
+
+    def test_a_failing_commit_is_a_failure(self, fp, clone_pair):
+        """Only `add` failures were tested; the commit step itself can fail
+        too (a hook, a lock taken between add and commit)."""
+        clone, _, _ = clone_pair
+        hook = clone / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0 and "commit FAILED" in text, text
+
+    def test_publish_without_prepare_is_refused(self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        with pytest.raises(ValueError):
+            fp.publish_snapshot(fp.new_publish_state(str(clone), str(rel)))
+
+    def test_a_dotted_snapshot_path_is_not_mistaken_for_a_hand_edit(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / rel).write_text((clone / rel).read_text() + "\n")
+        assert fp.dirty_tracked(str(clone), "./" + str(rel)) == []
+        state = fp.new_publish_state(str(clone), "./" + str(rel))
+        assert state["rel"] == str(rel)
+
+    def test_a_dirty_file_with_a_space_is_named_plainly(self, fp, clone_pair):
+        clone, work, _ = clone_pair
+        _human_commit(work, "a b.txt", "x\n")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "a b.txt").write_text("edited\n")
+        assert fp.dirty_tracked(str(clone), "state/fleet-state.csv") == \
+            ["a b.txt"]
+
+    def test_changed_since_survives_a_corrupt_historic_snapshot(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        (clone / rel).parent.mkdir(exist_ok=True)
+        (clone / rel).write_text("unit,front_end\nmjolnir02," + "x" * 200000
+                                 + "\n")
+        _git(clone, "add", str(rel))
+        _git(clone, "commit", "-q", "-m", "corrupt")
+        assert fp.changed_since(str(clone), str(rel), "mjolnir02",
+                                ("on", "default")) is None
+
+    def test_a_problem_without_publishing_gets_its_own_heading(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        (clone / rel).parent.mkdir(exist_ok=True)
+        (clone / rel).write_text("unit,front_end\nmjolnir02," + "x" * 200000
+                                 + "\n")
+        rc, text = _run_main(fp, clone, ["--notify"])
+        assert text.startswith("*** FLEET PROBE PROBLEM ***"), text
+        assert "unreadable" in text
+
+
+class TestRoundFiveFallbackOrder:
+
+    def _corrupt(self, clone, rel):
+        (clone / rel).write_text("unit,front_end\nmjolnir02," + "x" * 200000
+                                 + "\n")
+
+    def test_the_local_commit_is_preferred_over_github(self, fp, clone_pair):
+        """HEAD holds the probe's newest state (an unpushed 'off'); GitHub
+        still says 'on'. The fallback must keep the newer local state."""
+        clone, _, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)                 # HEAD off, origin on
+        self._corrupt(clone, rel)
+        _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        assert "mjolnir02,off," in _published(clone, rel)
+
+    def test_github_is_used_when_the_local_commit_is_corrupt(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0     # origin: on
+        self._corrupt(clone, rel)
+        _git(clone, "commit", "-q", "-am", "corrupt, unpushed")
+        _run_main(fp, clone, PUBLISH, front_end="unreachable")
+        assert "mjolnir02,on," in _published(clone, rel), \
+            "last-known state lost when HEAD was unreadable"
+
+
+def test_a_staged_rename_is_listed_once_by_its_new_name(fp, clone_pair):
+    clone, work, _ = clone_pair
+    _human_commit(work, "old.txt", "x\n")
+    _human_commit(work, "keep.txt", "y\n")
+    _git(clone, "pull", "-q", "--ff-only", "origin", "main")
+    _git(clone, "mv", "old.txt", "new.txt")
+    (clone / "keep.txt").write_text("edited\n")
+    assert sorted(fp.dirty_tracked(str(clone), "state/fleet-state.csv")) == \
+        ["keep.txt", "new.txt"]
