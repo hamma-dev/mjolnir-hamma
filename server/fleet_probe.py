@@ -325,10 +325,21 @@ def read_snapshot(path):
         return parse_snapshot(handle)
 
 
+class SnapshotUnreadable(Exception):
+    """The snapshot exists but is not parseable CSV."""
+
+
 def parse_snapshot(lines):
-    """{unit: row} from CSV text lines, keeping only real unit rows."""
-    return {r["unit"]: r for r in csv.DictReader(lines)
-            if UNIT_ROW.match(r.get("unit") or "")}
+    """{unit: row} from CSV text lines, keeping only real unit rows.
+
+    Raises SnapshotUnreadable rather than csv.Error: a NUL byte (Python 3.8,
+    the VPS) or an over-long field used to kill the run before the digest.
+    """
+    try:
+        return {r["unit"]: r for r in csv.DictReader(lines)
+                if UNIT_ROW.match(r.get("unit") or "")}
+    except csv.Error as error:
+        raise SnapshotUnreadable(str(error))
 
 
 def render(rows):
@@ -470,7 +481,7 @@ def changed_since(repo, snapshot_rel, unit, current_state, limit=200):
                 universal_newlines=True, timeout=30)
             if show.returncode != 0:
                 break
-            rows = {r["unit"]: r for r in csv.DictReader(io.StringIO(show.stdout))}
+            rows = parse_snapshot(io.StringIO(show.stdout))
             row = rows.get(unit)
             if row is None:
                 break
@@ -478,7 +489,7 @@ def changed_since(repo, snapshot_rel, unit, current_state, limit=200):
                 break
             oldest_matching = date.strip()
         return oldest_matching
-    except (OSError, subprocess.SubprocessError, csv.Error):
+    except (OSError, subprocess.SubprocessError, SnapshotUnreadable):
         return None
 
 
@@ -580,7 +591,7 @@ IN_PROGRESS = [
     ("MERGE_HEAD", "a merge", "merge --abort"),
     ("CHERRY_PICK_HEAD", "a cherry-pick", "cherry-pick --abort"),
     ("REVERT_HEAD", "a revert", "revert --abort"),
-    ("sequencer", "a cherry-pick/revert sequence", "cherry-pick --quit"),
+    ("sequencer", "a cherry-pick/revert sequence", "cherry-pick --abort"),
     ("BISECT_START", "a bisect", "bisect reset"),
 ]
 
@@ -615,20 +626,30 @@ def clone_blocker(repo):
         branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD")
         if branch.stdout.strip() != BRANCH:
             where = branch.stdout.strip() or "a detached HEAD"
+            # Uncommitted edits would make the checkout refuse.
+            dirty = _git(repo, "status", "--porcelain", "-uno")
+            stash = [git_step("stash")] if dirty.stdout.strip() else []
             return ("not on {} (on {})".format(BRANCH, where),
-                    [git_step("checkout", BRANCH)])
+                    stash + [git_step("checkout", BRANCH)])
     except (OSError, subprocess.SubprocessError) as error:
         return "not inspectable ({})".format(error), []
     return None
 
 
 def _brief(output):
-    """The meaningful line(s) of git output, for a chat bullet."""
+    """The meaningful line(s) of git output, for a chat bullet.
+
+    git puts the cause first (`fatal:`, `error:`, `ssh:`) and boilerplate
+    after it, so prefer those lines; the last lines were often "Please make
+    sure you have the correct access rights", hiding a key or timeout error.
+    """
     noise = ("hint:", "From ", " * branch", "To ")
     lines = [line.strip() for line in (output or "").splitlines()
              if line.strip() and not line.startswith(noise)
              and "FETCH_HEAD" not in line]
-    return " / ".join(lines[-2:]) or "(no output)"
+    causes = [line for line in lines
+              if line.startswith(("fatal:", "error:", "ssh:", "!"))]
+    return " / ".join(causes[:2] or lines[-2:]) or "(no output)"
 
 
 def pull_snapshot(repo):
@@ -639,9 +660,13 @@ def pull_snapshot(repo):
     means local commits are stacked up from an earlier failed push, which a
     human resolves with RECOVER. Fetch and merge are separate so the caller
     knows whether origin/main is current (a refusal) or stale (no network).
+    The explicit refspec updates origin/main even if the clone's
+    remote.origin.fetch was narrowed.
     """
     try:
-        fetch = _git(repo, "fetch", "origin", BRANCH, timeout=120)
+        fetch = _git(repo, "fetch", "origin",
+                     "+refs/heads/{0}:refs/remotes/origin/{0}".format(BRANCH),
+                     timeout=120)
         if fetch.returncode != 0:
             return False, "fetch failed: " + _brief(fetch.stdout), False
         merge = _git(repo, "merge", "--ff-only", "origin/" + BRANCH)
@@ -650,6 +675,14 @@ def pull_snapshot(repo):
         return True, _brief(merge.stdout), True
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error), False
+
+
+def dirty_tracked(repo, snapshot_rel):
+    """Tracked files other than the snapshot with uncommitted changes."""
+    status = _git(repo, "status", "--porcelain", "-uno")
+    paths = [line[3:].split(" -> ")[-1] for line in status.stdout.splitlines()
+             if line.strip()]
+    return [path for path in paths if path != snapshot_rel]
 
 
 def snapshot_uncommitted(repo, snapshot_rel):
@@ -666,14 +699,18 @@ def snapshot_uncommitted(repo, snapshot_rel):
 def snapshot_untracked(repo, snapshot_rel):
     """Why git would never publish the snapshot file, or None.
 
-    A gitignored or skip-worktree snapshot reads as clean to `git status`, so
-    it would be written every day and never committed, with exit 0.
+    A gitignored, skip-worktree or assume-unchanged snapshot reads as clean to
+    `git status`, so it would be written every day and never committed, with
+    exit 0. `ls-files -v` tags: S = skip-worktree, lowercase = assume-unchanged
+    (also fsmonitor-valid, which the VPS clone does not use).
     """
     listed = _git(repo, "ls-files", "-v", "--", snapshot_rel)
     if listed.returncode != 0 or not listed.stdout.strip():
         return "the snapshot is not tracked by git (gitignored?)"
-    if listed.stdout.startswith("S"):
-        return "the snapshot is marked skip-worktree, so git ignores changes"
+    tag = listed.stdout[0]
+    if tag == "S" or tag.islower():
+        return ("the snapshot is marked skip-worktree/assume-unchanged, so "
+                "git ignores its changes")
     return None
 
 
@@ -735,12 +772,12 @@ def push_snapshot(repo):
         return False, str(error)
 
 
-def commit_snapshot(repo, snapshot_rel, message, push=True):
-    """Commit the snapshot (and only it) and, if `push`, push.
+def commit_snapshot(repo, snapshot_rel, message):
+    """Commit the snapshot, and only it. Returns (ok, detail).
 
-    Returns (ok, detail). With push=True, ok is False both when the commit
-    failed and when it succeeded but the push did not -- callers that must
-    tell those apart pass push=False and call push_snapshot() themselves.
+    Never pushes: with the push folded in, (False, ...) meant either "not
+    committed" or "committed but not pushed", and a caller rolling back on
+    False stranded a commit. Pushing is push_snapshot()'s job.
     """
     try:
         add = _git(repo, "add", "--", snapshot_rel)
@@ -750,52 +787,135 @@ def commit_snapshot(repo, snapshot_rel, message, push=True):
         commit = _git(repo, "commit", "-q", "-m", message, "--", snapshot_rel)
         if commit.returncode != 0:
             return False, _brief(commit.stdout)
-        if not push:
-            return True, "committed locally; NOT pushed"
-        ok, detail = push_snapshot(repo)
-        return ok, ("committed and " + detail) if ok else detail
+        return True, "committed locally"
     except (OSError, subprocess.SubprocessError) as error:
         return False, str(error)
 
 
-def publish_banner(repo, problems, blocker, fetched, ahead, commit_failed):
-    """The text put in front of the digest when publishing went wrong.
+def new_publish_state(repo, snapshot_rel):
+    """What prepare_clone() / publish_snapshot() found, for the banner."""
+    return {"repo": repo, "rel": snapshot_rel, "checked": False,
+            "blocker": None, "pulled": False, "fetched": False,
+            "commit_failed": False, "untracked": None, "ahead": None,
+            "problems": []}
+
+
+def prepare_clone(repo, snapshot_rel):
+    """Publishing, step 1 -- before the baseline is read.
+
+    Refuses a clone that needs a human (clone_blocker), else fetches and
+    fast-forwards. Any other writer of the snapshot (e.g. the mjol_array
+    hook) must call this and publish_snapshot() rather than re-implement them.
+    """
+    state = new_publish_state(repo, snapshot_rel)
+    state["checked"] = True
+    blocker = clone_blocker(repo)
+    if not blocker:
+        pulled, detail, fetched = pull_snapshot(repo)
+        print("pull: {}".format(detail), file=sys.stderr)
+        state.update(pulled=pulled, fetched=fetched)
+        if not pulled and fetched:
+            # A hand edit to a file origin then changed refuses the
+            # fast-forward every day, and RECOVER refuses it too.
+            dirty = dirty_tracked(repo, snapshot_rel)
+            if dirty:
+                blocker = ("holding uncommitted edits ({}) that block the "
+                           "fast-forward".format(", ".join(dirty)),
+                           ["git -C {} stash".format(repo)])
+        if not pulled and not blocker:
+            state["problems"].append(
+                "could not refresh the sensor-log clone: {}".format(detail))
+    if blocker:
+        state["blocker"] = blocker
+        state["problems"].append(
+            "the sensor-log clone is {}; nothing was written or "
+            "committed".format(blocker[0]))
+    return state
+
+
+def publish_snapshot(state):
+    """Publishing, step 2 -- after the snapshot file is written.
+
+    Commits the snapshot if it differs from HEAD, checks git can see it, and
+    pushes whatever origin/main lacks (only if the fast-forward succeeded).
+    """
+    repo, rel = state["repo"], state["rel"]
+    if state["blocker"]:
+        return state
+    if snapshot_uncommitted(repo, rel):
+        ok, detail = commit_snapshot(repo, rel, commit_summary(repo, rel))
+        print("commit: {}".format(detail), file=sys.stderr)
+        if not ok:
+            state["problems"].append(
+                "snapshot commit FAILED: {}".format(detail))
+            state["commit_failed"] = True
+    if not state["commit_failed"] and os.path.exists(os.path.join(repo, rel)):
+        state["untracked"] = snapshot_untracked(repo, rel)
+        if state["untracked"]:
+            state["problems"].append(state["untracked"])
+    if state["pulled"]:
+        ok, detail = push_snapshot(repo)
+        print("push: {}".format(detail), file=sys.stderr)
+        if not ok:
+            state["problems"].append(
+                "snapshot push FAILED: {}".format(detail))
+    state["ahead"] = unpushed(repo)
+    return state
+
+
+def publish_banner(state):
+    """The text put in front of the digest when something went wrong.
 
     Every command a human is told to run is on its own `$ ` line, and each one
     has been run by the tests in the state it is printed for.
     """
+    repo, problems, ahead = state["repo"], state["problems"], state["ahead"]
+    if not state["checked"]:
+        return ("*** FLEET PROBE PROBLEM ***\n"
+                + "".join("  - {}\n".format(p) for p in problems) + "\n")
     recover = RECOVER.format(repo=repo)
-    if blocker or ahead != 0:
-        lines = ["*** THE FLEET RECORD IS NOT BEING PUBLISHED ***"]
-    else:
-        lines = ["*** COULD NOT REFRESH THE SENSOR-LOG CLONE ***"]
+    unpublished = (state["blocker"] or ahead != 0 or state["commit_failed"]
+                   or state["untracked"])
+    lines = ["*** THE FLEET RECORD IS NOT BEING PUBLISHED ***" if unpublished
+             else "*** COULD NOT REFRESH THE SENSOR-LOG CLONE ***"]
     lines += ["  - {}".format(p) for p in problems]
-    if ahead is None and not blocker:
+    if state["blocker"]:
+        lines.append("  Fix by hand, as monitor, and only if nobody is "
+                     "working in the clone (this discards an unfinished operation; "
+                     "anything already committed on {} is then "
+                     "published):".format(BRANCH))
+        lines += ["    $ {}".format(step)
+                  for step in state["blocker"][1] + [recover]]
+        return "\n".join(lines) + "\n\n"
+    if ahead is None:
         lines.append("  Local commits not on GitHub: unknown (no origin/{} "
                      "ref)".format(BRANCH))
     elif ahead:
         lines.append("  Local commits not on GitHub: {}{}".format(
-            ahead, "" if fetched else " (as of the last successful fetch)"))
-    if blocker:
-        reason, steps = blocker
-        lines.append("  Fix by hand, as monitor, in this order:")
-        lines += ["    $ {}".format(step) for step in steps + [recover]]
-        return "\n".join(lines) + "\n\n"
-    if commit_failed:
+            ahead, "" if state["fetched"]
+            else " (as of the last successful fetch)"))
+    if state["commit_failed"]:
         lines.append("  The commit failed; the next run retries it.")
         lock = os.path.join(repo, ".git", "index.lock")
         if os.path.exists(lock):
             lines.append("  A stale lock blocks git. If no git command is "
                          "running, as monitor:")
             lines.append("    $ rm {}".format(lock))
+    if state["untracked"]:
+        lines.append("  Fix that and the next run commits it; to see why:")
+        lines.append("    $ git -C {} {}".format(
+            repo, "check-ignore -v " + state["rel"]
+            if "gitignored" in state["untracked"]
+            else "ls-files -v " + state["rel"]))
     if ahead != 0:
-        if not fetched:
+        if not state["fetched"]:
             lines.append("  GitHub was unreachable; the next run retries on "
                          "its own. If it keeps failing:")
-        lines.append("  Recover (as monitor): {}".format(recover))
-        lines.append("  If that stops on a conflict: git -C {} rebase --abort,"
-                     " then resolve by hand.".format(repo))
-    else:
+        lines.append("  Recover (as monitor):")
+        lines.append("    $ {}".format(recover))
+        lines.append("  If that stops on a conflict, back out with: "
+                     "git -C {} rebase --abort".format(repo))
+    elif not state["fetched"] and not unpublished:
         lines.append("  Usually transient: the next run retries on its own. "
                      "If it repeats, check monitor can reach GitHub:")
         lines.append("    $ git -C {} fetch origin".format(repo))
@@ -860,6 +980,8 @@ def main():
     # cannot surprise anyone by pushing or paging. The cron line asks for them.
     if args.commit and not args.repo:
         parser.error("--commit requires --repo")
+    if args.repo:                  # banner paths must be copy-pasteable
+        args.repo = os.path.abspath(args.repo)
     snapshot_rel = os.path.join("state", "fleet-state.csv")
     snapshot = (os.path.join(args.repo, snapshot_rel) if args.repo
                 else args.snapshot)
@@ -867,7 +989,12 @@ def main():
     # --field is a read-only report over the existing snapshot: no probing, no
     # fleet contact, no write. It short-circuits before anything reaches out.
     if args.field:
-        rows = read_snapshot(snapshot)
+        try:
+            rows = read_snapshot(snapshot)
+        except SnapshotUnreadable as error:
+            print("snapshot at {} is unreadable: {}".format(snapshot, error),
+                  file=sys.stderr)
+            return 1
         if not rows:
             print("no snapshot to report on at {}".format(snapshot),
                   file=sys.stderr)
@@ -920,24 +1047,20 @@ def main():
     # window between pull and push short -- the sweep is serial and can take
     # ~27 minutes. A failure here is recorded, not raised: the digest still has
     # to go out, because a wedged clone and a dead probe must not look alike.
-    repo_problems = []
-    blocker, pulled, fetched = None, False, False
-    if args.commit and not args.dry_run:
-        blocker = clone_blocker(args.repo)
-        if blocker:
-            repo_problems.append("the sensor-log clone is {}; nothing was "
-                                 "written or committed".format(blocker[0]))
-        else:
-            pulled, detail, fetched = pull_snapshot(args.repo)
-            print("pull: {}".format(detail), file=sys.stderr)
-            if not pulled:
-                repo_problems.append(
-                    "could not refresh the sensor-log clone: {}".format(detail))
+    publish = (prepare_clone(args.repo, snapshot_rel)
+               if args.commit and not args.dry_run
+               else new_publish_state(args.repo, snapshot_rel))
+    repo_problems = publish["problems"]
 
     # A blocked clone's working file is not the record (it may hold conflict
     # markers or another branch's state), so diff against what GitHub has.
-    previous = (published_snapshot(args.repo, snapshot_rel) if blocker
-                else read_snapshot(snapshot))
+    try:
+        previous = (published_snapshot(args.repo, snapshot_rel)
+                    if publish["blocker"] else read_snapshot(snapshot))
+    except SnapshotUnreadable as error:
+        previous = {}
+        repo_problems.append("the snapshot is unreadable ({}); treated as "
+                             "empty and rewritten".format(error))
     baseline = not previous
     changes = diff(previous, current)
     merged = merge(previous, current)
@@ -964,39 +1087,19 @@ def main():
     # baseline; skipping the write would drop the day from history. The stacked
     # commits publish when a human runs RECOVER. A blocked clone (mid-rebase,
     # off main) is not touched at all.
-    status = 1 if repo_problems else 0
-    if not blocker and (baseline or changes):
+    if not publish["blocker"] and (baseline or changes):
         directory = os.path.dirname(snapshot)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(snapshot, "w") as handle:
+        # Atomic: a crash mid-write must not leave a truncated record.
+        partial = snapshot + ".partial"
+        with open(partial, "w") as handle:
             handle.write(text)
+        os.replace(partial, snapshot)
 
-    ahead, commit_failed = None, False
-    if args.commit and not blocker:
-        if snapshot_uncommitted(args.repo, snapshot_rel):
-            summary = commit_summary(args.repo, snapshot_rel)
-            ok, detail = commit_snapshot(args.repo, snapshot_rel, summary,
-                                         push=False)
-            print("commit: {}".format(detail), file=sys.stderr)
-            if not ok:
-                repo_problems.append(
-                    "snapshot commit FAILED: {}".format(detail))
-                commit_failed = True
-                status = 1
-        if os.path.exists(snapshot):
-            untracked = snapshot_untracked(args.repo, snapshot_rel)
-            if untracked:
-                repo_problems.append(untracked)
-                status = 1
-        if pulled:
-            ok, detail = push_snapshot(args.repo)
-            print("push: {}".format(detail), file=sys.stderr)
-            if not ok:
-                repo_problems.append(
-                    "snapshot push FAILED: {}".format(detail))
-                status = 1
-        ahead = unpushed(args.repo)
+    if publish["checked"]:
+        publish_snapshot(publish)
+    status = 1 if repo_problems else 0
 
     for problem in repo_problems:
         print("PUBLISH PROBLEM: {}".format(problem), file=sys.stderr)
@@ -1009,8 +1112,7 @@ def main():
             # Say it where humans actually read, and first. This failure was
             # silent for a month because it went only to a cron log while the
             # digest looked completely normal.
-            outgoing = publish_banner(args.repo, repo_problems, blocker,
-                                      fetched, ahead, commit_failed) + report
+            outgoing = publish_banner(publish) + report
         try:
             send_digest(outgoing, args.key_file, args.channel)
             print("digest sent to '{}'".format(args.channel), file=sys.stderr)

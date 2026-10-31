@@ -939,7 +939,13 @@ class TestNothingStaysUnpublishedSilently:
         rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
         assert rc != 0
         assert "commit FAILED" in text, text
-        assert "index.lock" in text, "no hint at the stale lock: " + text
+        assert any(step.startswith("rm ") and step.endswith("index.lock")
+                   for step in _fix_steps(text)), "no lock step: " + text
+        assert text.startswith("*** THE FLEET RECORD IS NOT BEING PUBLISHED"), \
+            "today's state is unpublished; wrong heading: " + text
+        assert "fetch origin" not in text, "GitHub was fine: " + text
+        assert "remove the file manually" not in text, \
+            "git boilerplate instead of the error: " + text
         lock.unlink()
         rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
         assert rc == 0, text
@@ -990,7 +996,7 @@ class TestNothingStaysUnpublishedSilently:
         assert "NOT BEING PUBLISHED" in text, text
         assert "None" not in capsys.readouterr().err
 
-    def test_a_refused_pull_with_nothing_pending_is_not_misreported(
+    def test_an_unreachable_origin_with_nothing_pending_is_not_misreported(
             self, fp, clone_pair):
         """Origin unreachable on a quiet day: nothing is unpublished, so the
         digest must not claim the state is missing from GitHub."""
@@ -1000,10 +1006,12 @@ class TestNothingStaysUnpublishedSilently:
         _git(clone, "remote", "set-url", "origin", url + "-gone")
         rc, text = _run_main(fp, clone, PUBLISH)
         assert rc != 0
-        assert "NOT BEING PUBLISHED" not in text, text
-        assert "could not refresh" in text.lower(), text
+        assert text.startswith(
+            "*** COULD NOT REFRESH THE SENSOR-LOG CLONE ***"), text
         assert "Recover (as monitor)" not in text, \
             "offered RECOVER with nothing to recover: " + text
+        assert "make sure you have the correct access rights" not in text, \
+            "git boilerplate instead of the error: " + text
         assert "next run retries" in text, text
 
 
@@ -1017,17 +1025,15 @@ class TestRecovery:
         _strand_a_commit(fp, clone, rel)
         _human_commit(work)
         _, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
-        hint = [l for l in text.splitlines() if "Recover" in l]
-        assert len(hint) == 1, text
-        assert "monitor" in hint[0]
-        assert "rebase --abort" in text, "no way out of a conflicted rebase"
+        assert "Recover (as monitor)" in text, text
+        backout = [l for l in text.splitlines() if "rebase --abort" in l]
+        assert len(backout) == 1 and backout[0].endswith("rebase --abort"), \
+            "the back-out command must end its line (no trailing comma)"
+        steps = _fix_steps(text)
+        assert steps == [fp.RECOVER.format(repo=clone)], steps
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        done = subprocess.run(hint[0].split(": ", 1)[1], shell=True,
-                              cwd=str(elsewhere), stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT,
-                              universal_newlines=True, timeout=60)
-        assert done.returncode == 0, done.stdout
+        _run_steps(steps, elsewhere)
         assert _head(_origin(clone), "main") == _head(clone)
         rc, text = _run_main(fp, clone, PUBLISH, front_end="unreachable")
         assert rc == 0, text
@@ -1067,7 +1073,7 @@ class TestRecovery:
         assert rc != 0
         branches = _git(_origin(clone), "branch", "--list")
         assert "foo" not in branches, branches
-        assert "main" in text and "by hand" in text, text
+        assert "not on main" in text and "by hand" in text, text
 
 
 class TestReadSnapshotIsDefensive:
@@ -1129,6 +1135,26 @@ def _start_conflict(clone, work, rel, fp, operation):
         _git(clone, "am", str(patch_file), check=False)
     elif operation == "bisect":
         _git(clone, "bisect", "start", "--no-checkout")
+    elif operation == "sequencer":
+        # Resolving the first pick by hand and committing leaves sequencer/
+        # with no CHERRY_PICK_HEAD: the operation's own marker is gone.
+        _git(clone, "checkout", "-q", "side")
+        (clone / "more.txt").write_text("more\n")
+        _git(clone, "add", "more.txt")
+        _git(clone, "commit", "-q", "-m", "side2")
+        _git(clone, "checkout", "-q", "main")
+        _git(clone, "cherry-pick", "side~1", "side", check=False)
+        (clone / rel).write_text("unit,front_end\nmjolnir02,hand\n")
+        _git(clone, "add", str(rel))
+        _git(clone, "commit", "-q", "--no-edit")
+        git_dir = pathlib.Path(_git(clone, "rev-parse",
+                                    "--absolute-git-dir").strip())
+        assert (git_dir / "sequencer").exists()
+        assert not (git_dir / "CHERRY_PICK_HEAD").exists()
+    elif operation == "rebase-from-side":
+        # Aborting returns to `side`, so the steps must also check out main.
+        _git(clone, "checkout", "-q", "side")
+        _git(clone, "rebase", "main", check=False)
     # Resolve and stage any conflict, as a human halfway through would.
     if _git(clone, "diff", "--name-only", "--diff-filter=U").strip():
         (clone / rel).write_text("unit,front_end\nmjolnir02,hand\n")
@@ -1145,6 +1171,8 @@ class TestEveryInProgressOperationBlocks:
         ("revert", "revert", "revert --abort"),
         ("am", "git am", "am --abort"),
         ("bisect", "bisect", "bisect reset"),
+        ("sequencer", "cherry-pick/revert sequence", "cherry-pick --abort"),
+        ("rebase-from-side", "rebase", "rebase --abort"),
     ])
     def test_blocks_and_gives_a_working_way_out(
             self, fp, clone_pair, tmp_path, operation, named, abort):
@@ -1199,6 +1227,8 @@ class TestEveryInProgressOperationBlocks:
         rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
         assert rc != 0 and _head(clone) == head
         assert "unresolved" in text, text
+        _run_steps(_fix_steps(text), clone.parent)
+        assert _run_main(fp, clone, PUBLISH, front_end="off")[0] == 0
 
     def test_an_uninspectable_clone_blocks(self, fp, tmp_path):
         assert fp.clone_blocker(str(tmp_path)) is not None
@@ -1270,6 +1300,24 @@ class TestSnapshotMustBeTracked:
         rc, text = _run_main(fp, clone, PUBLISH)
         assert rc != 0
         assert "not tracked" in text, text
+        assert text.startswith("*** THE FLEET RECORD IS NOT BEING PUBLISHED"), text
+        assert "check-ignore" in text and "fetch origin" not in text, text
+
+    def test_an_assume_unchanged_snapshot_is_reported(self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _git(clone, "update-index", "--assume-unchanged", str(rel))
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc != 0
+        assert "assume-unchanged" in text, text
+
+    def test_a_first_run_commit_failure_is_not_called_gitignored(
+            self, fp, clone_pair):
+        clone, _, _ = clone_pair
+        (clone / ".git" / "index.lock").write_text("")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        assert "commit FAILED" in text and "not tracked" not in text, text
 
     def test_a_skip_worktree_snapshot_is_reported(self, fp, clone_pair):
         clone, _, rel = clone_pair
@@ -1293,3 +1341,155 @@ class TestGitIsNonInteractive:
             fp._git(str(tmp_path), "status")
         assert seen["stdin"] is subprocess.DEVNULL
         assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+
+class TestUncommittedEditsInTheClone:
+
+    def test_a_conflicting_hand_edit_blocks_with_a_working_way_out(
+            self, fp, clone_pair, tmp_path):
+        """A hand edit to a file origin then changes made --ff-only refuse
+        every day, and RECOVER refused too ('unstaged changes')."""
+        clone, work, _ = clone_pair
+        _human_commit(work, "deployments/mj02.md", "v1\n")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "deployments" / "mj02.md").write_text("edited on the VPS\n")
+        _human_commit(work, "deployments/mj02.md", "v2\n")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc != 0
+        assert "deployments/mj02.md" in text, "which file? " + text
+        assert "stash" in text, text
+        _run_steps(_fix_steps(text), tmp_path)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert "edited on the VPS" in _git(clone, "stash", "show", "-p")
+
+    def test_an_uncommitted_snapshot_on_a_diverged_clone_is_not_stashed(
+            self, fp, clone_pair):
+        """The snapshot is the probe's own file: a leftover change to it is
+        committed locally (then RECOVER), never stashed away."""
+        clone, work, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        _human_commit(work)
+        _run_main(fp, clone, front_end="on")              # hand run, dirty
+        head = _head(clone)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="on")
+        assert rc != 0
+        assert "stash" not in text, text
+        assert _head(clone, "HEAD~1") == head, "not committed locally"
+        assert _fix_steps(text) == [fp.RECOVER.format(repo=clone)], text
+
+    def test_off_main_with_an_edited_snapshot_can_still_be_fixed(
+            self, fp, clone_pair, tmp_path):
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _git(clone, "checkout", "-q", "-b", "side")
+        (clone / rel).write_text("unit,front_end\nmjolnir02,side\n")
+        _git(clone, "commit", "-q", "-am", "side")
+        (clone / rel).write_text("unit,front_end\nmjolnir02,dirty\n")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        _run_steps(_fix_steps(text), tmp_path)
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+
+
+class TestRobustness:
+
+    def test_brief_keeps_the_error_not_the_boilerplate(self, fp):
+        out = ("fatal: Unable to create '/r/.git/index.lock': File exists.\n"
+               "\n"
+               "Another git process seems to be running in this repository\n"
+               "may have crashed in this repository earlier:\n"
+               "remove the file manually to continue.\n")
+        assert fp._brief(out).startswith("fatal: Unable to create"), \
+            fp._brief(out)
+        ssh = ("ssh: connect to host github.com port 22: Operation timed out\n"
+               "fatal: Could not read from remote repository.\n\n"
+               "Please make sure you have the correct access rights\n"
+               "and the repository exists.\n")
+        assert "timed out" in fp._brief(ssh), fp._brief(ssh)
+
+    def test_an_unreadable_snapshot_does_not_stop_the_digest(
+            self, fp, clone_pair):
+        """csv.Error (a NUL byte on Python 3.8; an over-long field on any
+        version) escaped read_snapshot and killed the run before the digest."""
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / rel).write_text("unit,front_end\nmjolnir02," + "x" * 200000
+                                 + "\n")
+        _git(clone, "commit", "-q", "-am", "corrupt")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert text, "no digest was sent"
+        assert rc != 0 and "unreadable" in text, text
+        assert "mjolnir02,off," in _published(clone, rel), \
+            "the next good snapshot was not published"
+
+    def test_the_snapshot_write_is_atomic(self, fp, clone_pair):
+        """A crash mid-write must leave the old file, not a truncated one."""
+        clone, _, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        before = (clone / rel).read_text()
+        real_replace = fp.os.replace
+        with patch.object(fp.os, "replace", side_effect=OSError("crash")):
+            with pytest.raises(OSError):
+                _run_main(fp, clone, PUBLISH, front_end="off")
+        assert (clone / rel).read_text() == before
+        assert real_replace
+
+    def test_a_narrowed_fetch_refspec_still_refreshes_origin_main(
+            self, fp, clone_pair):
+        clone, work, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _git(clone, "config", "remote.origin.fetch",
+             "+refs/heads/other:refs/remotes/origin/other")
+        _human_commit(work)
+        assert _run_main(fp, clone, PUBLISH, front_end="off")[0] == 0
+        assert (clone / "other.txt").exists(), "origin/main went stale"
+
+    def test_a_relative_repo_prints_absolute_paths(self, fp, clone_pair,
+                                                   monkeypatch):
+        clone, _, _ = clone_pair
+        _git(clone, "checkout", "-q", "-b", "foo")
+        monkeypatch.chdir(str(clone.parent))
+        argv_repo = "clone"
+        _, text = _run_main(fp, argv_repo, PUBLISH)
+        assert "git -C {} ".format(clone) in text, text
+
+
+class TestPublishApi:
+    """The steps main() uses, callable by another writer (#98) so it does not
+    re-implement them: prepare_clone() before reading the baseline,
+    publish_snapshot() after writing."""
+
+    def test_prepare_then_publish(self, fp, clone_pair):
+        clone, work, rel = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _human_commit(work)
+        state = fp.prepare_clone(str(clone), str(rel))
+        assert state["pulled"] and not state["problems"], state
+        (clone / rel).write_text((clone / rel).read_text()
+                                 .replace("mjolnir02,on,", "mjolnir02,off,"))
+        state = fp.publish_snapshot(state)
+        assert not state["problems"] and state["ahead"] == 0, state
+        assert "mjolnir02,off," in _published(clone, rel)
+
+    def test_commit_snapshot_only_commits(self, fp, clone_pair):
+        """With push folded in, (False, ...) meant either 'not committed' or
+        'committed, not pushed' -- the ambiguity #98's rollback tripped on."""
+        clone, _, rel = clone_pair
+        (clone / rel).parent.mkdir(exist_ok=True)
+        (clone / rel).write_text("unit,front_end\nmjolnir02,on\n")
+        before = _head(_origin(clone), "main")
+        ok, _ = fp.commit_snapshot(str(clone), str(rel), "state: x")
+        assert ok
+        assert _head(_origin(clone), "main") == before, "commit pushed"
+
+
+def test_field_report_on_an_unreadable_snapshot_fails_cleanly(fp, tmp_path,
+                                                              capsys):
+    snap = tmp_path / "fleet-state.csv"
+    snap.write_text("unit,front_end\nmjolnir02," + "x" * 200000 + "\n")
+    with patch.object(fp.sys, "argv", ["fleet_probe", "--snapshot",
+                                       str(snap), "--field", "front_end"]):
+        assert fp.main() == 1
+    assert "unreadable" in capsys.readouterr().err
