@@ -51,7 +51,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
     if log_bounds_all_present; then
         log "All bounds present."
     else
-        log "One or more bounds MISSING -- re-run without --check to apply."
+        log "One or more bounds MISSING or not in effect -- re-run without --check to apply."
     fi
     exit 0
 fi

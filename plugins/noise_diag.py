@@ -1,8 +1,9 @@
 """
-Plugin to compute fast-channel noise diagnostics from live HAMMA triggers.
+Plugin to compute fast- and slow-channel noise diagnostics from live HAMMA triggers.
 """
 
 import csv
+import os
 from pathlib import Path
 
 import hamma
@@ -27,14 +28,18 @@ def _sensor_prefix():
 
 
 class NoiseDiag(brokkr.pipeline.base.OutputStep):
-    """Sample the fast-channel noise floor and report it."""
+    """Sample the fast- and slow-channel noise floors and report them."""
 
+    # Slow-channel columns are appended after the original fast-channel set so
+    # older readers that select columns by name keep working.
     CSV_COLUMNS = ["time", "trigger_time", "fast_offset", "fast_noise", "fast_vpp",
-                   "fast_snr", "threshold", "noise_thresh_ratio"]
+                   "fast_snr", "threshold", "noise_thresh_ratio",
+                   "slow_offset", "slow_noise", "slow_vpp", "slow_snr"]
 
     def __init__(self,
                  min_update_time=60,
                  medsize=200000,
+                 medsize_slow=None,
                  min_pretrigger_ms=50,
                  output_path=None,
                  filename_template=None,
@@ -51,6 +56,17 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         self._under_count = 0
         self.min_update_time = min_update_time
         self.medsize = medsize
+        # The slow channel is every 11th sample, so a window of medsize / 10
+        # spans the same pre-trigger stretch as the fast window -- which is
+        # what lets min_pretrigger_ms guard both.
+        self.medsize_slow = (medsize // 10 if medsize_slow is None
+                             else medsize_slow)
+        if self.medsize_slow * 10 != self.medsize:
+            self.logger.warning(
+                "noise_diag: medsize_slow=%d is not medsize/10 (%d); the slow "
+                "window no longer covers the fast one's pre-trigger span.",
+                self.medsize_slow, self.medsize // 10)
+        self._warned_files = set()
         self.min_pretrigger_ms = min_pretrigger_ms
         self.output_path = output_path if output_path is not None else Path()
         self.filename_template = filename_template
@@ -72,15 +88,96 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             output_path=self.output_path,
             filename_template=self.filename_template)
         out_file.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not out_file.exists()
+        header = self.CSV_COLUMNS
+        if out_file.exists():
+            # An unreadable day file (e.g. NUL bytes after power loss, which
+            # Python <= 3.10's csv rejects) must not block the append or the
+            # alert check after it; fall back to a plain append.
+            try:
+                header = self._upgrade_csv_header(out_file) or self.CSV_COLUMNS
+            except (csv.Error, ValueError, OSError) as e:
+                self.logger.warning(
+                    "noise_diag: could not check header of %s (%s: %s); "
+                    "appending without upgrade.", out_file, type(e).__name__, e)
+        if header != self.CSV_COLUMNS and not set(header) <= set(self.CSV_COLUMNS):
+            header = self.CSV_COLUMNS   # unknown layout: keep the full row
+        # A 0-byte file (e.g. power loss right after creation) also needs the
+        # header, or every row that day lands headerless.
+        new_file = not out_file.exists() or out_file.stat().st_size == 0
+        values = dict(metrics, time=sample_time)
         with open(out_file, "a", newline="") as f:
             writer = csv.writer(f)
             if new_file:
+                header = self.CSV_COLUMNS
+                writer.writerow(header)
+            # Match the file's own header: 12 values under an 8-column header
+            # make pandas skip the row -- fast data included -- all day.
+            writer.writerow([values[c] for c in header])
+
+    def _upgrade_csv_header(self, out_file):
+        """Rewrite a day file written with an older column set to the current
+        CSV_COLUMNS, keeping every existing row and leaving new columns blank.
+        Without this, a file started before an upgrade would get rows wider
+        than its header for the rest of that day.
+
+        Returns the header the file has afterwards (None for an empty file),
+        so the caller appends rows that match it.
+        """
+        with open(out_file, newline="") as f:
+            old_header = next(csv.reader(f), None)
+        if not old_header or old_header == self.CSV_COLUMNS:
+            return old_header
+        if not set(old_header) <= set(self.CSV_COLUMNS):
+            if str(out_file) not in self._warned_files:
+                # Once per file: a headerless day file would otherwise log
+                # this every minute until the UTC day rolls over.
+                self._warned_files.add(str(out_file))
+                self.logger.warning(
+                    "noise_diag: %s has unexpected columns %s; leaving it as "
+                    "is.", out_file, old_header)
+            return old_header
+        try:
+            with open(out_file, newline="") as f:
+                rows = list(csv.reader(f))
+        except (csv.Error, ValueError) as e:
+            # Header readable, body not (e.g. a NUL tail): no rewrite, but
+            # keep appending in the file's own layout.
+            self.logger.warning(
+                "noise_diag: could not read the rows of %s (%s: %s); "
+                "appending in its old layout.", out_file, type(e).__name__, e)
+            return old_header
+        tmp_file = out_file.with_name(out_file.name + ".tmp")
+        try:
+            with open(tmp_file, "w", newline="") as f:
+                writer = csv.writer(f)
                 writer.writerow(self.CSV_COLUMNS)
-            writer.writerow([sample_time] + [metrics[c] for c in self.CSV_COLUMNS[1:]])
+                for row in rows[1:]:
+                    by_name = dict(zip(old_header, row))
+                    writer.writerow([by_name.get(c, "") for c in self.CSV_COLUMNS])
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.replace(out_file)   # rename: atomic on the Pi's ext4
+        except BaseException:
+            # e.g. SD card full mid-rewrite: don't leave the temp file behind.
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+            raise
+        self.logger.info("noise_diag: upgraded CSV header of %s.", out_file)
+        return self.CSV_COLUMNS
+
+    def _channel_metrics(self, volt, medsize):
+        """Offset, noise, Vpp and SNR for one channel (same derivation as the
+        fast-channel block in _compute; no threshold ratio, since the AGS
+        trigger threshold does not apply to the slow channel)."""
+        offset, vmax, vmin, noise = diagnostic_data(volt, medsize)
+        vpp = float(vmax) - float(vmin)
+        snr = vpp / noise if noise else float("nan")
+        return float(offset), float(noise), float(vpp), float(snr)
 
     def _compute(self, input_data):
-        """Decode the packet and derive fast-channel noise metrics."""
+        """Decode the packet and derive fast- and slow-channel noise metrics."""
         h = hamma.Header()
         data = h.read_stream(input_data['science_packet'].value)
         if getattr(data, "voltFast", None) is None:
@@ -105,6 +202,22 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
         threshold = float(h.data.threshold.iloc[0])
         ratio = noise / threshold if threshold else float("nan")
 
+        # Slow channel: same pre-trigger baseline approach, its own window size.
+        # A missing or unreadable slow channel leaves the slow columns NaN
+        # rather than dropping the fast-channel sample.
+        nan = float("nan")
+        slow_offset = slow_noise = slow_vpp = slow_snr = nan
+        if getattr(data, "volt", None) is not None:
+            try:
+                (slow_offset, slow_noise, slow_vpp,
+                 slow_snr) = self._channel_metrics(data.volt, self.medsize_slow)
+            except Exception as e:
+                self.logger.warning(
+                    "Slow-channel noise failed (%s: %s); slow noise left blank.",
+                    type(e).__name__, e)
+        else:
+            self.logger.info("No slow channel in trigger; slow noise left blank.")
+
         # Absolute trigger instant: the fast-channel timestamp at triggerPos
         # (the pre/post boundary). triggerPos indexes the FAST array.
         times_fast = getattr(data, "timesFast", None)
@@ -124,6 +237,10 @@ class NoiseDiag(brokkr.pipeline.base.OutputStep):
             "fast_snr": float(snr),
             "threshold": float(threshold),
             "noise_thresh_ratio": float(ratio),
+            "slow_offset": slow_offset,
+            "slow_noise": slow_noise,
+            "slow_vpp": slow_vpp,
+            "slow_snr": slow_snr,
         }
 
     def _maybe_alert(self, metrics, now):

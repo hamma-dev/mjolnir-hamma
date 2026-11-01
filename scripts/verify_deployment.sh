@@ -411,6 +411,46 @@ check_ags_data_mount() {
     fi
 }
 
+# A unit whose log bounds were never applied verifies clean today, and the only
+# signal is the SD card filling months later (HAM-112 / HAM-113). It also catches
+# bounds applied by hand under a non-canonical filename -- mj02 carried its cap in
+# journald.conf.d/size.conf rather than the shipped drop-in, which is bounded in
+# practice but invisible to every tool that looks for the canonical file.
+check_log_bounds() {
+    print_section "Log Size Bounds"
+
+    # Source the installer's own library rather than re-deriving the paths.
+    # HAM-181 de-duplicated this logic precisely so a second copy could not
+    # drift from it; re-implementing the checks here would undo that.
+    local lib lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../unified_install/lib" 2>/dev/null && pwd || true)"
+    lib="${lib_dir:-/home/pi/dev/mjolnir-hamma/unified_install/lib}/log_bounds.sh"
+
+    if [[ ! -f "$lib" ]]; then
+        # The installer ships this file: without it the checkout is broken.
+        fail "log_bounds.sh not found at $lib -- cannot verify log bounds"
+        return 0
+    fi
+
+    # shellcheck source=/dev/null
+    source "$lib"
+
+    if log_bounds_all_present; then
+        pass "Log size bounds in place (journald, rsyslog, hourly logrotate)"
+        return 0
+    fi
+
+    local journald
+    journald="$(log_bounds_status_journald)"
+    fail "Log size bounds incomplete: journald=$journald rsyslog=$(log_bounds_status_rsyslog) cron=$(log_bounds_status_cron)"
+    # Absolute: this script is run from ~ or from scripts/, so a relative
+    # path fails from either.
+    info "Remediate with: sudo bash ${lib%/unified_install/lib/log_bounds.sh}/scripts/apply_log_bounds.sh   (HAM-113, rollout HAM-181)"
+    if [[ "$journald" == "RAM-ONLY" ]]; then
+        info "If it stays RAM-ONLY after that, look for Storage=volatile in another journald drop-in (HAM-216)"
+    fi
+}
+
 check_server_connection() {
     print_section "Server Connection"
 
@@ -551,6 +591,7 @@ main() {
     check_file_setup
     check_brokkr_status
     check_ags_data_mount
+    check_log_bounds
 
     if $full_check; then
         check_server_connection
