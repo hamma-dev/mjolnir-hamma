@@ -3,7 +3,7 @@
 
 ## Version 0.5.0 (2026-11-01)
 
-35 PRs merged to `0.4.x` since 0.4.0. Changes are grouped by area, most important first; dates are when each landed on `0.4.x`.
+36 PRs merged to `0.4.x` since 0.4.0. Changes are grouped by area, most important first; dates are when each landed on `0.4.x`.
 
 **Noise diagnostics**
 * **Slow-channel noise tracked alongside fast** — `noise_diag` adds `slow_offset`, `slow_noise`, `slow_vpp`, `slow_snr`; existing CSVs are upgraded in place. (2026-10-30 #110)
@@ -35,6 +35,7 @@
 * Bootstrap guards the paths passed to `rm -rf` / `find -delete`. (2026-08-12 #90)
 * `daily_compression` disabled by default; compression docs no longer quote a fixed ratio. (2026-07-01 #71, 2026-10-30 #111)
 * Docs: fleet deployment plan for threshold/gain control. (2026-08-07 #76)
+* `.gitignore`: scope `lib/` to the repo root so new `unified_install/lib/` files are not silently dropped. (2026-11-01 #119)
 
 **Deploy note:** requires the `hamma` package **0.3.0** (unchanged from 0.4.0; provides `diagnostic_data`), brokkr ≥ 0.4.0, sindri 0.3.x. Restart `brokkr-hamma-default` after updating; the first record after a restart gets no noise_diag row.
 
