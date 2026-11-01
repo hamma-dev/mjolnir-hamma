@@ -906,6 +906,116 @@ class TestInstallFlapIsSteadied:
         assert merged["mjolnir08"]["notifiers_install"] == "installed"
         assert fp.diff(prev, merged) == []    # first measurement, no change
 
+    def test_m20_broken_then_timeout_is_held_by_rule_a_not_overwritten(
+            self, fp):
+        # Red-team round 4, mutant M20: `broken` IS a real value for rule
+        # (a)'s purposes -- a timeout over it must steady back to
+        # `broken`, not be stored (and must not commit either).
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install="broken")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.TIMEOUT)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "broken"
+        assert fp.diff(prev, merged) == []
+
+    def test_m5_timeout_then_unknown_is_held_by_rule_c(self, fp):
+        # Red-team round 4, mutant M5: a field already sitting in
+        # `timeout` (a genuine prior degraded state, not a placeholder --
+        # see merge()'s `never_measured`) does not flip to `unknown`.
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install=fp.TIMEOUT)}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.UNKNOWN)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == fp.TIMEOUT
+        assert fp.diff(prev, merged) == []
+
+
+class TestFirstSeenTransientDoesNotFabricateALaterChange:
+    """Red-team round 4: a degraded (timeout/unknown) *_install reading
+    with no GENUINE prior measurement behind it must never be STORED as
+    that degraded value -- only as "" (not yet measured) -- or its
+    eventual first real value looks like a fake recovery later.
+    """
+
+    def test_a_brand_new_unit_first_probed_with_a_timeout_stays_blank(
+            self, fp):
+        # No row in `previous` at all.
+        prev = {}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.TIMEOUT)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == ""
+
+    def test_a_brand_new_unit_does_not_fabricate_a_change_the_next_day(
+            self, fp, tmp_path, capsys):
+        snap = tmp_path / "fleet-state.csv"
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+
+        # Day 1: mjolnir08 has never been seen before, and its first
+        # *_install reading is a transient timeout.
+        day1 = dict(row(fp, "mjolnir08"), notifiers_install=fp.TIMEOUT)
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=day1):
+            assert fp.main() == 0
+        capsys.readouterr()
+
+        # Day 2: a real reading. Must be a first measurement, not a
+        # reported "timeout -> editable" recovery.
+        day2 = dict(row(fp, "mjolnir08"), notifiers_install="editable")
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=day2):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "notifiers_install" not in out, out
+
+    def test_an_unreachable_placeholder_returning_with_unknown_stays_blank(
+            self, fp):
+        # The placeholder merge() itself creates for a brand-new,
+        # unreachable unit: front_end stored as `unreachable`, every
+        # field (including *_install) at the UNKNOWN default.
+        placeholder = {f: fp.UNKNOWN for f in fp.FIELDS}
+        placeholder["unit"] = "mjolnir08"
+        placeholder["front_end"] = fp.UNREACHABLE
+        prev = {"mjolnir08": placeholder}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.UNKNOWN)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == ""
+
+    def test_a_placeholder_does_not_fabricate_a_recovery_later(
+            self, fp, tmp_path, capsys):
+        snap = tmp_path / "fleet-state.csv"
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+
+        # Day 1: mjolnir08 is unreachable on its very first probe --
+        # merge() stores the all-UNKNOWN placeholder.
+        day1 = dict(row(fp, "mjolnir08"), front_end=fp.UNREACHABLE)
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=day1):
+            assert fp.main() == 0
+        capsys.readouterr()
+
+        # Day 2: reachable now, but the classifier itself is transient.
+        day2 = dict(row(fp, "mjolnir08"), notifiers_install=fp.UNKNOWN)
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=day2):
+            assert fp.main() == 0
+        capsys.readouterr()
+
+        # Day 3: a real reading. Must not read as `unknown -> editable`,
+        # a "lost interpreter recovered" event that never happened --
+        # this unit was never confirmed to import in the first place.
+        day3 = dict(row(fp, "mjolnir08"), notifiers_install="editable")
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=day3):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "notifiers_install" not in out, out
+
 
 # --------------------------------------------------------------------------
 # Red-team finding 2 (SHOULD FIX): a unit that is broken/missing on its
@@ -980,6 +1090,27 @@ class TestInstallProblemsStandingLine:
         text = fp.digest(stored, [], [], baseline=False, current=probed_today)
         assert "mjolnir42  notifiers=timeout" in text
         assert "installed" not in text.split("install problems:")[-1]
+
+    def test_caps_a_long_list(self, fp):
+        # Red-team round 4 item 3: capped like pending/behind -- an
+        # over-long digest is REJECTED, not truncated, by the chat sender.
+        rows = {"mjolnir{:02d}".format(n): dict(
+                    row(fp, "mjolnir{:02d}".format(n)),
+                    notifiers_install="broken")
+               for n in range(25)}
+        text = fp.digest(rows, [], [], baseline=False)
+        body = [ln for ln in text.splitlines() if ln.startswith("  mjolnir")]
+        assert len(body) == fp.INSTALL_PROBLEMS_DIGEST_MAX
+        assert "... and 5 more" in text
+
+    def test_cap_boundary_at_exactly_the_max_shows_no_more_line(self, fp):
+        n = fp.INSTALL_PROBLEMS_DIGEST_MAX
+        rows = {"mjolnir{:02d}".format(i): dict(
+                    row(fp, "mjolnir{:02d}".format(i)),
+                    notifiers_install="broken")
+               for i in range(n)}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "more" not in text
 
 
 # --------------------------------------------------------------------------
@@ -3222,7 +3353,74 @@ class TestCommitSummaryNamesSchemaAndUnits:
 
 
 class TestMutationSurvivorCoverage:
-    """Round 3: named survivors from the coordinator's mutation review."""
+    """Round 3/4: named survivors from the coordinator's mutation review."""
+
+    def _repo2(self, tmp_path, name="repo_m"):
+        repo = tmp_path / name
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return repo
+
+    def test_m14_a_new_unit_is_named_not_called_uncommitted(self, fp,
+                                                             tmp_path):
+        repo = self._repo2(tmp_path)
+        rel = "state/fleet-state.csv"
+        (repo / rel).write_text(fp.render({"mjolnir02": row(fp, "mjolnir02")}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        # mjolnir05 appears for the first time; mjolnir02 is unchanged.
+        (repo / rel).write_text(fp.render(
+            {"mjolnir02": row(fp, "mjolnir02"),
+             "mjolnir05": row(fp, "mjolnir05")}))
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir05", message
+
+    def test_m14_a_removed_unit_is_also_named(self, fp, tmp_path):
+        repo = self._repo2(tmp_path, "repo_m2")
+        rel = "state/fleet-state.csv"
+        (repo / rel).write_text(fp.render(
+            {"mjolnir02": row(fp, "mjolnir02"),
+             "mjolnir05": row(fp, "mjolnir05")}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        (repo / rel).write_text(fp.render({"mjolnir02": row(fp, "mjolnir02")}))
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir05", message
+
+    def test_m10_a_blank_to_value_change_in_a_non_install_column_is_named(
+            self, fp, tmp_path):
+        # The backfill classification is specific to *_install: a blank
+        # old value in any OTHER column is a real, named change.
+        repo = self._repo2(tmp_path, "repo_m10")
+        rel = "state/fleet-state.csv"
+        blank_mode = dict(row(fp, "mjolnir02"), brokkr_mode="")
+        (repo / rel).write_text(",".join(fp.FIELDS[:12]) + "\n"
+                                + ",".join(blank_mode.values()) + "\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        filled_mode = dict(row(fp, "mjolnir02"), brokkr_mode="default")
+        (repo / rel).write_text(",".join(fp.FIELDS[:12]) + "\n"
+                                + ",".join(filled_mode.values()) + "\n")
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir02", message
 
     def test_m9_a_missing_key_skips_any_field_not_just_install(self, fp):
         # The "field not in old" skip in diff() applies to ANY future

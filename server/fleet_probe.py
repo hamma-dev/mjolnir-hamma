@@ -368,6 +368,10 @@ PENDING_DIGEST_MAX = 20
 # digest().
 BEHIND_DIGEST_MAX = 10
 
+# Same reasoning, a third time: a fleet-wide classifier problem (a shared
+# ltgenv issue, say) could push "install problems" past the limit too.
+INSTALL_PROBLEMS_DIGEST_MAX = 20
+
 
 def _is_pending_heading(line):
     """True for `## Pending` and the spellings people actually write.
@@ -622,15 +626,27 @@ def merge(previous, current):
     (b) A field that has never been measured ("") stays "" across EITHER
         a `timeout` or an `unknown` reading: there is no real value to
         fall back to, and recording the transient reading would make its
-        eventual first real measurement look like a change too.
-    (c) Once a field is already sitting in `timeout` or `unknown` (from an
-        earlier application of (a) continuing to fail, or (a) not
-        applying because there was no real prior value), a further
-        `timeout` or `unknown` reading -- in either direction -- does not
-        overwrite it. Otherwise two degraded-but-different readings on
-        back-to-back days would themselves look like a change and commit
-        every time, which is exactly the noise this whole rule exists to
-        avoid.
+        eventual first real measurement look like a change too. This
+        also applies -- treating the OLD value as "" regardless of what
+        it literally is -- whenever there is no PRIOR GENUINE measurement
+        to fall back to at all: a brand-new unit (no row in `previous`),
+        or a unit whose only prior row is itself an unreachable
+        placeholder (front_end stored as `unreachable`, install fields
+        never really read). Without this, a brand-new unit's first,
+        transient reading got stored as literal `timeout`/`unknown`, and
+        a placeholder's default `unknown` got carried into rule (c) below
+        as if it were a genuine prior state; either way, the EVENTUAL
+        first real measurement then compared against that fabricated old
+        value and reported a fake `timeout -> editable` or
+        `unknown -> editable` "recovery" that never happened.
+    (c) Once a field is already sitting in `timeout` or `unknown` from a
+        GENUINE prior measurement (an earlier application of (a)
+        continuing to fail, or (a) not applying because the prior value
+        was itself not real), a further `timeout` or `unknown` reading --
+        in either direction -- does not overwrite it. Otherwise two
+        degraded-but-different readings on back-to-back days would
+        themselves look like a change and commit every time, which is
+        exactly the noise this whole rule exists to avoid.
 
     None of this hides a problem from a human: digest()'s "install
     problems" section is built from the day's RAW probe (`current`), not
@@ -642,21 +658,25 @@ def merge(previous, current):
         if row.get("front_end") == UNREACHABLE and unit in previous:
             continue
         old = previous.get(unit)
-        if old is not None:
-            steadied = {}
-            for field in INSTALL_FIELDS:
-                new_val = row.get(field) or ""
-                old_val = old.get(field) or ""
-                if old_val == "" and new_val in (TIMEOUT, UNKNOWN):
-                    steadied[field] = ""                          # (b)
-                elif (old_val not in ("", TIMEOUT, UNKNOWN)
-                        and new_val == TIMEOUT):
-                    steadied[field] = old_val                     # (a)
-                elif old_val in (TIMEOUT, UNKNOWN) and new_val in (
-                        TIMEOUT, UNKNOWN):
-                    steadied[field] = old_val                     # (c)
-            if steadied:
-                row = dict(row, **steadied)
+        # No GENUINE prior measurement to compare against: either this
+        # unit has no row at all yet, or its only row is an unreachable
+        # placeholder (see (b) above). Treat every *_install old value as
+        # "" in that case, not whatever is literally stored.
+        never_measured = old is None or old.get("front_end") == UNREACHABLE
+        steadied = {}
+        for field in INSTALL_FIELDS:
+            new_val = row.get(field) or ""
+            old_val = "" if never_measured else (old.get(field) or "")
+            if old_val == "" and new_val in (TIMEOUT, UNKNOWN):
+                steadied[field] = ""                              # (b)
+            elif (old_val not in ("", TIMEOUT, UNKNOWN)
+                    and new_val == TIMEOUT):
+                steadied[field] = old_val                         # (a)
+            elif old_val in (TIMEOUT, UNKNOWN) and new_val in (
+                    TIMEOUT, UNKNOWN):
+                steadied[field] = old_val                         # (c)
+        if steadied:
+            row = dict(row, **steadied)
         merged[unit] = row
     return merged
 
@@ -822,13 +842,15 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     # STANDING too: a unit that is broken/missing on its FIRST measurement
     # never produces a change line (diff() reports a brand-new row as one
     # "first seen" line for the whole unit, not per field), and merge()
-    # deliberately steadies -- never stores -- a transient timeout/unknown
-    # reading over a real prior value, so one of those could also go
-    # unreported indefinitely. Built from `current` (today's RAW probe),
-    # NOT `rows` (the merged/stored snapshot): that is the only place a
-    # lost interpreter (editable -> unknown, steadied back to editable in
-    # storage -- see merge()) or a persistent timeout is still visible
-    # every single day, with no false change line and no commit either.
+    # deliberately steadies a transient timeout over a real prior value
+    # (and never even stores a degraded first reading -- see merge()), so
+    # one of those could also go unreported indefinitely. Built from
+    # `current` (today's RAW probe), NOT `rows` (the merged/stored
+    # snapshot): that is the only place a lost interpreter (a real,
+    # reportable `editable -> unknown` in the snapshot -- see merge() --
+    # but still worth flagging the same day it happens) or a persistent
+    # timeout/unknown is visible every single day it is probed, including
+    # days merge() stores it with no change line and no commit.
     # Scoped to units this run actually probed, like the two sections above.
     install_problems = []
     for unit in sorted(reachable - set(unreachable)):
@@ -842,7 +864,12 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
     if install_problems:
         lines.append("")
         lines.append("install problems:")
-        lines.extend(install_problems)
+        # Same reasoning as the pending/behind sections: an over-long
+        # digest is REJECTED, not truncated, by the chat sender.
+        lines.extend(install_problems[:INSTALL_PROBLEMS_DIGEST_MAX])
+        if len(install_problems) > INSTALL_PROBLEMS_DIGEST_MAX:
+            lines.append("  ... and {} more".format(
+                len(install_problems) - INSTALL_PROBLEMS_DIGEST_MAX))
     standing = not_capturing(rows)
     if standing:
         lines.append("")
@@ -1159,7 +1186,7 @@ def commit_summary(repo, snapshot_rel, schema_added=None):
     shown = _git(repo, "show", "HEAD:" + snapshot_rel)
     try:
         old_rows = (parse_snapshot(io.StringIO(shown.stdout))
-                   if shown.returncode == 0 else {})
+                    if shown.returncode == 0 else {})
     except SnapshotUnreadable:
         old_rows = {}
     try:
