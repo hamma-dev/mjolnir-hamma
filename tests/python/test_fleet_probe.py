@@ -5,7 +5,9 @@ contacts the fleet. probe_unit() is covered by mocking subprocess.run so the
 stdout parser is tested without ssh.
 """
 
+import csv
 import importlib.util
+import io
 import os
 import pathlib
 import shutil
@@ -765,21 +767,65 @@ class TestBlankSkipIsNotGeneric:
 # missing are real, persistent outcomes and are never overridden.
 # --------------------------------------------------------------------------
 class TestInstallFlapIsSteadied:
-    def test_merge_restores_the_last_real_value_over_a_timeout(self, fp):
-        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
-                                  notifiers_install="installed")}
-        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
-                                 notifiers_install=fp.TIMEOUT)}
-        merged = fp.merge(prev, cur)
-        assert merged["mjolnir08"]["notifiers_install"] == "installed"
+    """Red-team round 3, merge-blocking finding 1: the previous steadying
+    rule treated `timeout` and `unknown` alike, so a LOST interpreter
+    (exit 127, reads `unknown`) was restored right back to its old real
+    value -- 0 changes, no commit, no digest line, forever. The new rule
+    has three cases (see merge()): `timeout` steadies over a real value;
+    `unknown` does NOT (it is a real, reportable change); a never-measured
+    field stays "" across either; and a field already stuck in
+    timeout/unknown does not flip between the two.
+    """
 
-    def test_merge_restores_the_last_real_value_over_unknown(self, fp):
+    def test_a_lost_interpreter_is_a_real_reported_change(self, fp):
+        # (a)/else: `unknown` over a REAL old value is NOT steadied.
         prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
                                   notifiers_install="editable")}
         cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
                                  notifiers_install=fp.UNKNOWN)}
         merged = fp.merge(prev, cur)
-        assert merged["mjolnir08"]["notifiers_install"] == "editable"
+        assert merged["mjolnir08"]["notifiers_install"] == fp.UNKNOWN
+        assert fp.diff(prev, merged) == [
+            ("mjolnir08", "notifiers_install", "editable", fp.UNKNOWN)]
+
+    def test_a_lost_interpreter_is_committed_and_appears_in_install_problems(
+            self, fp, tmp_path, capsys):
+        snap = tmp_path / "fleet-state.csv"
+        stable = dict(row(fp, "mjolnir08"), notifiers_install="editable")
+        snap.write_text(fp.render({"mjolnir08": stable}))
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+        lost = dict(stable, notifiers_install=fp.UNKNOWN)
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=lost):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "0 change(s)" not in out, out
+        assert "notifiers_install editable -> unknown" in out, out
+        assert "mjolnir08  notifiers=unknown" in out, out
+        row_line = next(l for l in snap.read_text().splitlines()
+                        if l.startswith("mjolnir08,"))
+        assert row_line.split(",")[-1] == fp.UNKNOWN
+
+    def test_timeout_over_a_real_value_steadies_with_no_change_or_commit(
+            self, fp, tmp_path, capsys):
+        snap = tmp_path / "fleet-state.csv"
+        stable = dict(row(fp, "mjolnir08"), notifiers_install="installed")
+        snap.write_text(fp.render({"mjolnir08": stable}))
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+        flapped = dict(stable, notifiers_install=fp.TIMEOUT)
+        before = snap.read_text()
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=flapped):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "0 change(s)" in out, out
+        assert "notifiers_install installed ->" not in out, out
+        # Still surfaced today, from the RAW probe, even with no commit.
+        assert "mjolnir08  notifiers=timeout" in out, out
+        assert snap.read_text() == before, \
+            "a timeout over a real value must not change what is on disk"
 
     def test_broken_is_never_overridden(self, fp):
         # broken/missing are real, persistent classifier outcomes, not
@@ -799,31 +845,66 @@ class TestInstallFlapIsSteadied:
         merged = fp.merge(prev, cur)
         assert merged["mjolnir08"]["notifiers_install"] == "missing"
 
-    def test_a_timeout_with_no_prior_real_value_is_not_overridden(self, fp):
-        # Nothing to steady back to -- the blank/unknown stays as probed.
+    def test_a_first_reading_that_is_a_timeout_stays_blank(self, fp):
+        # (b): nothing real to fall back to -- record "not yet measured",
+        # not the transient reading itself, so its EVENTUAL first real
+        # value still reads as a first measurement, not a change.
         prev = {"mjolnir08": dict(row(fp, "mjolnir08"), notifiers_install="")}
         cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
                                  notifiers_install=fp.TIMEOUT)}
         merged = fp.merge(prev, cur)
-        assert merged["mjolnir08"]["notifiers_install"] == fp.TIMEOUT
+        assert merged["mjolnir08"]["notifiers_install"] == ""
 
-    def test_a_flap_produces_no_change_line_and_no_commit(self, fp, tmp_path,
-                                                          capsys):
+    def test_a_first_reading_that_is_unknown_also_stays_blank(self, fp):
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"), notifiers_install="")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.UNKNOWN)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == ""
+
+    def test_timeout_and_unknown_flapping_from_blank_never_commits(
+            self, fp, tmp_path, capsys):
         snap = tmp_path / "fleet-state.csv"
-        stable = dict(row(fp, "mjolnir08"), notifiers_install="installed")
-        snap.write_text(fp.render({"mjolnir08": stable}))
+        blank = row(fp, "mjolnir08")                 # no *_install keys yet
+        snap.write_text(",".join(fp.FIELDS[:12]) + "\n"
+                        + ",".join(blank.values()) + "\n")
         argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
-        flapped = dict(stable, notifiers_install=fp.TIMEOUT)
-        before = snap.read_text()
-        with patch.object(fp.sys, "argv", argv), \
-                patch.object(fp, "probe_unit", return_value=flapped):
-            status = fp.main()
-        assert status == 0
-        out = capsys.readouterr().out
-        assert "0 change(s)" in out, out
-        assert "notifiers_install" not in out, out
-        assert snap.read_text() == before, \
-            "a flap must not change what is on disk"
+        readings = [fp.TIMEOUT, fp.UNKNOWN, fp.TIMEOUT]
+        for reading in readings:
+            probed = dict(blank, brokkr_install="", sindri_install="",
+                          hamma_install="", notifiers_install=reading)
+            with patch.object(fp.sys, "argv", argv), \
+                    patch.object(fp, "probe_unit", return_value=probed):
+                status = fp.main()
+            assert status == 0
+            capsys.readouterr()
+        row_line = next(l for l in snap.read_text().splitlines()
+                        if l.startswith("mjolnir08,"))
+        assert row_line.split(",")[-1] == "", \
+            "a field that has never had a real value must stay blank"
+
+    def test_flapping_between_timeout_and_unknown_with_a_real_history_steadies(
+            self, fp):
+        # (c): once a field is already sitting in a degraded state (from an
+        # earlier real -> unknown transition -- see the lost-interpreter
+        # test above), a further timeout/unknown reading does not overwrite
+        # it either way -- it is the SAME standing problem, not a new one.
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install=fp.UNKNOWN)}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.TIMEOUT)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == fp.UNKNOWN
+        assert fp.diff(prev, merged) == []
+
+    def test_a_real_value_arriving_after_a_blank_is_not_steadied_away(
+            self, fp):
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"), notifiers_install="")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install="installed")}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "installed"
+        assert fp.diff(prev, merged) == []    # first measurement, no change
 
 
 # --------------------------------------------------------------------------
@@ -873,6 +954,32 @@ class TestInstallProblemsStandingLine:
         text = fp.digest(rows, [], [], baseline=False)
         line = next(l for l in text.splitlines() if l.startswith("  mjolnir42"))
         assert "brokkr=missing" in line and "notifiers=broken" in line
+
+    def test_unknown_is_also_listed(self, fp):
+        # Round 3 merge-blocking finding 1(d): unknown is a real problem
+        # (a lost interpreter), not swept under the rug like a timeout.
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                  notifiers_install=fp.UNKNOWN)}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "mjolnir42  notifiers=unknown" in text
+
+    def test_timeout_is_also_listed(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                  notifiers_install=fp.TIMEOUT)}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "mjolnir42  notifiers=timeout" in text
+
+    def test_built_from_current_not_the_merged_stored_row(self, fp):
+        # Round 3 finding 1(d): the stored/merged row can have a STEADIED
+        # real value (merge() restoring a timeout -- see merge()), but
+        # "install problems" must still see today's RAW reading.
+        stored = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                    notifiers_install="installed")}
+        probed_today = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                          notifiers_install=fp.TIMEOUT)}
+        text = fp.digest(stored, [], [], baseline=False, current=probed_today)
+        assert "mjolnir42  notifiers=timeout" in text
+        assert "installed" not in text.split("install problems:")[-1]
 
 
 # --------------------------------------------------------------------------
@@ -2963,3 +3070,203 @@ class TestCommitSummaryNamesSchemaAndUnits:
                                 + ",".join(new_row.values()) + "\n")
         message = fp.commit_summary(str(repo), rel)
         assert message == "state: mjolnir02"
+
+    def test_a_quoted_comma_in_a_value_does_not_hide_a_real_change(
+            self, fp, tmp_path):
+        """Red-team round 3 should-fix 2 (mutant M11): a value containing
+        a comma is written quoted (csv.DictWriter does this automatically
+        -- see render()). The SAME quoted value on both sides contributes
+        no real difference by itself, but naively splitting the raw line
+        on every comma shifts every column after it by one -- on a
+        schema day, where the old row is also a different WIDTH, that
+        shift can make a genuinely changed column (here, `notifiers`)
+        compare equal to a wrong, shifted-in column instead, hiding the
+        change entirely. parse_snapshot() is real CSV, so it isn't fooled.
+        """
+        repo = tmp_path / "repo_comma"
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rel = "state/fleet-state.csv"
+        old_row = dict(row(fp, "mjolnir02"), brokkr_mode="a,b")
+        # Written with csv, not a plain join: a real pre-upgrade snapshot
+        # (written by this same render(), just with fewer columns back
+        # then) would have quoted "a,b" too. A plain join would add no
+        # quote at all, which is itself a difference from the new row's
+        # quoted copy and would mask what this test is isolating.
+        old_buf = io.StringIO()
+        csv.writer(old_buf, lineterminator="\n").writerow(
+            [old_row[f] for f in fp.FIELDS[:12]])
+        (repo / rel).write_text(",".join(fp.FIELDS[:12]) + "\n"
+                                + old_buf.getvalue())
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        new_row = dict(old_row, notifiers="deadbee",      # the real change
+                       **{f: "" for f in INSTALL_FIELDS})
+        (repo / rel).write_text(fp.render({"mjolnir02": new_row}))
+
+        message = fp.commit_summary(str(repo), rel, schema_added=INSTALL_FIELDS)
+        assert message == "state: schema +{}; mjolnir02".format(
+            ",".join(INSTALL_FIELDS)), message
+
+    def test_a_hand_edited_header_missing_a_column_still_finds_the_change(
+            self, fp, tmp_path):
+        """A middle column dropped by hand (not a schema change -- no
+        schema_added) must not hide a real change elsewhere in the row.
+        """
+        repo, rel, old = self._repo(fp, tmp_path)
+        fields = [f for f in fp.FIELDS[:12] if f != "gain_slow"]
+        new_values = dict(old, threshold_1_mv="999")
+        (repo / rel).write_text(
+            ",".join(fields) + "\n"
+            + ",".join(new_values[f] for f in fields) + "\n")
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir02", message
+
+    def test_a_pure_backfill_day_is_named_as_a_count_not_by_unit(self, fp,
+                                                                  tmp_path):
+        """Red-team round 3 should-fix 3: a day where *_install goes
+        blank -> real for several units, with nothing else changed, must
+        not read in the git log as a configuration change to those units
+        -- the daily digest already says "0 change(s)" for exactly this
+        reason (see diff()'s INSTALL_FIELDS check).
+        """
+        repo = tmp_path / "repo_backfill"
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rel = "state/fleet-state.csv"
+        old04, old05 = row(fp, "mjolnir04"), row(fp, "mjolnir05")
+        # Already past the schema day: both rows have the full header,
+        # blank for *_install (never yet measured).
+        (repo / rel).write_text(fp.render(
+            {"mjolnir04": old04, "mjolnir05": old05}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        new04 = dict(old04, **{f: "installed" for f in INSTALL_FIELDS})
+        new05 = dict(old05, **{f: "editable" for f in INSTALL_FIELDS})
+        (repo / rel).write_text(fp.render(
+            {"mjolnir04": new04, "mjolnir05": new05}))
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: install backfill: 2 units", message
+
+    def test_backfill_and_a_real_change_are_both_named(self, fp, tmp_path):
+        repo = tmp_path / "repo_backfill2"
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rel = "state/fleet-state.csv"
+        old04, old05 = row(fp, "mjolnir04"), row(fp, "mjolnir05")
+        (repo / rel).write_text(fp.render(
+            {"mjolnir04": old04, "mjolnir05": old05}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        new04 = dict(old04, **{f: "installed" for f in INSTALL_FIELDS})
+        new05 = dict(old05, front_end="off")        # a real change
+        (repo / rel).write_text(fp.render(
+            {"mjolnir04": new04, "mjolnir05": new05}))
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir05; install backfill: 1 units", \
+            message
+
+    def test_a_unit_with_both_a_real_change_and_a_backfill_is_named_not_counted(
+            self, fp, tmp_path):
+        """A unit's real change takes priority over its OWN backfill: it
+        is named by unit, not folded into the backfill count, which would
+        otherwise hide that specific unit's actual configuration change.
+        """
+        repo = tmp_path / "repo_backfill3"
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rel = "state/fleet-state.csv"
+        old06 = row(fp, "mjolnir06")
+        (repo / rel).write_text(fp.render({"mjolnir06": old06}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        # Both on the SAME unit: a real front_end flip, and its first
+        # *_install reading (blank -> real).
+        new06 = dict(old06, front_end="off",
+                     **{f: "installed" for f in INSTALL_FIELDS})
+        (repo / rel).write_text(fp.render({"mjolnir06": new06}))
+
+        message = fp.commit_summary(str(repo), rel)
+        assert message == "state: mjolnir06", message
+
+
+class TestMutationSurvivorCoverage:
+    """Round 3: named survivors from the coordinator's mutation review."""
+
+    def test_m9_a_missing_key_skips_any_field_not_just_install(self, fp):
+        # The "field not in old" skip in diff() applies to ANY future
+        # schema addition, not just *_install -- drop a non-install key
+        # entirely from `old` and confirm its first real value is still
+        # not reported as a change.
+        old = row(fp, "mjolnir02")
+        del old["brokkr_mode"]
+        new = dict(row(fp, "mjolnir02"), brokkr_mode="nochargecontroller")
+        assert fp.diff({"mjolnir02": old}, {"mjolnir02": new}) == []
+
+    def test_m22_timeout_constant_matches_the_bash_literal(self, fp):
+        # Ties fp.TIMEOUT to the actual bash assignment in INSTALL_PROBE,
+        # not just the python-side comparisons against the constant.
+        assert "I=" + fp.TIMEOUT in fp.INSTALL_PROBE
+
+
+class TestShortRowDoesNotPrintNone:
+    """Red-team round 3, low-priority finding 5: csv.DictReader fills a
+    short row's missing trailing cells with None, not "". A bare
+    `.get(field, "")` default only covers a MISSING key, not a PRESENT
+    None value, so str(None) == "None" could leak into a change line.
+    """
+
+    def test_a_short_row_never_prints_a_literal_none(self, fp):
+        header = ",".join(fp.FIELDS)
+        full = row(fp, "mjolnir02")
+        # Drop the LAST of the 12 base cells (notifiers) -- the row has
+        # fewer cells than the header, so csv.DictReader fills notifiers
+        # AND every *_install column (also trailing) with None, not "".
+        short_row = ",".join(list(full.values())[:-1])
+        old_rows = fp.parse_snapshot(
+            io.StringIO(header + "\n" + short_row + "\n"))
+        new = dict(full, notifiers="9999999")
+        changes = fp.diff(old_rows, {"mjolnir02": new})
+        for _, _, old_val, new_val in changes:
+            assert old_val != "None" and new_val != "None", changes
+
+    def test_a_short_row_reports_the_real_change_as_blank_to_value(self, fp):
+        header = ",".join(fp.FIELDS)
+        full = row(fp, "mjolnir02")
+        short_row = ",".join(list(full.values())[:-1])
+        old_rows = fp.parse_snapshot(
+            io.StringIO(header + "\n" + short_row + "\n"))
+        new = dict(full, notifiers="9999999")
+        assert fp.diff(old_rows, {"mjolnir02": new}) == [
+            ("mjolnir02", "notifiers", "", "9999999")]
