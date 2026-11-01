@@ -71,7 +71,9 @@ def load_ags_parser(extra_path=None):
     Search order: explicit path, $FLEET_PROBE_AGS_PATH, sibling ../scripts, then
     the known VPS checkout.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
+    # realpath, not abspath: installed as a symlink on PATH (install.sh),
+    # abspath gives the link's directory and ../scripts is not there.
+    here = os.path.dirname(os.path.realpath(__file__))
     candidates = []
     if extra_path:
         candidates.append(extra_path)
@@ -1595,8 +1597,9 @@ def main():
                          if r.get("front_end") == UNREACHABLE)
     # Refresh the clone BEFORE reading the baseline, so the diff is against
     # what is actually published. After probing rather than before, to keep the
-    # window between pull and push short -- the sweep is serial and can take
-    # ~27 minutes. A failure here is recorded, not raised: the digest still has
+    # window between pull and push short -- the sweep is serial (under a minute
+    # for the fleet today, longer when tunnels time out). A failure here is
+    # recorded, not raised: the digest still has
     # to go out, because a wedged clone and a dead probe must not look alike.
     publish = (prepare_clone(args.repo, snapshot_rel)
                if args.commit and not args.dry_run

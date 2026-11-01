@@ -6,6 +6,7 @@ stdout parser is tested without ssh.
 """
 
 import csv
+import importlib.machinery
 import importlib.util
 import io
 import os
@@ -3468,3 +3469,66 @@ class TestShortRowDoesNotPrintNone:
         new = dict(full, notifiers="9999999")
         assert fp.diff(old_rows, {"mjolnir02": new}) == [
             ("mjolnir02", "notifiers", "", "9999999")]
+
+
+# --------------------------------------------------------------------------
+# Installing and scheduling (PR #106): the probe is run as an installed
+# command and from cron, so the install path itself is tested.
+# --------------------------------------------------------------------------
+
+class TestInstallAndSchedule:
+
+    def test_the_script_is_executable_in_git(self):
+        mode = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-s",
+             "server/fleet_probe.py"], stdout=subprocess.PIPE,
+            universal_newlines=True, check=True).stdout.split()[0]
+        assert mode == "100755", "fleet_probe.py lost its exec bit: " + mode
+
+    def test_the_shebang_is_python3(self):
+        first = SCRIPT_PATH.read_text().splitlines()[0]
+        assert first == "#!/usr/bin/env python3", first
+
+    def test_install_sh_links_fleet_probe(self, tmp_path):
+        bindir = tmp_path / "bin"
+        done = subprocess.run(
+            ["bash", str(REPO_ROOT / "server" / "install.sh"), str(bindir)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=60)
+        assert done.returncode == 0, done.stdout
+        link = bindir / "fleet_probe"
+        assert link.is_symlink(), done.stdout
+        assert link.resolve() == SCRIPT_PATH.resolve()
+
+    def test_the_installed_symlink_finds_ags(self, tmp_path, monkeypatch):
+        """load_ags_parser resolved ../scripts from the symlink's own
+        directory (abspath), so the installed command could not find ags.py
+        and fell back to a hard-coded VPS path that exists nowhere else."""
+        monkeypatch.delenv("FLEET_PROBE_AGS_PATH", raising=False)
+        link = tmp_path / "fleet_probe"
+        link.symlink_to(SCRIPT_PATH)
+        loader = importlib.machinery.SourceFileLoader("fleet_probe_link",
+                                                      str(link))
+        spec = importlib.util.spec_from_loader("fleet_probe_link", loader)
+        module = importlib.util.module_from_spec(spec)
+        with patch("sys.path", list(__import__("sys").path)):
+            spec.loader.exec_module(module)
+        module.AGS_FALLBACK_DIRS[:] = []
+        parser, source = module.load_ags_parser()
+        assert parser is not None, "ags.py not found through the symlink"
+        assert os.path.realpath(source) == os.path.realpath(
+            str(REPO_ROOT / "scripts"))
+
+    def test_the_installed_command_runs(self, tmp_path):
+        """--field reads the snapshot only (no fleet contact): enough to
+        prove the symlinked command starts and parses its arguments."""
+        link = tmp_path / "fleet_probe"
+        link.symlink_to(SCRIPT_PATH)
+        snap = tmp_path / "fleet-state.csv"
+        snap.write_text("unit,front_end\nmjolnir02,on\n")
+        done = subprocess.run(
+            [str(link), "--snapshot", str(snap), "--field", "front_end"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=60)
+        assert done.returncode == 0, done.stdout
+        assert "mjolnir02" in done.stdout
