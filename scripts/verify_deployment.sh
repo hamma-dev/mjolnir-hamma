@@ -451,155 +451,115 @@ check_log_bounds() {
     fi
 }
 
-# Read a single `key = "value"` line out of a TOML [section] block. Prints
-# nothing when the file, section, or key is absent -- callers treat an empty
-# result as "not configured", not as an error, since per-unit overrides are
-# optional.
-_toml_section_value() {
-    local file="$1" section="$2" key="$3"
-
-    [[ -f "$file" ]] || return 0
-
-    awk -v want="[$section]" -v key="$key" '
-        /^[ \t]*\[/ {
-            line = $0
-            sub(/^[ \t]+/, "", line)
-            sub(/[ \t]+$/, "", line)
-            insec = (line == want)
-            next
-        }
-        insec {
-            line = $0
-            sub(/^[ \t]+/, "", line)
-            if (line ~ "^" key "[ \t]*=") {
-                val = line
-                sub("^" key "[ \t]*=[ \t]*", "", val)
-                sub(/[ \t]*(#.*)?$/, "", val)
-                gsub(/"/, "", val)
-                print val
-                exit
-            }
-        }
-    ' "$file" 2>/dev/null || true
-}
-
-# Effective channel for a notifier step. The per-unit override in
-# ~/.config/brokkr/hamma/main.toml wins when it sets one -- the same
-# local-overrides-system precedent as the rest of brokkr's config hierarchy
-# (see the mode.toml precedence note above) -- otherwise fall back to the
-# channel shipped in config/main.toml.
-_gchat_effective_channel() {
-    local step="$1" base_toml="$2" local_toml="$3"
-    local channel
-    channel="$(_toml_section_value "$local_toml" "steps.$step" "channel")"
-    if [[ -z "$channel" ]]; then
-        channel="$(_toml_section_value "$base_toml" "steps.$step" "channel")"
-    fi
-    echo "$channel"
-}
-
-# The Google Chat key file is a single [channel] table whose KEYS are
-# channel names mapped to webhook URLs, e.g.:
-#   [channel]
-#   status = https://chat.googleapis.com/...
-#   # hamma = https://chat.googleapis.com/...
-# Prints each live (uncommented) key under [channel], one per line, and
-# nothing else -- callers must never read or print the values on the right
-# of "=".
-_gchat_keyfile_channels() {
-    local file="$1"
-
-    [[ -f "$file" ]] || return 0
-
-    awk '
-        /^[ \t]*#/ { next }
-        /^[ \t]*\[/ {
-            line = $0
-            sub(/^[ \t]+/, "", line)
-            sub(/[ \t]+$/, "", line)
-            insec = (line == "[channel]")
-            next
-        }
-        insec {
-            line = $0
-            sub(/^[ \t]+/, "", line)
-            if (line == "") next
-            if (line ~ /^[A-Za-z0-9_.-]+[ \t]*=/) {
-                key = line
-                sub(/[ \t]*=.*/, "", key)
-                print key
-            }
-        }
-    ' "$file" 2>/dev/null || true
-}
-
 # HAM-118: state_monitor and noise_diag both alert over Google Chat via a
-# key file whose [channel] table maps channel names to webhook URLs. A
-# missing/empty key file, or a configured channel with no matching key in
-# that table, disables that step's alerts with no error -- notifiers logs
-# once and send() becomes a permanent no-op.
+# key file parsed by the notifiers package with configparser, under a
+# channel name read from brokkr's own rendered config (presets + system
+# config/main.toml + local override + the active mode overlay). A missing
+# key, an empty value, or a key file that fails to parse disables that
+# step's alerts with no error -- notifiers logs once and send() becomes a
+# permanent no-op.
+#
+# The channel/method/key_file resolution and the key-file parsing are both
+# delegated to real parsers (brokkr's config renderer, Python's
+# configparser) via scripts/verify_googlechat_channels.py, run under
+# brokkr's own interpreter -- re-deriving either in bash is what produced
+# the false FAILs this check shipped with originally (channel names are
+# config options, not TOML/INI section headers).
 check_googlechat_key() {
     print_section "Google Chat Alerts"
 
-    local key_file="${GOOGLECHAT_KEY_FILE:-/home/pi/.googlechat}"
-
-    if [[ ! -e "$key_file" ]]; then
-        fail "Google Chat key file not found ($key_file) -- alerts are silently disabled"
+    local ltgenv_py="${GOOGLECHAT_PYTHON:-/home/pi/dev/ltgenv/bin/python}"
+    if [[ ! -x "$ltgenv_py" ]]; then
+        skip "ltgenv python not found ($ltgenv_py) -- cannot render brokkr config, skipping Google Chat check"
         return 0
     fi
-    if [[ ! -s "$key_file" ]]; then
-        fail "Google Chat key file is empty ($key_file) -- alerts are silently disabled"
+
+    local script_dir helper
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    helper="${GOOGLECHAT_HELPER:-${script_dir:-/home/pi/dev/mjolnir-hamma/scripts}/verify_googlechat_channels.py}"
+    if [[ ! -f "$helper" ]]; then
+        skip "verify_googlechat_channels.py not found ($helper) -- checkout may be incomplete"
         return 0
     fi
-    pass "Google Chat key file exists and is non-empty"
 
-    local config_dir base_toml local_toml
-    config_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../config" 2>/dev/null && pwd || true)"
-    base_toml="${GOOGLECHAT_BASE_TOML:-${config_dir:-/home/pi/dev/mjolnir-hamma/config}/main.toml}"
-    local_toml="${GOOGLECHAT_LOCAL_TOML:-/home/pi/.config/brokkr/hamma/main.toml}"
+    # Resolve the unit's active brokkr mode the way brokkr itself resolves
+    # it at import time: CLI --mode (baked into ExecStart) outranks
+    # Environment=BROKKR_MODE (the mode.conf drop-in sensors.py writes),
+    # which outranks brokkr's own mode.toml precedence -- so only the first
+    # two need resolving here; absent both, importing brokkr applies its
+    # own system/local mode.toml default unassisted.
+    local brokkr_service="brokkr-hamma-default.service"
+    local mode="" execstart env_prop
+    execstart="$(systemctl show "$brokkr_service" --property=ExecStart 2>/dev/null || true)"
+    if [[ "$execstart" =~ --mode[=\ ]+([^[:space:];}]+) ]]; then
+        mode="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$mode" ]]; then
+        env_prop="$(systemctl show "$brokkr_service" --property=Environment 2>/dev/null || true)"
+        if [[ "$env_prop" =~ BROKKR_MODE=([^[:space:]]+) ]]; then
+            mode="${BASH_REMATCH[1]}"
+        fi
+    fi
 
-    # Channel NAMES only -- never read or print the webhook URLs the key
-    # file holds.
-    local keyfile_channels
-    keyfile_channels="$(_gchat_keyfile_channels "$key_file")"
+    local output
+    if [[ -n "$mode" ]]; then
+        output="$(BROKKR_MODE="$mode" "$ltgenv_py" "$helper" 2>&1)"
+    else
+        output="$("$ltgenv_py" "$helper" 2>&1)"
+    fi
 
-    local step channel
-    for step in state_monitor noise_diag; do
-        channel="$(_gchat_effective_channel "$step" "$base_toml" "$local_toml")"
-        if [[ -z "$channel" ]]; then
-            skip "No channel configured for steps.$step"
+    if [[ -z "$output" ]]; then
+        skip "verify_googlechat_channels.py produced no output"
+        return 0
+    fi
+
+    # Each step that reaches the parsing stage also emits a "KEYFILE <path>"
+    # line, so permissions are checked on the file brokkr's own config
+    # actually resolved for that step -- never a hardcoded guess.
+    local step status detail
+    local -a keyfiles=()
+    while IFS=' ' read -r step status detail; do
+        [[ -z "$step" ]] && continue
+        if [[ "$step" == "KEYFILE" ]]; then
+            local kf="$status" already=0 existing
+            for existing in "${keyfiles[@]-}"; do
+                [[ -n "$existing" && "$existing" == "$kf" ]] && already=1 && break
+            done
+            [[ "$already" -eq 0 && -n "$kf" ]] && keyfiles+=("$kf")
             continue
         fi
-        if printf '%s\n' "$keyfile_channels" | grep -Fxq "$channel"; then
-            pass "Channel '$channel' (steps.$step) present in key file"
-        else
-            fail "Channel '$channel' (steps.$step) not found in key file -- its alerts go nowhere"
+        case "$status" in
+            PASS) pass "steps.$step: $detail" ;;
+            FAIL) fail "steps.$step: $detail" ;;
+            SKIP) skip "steps.$step: $detail" ;;
+            *) fail "steps.$step: unexpected helper output ($status $detail)" ;;
+        esac
+    done <<< "$output"
+
+    # Ownership/permissions. Every unit today is pi:pi 644: that's expected
+    # across the fleet, so it's informational, not a WARN that would fire
+    # on every run. A non-pi owner is still unexpected and worth a WARN.
+    local key_file
+    for key_file in "${keyfiles[@]-}"; do
+        [[ -n "$key_file" && -e "$key_file" ]] || continue
+
+        local owner perms
+        owner="$(stat -c %U "$key_file" 2>/dev/null || echo "unknown")"
+        perms="$(stat -c %a "$key_file" 2>/dev/null || echo "unknown")"
+
+        if [[ "$owner" != "pi" && "$owner" != "unknown" ]]; then
+            warn "Google Chat key file not owned by pi (owned by $owner): $key_file"
+        fi
+
+        if [[ "$perms" =~ ^[0-7]{3,4}$ ]]; then
+            local group_bit="${perms: -2:1}" other_bit="${perms: -1}"
+            if (( (group_bit & 4) != 0 || (other_bit & 4) != 0 )); then
+                info "Google Chat key file is group/world readable (perms $perms) -- expected across the fleet today: $key_file"
+            else
+                pass "Google Chat key file permissions ($perms) restrict read access: $key_file"
+            fi
         fi
     done
-
-    # Ownership/permissions: WARN, not FAIL. Every unit today is pi:pi 644,
-    # so gating on this would break every deployment; still worth flagging
-    # since the file holds webhook secrets.
-    local owner perms
-    owner="$(stat -c %U "$key_file" 2>/dev/null || echo "unknown")"
-    perms="$(stat -c %a "$key_file" 2>/dev/null || echo "unknown")"
-
-    if [[ "$owner" != "pi" ]]; then
-        warn "Google Chat key file not owned by pi (owned by $owner) -- not failed, every unit today is 644"
-    else
-        pass "Google Chat key file owned by pi"
-    fi
-
-    if [[ "$perms" =~ ^[0-7]{3,4}$ ]]; then
-        local group_bit="${perms: -2:1}" other_bit="${perms: -1}"
-        if (( (group_bit & 4) != 0 || (other_bit & 4) != 0 )); then
-            warn "Google Chat key file is group/world readable (perms $perms) -- not failed, every unit today is 644"
-        else
-            pass "Google Chat key file permissions ($perms) restrict read access"
-        fi
-    else
-        skip "Could not read Google Chat key file permissions"
-    fi
 
     return 0
 }
