@@ -43,6 +43,7 @@ import glob
 import io
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -647,20 +648,30 @@ def _brief(output):
     raw = [line for line in (output or "").splitlines()
            if line.strip() and not line.startswith(noise)
            and "FETCH_HEAD" not in line]
-    causes, after_error = [], 0
+    causes, files, in_error = [], [], False
+
+    def flush_files():
+        causes.extend(files[:3])             # the files an error: names
+        if len(files) > 3:
+            causes.append("(+{} more)".format(len(files) - 3))
+        del files[:]
+
     for line in raw:
         text = line.strip()
-        if line.startswith("\t") and after_error:
-            causes.append(text)              # the files an error: names
-            after_error -= 1
-        elif (text.startswith(("fatal:", "error:", "ssh:", "!"))
-              or "Permission denied" in text):
+        if line.startswith("\t") and in_error:
+            files.append(text)
+            continue
+        flush_files()
+        # "warning: ... Permission denied" lines (one per file) must not
+        # crowd out the fatal: line after them.
+        if (text.startswith(("fatal:", "error:", "ssh:", "!"))
+                or ("Permission denied" in text
+                    and not text.startswith("warning:"))):
             causes.append(text)
-            after_error = 3 if text.startswith("error:") else 0
-        else:
-            after_error = 0
+        in_error = text.startswith("error:")
+    flush_files()
     lines = [line.strip() for line in raw]
-    return " / ".join(causes[:5] or lines[-2:]) or "(no output)"
+    return " / ".join(causes[:6] or lines[-2:]) or "(no output)"
 
 
 def pull_snapshot(repo):
@@ -707,14 +718,22 @@ def dirty_tracked(repo, snapshot_rel):
     return [path for path in paths if path != _snapshot_path(snapshot_rel)]
 
 
-def incoming_changes(repo):
-    """(changed, added) paths between HEAD and origin/main's trees."""
-    changed = _git(repo, "diff", "--name-only", "-z", "HEAD",
-                   "origin/" + BRANCH)
-    added = _git(repo, "diff", "--name-only", "-z", "--diff-filter=A",
-                 "HEAD", "origin/" + BRANCH)
-    return (set(filter(None, changed.stdout.split("\0"))),
-            set(filter(None, added.stdout.split("\0"))))
+def incoming_additions(repo):
+    """Paths origin/main has that HEAD does not.
+
+    --no-renames: a rename is otherwise reported as R and the path it
+    renames *to* was missed (profiles do move between array directories).
+    """
+    added = _git(repo, "diff", "--name-only", "-z", "--no-renames",
+                 "--diff-filter=A", "HEAD", "origin/" + BRANCH)
+    return set(filter(None, added.stdout.split("\0")))
+
+
+def in_the_way(untracked, incoming):
+    """Untracked paths a checkout of `incoming` would overwrite: the same
+    path, or a file where a directory is coming (or the reverse)."""
+    return sorted(u for u in untracked for c in incoming
+                  if u == c or c.startswith(u + "/") or u.startswith(c + "/"))
 
 
 def untracked_files(repo):
@@ -869,22 +888,22 @@ def prepare_clone(repo, snapshot_rel):
         pulled, detail, fetched = pull_snapshot(repo)
         print("pull: {}".format(detail), file=sys.stderr)
         state.update(pulled=pulled, fetched=fetched)
-        if not pulled and fetched:
-            # A hand edit to a file origin changed, or an untracked file
-            # where origin adds one, refuses the fast-forward every day, and
-            # RECOVER refuses it too. Unrelated edits are not the cause (a
-            # divergence is), but they still stop RECOVER: the banner sets
-            # them aside first, without dropping the day.
+        if not pulled:
+            # Uncommitted edits stop RECOVER (a rebase refuses them), so the
+            # banner sets them aside first -- without dropping the day.
             state["dirty"] = dirty_tracked(repo, state["rel"])
-            changed, added = incoming_changes(repo)
-            in_the_way = sorted((set(state["dirty"]) & changed)
-                                | (untracked_files(repo) & added))
-            if in_the_way:
-                blocker = ("holding uncommitted or untracked files ({}) that "
-                           "block the fast-forward".format(
-                               ", ".join(in_the_way)),
-                           ["git -C {} stash --include-untracked".format(
-                               repo)])
+        if not pulled and fetched:
+            # An untracked file where origin adds one (or a file/directory
+            # clash) refuses the fast-forward every day, and RECOVER too;
+            # a plain stash does not move it. Stash exactly those paths.
+            blocking = in_the_way(untracked_files(repo),
+                                  incoming_additions(repo))
+            if blocking:
+                blocker = ("holding untracked files ({}) where origin adds "
+                           "files".format(", ".join(blocking)),
+                           ["git -C {} stash push --include-untracked -- {}"
+                            .format(repo, " ".join(shlex.quote(p)
+                                                   for p in blocking))])
         if not pulled and not blocker:
             state["problems"].append(
                 "could not refresh the sensor-log clone: {}".format(detail))
@@ -951,8 +970,8 @@ def publish_banner(state):
     lines += ["  - {}".format(p) for p in problems]
     if state["blocker"]:
         lines.append("  Fix by hand, as monitor, and only if nobody is "
-                     "working in the clone (this discards an unfinished operation; "
-                     "anything already committed on {} is then "
+                     "working in the clone (an abort step ends an unfinished "
+                     "operation; anything already committed on {} is then "
                      "published):".format(BRANCH))
         lines += ["    $ {}".format(step)
                   for step in state["blocker"][1] + [recover]]
@@ -990,6 +1009,16 @@ def publish_banner(state):
         lines.append("    $ {}".format(recover))
         lines.append("  If that stops on a conflict, back out with: "
                      "git -C {} rebase --abort".format(repo))
+    elif state["fetched"] and not state["pulled"]:
+        if state["dirty"]:
+            lines.append("  Uncommitted edits to {} stop the fast-forward; set "
+                         "them aside and the next run catches up:".format(
+                             ", ".join(state["dirty"])))
+            lines.append("    $ git -C {} stash".format(repo))
+        else:
+            lines.append("  The fast-forward was refused; to see why:")
+            lines.append("    $ git -C {} merge --ff-only origin/{}".format(
+                repo, BRANCH))
     elif not state["fetched"] and not unpublished:
         lines.append("  Usually transient: the next run retries on its own. "
                      "If it repeats, check monitor can reach GitHub:")

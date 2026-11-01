@@ -1346,19 +1346,22 @@ class TestGitIsNonInteractive:
 
 class TestUncommittedEditsInTheClone:
 
-    def test_a_conflicting_hand_edit_blocks_with_a_working_way_out(
+    def test_a_conflicting_hand_edit_keeps_the_day_and_a_working_way_out(
             self, fp, clone_pair, tmp_path):
         """A hand edit to a file origin then changes made --ff-only refuse
-        every day, and RECOVER refused too ('unstaged changes')."""
+        every day, and RECOVER refused too ('unstaged changes'). The day is
+        still committed locally; the steps set the edit aside first."""
         clone, work, _ = clone_pair
         _human_commit(work, "deployments/mj02.md", "v1\n")
         assert _run_main(fp, clone, PUBLISH)[0] == 0
         (clone / "deployments" / "mj02.md").write_text("edited on the VPS\n")
         _human_commit(work, "deployments/mj02.md", "v2\n")
+        head = _head(clone)
         rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
         assert rc != 0
+        assert _head(clone, "HEAD~1") == head, "the day was dropped"
         assert "deployments/mj02.md" in text, "which file? " + text
-        assert "stash" in text, text
+        assert _fix_steps(text)[0].endswith("stash"), text
         _run_steps(_fix_steps(text), tmp_path)
         rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
         assert rc == 0, text
@@ -1685,3 +1688,111 @@ def test_a_staged_rename_is_listed_once_by_its_new_name(fp, clone_pair):
     (clone / "keep.txt").write_text("edited\n")
     assert sorted(fp.dirty_tracked(str(clone), "state/fleet-state.csv")) == \
         ["keep.txt", "new.txt"]
+
+
+
+class TestRoundSix:
+    """Findings of the red team on 48b106a."""
+
+    def _blocked_then_fixed(self, fp, clone, tmp_path, keep):
+        (clone / "scratch.txt").write_text("unrelated, untracked\n")
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc != 0
+        assert keep in text, text
+        assert "discards" not in text, "a stash discards nothing: " + text
+        _run_steps(_fix_steps(text), tmp_path)
+        rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        assert rc == 0, text
+        assert (clone / "scratch.txt").exists(), \
+            "the stash swept up an unrelated untracked file"
+
+    def test_an_untracked_file_where_origin_renames_one_to(
+            self, fp, clone_pair, tmp_path):
+        """A rename shows as R, not A, so --diff-filter=A missed it."""
+        clone, work, _ = clone_pair
+        _human_commit(work, "notes/old.md", "x\n")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        _git(work, "pull", "-q", "--ff-only", "origin", "main")
+        (work / "deployments").mkdir()
+        _git(work, "mv", "notes/old.md", "deployments/mj02.md")
+        _git(work, "commit", "-q", "-m", "move a profile")
+        _git(work, "push", "-q", "origin", "main")
+        (clone / "deployments").mkdir()
+        (clone / "deployments" / "mj02.md").write_text("local notes\n")
+        self._blocked_then_fixed(fp, clone, tmp_path, "deployments/mj02.md")
+
+    def test_an_untracked_file_where_origin_adds_a_directory(
+            self, fp, clone_pair, tmp_path):
+        clone, work, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "deployments").write_text("a file, not a directory\n")
+        _human_commit(work, "deployments/mj02.md", "x\n")
+        self._blocked_then_fixed(fp, clone, tmp_path, "deployments")
+
+    def test_an_untracked_directory_where_origin_adds_a_file(
+            self, fp, clone_pair, tmp_path):
+        clone, work, _ = clone_pair
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "notes").mkdir()
+        (clone / "notes" / "x.md").write_text("local\n")
+        _human_commit(work, "notes", "a file\n")
+        self._blocked_then_fixed(fp, clone, tmp_path, "notes/x.md")
+
+    def test_unreachable_github_with_an_edit_still_stashes_before_recover(
+            self, fp, clone_pair):
+        clone, _, rel = clone_pair
+        _strand_a_commit(fp, clone, rel)
+        (clone / "README").write_text("edited by hand\n")
+        url = _git(clone, "remote", "get-url", "origin").strip()
+        _git(clone, "remote", "set-url", "origin", url + "-gone")
+        _, text = _run_main(fp, clone, PUBLISH, front_end="off")
+        steps = _fix_steps(text)
+        assert steps[0].endswith("stash") and \
+            steps[-1] == fp.RECOVER.format(repo=clone), steps
+
+    def test_a_refused_quiet_day_still_prints_a_step(self, fp, clone_pair,
+                                                     tmp_path):
+        """Nothing to commit and nothing ahead, but the fast-forward is
+        refused: the banner used to give no step at all."""
+        clone, work, _ = clone_pair
+        _human_commit(work, "deployments/mj02.md", "v1\n")
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        (clone / "deployments" / "mj02.md").write_text("edited\n")
+        _human_commit(work, "deployments/mj02.md", "v2\n")
+        rc, text = _run_main(fp, clone, PUBLISH)
+        assert rc != 0
+        steps = _fix_steps(text)
+        assert steps, "no way out printed: " + text
+        _run_steps(steps, tmp_path)
+        assert _run_main(fp, clone, PUBLISH)[0] == 0
+        assert (clone / "deployments" / "mj02.md").read_text() == "v2\n"
+
+    def test_brief_prefers_the_cause_over_warnings(self, fp):
+        out = "".join("warning: unable to unlink 'f{}': Permission denied\n"
+                      .format(i) for i in range(6))
+        out += "fatal: cannot do a partial commit during a merge.\n"
+        brief = fp._brief(out)
+        assert brief.startswith("fatal: cannot do a partial commit"), brief
+
+    def test_brief_lists_three_files_and_counts_the_rest(self, fp):
+        out = ("error: Your local changes to the following files would be "
+               "overwritten by merge:\n\ta\n\tb\n\tc\n\td\n\te\nAborting\n")
+        brief = fp._brief(out)
+        assert all(" / {}".format(f) in brief for f in "abc"), brief
+        assert "(+2 more)" in brief, brief
+
+    def test_brief_ignores_indented_lines_without_an_error(self, fp):
+        out = "Updating a..b\n\tsomething indented\nfatal: boom\n"
+        assert "indented" not in fp._brief(out)
+
+
+def test_an_untracked_path_with_a_space_gets_a_working_stash_step(
+        fp, clone_pair, tmp_path):
+    clone, work, _ = clone_pair
+    assert _run_main(fp, clone, PUBLISH)[0] == 0
+    (clone / "my notes.md").write_text("local\n")
+    _human_commit(work, "my notes.md", "from origin\n")
+    rc, text = _run_main(fp, clone, PUBLISH, front_end="off")
+    assert rc != 0
+    _run_steps(_fix_steps(text), tmp_path)
+    assert _run_main(fp, clone, PUBLISH, front_end="off")[0] == 0
