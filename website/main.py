@@ -39,11 +39,11 @@ SENSORS = [f"hamma{sensor_number}" for sensor_number in SENSOR_NUMBERS]
 
 # PAMMA sensors (50-56)
 PAMMA_SENSOR_NUMBERS = [50, 51, 52, 53, 54, 55, 56]
-PAMMA_SENSORS = [f"hamma{sensor_number}" for sensor_number in PAMMA_SENSOR_NUMBERS]
+PAMMA_SENSORS = [f"hamma{number}" for number in PAMMA_SENSOR_NUMBERS]
 
 # AUMMA sensors (41-43)
 AUMMA_SENSOR_NUMBERS = [41, 42, 43]
-AUMMA_SENSORS = [f"hamma{sensor_number}" for sensor_number in AUMMA_SENSOR_NUMBERS]
+AUMMA_SENSORS = [f"hamma{number}" for number in AUMMA_SENSOR_NUMBERS]
 
 STATUS_UPDATE_INTERVAL_SECONDS = 10
 STATUS_UPDATE_INTERVAL_SERVER_SECONDS = 10
@@ -276,7 +276,8 @@ DATA_DIR_CLIENT = Path.home() / "brokkr" / "hamma" / "telemetry"
 GLOB_PATTERN_CLIENT = "telemetry_hamma_???_????-??-??.csv"
 
 DATA_DIR_SERVER = Path("/") / "var" / "www" / "hamma.dev" / "public_html"
-UNIT_DIRS_SERVER = [Path(sensor) for sensor in SENSORS + PAMMA_SENSORS + AUMMA_SENSORS]
+UNIT_DIRS_SERVER = [
+    Path(sensor) for sensor in SENSORS + PAMMA_SENSORS + AUMMA_SENSORS]
 DATA_SUBDIR_SERVER = Path("daily")
 GLOB_PATTERN_SERVER = "hamma*_????-??-??.csv"
 
@@ -1593,15 +1594,18 @@ OVERVIEW_SUBPLOT_KEYS = [
     ]
 OVERVIEW_ROWS = 3
 OVERVIEW_COLUMNS = 3
-OVERVIEW_COORDS = itertools.product(
-    range(OVERVIEW_ROWS), range(OVERVIEW_COLUMNS))
 
 SOURCE_PLOTS = {**STATUS_DASHBOARD_PLOTS}
 SOURCE_PLOTS["sourcelatency"] = copy.deepcopy(SOURCE_PLOTS["weblatency"])
 
 
 def create_overview_dashboard(sensors, rows, columns):
-    """Create overview dashboard plots for a group of sensors."""
+    """One overview card per sensor, each a `rows` x `columns` grid of the
+    OVERVIEW_SUBPLOT_KEYS gauges (the grid inside a card, not the page)."""
+    if rows * columns < len(OVERVIEW_SUBPLOT_KEYS):
+        # zip() would silently drop the gauges that do not fit.
+        raise ValueError("a {}x{} card cannot hold {} gauges".format(
+            rows, columns, len(OVERVIEW_SUBPLOT_KEYS)))
     coords = itertools.product(range(rows), range(columns))
     overview_subplots = {
         plot_key: {
@@ -1619,7 +1623,8 @@ def create_overview_dashboard(sensors, rows, columns):
     for sensor in sensors:
         overview_subplots_sensor = copy.deepcopy(overview_subplots)
         overview_subplots_sensor["sourcelatency"]["plot_update_code"] = (
-            f"data['value'] = (new Date() - lastUpdateSources_overview.{sensor}) / (1000);\n"
+            "data['value'] = (new Date() - "
+            f"lastUpdateSources_overview.{sensor}) / (1000);\n"
             + GAUGE_PLOT_UPDATE_CODE_COLOR)
         overview_plots[sensor] = {
             "plot_type": "numeric",
@@ -1683,7 +1688,7 @@ def status_page_link(array):
         array.upper(), STATUS_PAGE_URL.format(array))
 
 
-# HAMMA Overview Dashboard (sensors 1-9) - 4x3 grid
+# HAMMA overview (sensors 1-9); every array's cards use the same 3x3 gauges.
 OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
     SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
 
@@ -1713,12 +1718,10 @@ OVERVIEW_DASHBOARD_ARGS = {
     }
 
 
-# --- PAMMA Overview Dashboard (sensors 50-56) - 3x3 grid ---
+# --- PAMMA Overview Dashboard (sensors 50-56) ---
 
-PAMMA_ROWS = 3
-PAMMA_COLUMNS = 3
 PAMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
-    PAMMA_SENSORS, PAMMA_ROWS, PAMMA_COLUMNS)
+    PAMMA_SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
 
 PAMMA_OVERVIEW_DASHBOARD_METADATA = {
     "section_title": "PAMMA Sensor Overview Dashboard",
@@ -1752,12 +1755,10 @@ PAMMA_OVERVIEW_PAGE_BLOCKS = {
     }
 
 
-# --- AUMMA Overview Dashboard (sensors 41-43) - 4x3 grid ---
+# --- AUMMA Overview Dashboard (sensors 41-43) ---
 
-AUMMA_ROWS = 3
-AUMMA_COLUMNS = 3
 AUMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
-    AUMMA_SENSORS, AUMMA_ROWS, AUMMA_COLUMNS)
+    AUMMA_SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
 
 AUMMA_OVERVIEW_DASHBOARD_METADATA = {
     "section_title": "AUMMA Sensor Overview Dashboard",
