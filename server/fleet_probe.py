@@ -118,6 +118,12 @@ FIELDS = [
     "brokkr_install", "sindri_install", "hamma_install", "notifiers_install",
 ]
 
+# Named apart from FIELDS so merge()/diff() can single them out without
+# hardcoding the slice, and tests can import the one list rather than a
+# second copy that could drift from it.
+INSTALL_FIELDS = ["brokkr_install", "sindri_install", "hamma_install",
+                  "notifiers_install"]
+
 # The release branch units are expected to track. "not at head" in the digest
 # means a unit's mjolnir_hamma SHA is not this branch's head.
 RELEASE_REMOTE = "https://github.com/hamma-dev/mjolnir-hamma.git"
@@ -126,6 +132,7 @@ RELEASE_BRANCH = "0.4.x"
 UNREACHABLE = "unreachable"
 UNIT_ROW = re.compile(r"^mjolnir\d{2}$")
 UNKNOWN = "unknown"
+TIMEOUT = "timeout"
 
 # Per-unit facts read every run for the digest's "not at <branch> head"
 # section only -- never written to the snapshot. They describe what's on
@@ -147,8 +154,16 @@ POWER_DERIVED_FIELDS = frozenset(
 # `broken`, or the real file's realpath -- CLASSIFY_INSTALL_MODE_SH turns the
 # realpath into `editable`/`installed`/`unknown`. `{pkg}` is filled with
 # bash's `$PKG` for the real run; tests fill it with a literal package name
-# so this is runnable directly under `python3 -c` against controlled
-# modules, not just checked by substring match against REMOTE.
+# so this is runnable directly under `python3 -I -c` against controlled
+# modules, not just checked by substring match against REMOTE. The real
+# invocation (INSTALL_PROBE) always passes `-I`: a plain `-c` puts '' (the
+# ssh session's cwd, /home/pi) first on sys.path, and /home/pi/brokkr/ on
+# mj02 -- a checkout with no __init__.py -- then resolves as a namespace
+# package. find_spec() succeeds and the import doesn't raise, so a brokkr
+# that is actually missing from ltgenv reads as `unknown` (no realpath
+# matches either glob) instead of `missing`. `-I` drops the cwd (and
+# PYTHONPATH/user-site) from sys.path but leaves the interpreter's own
+# site-packages alone, so the real venv package is still found.
 INSTALL_CLASSIFIER_PY = r"""
 import importlib.util as _u, os, sys
 spec = _u.find_spec('{pkg}')
@@ -189,7 +204,7 @@ esac
 INSTALL_PROBE = r'''
 for pair in brokkr:ltgenv notifiers:ltgenv hamma:ltgenv sindri:sindrienv; do
   PKG=${pair%%:*}; ENV=${pair##*:}
-  OUT=$(timeout 10 /home/pi/dev/$ENV/bin/python3 -c "\
+  OUT=$(timeout 10 /home/pi/dev/$ENV/bin/python3 -I -c "\
 ''' + INSTALL_CLASSIFIER_PY.format(pkg="$PKG") + r'''" 2>/dev/null)
   RC=$?
   F=$(printf '%s\n' "$OUT" | tail -n 1)
@@ -553,14 +568,20 @@ def diff(previous, current):
         came_back = (str(old.get("front_end", "")) == UNREACHABLE
                      and str(new.get("front_end", "")) != UNREACHABLE)
         for field in FIELDS[1:]:
+            if field not in old:
+                # The column is new to FIELDS and this row predates it
+                # entirely (a schema upgrade) -- not a change. Applies to
+                # any future column, not just the *_install ones below.
+                continue
             old_val = str(old.get(field, ""))
-            # No old value to compare against: either this column is new to
-            # FIELDS and the row predates it entirely (a genuinely missing
-            # key), or the row was carried forward across that same schema
-            # upgrade without being re-measured, in which case render() left
-            # it "" rather than fabricating "unknown" (see render()). Either
-            # way, the field's first real measurement is not a change.
-            if not old_val:
+            # *_install only: a row carried forward across the schema
+            # upgrade without being re-measured has "" here, not a real
+            # value -- render() backfills blank rather than fabricating
+            # "unknown" (see render()), so the field's first real
+            # measurement is not a change. Restricted to these columns
+            # deliberately: a blank old value in any OTHER field is real
+            # and must still be reported if it changes.
+            if field in INSTALL_FIELDS and not old_val:
                 continue
             new_val = str(new.get(field, ""))
             if old_val != new_val:
@@ -576,11 +597,33 @@ def diff(previous, current):
 
 
 def merge(previous, current):
-    """Carry an unreachable unit's previous row forward untouched."""
+    """Carry an unreachable unit's previous row forward untouched.
+
+    For *_install fields specifically, also carries forward a REACHABLE
+    unit's previous value when today's reading is `timeout` or `unknown`
+    over a real prior one. The classifier actually imports each package
+    (hamma pulls in numpy/pandas), so a slow or cold unit can transiently
+    miss the `timeout 10` bound and flap between its real mode and
+    timeout/unknown run to run; without this, main() diffs against this
+    merged row (see its call), and that flap would fire a change line and a
+    commit every time it happens. `broken` and `missing` are real,
+    persistent classifier outcomes and are never overridden this way.
+    """
     merged = dict(previous)
     for unit, row in current.items():
         if row.get("front_end") == UNREACHABLE and unit in previous:
             continue
+        old = previous.get(unit)
+        if old is not None:
+            steadied = {}
+            for field in INSTALL_FIELDS:
+                new_val = row.get(field)
+                old_val = old.get(field)
+                if (new_val in (TIMEOUT, UNKNOWN)
+                        and old_val and old_val not in (TIMEOUT, UNKNOWN)):
+                    steadied[field] = old_val
+            if steadied:
+                row = dict(row, **steadied)
         merged[unit] = row
     return merged
 
@@ -655,6 +698,12 @@ def release_head(branch, remote=RELEASE_REMOTE):
     return result.stdout.split()[0]
 
 
+# A `rev-parse --short` SHA is at least this long in practice; below it,
+# head.startswith(sha) is too easily satisfied by chance (an empty or
+# single-character sha "starts" almost anything) to count as "at head".
+MIN_SHA_PREFIX = 7
+
+
 def behind_release(rows, probed_units, unreachable, head):
     """[(unit, sha, branch, dirty)] for units of `probed_units` not at `head`.
 
@@ -672,7 +721,9 @@ def behind_release(rows, probed_units, unreachable, head):
     for unit in sorted(set(probed_units) - set(unreachable)):
         row = rows.get(unit, {})
         sha = str(row.get("mjolnir_hamma", UNKNOWN))
-        if sha == UNKNOWN or not sha or not head.startswith(sha):
+        at_head = (sha not in (UNKNOWN, "") and len(sha) >= MIN_SHA_PREFIX
+                   and head.startswith(sha))
+        if not at_head:
             branch = row.get("mjolnir_hamma_branch", UNKNOWN)
             dirty = row.get("mjolnir_hamma_dirty", UNKNOWN)
             out.append((unit, sha, branch, dirty))
@@ -727,6 +778,24 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
         if len(pending_lines) > PENDING_DIGEST_MAX:
             lines.append("  ... and {} more, see sensor-log/deployments/".format(
                 len(pending_lines) - PENDING_DIGEST_MAX))
+    # STANDING too: a unit that is broken/missing on its FIRST measurement
+    # never produces a change line (diff() reports a brand-new row as one
+    # "first seen" line for the whole unit, not per field), so without this
+    # a persistently broken package could go unreported indefinitely.
+    # Scoped to units this run actually probed, like the two sections above.
+    install_problems = []
+    for unit in sorted(reachable - set(unreachable)):
+        row = rows.get(unit, {})
+        bad = [(field[:-len("_install")], row.get(field))
+               for field in INSTALL_FIELDS
+               if row.get(field) in ("broken", "missing")]
+        if bad:
+            install_problems.append("  {}  {}".format(
+                unit, ", ".join("{}={}".format(pkg, val) for pkg, val in bad)))
+    if install_problems:
+        lines.append("")
+        lines.append("install problems:")
+        lines.extend(install_problems)
     standing = not_capturing(rows)
     if standing:
         lines.append("")
@@ -765,13 +834,23 @@ def digest(rows, changes, unreachable, baseline=False, repo=None,
                 for key in keys[:BEHIND_DIGEST_MAX]:
                     branch_name, sha, dirty = key
                     extra = []
-                    if branch_name not in (UNKNOWN, ""):
+                    # `rev-parse --abbrev-ref HEAD` prints the literal
+                    # string "HEAD" for a detached checkout -- say so in
+                    # plain language rather than the confusing-looking
+                    # "branch=HEAD".
+                    if branch_name == "HEAD":
+                        extra.append("detached")
+                    elif branch_name not in (UNKNOWN, ""):
                         extra.append("branch={}".format(branch_name))
                     if dirty not in (UNKNOWN, ""):
                         extra.append(dirty)
                     suffix = "  " + ", ".join(extra) if extra else ""
                     units = ", ".join(sorted(groups[key]))
-                    lines.append("  {}{}  {}".format(sha, suffix, units))
+                    # A blank CSV cell must not print as an empty column;
+                    # say so explicitly, same as branch/dirty above.
+                    sha_display = sha if sha else UNKNOWN
+                    lines.append("  {}{}  {}".format(
+                        sha_display, suffix, units))
                 if len(keys) > BEHIND_DIGEST_MAX:
                     lines.append("  ... and {} more state(s)".format(
                         len(keys) - BEHIND_DIGEST_MAX))
@@ -1011,19 +1090,37 @@ def commit_summary(repo, snapshot_rel, schema_added=None):
 
     `schema_added` is added_fields(previous, FIELDS) from the run that wrote
     this snapshot: the columns FIELDS gained that the previous header lacked.
-    A header-only change touches every row in the diff without any unit's
-    value actually changing, so it is named separately ("schema +...")
+    A header-only change appends columns to EVERY row (see render()), which
+    makes every row's raw text differ in the diff even though no unit's own
+    value moved -- so a unit is named only if its values in the columns the
+    OLD header actually had changed, compared positionally (appending is
+    the only schema change FIELDS allows, so those are always a leading,
+    shared prefix). A row appearing or disappearing outright is always
+    real. The schema addition itself is named separately ("schema +...")
     rather than folded into, or hidden by, the per-unit list.
     """
     if _git(repo, "cat-file", "-e", "HEAD:" + snapshot_rel).returncode != 0:
         return "state: fleet baseline"
     patch = _git(repo, "diff", "-U0", "HEAD", "--", snapshot_rel)
-    units = set()
+    removed, added = {}, {}
     for line in patch.stdout.splitlines():
-        if line[:1] in "+-" and line[:3] not in ("+++", "---"):
-            unit = line[1:].split(",", 1)[0]
-            if UNIT_ROW.match(unit):
-                units.add(unit)
+        if line[:1] not in "+-" or line[:3] in ("+++", "---"):
+            continue
+        cells = line[1:].split(",")
+        unit = cells[0]
+        if not UNIT_ROW.match(unit):
+            continue
+        (removed if line[0] == "-" else added)[unit] = cells
+
+    old_width = len(FIELDS) - len(schema_added or [])
+    units = set()
+    for unit in set(removed) | set(added):
+        old_cells, new_cells = removed.get(unit), added.get(unit)
+        if old_cells is None or new_cells is None:
+            units.add(unit)          # the row appeared or disappeared
+        elif old_cells[:old_width] != new_cells[:old_width]:
+            units.add(unit)
+
     parts = []
     if schema_added:
         parts.append("schema +{}".format(",".join(schema_added)))
@@ -1431,8 +1528,12 @@ def main():
                     if previous else "no readable copy in git, so treated "
                     "as empty"))
     baseline = not previous
-    changes = diff(previous, current)
+    # merge() first: for *_install fields it steadies a transient timeout/
+    # unknown reading back to the unit's last real value (see merge()), and
+    # diffing against that steadied row -- not the raw probe -- is what
+    # keeps a flap from firing a change line here.
     merged = merge(previous, current)
+    changes = diff(previous, merged)
     text = render(merged)
 
     # "since" comes from the snapshot's own git history, so it is only available
@@ -1463,13 +1564,23 @@ def main():
     # upgrade is an exception to "identical" by construction -- the header
     # changed even though no field's value did -- so it still writes.
     #
+    # `text != render(previous)` also catches the day a *_install field's
+    # backfilled "" (see render()) finally gets a real value: diff() rightly
+    # does not call that a "change" (there was no old value to compare
+    # against -- see diff()'s INSTALL_FIELDS check), so `changes` is empty
+    # and `schema_added` is too (the column has existed since the upgrade
+    # day). Without this, that first real reading would never reach disk
+    # on a quiet day, and every day after would see the same blank "old"
+    # value and stay silent too.
+    #
     # When the pull was refused, still write and commit -- locally only. The
     # probe is the only writer of state/, so its own last commit is the right
     # baseline; skipping the write would drop the day from history. The stacked
     # commits publish when a human runs RECOVER. A blocked clone (mid-rebase,
     # off main) is not touched at all.
     if not publish["blocker"] and (baseline or changes or unreadable
-                                   or schema_added):
+                                   or schema_added
+                                   or text != render(previous)):
         directory = os.path.dirname(snapshot)
         if directory:
             os.makedirs(directory, exist_ok=True)

@@ -29,6 +29,26 @@ def fp():
     return module
 
 
+@pytest.fixture(autouse=True)
+def _no_network_release_head(request, fp):
+    """main() always reads the release head via a real `git ls-remote` --
+    a network call. Default it to None here so a test that calls main()
+    without caring about the release-drift section can't hang (or flake)
+    offline; a test that patches release_head itself inside its own
+    `with`/context overrides this fixture's patch for exactly its own
+    scope and is restored to it afterward.
+
+    Excludes TestReleaseHead: those tests call the REAL release_head() to
+    exercise its own implementation (they patch subprocess.run instead),
+    so patching the function itself here would hide what they test.
+    """
+    if request.cls is not None and request.cls.__name__ == "TestReleaseHead":
+        yield
+        return
+    with patch.object(fp, "release_head", return_value=None):
+        yield
+
+
 def row(fp, unit, front_end="on", mode="default",
         t1="450", t2="450", gf="10", gs="1",
         mh="a1b2c3d", brk="e4f5a6b", snd="0c1d2e3", ham="4455667", ntf="ce1dcb5"):
@@ -708,6 +728,152 @@ class TestInstallFields:
         text = fp.render(rows)
         assert text.splitlines()[0] == ",".join(fp.FIELDS)
 
+    def test_remote_invokes_isolated_mode(self, fp):
+        # Red-team finding 3: a plain `python3 -c` puts '' (the ssh
+        # session's cwd) first on sys.path. mj02's /home/pi/brokkr/ has no
+        # __init__.py, so a genuinely missing brokkr resolves as a
+        # namespace package there and reads `unknown`, not `missing`.
+        assert "/bin/python3 -I -c" in fp.INSTALL_PROBE
+
+
+# --------------------------------------------------------------------------
+# Red-team finding 4: the blank-old-value skip in diff() is specific to
+# *_install -- a future field that legitimately goes blank must still be
+# able to report its first real value as a change.
+# --------------------------------------------------------------------------
+class TestBlankSkipIsNotGeneric:
+    def test_a_blank_to_value_change_in_a_non_install_field_is_reported(
+            self, fp):
+        prev = {"mjolnir02": dict(row(fp, "mjolnir02"), brokkr_mode="")}
+        cur = {"mjolnir02": dict(row(fp, "mjolnir02"), brokkr_mode="default")}
+        assert fp.diff(prev, cur) == [
+            ("mjolnir02", "brokkr_mode", "", "default")]
+
+    def test_a_blank_old_install_value_is_still_not_a_change(self, fp):
+        # The actual *_install case stays suppressed.
+        prev = {"mjolnir02": dict(row(fp, "mjolnir02"), notifiers_install="")}
+        cur = {"mjolnir02": dict(row(fp, "mjolnir02"),
+                                 notifiers_install="installed")}
+        assert fp.diff(prev, cur) == []
+
+
+# --------------------------------------------------------------------------
+# Red-team finding 1 (SHOULD FIX): the classifier really imports each
+# package (hamma pulls numpy/pandas), so a slow or cold unit can flap
+# between its real mode and timeout/unknown run to run. merge() steadies
+# that back to the last real value for *_install specifically; broken/
+# missing are real, persistent outcomes and are never overridden.
+# --------------------------------------------------------------------------
+class TestInstallFlapIsSteadied:
+    def test_merge_restores_the_last_real_value_over_a_timeout(self, fp):
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install="installed")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.TIMEOUT)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "installed"
+
+    def test_merge_restores_the_last_real_value_over_unknown(self, fp):
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install="editable")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.UNKNOWN)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "editable"
+
+    def test_broken_is_never_overridden(self, fp):
+        # broken/missing are real, persistent classifier outcomes, not
+        # transient failures -- they must stand even over a real old value.
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install="installed")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install="broken")}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "broken"
+
+    def test_missing_is_never_overridden(self, fp):
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                  notifiers_install="installed")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install="missing")}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == "missing"
+
+    def test_a_timeout_with_no_prior_real_value_is_not_overridden(self, fp):
+        # Nothing to steady back to -- the blank/unknown stays as probed.
+        prev = {"mjolnir08": dict(row(fp, "mjolnir08"), notifiers_install="")}
+        cur = {"mjolnir08": dict(row(fp, "mjolnir08"),
+                                 notifiers_install=fp.TIMEOUT)}
+        merged = fp.merge(prev, cur)
+        assert merged["mjolnir08"]["notifiers_install"] == fp.TIMEOUT
+
+    def test_a_flap_produces_no_change_line_and_no_commit(self, fp, tmp_path,
+                                                          capsys):
+        snap = tmp_path / "fleet-state.csv"
+        stable = dict(row(fp, "mjolnir08"), notifiers_install="installed")
+        snap.write_text(fp.render({"mjolnir08": stable}))
+        argv = ["fleet_probe.py", "-p", "8", "--snapshot", str(snap)]
+        flapped = dict(stable, notifiers_install=fp.TIMEOUT)
+        before = snap.read_text()
+        with patch.object(fp.sys, "argv", argv), \
+                patch.object(fp, "probe_unit", return_value=flapped):
+            status = fp.main()
+        assert status == 0
+        out = capsys.readouterr().out
+        assert "0 change(s)" in out, out
+        assert "notifiers_install" not in out, out
+        assert snap.read_text() == before, \
+            "a flap must not change what is on disk"
+
+
+# --------------------------------------------------------------------------
+# Red-team finding 2 (SHOULD FIX): a unit that is broken/missing on its
+# FIRST measurement is never reported by diff() (a brand-new row is one
+# "first seen" line, not a per-field change), so it needs its own standing
+# digest line, like "not capturing".
+# --------------------------------------------------------------------------
+class TestInstallProblemsStandingLine:
+    def test_a_first_measurement_broken_package_is_listed(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                  notifiers_install="broken")}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "install problems:" in text
+        assert "mjolnir42  notifiers=broken" in text
+
+    def test_missing_is_also_listed(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                  brokkr_install="missing")}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "mjolnir42  brokkr=missing" in text
+
+    def test_real_values_are_not_listed(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"),
+                                  notifiers_install="installed")}
+        text = fp.digest(rows, [], [], baseline=False)
+        assert "install problems" not in text
+
+    def test_an_unreachable_unit_is_not_listed(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"), front_end=fp.UNREACHABLE,
+                                  notifiers_install="broken")}
+        text = fp.digest(rows, [], ["mjolnir42"], baseline=False)
+        assert "install problems" not in text
+
+    def test_scoped_to_probed_units(self, fp):
+        # Not probed this run (a -p/-a subset) -- must not surface a stale
+        # reading as if it were today's finding.
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"), notifiers_install="broken"),
+               "mjolnir02": row(fp, "mjolnir02")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         probed_units={"mjolnir02"})
+        assert "install problems" not in text
+
+    def test_multiple_bad_packages_on_one_unit_are_both_named(self, fp):
+        rows = {"mjolnir42": dict(row(fp, "mjolnir42"), brokkr_install="missing",
+                                  notifiers_install="broken")}
+        text = fp.digest(rows, [], [], baseline=False)
+        line = next(l for l in text.splitlines() if l.startswith("  mjolnir42"))
+        assert "brokkr=missing" in line and "notifiers=broken" in line
+
 
 # --------------------------------------------------------------------------
 # The import classifier (HAM-227) -- a package that is installed but fails
@@ -828,12 +994,14 @@ class TestInstallProbeExitCodeMapping:
         ltgenv_bin.mkdir(parents=True)
         sindrienv_bin.mkdir(parents=True)
         shim_bin.mkdir(parents=True)
-        # One fake interpreter per env; it inspects its own -c argument
-        # (which embeds the real package name) to behave differently per
+        # One fake interpreter per env; it inspects its own arguments (one
+        # of which embeds the real package name) to behave differently per
         # package, so one script stands in for all three ltgenv calls.
+        # "$*", not a fixed positional slot: real INSTALL_PROBE passes
+        # `-I -c <script>`, so the script text itself is $3, not $2.
         (ltgenv_bin / "python3").write_text(
             "#!/bin/sh\n"
-            'case "$2" in\n'
+            'case "$*" in\n'
             "  *brokkr*) sleep 5 ;;\n"                      # killed -> 124
             "  *notifiers*) exit 7 ;;\n"                    # crash -> unknown
             "  *) printf 'a warning\\nnot the answer\\n"
@@ -1042,6 +1210,19 @@ class TestBehindRelease:
         out = fp.behind_release(rows, set(rows), [], self.HEAD)
         assert out == [("mjolnir02", "", fp.UNKNOWN, fp.UNKNOWN)]
 
+    def test_a_too_short_sha_is_never_treated_as_at_head(self, fp):
+        # Red-team finding 5: head.startswith(sha) accepts any prefix,
+        # including a 1-character one that trivially "starts" the head.
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh=self.HEAD[0])}
+        out = fp.behind_release(rows, set(rows), [], self.HEAD)
+        assert out == [("mjolnir02", self.HEAD[0], fp.UNKNOWN, fp.UNKNOWN)]
+
+    def test_a_seven_char_sha_at_head_is_not_listed(self, fp):
+        # The boundary itself must still work: a real `--short` sha (>= 7
+        # chars, the git default) that IS a real prefix is still "at head".
+        rows = {"mjolnir02": row(fp, "mjolnir02", mh=self.HEAD[:7])}
+        assert fp.behind_release(rows, set(rows), [], self.HEAD) == []
+
     def test_restricted_to_the_probed_set_not_all_known_rows(self, fp):
         # A --ports/--array subset run must not report units it never
         # touched this run, even though they're still in the merged rows.
@@ -1072,6 +1253,26 @@ class TestBehindRelease:
                          release=("0.4.x", self.HEAD))
         assert "branch=0.3.x" in text
         assert "dirty" in text
+
+    def test_digest_says_detached_not_branch_equals_head(self, fp):
+        # Red-team finding 5: `rev-parse --abbrev-ref HEAD` prints the
+        # literal string "HEAD" for a detached checkout -- "branch=HEAD"
+        # reads as a bug, not a state. Say "detached" instead.
+        r = dict(row(fp, "mjolnir08", mh="a6147a1"),
+                 mjolnir_hamma_branch="HEAD", mjolnir_hamma_dirty="clean")
+        text = fp.digest({"mjolnir08": r}, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        assert "detached" in text
+        assert "branch=HEAD" not in text
+
+    def test_digest_shows_unknown_not_a_blank_column_for_a_blank_sha(self, fp):
+        # Red-team finding 5: a blank CSV cell must not print as an empty
+        # column in the grouped line.
+        r = row(fp, "mjolnir08", mh="")
+        text = fp.digest({"mjolnir08": r}, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        line = next(l for l in text.splitlines() if "mjolnir08" in l)
+        assert line.split()[0] == fp.UNKNOWN, line
 
     def test_digest_silent_when_all_at_head(self, fp):
         rows = {"mjolnir02": row(fp, "mjolnir02", mh="52bb35d")}
@@ -1315,6 +1516,83 @@ class TestUpgradeDoesNotFabricateChanges:
         out = capsys.readouterr().out
         for field in INSTALL_FIELDS:
             assert field not in out, out
+
+    def test_a_real_flip_after_a_quiet_backfill_day_reaches_disk(
+            self, fp, tmp_path, capsys):
+        """Red-team B1: diff() correctly treats a blank->value transition
+        as "no old value to compare against" (see diff()'s INSTALL_FIELDS
+        check) -- a first real measurement is not a "change" any more than
+        a schema addition is, and the digest is right to stay at "0
+        change(s)" for it. The actual bug was the WRITE condition: without
+        `text != render(previous)`, that first real value never reached
+        disk at all, so it (and everything after it, forever) kept
+        comparing against the same blank "old" value. Repro: a subset-run
+        schema day, a quiet full-fleet day, then the first real reading.
+        A first-time `broken` reading is still surfaced -- via the
+        "install problems" standing line (finding 2), not a change line.
+        """
+        snap = tmp_path / "fleet-state.csv"
+        old = {"mjolnir01": row(fp, "mjolnir01"),
+              "mjolnir41": row(fp, "mjolnir41"),
+              "mjolnir42": row(fp, "mjolnir42")}
+        snap.write_text(",".join(fp.FIELDS[:12]) + "\n" + "\n".join(
+            ",".join(r.values()) for r in old.values()) + "\n")
+
+        # Day 1: a subset run (stand-in for `-a hamma`) probes only
+        # mjolnir01, but the schema still reaches disk for every unit.
+        probed_01 = dict(old["mjolnir01"],
+                         **{f: "installed" for f in INSTALL_FIELDS})
+        argv_day1 = ["fleet_probe.py", "-p", "1", "--snapshot", str(snap)]
+        with patch.object(fp.sys, "argv", argv_day1), \
+                patch.object(fp, "probe_unit", return_value=probed_01):
+            assert fp.main() == 0
+        capsys.readouterr()
+        after_day1 = snap.read_text()
+        assert after_day1.splitlines()[0] == ",".join(fp.FIELDS)
+
+        # Day 2: a full run. mjolnir41/42 are unreachable; mjolnir01 is
+        # unchanged. Nothing must be written -- this day is genuinely quiet.
+        def probe_day2(n):
+            if n == 1:
+                return probed_01
+            return dict(old["mjolnir{:02d}".format(n)],
+                       front_end=fp.UNREACHABLE)
+        argv_day2 = ["fleet_probe.py", "-p", "1", "41", "42",
+                    "--snapshot", str(snap)]
+        with patch.object(fp.sys, "argv", argv_day2), \
+                patch.object(fp, "probe_unit", side_effect=probe_day2):
+            status2 = fp.main()
+        out2 = capsys.readouterr().out
+        assert status2 == 0
+        assert "0 change(s)" in out2, out2
+        assert snap.read_text() == after_day1, \
+            "a genuinely quiet day must not touch the file"
+
+        # Day 3: mjolnir41 and mjolnir42 are finally measured for real.
+        probed_41 = dict(old["mjolnir41"], brokkr_install="", sindri_install="",
+                         hamma_install="", notifiers_install="installed")
+        probed_42 = dict(old["mjolnir42"], brokkr_install="", sindri_install="",
+                         hamma_install="", notifiers_install="broken")
+
+        def probe_day3(n):
+            return {1: probed_01, 41: probed_41, 42: probed_42}[n]
+        with patch.object(fp.sys, "argv", argv_day2), \
+                patch.object(fp, "probe_unit", side_effect=probe_day3):
+            status3 = fp.main()
+        out3 = capsys.readouterr().out
+        assert status3 == 0
+        # By design (confirmed correct in finding 1): a first real
+        # measurement is not a reportable "change".
+        assert "0 change(s)" in out3, out3
+        # But mj42's broken reading must not go unseen just because it
+        # arrived with no prior value to diff against.
+        assert "mjolnir42  notifiers=broken" in out3, out3
+        written = snap.read_text()
+        assert written != after_day1, \
+            "the real flip must reach disk, not stay blank forever"
+        mj41_line = next(l for l in written.splitlines()
+                         if l.startswith("mjolnir41,"))
+        assert mj41_line.split(",")[-4:] == ["", "", "", "installed"]
 
 
 class TestPendingRespectsWhatWasActuallyProbed:
@@ -2555,9 +2833,10 @@ class TestSchemaWriteReachesDiskAndIsCommitted:
         assert "0 change(s)" in text, text
 
         message = _git(clone, "log", "-1", "--format=%s").strip()
-        assert message.startswith("state: schema +"), message
-        for field in INSTALL_FIELDS:
-            assert field in message
+        # Red-team B2: a pure schema day must name no unit, even though
+        # every row's raw CSV text differs once the columns are appended.
+        assert message == "state: schema +{}".format(
+            ",".join(INSTALL_FIELDS)), message
 
         header = (clone / rel).read_text().splitlines()[0]
         assert header == ",".join(fp.FIELDS), "schema must reach the working file"
@@ -2627,10 +2906,54 @@ class TestCommitSummaryNamesSchemaAndUnits:
         (repo / rel).write_text(fp.render({"mjolnir02": new_row}))
 
         message = fp.commit_summary(str(repo), rel, schema_added=INSTALL_FIELDS)
-        assert message.startswith("state: schema +"), message
-        for field in INSTALL_FIELDS:
-            assert field in message
-        assert "mjolnir02" in message
+        expected = "state: schema +{}; mjolnir02".format(
+            ",".join(INSTALL_FIELDS))
+        assert message == expected, message
+
+    def test_a_schema_only_change_names_no_unit(self, fp, tmp_path):
+        """Red-team B2: every row's raw CSV text differs once the new
+        columns are appended, but if no unit's OLD-header values actually
+        moved, the message must say only "schema +...", naming nobody.
+        """
+        repo, rel, old = self._repo(fp, tmp_path)
+        unchanged_row = dict(old, **{f: "" for f in INSTALL_FIELDS})
+        (repo / rel).write_text(fp.render({"mjolnir02": unchanged_row}))
+
+        message = fp.commit_summary(str(repo), rel, schema_added=INSTALL_FIELDS)
+        assert message == "state: schema +{}".format(
+            ",".join(INSTALL_FIELDS)), message
+
+    def test_a_schema_day_with_a_real_change_elsewhere_names_only_that_unit(
+            self, fp, tmp_path):
+        """Two units get the new header; only one's old-header values moved."""
+        repo = tmp_path / "repo2"
+        (repo / "state").mkdir(parents=True)
+        for args in (["init", "-q"], ["config", "user.email", "t@t"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo)] + args, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rel = "state/fleet-state.csv"
+        old02, old03 = row(fp, "mjolnir02"), row(fp, "mjolnir03")
+        (repo / rel).write_text(
+            ",".join(fp.FIELDS[:12]) + "\n"
+            + ",".join(old02.values()) + "\n"
+            + ",".join(old03.values()) + "\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "old"],
+                       check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+
+        unchanged03 = dict(old03, **{f: "" for f in INSTALL_FIELDS})
+        changed02 = dict(old02, front_end="off",
+                         **{f: "" for f in INSTALL_FIELDS})
+        (repo / rel).write_text(fp.render(
+            {"mjolnir02": changed02, "mjolnir03": unchanged03}))
+
+        message = fp.commit_summary(str(repo), rel, schema_added=INSTALL_FIELDS)
+        expected = "state: schema +{}; mjolnir02".format(
+            ",".join(INSTALL_FIELDS))
+        assert message == expected, message
 
     def test_no_schema_addition_is_unchanged(self, fp, tmp_path):
         """Pins the no-schema case to exactly #109's own behavior."""
