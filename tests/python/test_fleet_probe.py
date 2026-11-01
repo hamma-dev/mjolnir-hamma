@@ -967,7 +967,10 @@ class TestBranchAndDirtyBashFragment:
                        "mjolnir_hamma_dirty": "unknown"}
 
     def test_uses_no_optional_locks(self, fp):
-        assert "--no-optional-locks" in fp.REMOTE
+        # The bare flag also appears in an explanatory comment, which would
+        # make a substring check on just "--no-optional-locks" pass even if
+        # the real invocation dropped it. Pin the actual command instead.
+        assert "--no-optional-locks status --porcelain" in fp.REMOTE
 
 
 # --------------------------------------------------------------------------
@@ -1103,6 +1106,29 @@ class TestBehindRelease:
         assert len(body) == 1, text
         assert "mjolnir03" in body[0] and "mjolnir41" in body[0]
         assert "2 unit(s) total" in text
+
+    def test_same_branch_and_sha_but_different_dirty_are_separate_groups(
+            self, fp):
+        # The grouping key is the full (branch, sha, dirty) triple -- a
+        # clean and a dirty checkout at the same SHA are different states
+        # and must not be merged into one line.
+        rows = {"mjolnir41": dict(row(fp, "mjolnir41", mh="a6147a1"),
+                                  mjolnir_hamma_branch="0.3.x",
+                                  mjolnir_hamma_dirty="clean"),
+                "mjolnir03": dict(row(fp, "mjolnir03", mh="a6147a1"),
+                                  mjolnir_hamma_branch="0.3.x",
+                                  mjolnir_hamma_dirty="dirty")}
+        text = fp.digest(rows, [], [], baseline=False,
+                         release=("0.4.x", self.HEAD))
+        body = [ln for ln in text.splitlines() if ln.startswith("  a6147a1")]
+        assert len(body) == 2, text
+        assert "2 unit(s) total" in text
+
+    def test_behind_digest_max_is_ten(self, fp):
+        # Pins the literal, not just self-consistency with the constant --
+        # a changed cap must fail this test even though the other cap tests
+        # read fp.BEHIND_DIGEST_MAX dynamically.
+        assert fp.BEHIND_DIGEST_MAX == 10
 
     def test_digest_caps_distinct_states_not_units(self, fp):
         # 15 units, each its OWN state (distinct sha), mirrors
