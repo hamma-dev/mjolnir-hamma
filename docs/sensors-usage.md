@@ -56,9 +56,9 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 2. Stop sindri service
 3. Toggle relay to power off sensor
 4. Archive today's telemetry CSV (rename to `.bak`)
-5. Write systemd drop-in (`BROKKR_MODE=nosensor`)
+5. Set the mode drop-in, adding `nosensor` and **keeping `nochargecontroller`**
 6. Reload systemd
-7. Start brokkr (now runs in nosensor mode)
+7. Start brokkr (now runs in a `nosensor*` mode)
 8. Start sindri
 
 ### `--on` Sequence
@@ -66,11 +66,126 @@ sensors.py --off --dry-run  # Confirm correct relay flag
 1. Stop brokkr service
 2. Stop sindri service
 3. Archive today's telemetry CSV
-4. Remove systemd drop-in (back to default mode)
+4. Set the mode drop-in, clearing `nosensor` and **keeping `nochargecontroller`**
+   (removes the drop-in entirely only when the result is plain `default`)
 5. Reload systemd
 6. Toggle relay to power on sensor
-7. Start brokkr (back to default mode)
+7. Start brokkr
 8. Start sindri
+
+### Mode is two axes, and on/off only moves one
+
+`nochargecontroller` describes the unit's **hardware** — whether a SunSaver MPPT is
+wired up. It has nothing to do with whether the sensor is powered, so it is **sticky**
+across `--on` and `--off`:
+
+| Current mode | `--off` → | `--on` → |
+|---|---|---|
+| `default` | `nosensor` | *(unchanged)* |
+| `nochargecontroller` | `nosensor_nochargecontroller` | *(unchanged)* |
+| `nosensor` | *(unchanged)* | `default` |
+| `nosensor_nochargecontroller` | *(unchanged)* | `nochargecontroller` |
+
+`mode.conf` is the **shared filename for every mode override** and appears in two
+forms in the field — `Environment=BROKKR_MODE=<mode>` and an `ExecStart=` override
+carrying `--mode <mode>`. Both are read, and the existing form is preserved when
+writing back (the unit's own interpreter path, quoting and co-resident directives
+are kept).
+
+**The two forms are not equal in force.** brokkr v0.4.0 merges its mode levels in
+this order, later winning (`brokkr/config/modehandler.py` in `hamma-dev/brokkr`):
+
+```
+config/mode.toml  <  ~/.config/brokkr/hamma/mode.toml  <  BROKKR_MODE (env)  <  CLI --mode
+```
+
+so on a drop-in holding both, the `ExecStart=` override wins and the
+`Environment=` line is dead text. `--status` reports the mode **`mode.conf`**
+puts in force, by that order, and for a repeated `Environment=` assignment the
+last one (systemd's own rule). It does not read the other sources below; `--on`
+and `--off` do, and refuse if any of them names a mode.
+
+**Reading is always answered; writing can refuse.** `--on`/`--off` refuse, and
+leave the file exactly as it was, when:
+
+| Case | Why |
+|---|---|
+| A mode is named in **more than one place** (two forms, two `Environment=` lines, two `--mode` flags on a line) | The resolved mode is knowable, but *which directive to edit* is not — editing one and leaving the other silently changes the mode in force |
+| A mode is named in a shape it cannot parse (`--mode=x`, a line continuation, an unhandled quoting, `--mode` on `ExecStartPre=`/`ExecReload=`) | Guessing could destroy the sticky axis |
+| The mode is outside the two-axis model (`test`, `realtime`, `sindri02x`, anything new) | `--on` would compute `default` and discard whatever the operator set |
+| A mode is named **outside `mode.conf`**: the unit file's own `Environment=`, or its `ExecStart=` when `mode.conf` does not reset and replace it (mj06's is replaced, so it is not refused); another drop-in for the unit, including one beside `mode.conf`; or a top-level `mode =` in either `mode.toml` (mj05) | A `mode.conf` write may lose to it, and removing `mode.conf` would bring it back into force |
+| systemd has a **pending daemon-reload** for brokkr's unit (mj54, 2026-10-29), or cannot be asked | The script's own reload would activate somebody else's unreviewed edit too |
+| The mode systemd has **loaded** (`systemctl show`) differs from what `mode.conf` reads as | The mode comes from a source this script does not edit; this catches any drop-in location it does not list |
+| `BROKKR_MODE` is in systemd's **manager environment** (`DefaultEnvironment=`, `systemctl set-environment`) | It reaches brokkr whenever `mode.conf` does not override it, and `show -p Environment` does not include it |
+| The mode is named outside `[Service]` (case-sensitive: `[service]` is an unknown section to systemd), or the drop-in has an empty `Environment=` reset or an `EnvironmentFile=` | systemd ignores the first; the reset wipes the mode above it; the file can set `BROKKR_MODE` unseen |
+| The drop-in cannot be read or decoded | Unreadable is not the same as absent |
+
+A file that provably names **no** mode reports `default` — including a bare
+`ExecStart=` reset line and a commented-out old command line (`#` *and* `;`, per
+`systemd.syntax(7)`). Lines are read the way systemd 241 reads them: comments and
+blank lines never continue and are skipped inside a continuation, and only an
+unescaped `\` at the very end of the raw line continues (`\ ` with a trailing
+space does not).
+
+**Every refusal happens before any service is stopped or any mode is changed.** A
+refused `--on` touches nothing. A refused `--off` **still cuts sensor power** — one
+relay command, nothing else — because at low battery the sensor's ~1 A has to go
+(decided 2026-10-30). brokkr is left running in its current mode; if that mode is
+not a `nosensor` one, brokkr will retry the dead sensor and log the failures
+(bounded by the HAM-113 log caps) until the refusal is fixed and `--off` re-run.
+The refusal goes to the same chat channel as the on/off notifications, with its
+reason and whether the power cut worked, because a message printed to a tunnelled
+stdout is a silent no-op from the operator's side. Exit codes: 1 = refused (on
+`--off`, power cut OK); **4** = refused and the power cut failed too (relay.py
+errored, is missing, or hung past 60 s); 3 = toggled, but systemd disagreed on the
+mode afterwards.
+
+That guarantee covers **refusals only**. A failure *after* the services have
+stopped — a `sudo`, write or `daemon-reload` error — stops the sequence there and
+does not restart brokkr (see [Error Handling](#error-handling)).
+
+`mode.conf` is written to a temp file in the same directory, renamed into place and
+flushed (`sync -f` on that filesystem only, bounded at 30 s), so a failed write
+(e.g. a full SD card) never leaves a truncated drop-in; a delete is flushed too.
+After the `daemon-reload`, the script asks systemd (`systemctl show -p ExecStart
+-p Environment`) which mode it will start brokkr in. On a mismatch:
+
+- `mode.conf` is **put back** as it was and systemd reloaded again — otherwise
+  `mode.conf` would disagree with what systemd runs and every later toggle,
+  including an emergency `--off`, would refuse;
+- on `--on` the relay is **not commanded**, so sensor power is unchanged — powering
+  the sensor on a mode the script got wrong is not the safe failure; on `--off`
+  the relay has already moved, so the sensor is off;
+- brokkr is **still started** (a stopped brokkr sends no telemetry and no alerts),
+  in its original mode if the restore worked — if it did not, in whatever mode
+  systemd now has, and the notice says the restore FAILED;
+- the run exits **3** (not 1) and the chat notice names both modes, the sensor
+  power state, and whether the restore worked.
+
+**When `--on`/`--off` refuses** (from the VPS, `mjol_array.py` prints the unit's
+output, including every offending line). Recovery depends on what refused:
+
+| Refusal | Recovery on the unit |
+|---|---|
+| `mode.conf` names the mode in more than one place, in an unreadable shape, outside `[Service]`, or beside an `Environment=` reset / `EnvironmentFile=` | `sudoedit /etc/systemd/system/brokkr-hamma-default.service.d/mode.conf` and keep exactly one mode declaration, in `[Service]`; then `sudo systemctl daemon-reload` |
+| A mode in another drop-in or in the unit file | Move that mode into `mode.conf` (one declaration), **then** remove it from the other file — removing it first can drop `nochargecontroller`; then `sudo systemctl daemon-reload` |
+| A top-level `mode =` in a `mode.toml` (mj05) | Same: put the mode into `mode.conf` first, e.g. `Environment=BROKKR_MODE=nochargecontroller` under `[Service]`, then delete the `mode =` line; then `sudo systemctl daemon-reload` |
+| A pending daemon-reload | Do **not** just reload. Review `systemctl cat brokkr-hamma-default` against what is loaded (`systemctl show -p ExecStart -p Environment brokkr-hamma-default`) and find who changed what; reload only once the pending change is understood |
+| systemd's loaded mode differs from `mode.conf` | Find the source with `systemctl cat brokkr-hamma-default` and `systemctl show -p DropInPaths brokkr-hamma-default`, then as above |
+
+Then check `sensors.py --status` on the unit, and re-run the toggle from the VPS
+with `mjol_array.py --up/--down`.
+
+> Before HAM-184 this file was treated as a boolean — present meant `nosensor`,
+> absent meant `default`. On mj06, mj50 and mj54 that made `--status` report
+> `nosensor` regardless of the real mode, and `--on` silently dropped them to
+> `default`, re-enabling charge-controller polling against hardware that isn't there.
+
+> **Do not remove a mode override with `rm -rf` on the drop-in directory.**
+> hamma-expert's `services-and-pipelines.md` still gives that as the manual
+> recipe. `mode.conf` is hand-edited in the field and routinely carries other
+> directives; `sensors.py` removes only the mode and keeps the rest, deleting the
+> file only when the mode was all it set.
 
 ### Why the CSV is archived
 
@@ -136,8 +251,11 @@ Each step prints `[OK]` or `[FAIL]` as it runs. If a critical step fails, the sc
 [OK] Relay off (de-energized) (pin 4)
 [OK] Archived telemetry_hamma_003_2026-05-11.csv -> ...csv.bak
 [OK] Created drop-in directory
-[OK] Wrote mode drop-in (nosensor)
+[OK] Wrote mode drop-in (nosensor) to a temp file
+[OK] Installed mode drop-in (nosensor)
+[OK] Flushed the drop-in to disk
 [OK] Reloaded systemd daemon
+  [OK] systemd will start brokkr in mode nosensor
 [OK] Started brokkr service
 [OK] Started sindri service
 ```

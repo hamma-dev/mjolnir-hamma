@@ -51,12 +51,19 @@ config_version = 1
 
     [steps.state_monitor]
         _preset = "state_monitor.outputs.plugin"
-        power_delim = 15  # delimiter between normal power and low power
+        power_delim = 15  # W (adc_vl_f * adc_il_f), not volts. Alerts ONCE
+                          # when load power falls from >= this to below it.
+                          # A powered unit draws ~17 W (~12.4 V x ~1.4 A), so
+                          # the margin is thin: a unit that trips on ordinary
+                          # dips overrides it locally (mj03 runs 12 W). Per-unit
+                          # overrides belong in that unit's
+                          # ~/.config/brokkr/hamma/main.toml, not here.
         purge_space = 200  # GB free on the AGS drive below which to drain proactively (level-triggered, no alert)
         alert_space = 75   # GB free below which to alert: falling despite the auto-scrub (purge losing)
         scrub_cooldown_s = 300  # min seconds between level-triggered scrub launches while below purge_space (more responsive than the 15-min timer)
-        hs_stale_cycles = 15  # alert if bytes_remaining is NA this many consecutive cycles (~15 min) -- the AGS is dark and /ags/data can fill unseen
+        hs_stale_cycles = 15  # alert if bytes_remaining is NA this many consecutive cycles (x monitor_interval_s; 15 min at 60 s) -- the AGS is dark and /ags/data can fill unseen
         ping_max = 3  # after this many pings, send chat message
+        ping_stale_cycles = 15  # alert once if ping is NA this many consecutive cycles (x monitor_interval_s) -- the ping input is broken, so outages cannot be detected
         method = "gchat"  # the method how we're going to send notifications
         channel = "status"
         key_file = "/home/pi/.googlechat"
@@ -75,7 +82,7 @@ config_version = 1
         filename_template = "{system_name}{unit_number:02d}.png"
         min_update_time = 30  # seconds
 
-    # Step for noise diagnostics on HAMMA fast-channel data
+    # Step for noise diagnostics on HAMMA fast- and slow-channel data
     [steps.noise_diag]
         _module_path = "noise_diag"
         _class_name = "NoiseDiag"
@@ -83,6 +90,7 @@ config_version = 1
         name = "HAMMA Noise Diagnostic"
         min_update_time = 60          # seconds between samples
         medsize = 200000             # fast-channel pre-trigger baseline samples
+        medsize_slow = 20000         # slow-channel pre-trigger baseline samples
         min_pretrigger_ms = 50       # skip noise calc if pre-trigger window is shorter
         output_path = "noise_diag"
         filename_template = "noise_{system_name}{unit_number:02d}_{utc_date}.csv"
@@ -102,6 +110,36 @@ config_version = 1
         server_path = '/var/www/hamma.dev/public_html/latest'
         update_time = 120  # seconds
         include = '*.png'
+
+    # Step to rsync the noise_diag CSVs to the server (flat dir, files are per-unit)
+    [steps.noise_diag_rsync]
+        _preset = "rsync_server.outputs.plugin"
+        name = "Rsync noise diagnostic CSVs"
+        server = "hamma.dev"  # also in autossh
+        local_path = 'noise_diag'  # same as steps.noise_diag.output_path
+        server_path = '/home/pi/noise_diag'
+        # Every 30 min. Just under 3 x period_s, so tick jitter on the 600 s
+        # grid cannot flip the cadence between 30 and 40 min.
+        update_time = 1790  # seconds
+        include = 'noise_hamma*.csv'
+        partial_dir = '.rsync-partial'  # resume interrupted transfers
+        # Nested so each layer gives up before the next: ssh (30 s connect,
+        # 45 s dead link) < rsync stall (60 s) < hard kill (300 s). Session
+        # setup alone measured up to ~6.5 s over cellular (AUMMA RTT ~330 ms).
+        # rsync's --timeout does not cover a stall before its handshake, so the
+        # hard kill is the real bound -- and it only is one with
+        # kill_process_group (Py 3.7.3 otherwise waits for rsync's ssh child).
+        ssh_options = '-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes'
+        io_timeout = 60  # seconds
+        timeout = 300  # seconds
+        kill_process_group = true
+        retry_on_failure = true  # any failed push retries on the next period
+        # Random phase + 0-60 s delay per push, so units restarted together do
+        # not all hit the VPS's sshd (and its ~240 MB free RAM) in one second.
+        jitter_s = 60
+        # No ssh at all when there is nothing new to send -- sensor-off units
+        # push their backlog once, then go quiet.
+        skip_if_unchanged = true
 
     # Step for outputting decoded headers of AGS science packets as CSV
     [steps.science_csv_output]
@@ -172,8 +210,11 @@ config_version = 1
         output_subdir = "compressed"  # Archives stored in each drive's compressed/ subdir
         min_age_days = 1  # Only compress files older than 1 day
         delete_originals = false  # Originals are ground truth; .hmc for transfer only
-        method = "quantize"  # 'lossless' (~25%) or 'quantize' (smaller)
-        step = 8  # Quantization step: 2=~18%, 4=~12%, 8=~7% of original
+        method = "quantize"  # 'lossless' or 'quantize' (smaller; sizes are data-dependent)
+        step = 8  # Quantization step. Sets RMSE (2:<1, 4:~2, 8:~4);
+                  # output size is DATA-DEPENDENT, not fixed. mj03 field
+                  # data ran 5-51% per record at step 8 (HAM-220), not
+                  # the ~7% once quoted here.
         quiet_start = 8   # 8 AM UTC — after overnight storms
         quiet_end = 0     # Midnight UTC — wide window for compression
 
@@ -263,6 +304,22 @@ config_version = 1
         ]
         output_steps = [
             "hamma_plot_rsync",
+        ]
+
+    # Run rsync of the noise diagnostic CSVs to the HAMMA server.
+    # Kept separate from the plot push so a slow transfer can't delay it.
+    [pipelines.rsync_noise_diag]
+        _builder = "pipeline"
+        _enabled = true
+        period_s = 600  # retry cadence after a failed push (retry_on_failure)
+        name = "Rsync noise diagnostic CSVs to server"
+        input_steps = [
+            "builtins.inputs.current_time",
+        ]
+        process_steps = [
+        ]
+        output_steps = [
+            "noise_diag_rsync",
         ]
 
     # AGS science data header decode and write
