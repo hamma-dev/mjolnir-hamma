@@ -180,6 +180,9 @@ def test_preprocess_mv_conversion(ns, tmp_noise_dir, monkeypatch):
 
 
 def test_gauge_variable_mv_conversion(ns, tmp_noise_dir, monkeypatch):
+    # Pin "now" just after the sample's last row so it is not stale.
+    monkeypatch.setitem(ns, "_noise_now",
+                        lambda: pd.Timestamp("2026-06-26 14:25:00"))
     orig = ns["ingest_noise_data"]
     ns["ingest_noise_data"] = lambda n_days=None, data_dir=tmp_noise_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]: orig(n_days=n_days, data_dir=tmp_noise_dir, glob_pattern=glob_pattern)
     try:
@@ -553,9 +556,437 @@ def test_clamp_threshold_into_range(ns):
 
 
 # ---------------------------------------------------------------------------
+# Slow-channel noise tracking
+# ---------------------------------------------------------------------------
+
+SLOW_CSV_CONTENT = textwrap.dedent("""\
+    time,trigger_time,fast_offset,fast_noise,fast_vpp,fast_snr,threshold,noise_thresh_ratio,slow_offset,slow_noise,slow_vpp,slow_snr
+    2026-06-27 14:23:01.123456+00:00,2026-06-27 14:23:01.000000+00:00,0.012,0.0045,0.1,5.0,0.05,0.09,,,,
+    2026-06-27 14:24:01.123456+00:00,2026-06-27 14:24:01.000000+00:00,0.013,0.0045,0.1,5.0,0.05,0.09,-0.025,0.0040,0.1,10.0
+    2026-06-27 14:25:01.123456+00:00,2026-06-27 14:25:01.000000+00:00,0.013,0.0045,0.1,5.0,0.05,0.09,0.020,0.0030,0.1,10.0
+""")
+
+
+def _use_noise_dir(ns, monkeypatch, data_dir):
+    orig = ns["ingest_noise_data"]
+    monkeypatch.setitem(
+        ns, "ingest_noise_data",
+        lambda n_days=None, data_dir=data_dir, glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+            orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
+
+
+def test_slow_gauges_registered(ns):
+    plots = ns["STATUS_DASHBOARD_PLOTS"]
+    assert plots["slownoisefloor"]["plot_metadata"]["plot_title"] == "Slow Noise Floor"
+    assert plots["slowdcoffset"]["plot_metadata"]["plot_title"] == "Slow DC Offset"
+
+
+def test_slow_subplots_and_names(ns):
+    assert "slow_noise" in ns["NOISE_PLOT_SUBPLOTS"]
+    assert "slow_offset" in ns["NOISE_PLOT_SUBPLOTS"]
+    assert ns["VARIABLE_NAME_MAP"]["slow_noise"] == "Slow Noise Floor"
+    assert ns["VARIABLE_NAME_MAP"]["slow_offset"] == "Slow DC Offset"
+    assert "slow_noise_thresh_ratio" not in ns["NOISE_CSV_COLUMNS"]
+
+
+def test_slow_axes_fall_back_to_fast_without_slow_data(ns):
+    """No slow data yet: the slow axes borrow the fast ranges (independent
+    copies), so the plots are not empty or degenerate."""
+    lm = ns["LAYOUT_MAP"]
+    assert lm["slow_noise"]["range"] == lm["fast_noise"]["range"]
+    assert lm["slow_offset"]["range"] == lm["fast_offset"]["range"]
+    assert lm["slow_noise"] is not lm["fast_noise"]
+    plots = ns["STATUS_DASHBOARD_PLOTS"]
+    assert (plots["slownoisefloor"]["plot_params"]["range"]
+            == lm["slow_noise"]["range"])
+
+
+def test_slow_offset_gauge_has_no_fast_zones(ns):
+    """The fast +-200 mV green/red zones mean nothing known for the slow
+    channel (PB, 2026-10-30): no zones until there is data to set them."""
+    plots = ns["STATUS_DASHBOARD_PLOTS"]
+    assert plots["slowdcoffset"]["plot_params"]["steps"] is None
+    assert plots["slowdcoffset"]["plot_params"]["range"] == ns["OFFSET_GAUGE_RANGE"]
+    assert plots["dcoffset"]["plot_params"]["steps"] is not None
+
+
+def test_slow_noise_has_no_threshold_band(ns):
+    assert "slow_noise" not in ns["NOISE_COLOR_TABLE_MAP"]
+    params = ns["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
+    assert params["steps"] is None
+    assert params["threshold_value"] == 0
+
+
+def test_ingest_old_csv_adds_float_slow_columns(ns, tmp_noise_dir):
+    """CSVs written before slow tracking load with NaN float slow columns."""
+    df = ns["ingest_noise_data"](data_dir=tmp_noise_dir)
+    for col in ("slow_noise", "slow_offset", "slow_vpp", "slow_snr"):
+        assert col in df.columns
+        assert pd.api.types.is_float_dtype(df[col])
+        assert df[col].isna().all()
+
+
+def test_ingest_mixed_old_and_new_csvs(ns, tmp_path):
+    (tmp_path / "noise_hamma02_2026-06-26.csv").write_text(SAMPLE_CSV_CONTENT)
+    (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
+    df = ns["ingest_noise_data"](data_dir=tmp_path)
+    assert len(df) == 5
+    assert df["slow_noise"].isna().sum() == 3
+    assert abs(df["slow_noise"].iloc[-1] - 0.003) < 1e-9
+
+
+def test_preprocess_slow_mv_conversion(ns, tmp_path, monkeypatch):
+    (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
+    _use_noise_dir(ns, monkeypatch, tmp_path)
+    result = ns["_noise_plot_preprocess"](pd.DataFrame())
+    assert abs(result["slow_noise"].iloc[-1] - 3.0) < 0.01
+    assert abs(result["slow_offset"].iloc[-2] - (-25.0)) < 0.01
+
+
+def test_slow_gauge_series_drops_leading_blank(ns, tmp_path, monkeypatch):
+    """A blank first row must not poison sindri's max() (max([nan, ...]) is nan)."""
+    (tmp_path / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
+    _use_noise_dir(ns, monkeypatch, tmp_path)
+    # Pin "now" just after the fixture's last row, or the gauges' 24 h
+    # staleness cutoff (#116) turns this June data into NA.
+    monkeypatch.setitem(ns, "_noise_now",
+                        lambda: pd.Timestamp("2026-06-27 14:26:00"))
+    series = ns["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_data"]["variable"](None)
+    assert not series.isna().any()
+    assert abs(max(series) - 4.0) < 0.01
+    assert abs(series.iloc[-1] - 3.0) < 0.01
+
+
+def test_wiring_slow_axes_are_sized_from_slow_data(tmp_path, monkeypatch):
+    """E2E: each channel's axes come from its own data (PB, 2026-10-30)."""
+    noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
+    noise_dir.mkdir(parents=True)
+    (noise_dir / "noise_hamma02_2026-06-27.csv").write_text(SLOW_CSV_CONTENT)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _install_stubs()
+    ns2 = {}
+    exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
+
+    lm = ns2["LAYOUT_MAP"]
+    # fast: threshold 50 mV -> [0, 1.25*50]; offsets 12-13 mV -> +-14.3
+    assert lm["fast_noise"]["range"] == [0, 62.5]
+    assert abs(lm["fast_offset"]["range"][1] - 14.3) < 0.01
+    # slow: noise peak 4.0 mV -> [0, 4.4]; offsets -25/+20 mV -> +-27.5
+    assert abs(lm["slow_noise"]["range"][1] - 4.4) < 0.01
+    assert lm["slow_noise"]["range"][0] == 0
+    assert abs(lm["slow_offset"]["range"][1] - 27.5) < 0.01
+    params = ns2["STATUS_DASHBOARD_PLOTS"]["slownoisefloor"]["plot_params"]
+    assert params["range"] == lm["slow_noise"]["range"]
+
+
+def test_wiring_large_slow_noise_does_not_widen_fast(tmp_path, monkeypatch):
+    """A slow channel running far above the fast one stays on its own plot
+    and leaves the fast (alarm) gauge and axes alone (PB, 2026-10-30)."""
+    noise_dir = tmp_path / "brokkr" / "hamma" / "noise_diag"
+    noise_dir.mkdir(parents=True)
+    # fast offset max 13 mV, slow offset -25 mV; fast noise 4.5 mV, slow 90 mV;
+    # threshold 50 mV -> 1.25*50 = 62.5 would clip the 90 mV slow noise.
+    csv = SLOW_CSV_CONTENT.replace(",0.0040,0.1,10.0", ",0.090,0.1,10.0")
+    (noise_dir / "noise_hamma02_2026-06-27.csv").write_text(csv)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _install_stubs()
+    ns2 = {}
+    exec(compile(MAIN_PY.read_text(), str(MAIN_PY), "exec"), ns2)  # noqa: S102
+
+    lm = ns2["LAYOUT_MAP"]
+    plots = ns2["STATUS_DASHBOARD_PLOTS"]
+    assert lm["slow_noise"]["range"] == [0, 99.0]      # 90 mV * 1.1
+    assert plots["slownoisefloor"]["plot_params"]["range"] == [0, 99.0]
+    assert abs(lm["slow_offset"]["range"][1] - 27.5) < 0.01   # |-25| * 1.1
+    # The fast channel is sized from fast data alone.
+    assert lm["fast_noise"]["range"] == [0, 62.5]
+    assert plots["noisefloor"]["plot_params"]["range"] == [0, 62.5]
+    assert abs(lm["fast_offset"]["range"][1] - 14.3) < 0.01
+    # Threshold band still sits at the fast-channel threshold.
+    assert ns2["NOISE_COLOR_TABLE_MAP"]["fast_noise"][0] == [50.0]
+
+
+# ---------------------------------------------------------------------------
 # Syntax check
 # ---------------------------------------------------------------------------
 
 def test_main_py_syntax():
     import py_compile
     py_compile.compile(str(MAIN_PY), doraise=True)
+
+
+# ---------------------------------------------------------------------------
+# HAM-187: noise gauges report NA -- not a traceback, not a stale value
+# ---------------------------------------------------------------------------
+# On a nosensor unit noise_diag writes nothing; an EMPTY Series made sindri's
+# gauge code raise (caught, but a full traceback per gauge per ~60 s build). A
+# unit switched to nosensor also keeps its old CSVs (mj43), so the gauge showed
+# a months-old value as current. Every assertion below goes through sindri's
+# REAL get_dashboard_plot_data (vendored verbatim from 436bf61) driven by each
+# gauge's own plot_data, so a config change cannot slip past a hand-copy.
+import datetime as dt  # noqa: E402
+import importlib.util  # noqa: E402
+
+_SINDRI_SPEC = importlib.util.spec_from_file_location(
+    "sindri_436bf61_gauge",
+    pathlib.Path(__file__).parent / "fixtures" / "sindri_436bf61_gauge.py")
+SINDRI_GAUGE = importlib.util.module_from_spec(_SINDRI_SPEC)
+_SINDRI_SPEC.loader.exec_module(SINDRI_GAUGE)
+
+GAUGES = ["noisefloor", "dcoffset", "slownoisefloor", "slowdcoffset"]
+SAMPLE_LAST_ROW = pd.Timestamp("2026-06-26 14:24:01.123456")
+
+
+def _gauge_values(ns, gauge):
+    """[value, delta_ref, threshold] exactly as the deployed sindri computes them."""
+    plot = ns["STATUS_DASHBOARD_PLOTS"][gauge]
+    return list(SINDRI_GAUGE.get_dashboard_plot_data(
+        pd.DataFrame(), plot_type=plot["plot_type"], plot_data=plot["plot_data"]))
+
+
+def _utc_now():
+    return pd.Timestamp(dt.datetime.now(dt.timezone.utc)).tz_convert(None)
+
+
+@pytest.fixture()
+def noise_source(ns):
+    """Point ingest_noise_data at a temp dir or an in-memory frame (volts)."""
+    orig = ns["ingest_noise_data"]
+
+    def use_dir(data_dir):
+        ns["ingest_noise_data"] = (
+            lambda n_days=None, data_dir=data_dir,
+            glob_pattern=ns["NOISE_GLOB_PATTERN"]:
+            orig(n_days=n_days, data_dir=data_dir, glob_pattern=glob_pattern))
+
+    def use_rows(rows):
+        index = pd.DatetimeIndex([t for t, _ in rows], name="time")
+        values = [v for _, v in rows]
+        frame = pd.DataFrame(
+            {"fast_noise": values, "fast_offset": values,
+             "slow_noise": values, "slow_offset": values},
+            index=index, dtype="float64")
+        ns["ingest_noise_data"] = lambda n_days=None, **kwargs: frame
+
+    def use_error(error):
+        def boom(*args, **kwargs):
+            raise error
+        ns["ingest_noise_data"] = boom
+
+    yield types.SimpleNamespace(dir=use_dir, rows=use_rows, error=use_error)
+    ns["ingest_noise_data"] = orig
+
+
+@pytest.fixture()
+def clock(ns):
+    orig = ns["_noise_now"]
+
+    def set_now(ts):
+        ns["_noise_now"] = ts if callable(ts) else (lambda: pd.Timestamp(ts))
+
+    yield set_now
+    ns["_noise_now"] = orig
+
+
+# --- no data / load failure -------------------------------------------------
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_gauge_reports_na_without_noise_data(ns, empty_noise_dir, noise_source, gauge):
+    noise_source.dir(empty_noise_dir)
+    series = ns["STATUS_DASHBOARD_PLOTS"][gauge]["plot_data"]["variable"](pd.DataFrame())
+    assert isinstance(series.index, pd.DatetimeIndex) and series.dtype == "float64"
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_gauge_reports_na_when_loading_fails(ns, noise_source, gauge):
+    noise_source.error(OSError("unreadable noise dir"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+# --- the real clock (nothing else exercises it) ------------------------------
+
+def test_real_clock_is_utc_and_tz_naive(ns):
+    """A tz-aware or local clock would mis-age every unit (or raise)."""
+    now = ns["_noise_now"]()
+    assert now.tz is None
+    assert abs(now - _utc_now()) < pd.Timedelta("1min")
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_fresh_data_shows_with_the_real_clock(ns, noise_source, gauge):
+    noise_source.rows([(_utc_now() - pd.Timedelta("10min"), 0.0045)])
+    assert _gauge_values(ns, gauge)[0] == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_a_broken_clock_degrades_to_na_not_a_traceback(ns, noise_source, clock, gauge):
+    """The staleness comparison must sit inside the guard (red team M18)."""
+    noise_source.rows([(_utc_now(), 0.0045)])
+    clock(lambda: pd.Timestamp.now(tz="UTC"))     # tz-aware vs naive index
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+# --- staleness: 24 h on the newest VALID row ---------------------------------
+
+def test_max_age_is_24h(ns):
+    assert ns["NOISE_GAUGE_MAX_AGE"] == pd.Timedelta("24h")
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_older_than_24h_reads_na(ns, tmp_noise_dir, noise_source, clock, gauge):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") + pd.Timedelta("1s"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
+
+
+def test_within_24h_shows_value(ns, tmp_noise_dir, noise_source, clock):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("24h") - pd.Timedelta("1s"))
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+def test_exactly_24h_old_still_counts_as_current(ns, noise_source, clock):
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0045)])
+    clock(t0 + pd.Timedelta("24h"))
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+def test_recent_nan_row_does_not_make_stale_data_current(ns, noise_source, clock):
+    """Age is taken from the newest VALID row, not any row (red team M03/M12)."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0045), (t0 + pd.Timedelta("23h"), float("nan"))])
+    clock(t0 + pd.Timedelta("25h"))
+    assert _gauge_values(ns, "noisefloor") == [None, None, None]
+
+
+def test_fresh_data_with_a_malformed_newest_value_shows_last_valid(ns, noise_source, clock):
+    """The gauge is fed the valid rows, so it agrees with its own age check."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, 0.0040), (t0 + pd.Timedelta("10min"), 0.0090),
+                       (t0 + pd.Timedelta("20min"), float("nan"))])
+    clock(t0 + pd.Timedelta("30min"))
+    value, _delta, threshold = _gauge_values(ns, "noisefloor")
+    assert value == pytest.approx(9.0)
+    assert threshold == pytest.approx(9.0)
+
+
+def test_nan_first_in_window_does_not_null_the_threshold(ns, noise_source, clock):
+    """Python's max() with a leading NaN returns NaN; feeding valid rows avoids it."""
+    t0 = pd.Timestamp("2026-10-01")
+    noise_source.rows([(t0, float("nan")), (t0 + pd.Timedelta("1min"), 0.0090),
+                       (t0 + pd.Timedelta("2min"), 0.0045)])
+    clock(t0 + pd.Timedelta("3min"))
+    assert _gauge_values(ns, "noisefloor")[2] == pytest.approx(9.0)
+
+
+@pytest.mark.parametrize("gauge", GAUGES)
+def test_unit_with_data_is_unchanged(ns, tmp_noise_dir, noise_source, clock, gauge):
+    noise_source.dir(tmp_noise_dir)
+    clock(SAMPLE_LAST_ROW + pd.Timedelta("1min"))
+    value = _gauge_values(ns, gauge)[0]
+    # The sample day file predates the slow columns: slow gauges read NA,
+    # the fast ones are unchanged.
+    expected = {"noisefloor": 4.5, "dcoffset": 13.0,
+                "slownoisefloor": None, "slowdcoffset": None}[gauge]
+    if expected is None:
+        assert value is None
+    else:
+        assert value == pytest.approx(expected)
+
+
+def test_na_series_is_stamped_with_the_clock(ns, clock):
+    clock("2026-10-29 12:00:00")
+    assert ns["_na_gauge_series"]().index[0] == pd.Timestamp("2026-10-29 12:00:00")
+
+
+def test_offset_override_applies_to_the_fast_channel_only(ns):
+    """offset_range is a fast-channel calibration; the slow axis ignores it."""
+    ov = {7: {"offset_range": [-50, 50]}}
+    fn = ns["get_noise_offset_range_mv"]
+    assert fn(unit_n=7, overrides=ov, column="fast_offset") == [-50, 50]
+    assert fn(unit_n=7, overrides=ov, column="slow_offset",
+              default=(-1.0, 1.0)) != [-50, 50]
+
+
+# --- slow gauges: their own column, and a dead slow channel is not current ---
+
+def _frame(ns, rows):
+    """rows: (time, fast_noise, fast_offset, slow_noise, slow_offset), volts."""
+    index = pd.DatetimeIndex([r[0] for r in rows], name="time")
+    frame = pd.DataFrame(
+        [r[1:] for r in rows], index=index, dtype="float64",
+        columns=["fast_noise", "fast_offset", "slow_noise", "slow_offset"])
+    ns["ingest_noise_data"] = lambda n_days=None, **kwargs: frame
+
+
+@pytest.fixture()
+def restore_ingest(ns):
+    orig = ns["ingest_noise_data"]
+    yield
+    ns["ingest_noise_data"] = orig
+
+
+def test_slow_gauges_read_their_own_columns(ns, clock, restore_ingest):
+    t0 = pd.Timestamp("2026-10-01")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0040, -0.025)])
+    clock(t0 + pd.Timedelta("1min"))
+    assert _gauge_values(ns, "slownoisefloor")[0] == pytest.approx(4.0)
+    assert _gauge_values(ns, "slowdcoffset")[0] == pytest.approx(-25.0)
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+    assert _gauge_values(ns, "dcoffset")[0] == pytest.approx(13.0)
+
+
+@pytest.mark.parametrize("gauge", ["slownoisefloor", "slowdcoffset"])
+def test_dead_slow_channel_reads_na_while_fast_is_fresh(
+        ns, clock, restore_ingest, gauge):
+    """Slow failed 2 h ago, fast still reporting: the last good slow value
+    must not read as current for the rest of the 24 h window."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), 0.0045, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, gauge) == [None, None, None]
+    assert _gauge_values(ns, "noisefloor")[0] == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize("gauge", ["slownoisefloor", "slowdcoffset"])
+def test_slow_one_blank_row_behind_fast_still_shows(
+        ns, clock, restore_ingest, gauge):
+    """A single blank slow reading within the lag allowance is not a dead
+    channel."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("30min"), 0.0045, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("31min"))
+    assert _gauge_values(ns, gauge)[0] == pytest.approx(9.0)
+
+
+def test_slow_lag_allowance_is_one_hour(ns):
+    assert ns["SLOW_GAUGE_MAX_LAG"] == pd.Timedelta("1h")
+
+
+def test_slow_lag_is_measured_against_the_matching_fast_column(
+        ns, clock, restore_ingest):
+    """slow_offset lags fast_offset, not fast_noise: a blank fast_noise on the
+    newest row must not hide a dead slow offset channel."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), nan, 0.013, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, "slowdcoffset") == [None, None, None]
+
+
+def test_an_all_blank_newest_row_is_not_a_dead_slow_channel(
+        ns, clock, restore_ingest):
+    """The lag is taken from the newest VALID fast reading."""
+    t0 = pd.Timestamp("2026-10-01")
+    nan = float("nan")
+    _frame(ns, [(t0, 0.0045, 0.013, 0.0090, 0.009),
+                (t0 + pd.Timedelta("2h"), nan, nan, nan, nan)])
+    clock(t0 + pd.Timedelta("2h1min"))
+    assert _gauge_values(ns, "slownoisefloor")[0] == pytest.approx(9.0)

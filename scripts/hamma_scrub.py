@@ -14,7 +14,9 @@ Usage:
 # Standard library imports
 import argparse
 import contextlib
+import csv
 import glob
+import io
 import json
 import logging
 import math
@@ -28,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -511,19 +513,23 @@ def write_scan_metrics(path, mj, recovered, purged):
         logger.debug("Could not write scan metrics %s: %s", path, e)
 
 
-def scan_mj_files(base_path, since=None, cache_file=None):
+def scan_mj_files(base_path, since=None, cache_file=None, until=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Dispatches to the incremental scanner when ``cache_file`` is given (reuses
     per-hourly-dir header sets whose ``(mtime, .bin-count)`` signature is
     unchanged -- the fix for the O(all-files) MJ scan), else the full scanner.
+
+    ``since``/``until`` bound the hourly directories read, inclusive, as
+    ``'YYYY-MM-DDTHH'``. Both scanners honour both bounds: silently ignoring
+    ``until`` on one path would make the caller's restriction a lie.
     """
     if cache_file:
-        return _scan_mj_incremental(base_path, since, cache_file)
-    return _scan_mj_full(base_path, since)
+        return _scan_mj_incremental(base_path, since, cache_file, until=until)
+    return _scan_mj_full(base_path, since, until=until)
 
 
-def _scan_mj_incremental(base_path, since, cache_file):
+def _scan_mj_incremental(base_path, since, cache_file, until=None):
     """MJ scan that re-reads only new/changed hourly dirs; reuses the rest.
 
     A directory whose ``(mtime, .bin-count)`` signature matches the cache is
@@ -559,6 +565,9 @@ def _scan_mj_incremental(base_path, since, cache_file):
             if name == "compressed" or not os.path.isdir(subdir):
                 continue
             if since and name < since:
+                dirs_skipped += 1
+                continue
+            if until and name > until:
                 dirs_skipped += 1
                 continue
             subdirs.append((name, subdir))
@@ -600,6 +609,12 @@ def _scan_mj_incremental(base_path, since, cache_file):
         "headers": headers,
         "file_count": file_count,
         "duplicate_count": duplicate_count,
+        # None, not []: a cached dir stores a header SET, so which header was
+        # duplicated inside it is not recoverable. [] would read as "no
+        # duplicates" and silently disarm the --audit-loss blocker, so the
+        # audit refuses on None instead (and run() forces cache_file=None for
+        # that path, making this unreachable from there).
+        "duplicate_headers": None,
         "skipped": skipped,
         "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
@@ -608,7 +623,7 @@ def _scan_mj_incremental(base_path, since, cache_file):
     }
 
 
-def _scan_mj_full(base_path, since=None):
+def _scan_mj_full(base_path, since=None, until=None):
     """Scan local mjolnir .bin files and collect headers.
 
     Parameters
@@ -618,6 +633,9 @@ def _scan_mj_full(base_path, since=None):
     since : str or None
         If set, skip directories with names before this cutoff
         (format: 'YYYY-MM-DDTHH').
+    until : str or None
+        If set, skip directories with names after this cutoff (same format).
+        Inclusive, like ``since``.
 
     Returns
     -------
@@ -625,13 +643,16 @@ def _scan_mj_full(base_path, since=None):
         headers: set of bytes (128-byte raw headers)
         file_count: int (total .bin files found)
         duplicate_count: int (files with headers already seen)
+        duplicate_headers: list of bytes (one per duplicate OCCURRENCE)
         skipped: int (files < 128 bytes)
         dirs_skipped: int (directories before --since cutoff)
         elapsed: float (seconds)
     """
     headers = set()
     file_count = 0
-    duplicate_count = 0
+    # See scan_ags_files: the duplicate headers themselves, so --audit-loss can
+    # place each one in (or outside) its window.
+    duplicate_headers = []
     skipped = 0
     dirs_skipped = 0
     t0 = time.time()
@@ -643,7 +664,7 @@ def _scan_mj_full(base_path, since=None):
 
     for drive in drives:
         try:
-            if since:
+            if since or until:
                 # Per-directory filtering: only glob .bin in qualifying dirs
                 dir_pattern = os.path.join(drive, "*")
                 subdirs = sorted(glob.glob(dir_pattern))
@@ -652,7 +673,10 @@ def _scan_mj_full(base_path, since=None):
                     if not os.path.isdir(subdir):
                         continue
                     dirname = os.path.basename(subdir)
-                    if dirname < since:
+                    if since and dirname < since:
+                        dirs_skipped += 1
+                        continue
+                    if until and dirname > until:
                         dirs_skipped += 1
                         continue
                     try:
@@ -685,7 +709,7 @@ def _scan_mj_full(base_path, since=None):
                     skipped += 1
                     continue
                 if header in headers:
-                    duplicate_count += 1
+                    duplicate_headers.append(header)
                 else:
                     headers.add(header)
             except PermissionError:
@@ -704,7 +728,8 @@ def _scan_mj_full(base_path, since=None):
     return {
         "headers": headers,
         "file_count": file_count,
-        "duplicate_count": duplicate_count,
+        "duplicate_count": len(duplicate_headers),
+        "duplicate_headers": duplicate_headers,
         "skipped": skipped,
         "dirs_skipped": dirs_skipped,
         "elapsed": elapsed,
@@ -837,6 +862,7 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
         entries: list of dict (filename, offset, index, header)
         headers: set of bytes (unique 128-byte headers)
         duplicate_count: int
+        duplicate_headers: list of bytes (one per duplicate OCCURRENCE)
         elapsed: float (seconds)
 
     Raises
@@ -901,12 +927,16 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
     entries = decode_strider_output(result.stdout)
 
     headers = set()
-    duplicate_count = 0
+    # The duplicate HEADERS, not merely a tally. --audit-loss has to know which
+    # window each duplicate falls in, and the raw header bytes are what carries
+    # the trigger time (see duplicates_in_window).
+    duplicate_headers = []
     for entry in entries:
         if entry["header"] in headers:
-            duplicate_count += 1
+            duplicate_headers.append(entry["header"])
         else:
             headers.add(entry["header"])
+    duplicate_count = len(duplicate_headers)
 
     elapsed = time.time() - t0
     file_count = len(set(e["filename"] for e in entries))
@@ -922,6 +952,7 @@ def scan_ags_files(ags_host, ags_path, control_path=None):
         "entries": entries,
         "headers": headers,
         "duplicate_count": duplicate_count,
+        "duplicate_headers": duplicate_headers,
         "elapsed": elapsed,
     }
 
@@ -984,6 +1015,21 @@ def decode_gps_time(header):
         subsecond = struct.unpack_from('<I', header, GPS_SUBSECOND_OFFSET)[0]
         ecc = struct.unpack_from('<I', header, GPS_ECC_OFFSET)[0]
     except struct.error:
+        return None
+
+    # Bad-GPS records carry NaN/inf in the float fields, and the struct.error
+    # guard above catches neither: math.floor() raises ValueError on NaN and
+    # OverflowError on inf, from OUTSIDE the try below. One such record
+    # therefore raises out of decode_gps_time() entirely.
+    #
+    # Observed: 8 such headers on mj08's data drive, which aborted a full-drive
+    # header walk. The scheduled scrub is less exposed -- `--since auto` only
+    # decodes the FIRST trigger of each AGS file -- but the same call sits on
+    # the recovery write path (compute_target_path) and in both report
+    # formatters, so a single bad record can take down a recover/purge run.
+    # Such records now decode to None and land under the existing "unknown/"
+    # target prefix, which the MJ scanners already sort above any date dir.
+    if not (math.isfinite(time_of_week) and math.isfinite(utc_offset)):
         return None
 
     # Compute base time (seconds since Unix epoch)
@@ -1911,6 +1957,637 @@ def format_json_report(results, ags_host, recovery=None, purge=None):
     return json.dumps(report, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# HAM-164 loss reconciliation
+#
+#     lost = delta valid_packets  -  |H_ags  union  H_mj|
+#
+# `valid_packets` counts records the FPGA produced and the AGS CRC-validated.
+# It increments AFTER both sinks are offered the packet (SciencePacketParser),
+# so it is an upstream reference independent of whether either sink accepted.
+# H_ags / H_mj are the raw 128-byte record headers found on the AGS stick and
+# the mjolnir data drives.
+#
+# This exists because `packets_dropped == 0` is NOT a sound acceptance
+# criterion: ThreadedPacketProcessor only counts a drop when the writer is
+# busy, so a unit whose stream is merely DISCONNECTED reports a perfect score
+# while shedding every record.
+#
+# IDENTITY: records are matched on the RAW HEADER BYTES. Trigger time is used
+# only to place a record in the window. The header is NOT guaranteed unique --
+# per-record entropy is essentially the GPS fields, and when GPS freezes many
+# records collapse to one header (this file already logs that: see the
+# "duplicate headers detected" warnings in the scanners). Duplicates make the
+# union UNDERCOUNT and therefore OVERSTATE loss, so a non-zero duplicate count
+# is a blocker, not a footnote.
+#
+# THE PRECONDITION -- why both boundaries must be quiet:
+# the window bounds come from brokkr telemetry `time` (the PI's wall clock),
+# while the header set is keyed to GPS TRIGGER time, and `valid_packets`
+# increments only when the last byte of a ~22 MB record has arrived -- >=905 ms
+# after the trigger, plus transfer, plus up to 1 s of H&S emission phase, plus
+# socket wait. So delta_valid counts triggers in (B0-L, B1-L] while the header
+# set holds [B0, B1), with L ~ 1-3 s and NOT constant. The residual therefore
+# carries a term N(B0-L, B0) - N(B1-L, B1) which is pure noise unless both
+# boundaries are QUIET. Rather than loosen the predicate to "small is fine" --
+# which trains operators to wave real loss through -- we measure activity
+# around each boundary and REFUSE TO CERTIFY when it is non-zero.
+#
+# BLIND SPOT: valid_packets counts only CRC-VALID records, so loss upstream of
+# the parser (FPGA FIFO overflow -> CRC failure) is in neither side of the
+# equation. Track crc_errors and the wrap-aware fifo_overflow delta separately.
+# ---------------------------------------------------------------------------
+
+DEFAULT_TELEMETRY_DIR = os.path.expanduser("~/brokkr/hamma/telemetry")
+
+# Derived, not restated: a record is header + payload + CRC pad. Reading this
+# from the existing constants means it tracks if the datasize assumption moves.
+RECORD_BYTES = HEADER_SIZE + EXPECTED_DATASIZE * 2 + PACKET_PAD
+
+# bytes_written is reported in GB (base-10) in the telemetry CSV.
+BYTES_WRITTEN_SCALE = 1e9
+
+# Seconds either side of a boundary that must contain no records. Covers the
+# trigger -> valid_packets latency L (~1-3 s) with margin.
+DEFAULT_EDGE_SECONDS = 10.0
+
+# How far the snapped telemetry row may sit from the requested bound before the
+# result is considered to describe a different window than the one asked for.
+DEFAULT_BOUND_TOLERANCE_S = 120.0
+
+# How far a record's GPS trigger time may sit outside the hourly directory it
+# was filed under. The two disagree because the directory name comes from the
+# PI'S wall clock, sampled after a ~22 MB socket read, while the header carries
+# the GPS trigger instant. Measured on mj08 (3,689 records over 25 random
+# dirs, 0 undecodable): 3 records outside their dir hour, worst case 3 s early,
+# none late. That sample is normal operation and this skew widens during
+# exactly the episodes that cause drops, so this allowance is deliberately
+# ~1000x the measurement rather than fitted to it. It only ever costs
+# directories, and surplus directories are free (see window_dir_range).
+DIR_NAME_SKEW_SECONDS = 3600.0
+
+# The only telemetry columns this reconciliation reads. Projecting to these at
+# parse time matters: units retain 240-270 days of 1/min telemetry (>500k rows,
+# 49 columns), and on the sensors' Python 3.7 csv.DictReader yields OrderedDict.
+# Keeping whole rows peaked ~3 GB on a 4 GB Pi -- enough to OOM it.
+TELEMETRY_COLUMNS = ("time", "valid_packets", "bytes_written",
+                     "packets_sent", "packets_dropped")
+
+_TELEMETRY_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.csv(?:\.bak)?$")
+
+# The fractional-seconds run of an ISO stamp. The only '.' in an ISO timestamp
+# is this separator (the UTC offset uses ':'), so the first match is it.
+_ISO_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+def _normalize_stamp(raw):
+    """Normalize a timestamp to ISO 'T' form for safe string comparison.
+
+    brokkr writes "2026-09-10 23:59:18.717565+00:00" (space-separated) while
+    decode_gps_time() emits "2026-09-10T23:59:18.717". These get compared
+    against the same bounds, and ' ' (0x20) sorts BELOW 'T' (0x54) -- so mixing
+    the forms silently puts a whole day on the wrong side of an edge. Applied
+    to BOTH rows and caller-supplied bounds.
+    """
+    stamp = (raw or "").strip()
+    return stamp.replace(" ", "T", 1) if stamp else ""
+
+
+def window_dir_range(t0, t1, edge_seconds=DEFAULT_EDGE_SECONDS,
+                     bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
+    """Hourly-dir bounds (inclusive) covering every record the audit reads.
+
+    Returns ``(since, until)`` as ``'YYYY-MM-DDTHH'`` -- the same lexicographic
+    form the scanners already compare directory names against -- or
+    ``(None, None)`` when a bound cannot be parsed, which means "do not
+    restrict". Deriving nothing here rather than raising is deliberate: the
+    authoritative bound validation lives in counter_window(), and a full scan
+    reaches it with the same verdict, just slower.
+
+    This is an I/O optimization and MUST NOT change the report. It is sound
+    where --since is not: --since auto derives a cutoff from AGS retention,
+    which is unrelated to the window and can therefore truncate the union and
+    inflate loss, whereas a WINDOW-derived range can only drop records that
+    headers_in_window() already discards.
+
+    The range is wider than the literal bounds for two reasons:
+      * the MJ scan runs before counter_window() picks the actual counter rows,
+        which may sit up to ``bound_tolerance_s`` outside the request, and
+        boundary_activity() then reaches a further ``edge_seconds`` past each;
+      * a record's trigger time can fall outside its directory's hour
+        (``DIR_NAME_SKEW_SECONDS``).
+
+    The asymmetry of failure drives the margin: over-inclusion costs a few
+    seconds of header reads and is discarded downstream, while
+    under-inclusion silently shrinks the union and manufactures a false FAIL
+    for someone hunting data loss that never happened. So the margin is summed
+    from all three named constants and then rounded OUTWARD to whole hours.
+    """
+    start_epoch, end_epoch = _iso_epoch(t0), _iso_epoch(t1)
+    if start_epoch is None or end_epoch is None:
+        return None, None
+    margin = bound_tolerance_s + edge_seconds + DIR_NAME_SKEW_SECONDS
+    low = _floor_hour(start_epoch - margin)
+    high = _floor_hour(end_epoch + margin)
+    return _hour_dir_name(low), _hour_dir_name(high)
+
+
+def _floor_hour(epoch):
+    """Round an epoch down to the start of its UTC hour."""
+    return epoch - (epoch % 3600.0)
+
+
+def _hour_dir_name(epoch):
+    """Format an epoch as the 'YYYY-MM-DDTHH' name of its hourly directory.
+
+    UTC, because that is what the units run and what the existing --since
+    comparison already assumes: earliest_ags_timestamp() builds this same form
+    from GPS trigger times and compares it to directory names directly.
+    """
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def _pad_iso_fraction(text):
+    """Normalize fractional seconds to exactly 6 digits, or leave them absent.
+
+    datetime.fromisoformat() on Python 3.7-3.10 accepts ONLY 3 or 6 fractional
+    digits -- it was written to read isoformat()'s own output, not ISO 8601 in
+    general. The sensors run 3.7 (Buster) while dev boxes run 3.11+, which
+    accepts any number of digits. Without this, an operator bound as ordinary
+    as '2026-09-10T23:59:18.5' parses on the dev box and is rejected ON THE
+    UNIT, i.e. a window bound that is "unparseable" only in the field. More
+    than 6 digits is sub-microsecond, which datetime cannot represent at all,
+    so truncating there matches what 3.11+ does itself.
+    """
+    found = _ISO_FRACTION_RE.search(text)
+    if found is None:
+        return text
+    padded = (found.group(1) + "000000")[:6]
+    return text[:found.start()] + "." + padded + text[found.end():]
+
+
+def _iso_epoch(stamp):
+    """Parse an ISO stamp to epoch seconds; None if unparseable.
+
+    Naive stamps are treated as UTC -- decode_gps_time() emits UTC without a
+    suffix, and brokkr telemetry carries an explicit +00:00.
+    """
+    text = _normalize_stamp(stamp)
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    text = _pad_iso_fraction(text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _telemetry_file_date(name):
+    """Extract the YYYY-MM-DD embedded in a telemetry filename, or None."""
+    found = _TELEMETRY_DATE_RE.search(name)
+    return found.group(1) if found else None
+
+
+def load_telemetry_rows(telemetry_dir, since_date=None, until_date=None):
+    """Load telemetry rows as (stamp, {column: value}), time-ordered.
+
+    Only ``TELEMETRY_COLUMNS`` are kept (see that constant for why), and files
+    whose embedded date falls outside [since_date, until_date] are not opened
+    at all.
+
+    ``.csv.bak`` is included -- brokkr rotates on restart, so a restart day is
+    split across both and reading only the ``.csv`` loses the earlier part. The
+    two can carry rows for the SAME timestamp, though, so rows are de-duplicated
+    by timestamp with the live ``.csv`` winning: the ``.bak`` holds pre-rotation
+    counter values, and letting those win manufactures a phantom reset.
+
+    NUL bytes (a row torn by a mid-write death) are stripped, not fatal.
+    """
+    try:
+        names = sorted(os.listdir(telemetry_dir))
+    except OSError as e:
+        raise RuntimeError(
+            "cannot read telemetry dir {}: {}".format(telemetry_dir, e))
+
+    def wanted(name):
+        if not (name.endswith(".csv") or name.endswith(".csv.bak")):
+            return False
+        stamp = _telemetry_file_date(name)
+        if stamp is None:
+            return True          # unparseable name: read it rather than guess
+        if since_date and stamp < since_date:
+            return False
+        if until_date and stamp > until_date:
+            return False
+        return True
+
+    # .bak first so the live .csv overwrites it at equal timestamps.
+    ordered = ([n for n in names if n.endswith(".csv.bak") and wanted(n)]
+               + [n for n in names if n.endswith(".csv") and wanted(n)])
+
+    by_stamp = {}
+    for name in ordered:
+        path = os.path.join(telemetry_dir, name)
+        try:
+            with open(path, "r", errors="replace") as fh:
+                text = fh.read().replace("\x00", "")
+        except OSError as e:
+            logger.warning("skipping telemetry file %s: %s", name, e)
+            continue
+        for raw in csv.DictReader(io.StringIO(text)):
+            stamp = _normalize_stamp(raw.get("time"))
+            if stamp:
+                by_stamp[stamp] = {k: raw.get(k) for k in TELEMETRY_COLUMNS}
+
+    return sorted(by_stamp.items())
+
+
+def _counter(row, field):
+    """Read a numeric counter column by name; None if absent or not finite.
+
+    Rejecting NaN/inf is load-bearing, not defensive: a bare float() accepts
+    them, and a NaN latched into the reset scan makes every subsequent
+    `value < previous` False -- silently disabling restart detection for the
+    rest of the window, which turns a real loss into a PASS.
+    """
+    raw = (row.get(field) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _row_epochs(rows):
+    """Attach an epoch to every telemetry row; None where it cannot be placed.
+
+    Unplaceable rows are kept, not dropped: ``counter_window`` refuses on the
+    ones that land inside the span it measures (see ``_refuse_unplaceable``),
+    because a row missing from the reset scan is how a real loss becomes a
+    PASS -- the same hole ``_counter`` closes for NaN. Outside that span a
+    torn row cannot affect the result, so aborting on it would be noise.
+    """
+    return [(_iso_epoch(stamp), stamp, row) for stamp, row in rows]
+
+
+def _refuse_unplaceable(placed, start_index, end_index):
+    """Refuse if any row inside the measured span has no usable timestamp.
+
+    The reset scan examines only ``start < t <= end``, so only unplaceable
+    rows in that span can hide a ``valid_packets`` reset; a NUL-torn row a day
+    away aborts a run it could not have influenced.
+
+    "Inside" has to be POSITIONAL, because an unplaceable row has no instant to
+    compare. That leans on load_telemetry_rows() returning rows in timestamp
+    order, which holds for same-format stamps but could be disturbed by a clock
+    jump that reorders the file. The failure direction is safe either way: a
+    row misplaced by such a jump is at worst refused when it need not have
+    been, never silently skipped while inside the span.
+    """
+    for epoch, stamp, _row in placed[start_index + 1:end_index + 1]:
+        if epoch is None:
+            raise RuntimeError(
+                "telemetry row timestamp {!r} inside the measured window is "
+                "unparseable, so a counter reset could hide behind it. "
+                "Narrow the window or repair the telemetry file.".format(
+                    stamp))
+
+
+def counter_window(rows, t0, t1, bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S):
+    """Snapshot H&S counters at the last telemetry row at or before each bound.
+
+    The window is defined BY the counter-read instants so the delta is exact.
+    Returns the row timestamps used, so the caller can bound the header sets
+    identically.
+
+    Refuses (RuntimeError) when the result would not describe the window that
+    was asked for:
+      * bounds out of order -- otherwise start/end are chosen independently and
+        a reversed pair yields delta=0, union=0, lost=0: a PASS that examined
+        nothing;
+      * no bracketing rows, or both bounds snapping to the same row;
+      * a snapped row further than ``bound_tolerance_s`` from its request,
+        which happens across a telemetry gap and silently measures a different
+        (often much wider) window;
+      * ``valid_packets`` decreasing anywhere inside -- an AGS restart resets
+        it, so end-start is meaningless. Stitching across a reset would
+        reintroduce the boundary error this reconciliation exists to remove.
+    """
+    t0, t1 = _normalize_stamp(t0), _normalize_stamp(t1)
+    if not (t0 and t1):
+        raise RuntimeError("window bounds must both be supplied")
+
+    # Compare INSTANTS, not strings. Telemetry rows always carry an explicit
+    # +00:00 and the documented --window-start form does not; at an equal
+    # prefix the longer string loses, so '...23:59:18+00:00' <= '...23:59:18'
+    # is False. A bound landing exactly on a row therefore excluded that row
+    # and snapped the window up to one telemetry interval (~60 s) early -- well
+    # inside the 120 s drift tolerance, so nothing below caught it.
+    t0_epoch, t1_epoch = _iso_epoch(t0), _iso_epoch(t1)
+    if t0_epoch is None or t1_epoch is None:
+        raise RuntimeError(
+            "window bounds must be ISO timestamps; got {} .. {}".format(
+                t0, t1))
+    if t0_epoch >= t1_epoch:
+        raise RuntimeError(
+            "window start {} is not before end {}".format(t0, t1))
+
+    placed = _row_epochs(rows)
+    start = end = None
+    start_index = end_index = None
+    for index, entry in enumerate(placed):
+        epoch, _stamp, row = entry
+        if epoch is None:
+            continue
+        if _counter(row, "valid_packets") is None:
+            continue
+        if epoch <= t0_epoch:
+            start, start_index = entry, index
+        if epoch <= t1_epoch:
+            end, end_index = entry, index
+
+    if start is None or end is None:
+        raise RuntimeError(
+            "no telemetry rows bracket the window {} .. {}".format(t0, t1))
+    if start[0] >= end[0]:
+        raise RuntimeError(
+            "both window bounds snap to the same telemetry row ({}): the "
+            "window contains no counter movement".format(start[1]))
+
+    for label, requested, req_epoch, chosen in (
+            ("start", t0, t0_epoch, start), ("end", t1, t1_epoch, end)):
+        drift = abs(req_epoch - chosen[0])
+        if drift > bound_tolerance_s:
+            raise RuntimeError(
+                "window {} snapped to {}, {:.0f}s from the requested {} "
+                "(telemetry gap?). That would measure a different window than "
+                "the one asked for.".format(
+                    label, chosen[1], drift, requested))
+
+    _refuse_unplaceable(placed, start_index, end_index)
+
+    # Seed from the START row: a reset between the start bound and the first
+    # in-window row would otherwise go undetected, and that is exactly where a
+    # restart tends to land.
+    previous = _counter(start[2], "valid_packets")
+    for epoch, stamp, row in placed:
+        # Unplaceable rows survive only OUTSIDE the span -- _refuse_unplaceable
+        # has already rejected any inside it -- so skipping them here cannot
+        # hide a reset.
+        if epoch is None:
+            continue
+        if not (start[0] < epoch <= end[0]):
+            continue
+        value = _counter(row, "valid_packets")
+        if value is None:
+            continue
+        if previous is not None and value < previous:
+            raise RuntimeError(
+                "valid_packets reset at {} ({:.0f} -> {:.0f}): AGS restarted "
+                "inside the window, so the delta is not meaningful. Choose a "
+                "window inside a single AGS boot.".format(
+                    stamp, previous, value))
+        previous = value
+
+    result = {"start_row": start[1], "end_row": end[1]}
+    for field in ("valid_packets", "bytes_written", "packets_sent",
+                  "packets_dropped"):
+        first, last = _counter(start[2], field), _counter(end[2], field)
+        result["delta_" + field] = (
+            None if first is None or last is None else last - first)
+    return result
+
+
+def decode_header_times(headers):
+    """Decode every header's trigger time once.
+
+    Returns ``(pairs, undecodable)`` where pairs is a list of
+    ``(epoch_seconds, header)``. Undecodable headers are bad-GPS records; they
+    cannot be placed in the window at all, so they can only make the union an
+    UNDERCOUNT -- never a false "loss" -- and are reported separately.
+    """
+    pairs, undecodable = [], 0
+    for header in headers:
+        epoch = _iso_epoch(decode_gps_time(header))
+        if epoch is None:
+            undecodable += 1
+        else:
+            pairs.append((epoch, header))
+    return pairs, undecodable
+
+
+def headers_in_window(pairs, start_epoch, end_epoch):
+    """Headers whose trigger time falls in [start, end)."""
+    return {h for epoch, h in pairs if start_epoch <= epoch < end_epoch}
+
+
+def duplicates_in_window(scan, start_epoch, end_epoch):
+    """Count duplicate record occurrences whose trigger time is in the window.
+
+    Counts the same thing the scanners' ``duplicate_count`` does -- occurrences
+    of a raw header beyond its first -- but only for the headers that land in
+    the window being certified. The scan-wide count is a property of everything
+    the unit still RETAINS, so a single past GPS-freeze episode (mj08) blocked
+    every later audit on that unit permanently, with no way out: --since and
+    --recover/--purge are all rejected alongside --audit-loss.
+
+    A duplicate cannot straddle a bound. The trigger time is decoded FROM the
+    header bytes, so every copy of a header decodes to the same instant and all
+    copies land on the same side. Copies whose header is undecodable (bad GPS)
+    are not counted: they are absent from the union whether duplicated or not,
+    and are already reported as the undecodable_* totals.
+    """
+    # Absent key and explicit None are different faults and get different
+    # messages, but neither may read as "no duplicates": that would silently
+    # disarm the blocker. Both refuse as RuntimeError, which run()'s audit
+    # branch already turns into an EXIT_NO_DATA refusal -- a bare subscript
+    # would escape it as an unhandled traceback instead.
+    if "duplicate_headers" not in scan:
+        raise RuntimeError(
+            "this scan result carries no 'duplicate_headers' key, so "
+            "in-window duplicates cannot be counted. A scan producer must "
+            "report the duplicated headers themselves, not duplicate_count.")
+    occurrences = scan["duplicate_headers"]
+    if occurrences is None:
+        raise RuntimeError(
+            "the incremental MJ scanner does not retain which headers were "
+            "duplicated, so in-window duplicates cannot be counted; re-run "
+            "the audit without --mj-cache")
+    count = 0
+    for header in occurrences:
+        epoch = _iso_epoch(decode_gps_time(header))
+        if epoch is not None and start_epoch <= epoch < end_epoch:
+            count += 1
+    return count
+
+
+def boundary_activity(pairs, bound_epoch, edge_seconds):
+    """Count records whose trigger time is within +/-edge_seconds of a bound.
+
+    Non-zero means the trigger->valid_packets latency straddles that boundary,
+    so the counter and the header set disagree about which records belong to
+    the window. See THE PRECONDITION in this section's header comment.
+    """
+    return sum(1 for epoch, _ in pairs
+               if abs(epoch - bound_epoch) <= edge_seconds)
+
+
+def build_lost_report(ags, mj, rows, t0, t1,
+                      edge_seconds=DEFAULT_EDGE_SECONDS,
+                      bound_tolerance_s=DEFAULT_BOUND_TOLERANCE_S,
+                      extra_blockers=()):
+    """Reconcile parsed-record count against the union actually on disk.
+
+    ``ags``/``mj`` are the scan result dicts (not bare header sets): the
+    duplicate headers and file counts they carry decide whether the union can
+    be trusted at all.
+    """
+    counters = counter_window(rows, t0, t1, bound_tolerance_s)
+
+    # Bound the header sets by the ACTUAL counter-read instants, not the
+    # caller's request. The delta is measured between those two rows, so
+    # filtering headers by anything else reintroduces a start/end mismatch.
+    start_epoch = _iso_epoch(counters["start_row"])
+    end_epoch = _iso_epoch(counters["end_row"])
+
+    ags_pairs, ags_undecodable = decode_header_times(ags["headers"])
+    mj_pairs, mj_undecodable = decode_header_times(mj["headers"])
+
+    ags_window = headers_in_window(ags_pairs, start_epoch, end_epoch)
+    mj_window = headers_in_window(mj_pairs, start_epoch, end_epoch)
+    union = ags_window | mj_window
+
+    delta_valid = counters["delta_valid_packets"]
+    lost = None if delta_valid is None else int(round(delta_valid)) - len(union)
+
+    all_pairs = ags_pairs + mj_pairs
+    edge_start = boundary_activity(all_pairs, start_epoch, edge_seconds)
+    edge_end = boundary_activity(all_pairs, end_epoch, edge_seconds)
+
+    # Independent cross-check of the local-write drop count. bytes_written is a
+    # byte odometer, entirely separate from the drop counter. ADVISORY ONLY:
+    # it assumes every record is exactly RECORD_BYTES, which is a config value
+    # (the preset's data_length), not a format invariant.
+    delta_written = counters.get("delta_bytes_written")
+    local_drops = None
+    if delta_valid is not None and delta_written is not None:
+        written_records = delta_written * BYTES_WRITTEN_SCALE / RECORD_BYTES
+        local_drops = int(round(delta_valid - written_records))
+
+    duplicates = (duplicates_in_window(ags, start_epoch, end_epoch)
+                  + duplicates_in_window(mj, start_epoch, end_epoch))
+
+    blockers = list(extra_blockers)
+    if edge_start or edge_end:
+        blockers.append(
+            "boundaries not quiet: {} record(s) within +/-{:.0f}s of the start "
+            "and {} of the end. The trigger->valid_packets latency straddles "
+            "the edge, so the counter and the header set disagree about which "
+            "records are in the window. Re-run with bounds in a trigger gap."
+            .format(edge_start, edge_seconds, edge_end))
+    if duplicates:
+        blockers.append(
+            "{} duplicate header(s) inside the window: records are matched by "
+            "raw header bytes, and duplicates collapse in the union, "
+            "overstating loss.".format(duplicates))
+    if not mj.get("file_count"):
+        blockers.append(
+            "no MJ .bin files were scanned: the union is empty by "
+            "construction, so any delta reads as total loss.")
+
+    return {
+        "window_start": _normalize_stamp(t0),
+        "window_end": _normalize_stamp(t1),
+        "counter_row_start": counters["start_row"],
+        "counter_row_end": counters["end_row"],
+        "delta_valid_packets": (
+            None if delta_valid is None else int(round(delta_valid))),
+        "ags_in_window": len(ags_window),
+        "mj_in_window": len(mj_window),
+        "ags_only": len(ags_window - mj_window),
+        "union": len(union),
+        "lost": lost,
+        "edge_records_start": edge_start,
+        "edge_records_end": edge_end,
+        "edge_seconds": edge_seconds,
+        "duplicate_headers": duplicates,
+        "undecodable_ags_total": ags_undecodable,
+        "undecodable_mj_total": mj_undecodable,
+        "stream_drops": _as_int(counters.get("delta_packets_dropped")),
+        "local_drops_derived": local_drops,
+        "blockers": blockers,
+        "certified": bool(not blockers and lost == 0),
+    }
+
+
+def _as_int(value):
+    return None if value is None else int(round(value))
+
+
+def _fmt(value):
+    """Format a possibly-None counter without raising."""
+    return "n/a" if value is None else "{:>8}".format(value)
+
+
+def format_lost_report(report):
+    """Human-readable reconciliation summary."""
+    lines = [
+        "",
+        "HAM-164 Loss Reconciliation",
+        "===========================",
+        "Window:   {} -> {}  (exclusive)".format(
+            report["window_start"], report["window_end"]),
+        "Counters: {} -> {}".format(
+            report["counter_row_start"], report["counter_row_end"]),
+        "",
+        "  delta valid_packets      {}".format(
+            _fmt(report["delta_valid_packets"])),
+        "  |H_ags union H_mj|       {}".format(_fmt(report["union"])),
+        "  " + "-" * 32,
+        "  LOST                     {}".format(_fmt(report["lost"])),
+        "",
+        "  on AGS only (not on MJ)  {}".format(_fmt(report["ags_only"])),
+        "  stream drops             {}".format(_fmt(report["stream_drops"])),
+        "  local drops (derived)    {}  (advisory)".format(
+            _fmt(report["local_drops_derived"])),
+        "  records near start edge  {}".format(
+            _fmt(report["edge_records_start"])),
+        "  records near end edge    {}".format(
+            _fmt(report["edge_records_end"])),
+    ]
+    undecodable = (report["undecodable_ags_total"]
+                   + report["undecodable_mj_total"])
+    if undecodable:
+        lines.append(
+            "  bad-GPS headers (whole scan, not window-scoped): {}".format(
+                undecodable))
+    lines.append("")
+
+    lost = report["lost"]
+    if report["certified"]:
+        lines.append(
+            "PASS: no records lost; every parsed record is on the AGS or MJ.")
+    elif lost is not None and lost < 0:
+        lines.append(
+            "INVALID: more records on disk ({}) than the counter reports. The "
+            "window bounds or the identity assumption are wrong -- this is not "
+            "a loss measurement.".format(-lost))
+    elif lost:
+        lines.append("FAIL: {} parsed record(s) are on NEITHER the AGS nor "
+                     "MJ.".format(lost))
+    for blocker in report["blockers"]:
+        lines.append("CANNOT CERTIFY: " + blocker)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _build_parser():
     """Build argument parser."""
     parser = argparse.ArgumentParser(
@@ -1977,13 +2654,57 @@ def _build_parser():
         help="Durable CSV appended one row per run with MJ-scan cache "
              "hit-rate/timing (default: %(default)s; empty string disables)",
     )
+    # NOTE: named --audit-loss, not --lost-report, deliberately. "--l" already
+    # resolves to --limit for existing callers; adding a second --l* flag makes
+    # that abbreviation ambiguous and breaks them with "error: ambiguous
+    # option". "--a" was already ambiguous (--ags-host/--ags-path), so this
+    # name adds no new collision.
+    parser.add_argument(
+        "--audit-loss", action="store_true",
+        help="HAM-164 reconciliation: compare delta valid_packets against the "
+             "union of AGS+MJ headers over a window, to count records lost by "
+             "BOTH paths. Requires --window-start/--window-end, and boundaries "
+             "in a trigger gap. Use instead of 'packets_dropped == 0', which a "
+             "DISCONNECTED stream satisfies while shedding every record. "
+             "Incompatible with --recover/--purge/--since.",
+    )
+    parser.add_argument(
+        "--window-start",
+        help="Audit window start, ISO (e.g. 2026-09-04T23:59:18). Pick a "
+             "moment with no triggers nearby -- see --edge-seconds.",
+    )
+    parser.add_argument(
+        "--window-end",
+        help="Audit window end, exclusive, ISO. Also must be quiet.",
+    )
+    parser.add_argument(
+        "--telemetry-dir", default=DEFAULT_TELEMETRY_DIR,
+        help="Directory of brokkr telemetry CSVs supplying valid_packets "
+             "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--edge-seconds", type=float, default=DEFAULT_EDGE_SECONDS,
+        help="Each boundary must have no records within +/- this many seconds, "
+             "or the audit refuses to certify: the trigger->valid_packets "
+             "latency would straddle the edge (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--bound-tolerance", type=float, default=DEFAULT_BOUND_TOLERANCE_S,
+        help="Refuse if a window bound snaps to a telemetry row further than "
+             "this many seconds away, which would silently measure a different "
+             "window (default: %(default)s)",
+    )
     return parser
 
 
 def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
         limit=DEFAULT_LIMIT, since=None, recover=False, dry_run=False,
         purge=False, status_file=DEFAULT_STATUS_FILE,
-        mj_cache=DEFAULT_MJ_CACHE, metrics_file=DEFAULT_METRICS_FILE):
+        mj_cache=DEFAULT_MJ_CACHE, metrics_file=DEFAULT_METRICS_FILE,
+        audit_loss=False, window_start=None, window_end=None,
+        telemetry_dir=DEFAULT_TELEMETRY_DIR,
+        edge_seconds=DEFAULT_EDGE_SECONDS,
+        bound_tolerance=DEFAULT_BOUND_TOLERANCE_S):
     """Run the scrubber and return exit code.
 
     Parameters
@@ -2015,12 +2736,53 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
     int
         Exit code.
     """
+    if audit_loss:
+        # Drop every shared-state path BEFORE the first write, which is what
+        # makes the "writes no shared state" property below actually hold: the
+        # three write_status() calls on the way to the audit branch ran
+        # unconditionally, so a hand-run audit stamped three heartbeats into
+        # the file the scheduled scrub shares, without holding
+        # hamma-scrub.sh's flock. state_monitor.check_scrub_health() reads a
+        # changing (pid, timestamp, phase) token as "the scrub is making
+        # progress", so those heartbeats mask a real hang -- and
+        # _recover_stuck_scrub() SIGKILLs the process group of whatever PID is
+        # in that file, which would match this run too (_pid_is_scrub() only
+        # checks that the cmdline names hamma_scrub.py).
+        #
+        # mj_cache goes with them: it is a world-writable tmpfs file the timer
+        # also owns, and its cached per-dir header SETS cannot say which header
+        # was duplicated -- which the in-window duplicate blocker needs. The
+        # audit pays a full MJ scan instead; it is hand-run and already
+        # refuses --since, so completeness over speed is the right trade here.
+        # write_status()/write_scan_metrics() are no-ops on a None path.
+        status_file = metrics_file = mj_cache = None
+
     write_status(status_file, "start")
     if dry_run and not recover:
         logger.warning("--dry-run has no effect without --recover")
 
     if purge and not recover:
         logger.error("--purge requires --recover")
+        return EXIT_NO_DATA
+
+    if audit_loss and not (window_start and window_end):
+        logger.error("--audit-loss requires --window-start and --window-end")
+        return EXIT_NO_DATA
+
+    if audit_loss and (recover or purge):
+        # --recover/--purge mutate the MJ and AGS sides mid-measurement, moving
+        # records into and out of the union while it is being counted.
+        logger.error("--audit-loss cannot be combined with --recover/--purge")
+        return EXIT_NO_DATA
+
+    if audit_loss and since:
+        # --since truncates the MJ scan. The deployed command carries
+        # `--since auto`, which derives its cutoff from the earliest AGS record
+        # -- hours ago on a healthy purged unit. That would empty the union and
+        # report the whole window as lost.
+        logger.error(
+            "--audit-loss cannot be combined with --since: it truncates the "
+            "MJ scan and would report un-scanned records as lost")
         return EXIT_NO_DATA
 
     # Parse --since into normalized directory prefix
@@ -2057,8 +2819,71 @@ def run(ags_host, ags_path, mj_path, json_output=False, output_file=None,
             logger.info(
                 "Auto-detect found no valid GPS data; scanning all MJ dirs")
 
+    # HAM-164: read only the hourly dirs that can hold a record this
+    # reconciliation will look at. The audit refuses --since (an AGS-retention
+    # cutoff, unrelated to the window, which would truncate the union), but a
+    # WINDOW-derived range cannot truncate anything headers_in_window() keeps
+    # -- so walking all 714 of mj08's dirs to certify one hour was pure waste.
+    # The scheduled scrub is fast for the same reason, not because of the
+    # cache: its deployed `--since auto` leaves it 3-4 dirs (measured mean
+    # 0.54 s over 6,787 runs, cache cold on 82% of them).
+    until_cutoff = None
+    if audit_loss:
+        since_cutoff, until_cutoff = window_dir_range(
+            window_start, window_end, edge_seconds, bound_tolerance)
+        if since_cutoff:
+            logger.info("Audit MJ scan restricted to dirs %s .. %s",
+                        since_cutoff, until_cutoff)
+
     write_status(status_file, "scan_mj")
-    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache)
+    mj = scan_mj_files(mj_path, since=since_cutoff, cache_file=mj_cache,
+                       until=until_cutoff)
+
+    # HAM-164 reconciliation. Deliberately ahead of the "no AGS data" bail
+    # below: once the scrub has purged confirmed files, an EMPTY AGS is the
+    # normal steady state and the union is carried entirely by the MJ side.
+    # Bailing there would make this audit unavailable on exactly the healthy
+    # units we most want to certify.
+    #
+    # This path writes NO shared state -- no write_status, no
+    # write_scan_metrics, no MJ-scan cache. That is enforced at the top of
+    # run(), where those paths are set to None; see the comment there for why
+    # it must happen before the first write rather than here.
+    if audit_loss:
+        try:
+            margin = timedelta(days=1)
+            first = datetime.strptime(window_start[:10], "%Y-%m-%d") - margin
+            last = datetime.strptime(window_end[:10], "%Y-%m-%d") + margin
+            rows = load_telemetry_rows(
+                telemetry_dir,
+                since_date=first.strftime("%Y-%m-%d"),
+                until_date=last.strftime("%Y-%m-%d"))
+            extra = []
+            # Compressed records never enter the union: the incremental MJ
+            # scanner skips compressed/ and both scanners glob only *.bin. The
+            # day compression is enabled, an un-guarded audit would report the
+            # whole window as lost.
+            if glob.glob(os.path.join(mj_path, DRIVE_PATTERN, "*", "*.hmc")):
+                extra.append(
+                    "compressed .hmc records present: they are invisible to "
+                    "both MJ scanners, so the union undercounts.")
+            report = build_lost_report(
+                ags, mj, rows, window_start, window_end,
+                edge_seconds=edge_seconds, bound_tolerance_s=bound_tolerance,
+                extra_blockers=extra)
+        except (RuntimeError, ValueError) as e:
+            logger.error("--audit-loss failed: %s", e)
+            return EXIT_NO_DATA
+
+        if json_output:
+            print(json.dumps(report, indent=2))
+        else:
+            print(format_lost_report(report))
+        if output_file:
+            with open(output_file, "w") as fh:
+                json.dump(report, fh, indent=2)
+
+        return EXIT_OK if report["certified"] else EXIT_MISSING
 
     if not ags["entries"]:
         logger.info("No AGS data found — nothing to compare")
@@ -2232,6 +3057,12 @@ def main():
         status_file=args.status_file or None,
         mj_cache=args.mj_cache or None,
         metrics_file=args.metrics_file or None,
+        audit_loss=args.audit_loss,
+        window_start=args.window_start,
+        window_end=args.window_end,
+        telemetry_dir=args.telemetry_dir,
+        edge_seconds=args.edge_seconds,
+        bound_tolerance=args.bound_tolerance,
     )
     sys.exit(rc)
 

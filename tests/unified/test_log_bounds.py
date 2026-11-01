@@ -7,6 +7,7 @@ dry-run manifest operations, and the fleet-remediation script's --check mode.
 """
 
 import os
+import re
 import json
 import subprocess
 from pathlib import Path
@@ -191,3 +192,283 @@ class TestSingleImplementation:
                    "log_bounds_status_rsyslog",
                    "log_bounds_status_cron"):
             assert f"{fn}()" in lib
+
+
+class TestJournaldPersistence:
+    """A cap on a RAM-only journal bounds nothing and loses history (HAM-216).
+
+    mj03 had the drop-in but no /var/log/journal, so the stock Storage=auto ran
+    journald in RAM: SystemMaxUse was inert and every reboot erased the logs,
+    while `apply_log_bounds.sh --check` reported "All bounds present".
+    """
+
+    def test_dropin_pins_persistent_storage(self):
+        """Parse the directive: the comment above it also says Storage=persistent."""
+        section, storage = None, []
+        for line in (FILES_DIR / "journald-sensor-bounds.conf").read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                section = line
+            elif section == "[Journal]" and line.split("=", 1)[0].strip() == "Storage":
+                storage.append(line.split("=", 1)[1].strip())
+        assert storage == ["persistent"], (
+            "Storage=auto silently falls back to RAM when /var/log/journal "
+            "is missing; pin persistent under [Journal]")
+
+    def test_default_journal_locations(self):
+        script = (f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+                  'echo "$LOG_BOUNDS_JOURNAL_DIR $LOG_BOUNDS_RUNTIME_JOURNAL_DIR"\n')
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True, timeout=30).stdout.split()
+        assert out == ["/var/log/journal", "/run/log/journal"]
+
+    def _status(self, tmp_path, dropin=True, journal_dir=True,
+                runtime_dir=False, fn="log_bounds_status_journald"):
+        dst = tmp_path / "00-sensor-bounds.conf"
+        jdir = tmp_path / "journal"
+        rdir = tmp_path / "run-journal"
+        if runtime_dir:
+            rdir.mkdir()
+        lr = tmp_path / "logrotate-rsyslog"
+        cron = tmp_path / "mjolnir-logrotate"
+        if dropin:
+            dst.write_text("[Journal]\n")
+        if journal_dir:
+            jdir.mkdir()
+        lr.write_text("maxsize 100M\n")
+        cron.write_text("#!/bin/sh\n")
+        script = (
+            f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+            f'LOG_BOUNDS_JOURNALD_DST="{dst}"\n'
+            f'LOG_BOUNDS_JOURNAL_DIR="{jdir}"\n'
+            f'LOG_BOUNDS_RUNTIME_JOURNAL_DIR="{rdir}"\n'
+            f'LOG_BOUNDS_RSYSLOG_LR="{lr}"\n'
+            f'LOG_BOUNDS_CRON_DST="{cron}"\n'
+            f'{fn} && echo "RC=0" || echo "RC=1"\n'
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        return result.stdout
+
+    def test_status_present_when_dropin_and_journal_dir_exist(self, tmp_path):
+        assert self._status(tmp_path).startswith("PRESENT")
+
+    def test_status_missing_without_dropin(self, tmp_path):
+        assert self._status(tmp_path, dropin=False).startswith("MISSING")
+
+    def test_status_ram_only_without_journal_dir(self, tmp_path):
+        """The mj03 state must not read as PRESENT."""
+        assert self._status(tmp_path, journal_dir=False).startswith("RAM-ONLY")
+
+    def test_all_present_fails_for_ram_only_journal(self, tmp_path):
+        out = self._status(tmp_path, journal_dir=False,
+                           fn="log_bounds_all_present")
+        assert "RC=1" in out
+
+    def test_all_present_passes_when_everything_is_in_place(self, tmp_path):
+        out = self._status(tmp_path, fn="log_bounds_all_present")
+        assert "RC=0" in out
+
+    def test_status_missing_with_neither_dropin_nor_journal_dir(self, tmp_path):
+        """A fresh unit: RAM-ONLY here would claim the drop-in is installed."""
+        out = self._status(tmp_path, dropin=False, journal_dir=False)
+        assert out.startswith("MISSING")
+
+    def test_status_ram_only_while_a_runtime_journal_exists(self, tmp_path):
+        """/var/log/journal existing is not proof: journald may still be writing
+        to /run (dir made but never flushed, or Storage=volatile elsewhere)."""
+        out = self._status(tmp_path, runtime_dir=True)
+        assert out.startswith("RAM-ONLY")
+
+
+class TestApplyJournaldMakesItPersistent:
+    """The apply path must reproduce the mj03 hand fix (HAM-216): journal dir
+    with the systemd-journal group/ACLs, restart, then flush RAM to disk.
+    A restart alone leaves the current boot's logs in /run (lost at reboot)."""
+
+    def _apply(self, tmp_path, failing=""):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        log = tmp_path / "sudo.log"
+        # Fake sudo: record the command, let the two journal tools chatter on
+        # stdout, and fail for the command named in $FAILING.
+        (bindir / "sudo").write_text(
+            '#!/bin/bash\n'
+            f'echo "$*" >> "{log}"\n'
+            '[[ "$1" == journalctl || "$1" == systemd-tmpfiles ]] && echo "noise from $1"\n'
+            '[[ -n "$FAILING" && "$1" == "$FAILING" ]] && exit 1\n'
+            'exit 0\n')
+        (bindir / "sudo").chmod(0o755)
+        script = (f'source "{LIB_DIR / "log_bounds.sh"}"\n'
+                  'log_bounds_apply_journald; echo "RC=$?"\n')
+        env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}",
+                   FAILING=failing)
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True, timeout=30, env=env).stdout
+        return out, log.read_text().splitlines()
+
+    @staticmethod
+    def _index(cmds, needle):
+        hits = [i for i, c in enumerate(cmds) if needle in c]
+        assert hits, f"{needle!r} never run; sudo saw {cmds}"
+        return hits[0]
+
+    def test_result_token_is_clean(self, tmp_path):
+        """apply_log_bounds.sh matches the captured stdout against APPLIED."""
+        out, _ = self._apply(tmp_path)
+        assert out.splitlines() == ["APPLIED", "RC=0"]
+
+    def test_journal_dir_prepared_before_restart(self, tmp_path):
+        _, cmds = self._apply(tmp_path)
+        mk = self._index(cmds, "mkdir -p /var/log/journal")
+        tmpf = self._index(cmds, "systemd-tmpfiles --create --prefix /var/log/journal")
+        restart = self._index(cmds, "systemctl restart systemd-journald")
+        assert mk < tmpf < restart
+
+    def test_flushes_runtime_journal_after_restart(self, tmp_path):
+        _, cmds = self._apply(tmp_path)
+        restart = self._index(cmds, "systemctl restart systemd-journald")
+        flush = self._index(cmds, "journalctl --flush")
+        assert restart < flush
+
+    def test_failed_flush_does_not_abort(self, tmp_path):
+        """The cap is installed regardless; a journal left in RAM is reported
+        as RAM-ONLY by the status check, not hidden by a crash here."""
+        out, _ = self._apply(tmp_path, failing="journalctl")
+        assert out.splitlines() == ["APPLIED", "RC=0"]
+
+
+class TestVerifyDeploymentWiring:
+    """HAM-181: verify_deployment.sh must report on the log bounds.
+
+    Without this, a unit whose bounds were never applied -- or were applied by
+    hand under a non-canonical filename, as mj02 was -- verifies clean, and the
+    only signal is the SD card filling months later (HAM-112/HAM-113).
+    """
+
+    VERIFY = REPO_ROOT / "scripts" / "verify_deployment.sh"
+
+    def test_check_function_is_defined(self):
+        assert "check_log_bounds()" in self.VERIFY.read_text(), \
+            "verify_deployment.sh needs a check_log_bounds function"
+
+    def test_check_is_called_from_main(self):
+        body = self.VERIFY.read_text()
+        main = body[body.index("main() {"):]
+        assert "check_log_bounds" in main, \
+            "check_log_bounds must run as part of main(), not just be defined"
+
+    def test_check_reuses_the_shared_library(self):
+        # HAM-181's own point: the bounds logic was de-duplicated into
+        # log_bounds.sh precisely so a second copy could not drift from it.
+        body = self.VERIFY.read_text()
+        assert "log_bounds.sh" in body, "must source unified_install/lib/log_bounds.sh"
+        assert "log_bounds_all_present" in body, \
+            "must call log_bounds_all_present rather than re-deriving the paths"
+
+    def test_check_does_not_hardcode_the_paths(self):
+        body = self.VERIFY.read_text()
+        section = body[body.index("check_log_bounds()"):]
+        section = section[:section.index("\n}\n")]
+        assert "journald.conf.d" not in section, \
+            "paths belong to log_bounds.sh; duplicating them is what HAM-181 fixed"
+
+    def test_failure_message_names_the_ticket(self):
+        # Matches the gpiozero check, which names HAM-84 so the operator can
+        # find the context without grepping Jira.
+        body = self.VERIFY.read_text()
+        section = body[body.index("check_log_bounds()"):]
+        section = section[:section.index("\n}\n")]
+        assert "HAM-113" in section or "HAM-181" in section
+
+    def test_script_still_parses(self):
+        subprocess.run(["bash", "-n", str(self.VERIFY)], check=True)
+
+
+class TestVerifyDeploymentBehaviour:
+    """check_log_bounds, RUN: the real function against a copy of the real
+    library whose paths point into tmp_path, counted the way main() counts.
+
+    The wiring tests above read the script's text, so inverting pass/fail,
+    downgrading the fail to a warning, or moving the call under --full all
+    passed them (red team, 2026-10-30).
+    """
+
+    def _run(self, tmp_path, dropin=True, journal=True, runtime=False,
+             rsyslog=True, cron=True, lib=True):
+        repo = tmp_path / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        script = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        assert script.rstrip().endswith('main "$@"')
+        (repo / "scripts" / "verify_deployment.sh").write_text(
+            script.rstrip()[:-len('main "$@"')])
+        sys_ = tmp_path / "sys"
+        sys_.mkdir()
+        if lib:
+            (repo / "unified_install" / "lib").mkdir(parents=True)
+            (repo / "unified_install" / "lib" / "log_bounds.sh").write_text(
+                (LIB_DIR / "log_bounds.sh").read_text() +
+                '\nLOG_BOUNDS_JOURNALD_DST="{0}/00-sensor-bounds.conf"'
+                '\nLOG_BOUNDS_JOURNAL_DIR="{0}/var-log-journal"'
+                '\nLOG_BOUNDS_RUNTIME_JOURNAL_DIR="{0}/run-log-journal"'
+                '\nLOG_BOUNDS_RSYSLOG_LR="{0}/logrotate-rsyslog"'
+                '\nLOG_BOUNDS_CRON_DST="{0}/mjolnir-logrotate"\n'.format(sys_))
+        if dropin:
+            (sys_ / "00-sensor-bounds.conf").write_text("[Journal]\n")
+        if journal:
+            (sys_ / "var-log-journal").mkdir()
+        if runtime:
+            (sys_ / "run-log-journal").mkdir()
+        (sys_ / "logrotate-rsyslog").write_text(
+            "{\n    maxsize 100M\n}\n" if rsyslog else "{\n}\n")
+        if cron:
+            (sys_ / "mjolnir-logrotate").write_text("#!/bin/sh\n")
+        result = subprocess.run(
+            ["bash", "-c",
+             'source "$1"; check_log_bounds; '
+             'echo "PASS=$PASS_COUNT FAIL=$FAIL_COUNT RC=$?"',
+             "_", str(repo / "scripts" / "verify_deployment.sh")],
+            capture_output=True, text=True, timeout=30)
+        return result.stdout + result.stderr, repo
+
+    def test_all_bounds_present_passes(self, tmp_path):
+        out, _ = self._run(tmp_path)
+        assert "PASS=1 FAIL=0" in out, out
+
+    @pytest.mark.parametrize("kw,token", [
+        ({"dropin": False}, "journald=MISSING"),
+        ({"journal": False}, "journald=RAM-ONLY"),
+        ({"runtime": True}, "journald=RAM-ONLY"),
+        ({"rsyslog": False}, "rsyslog=MISSING"),
+        ({"cron": False}, "cron=MISSING"),
+    ])
+    def test_each_missing_bound_is_one_failure(self, tmp_path, kw, token):
+        out, _ = self._run(tmp_path, **kw)
+        assert "PASS=0 FAIL=1" in out, out
+        assert token in out, out
+
+    def test_remediation_names_the_script_by_absolute_path(self, tmp_path):
+        """verify_deployment.sh is run from ~ or from scripts/; a relative
+        hint fails from either."""
+        out, repo = self._run(tmp_path, dropin=False)
+        assert "sudo bash {}/scripts/apply_log_bounds.sh".format(repo) in out
+
+    def test_ram_only_hint_names_a_volatile_override(self, tmp_path):
+        out, _ = self._run(tmp_path, runtime=True)
+        assert "Storage=volatile" in out, out
+
+    def test_missing_library_is_a_failure(self, tmp_path):
+        """The installer ships log_bounds.sh: without it the checkout is
+        broken, which must not read READY FOR DEPLOYMENT."""
+        out, _ = self._run(tmp_path, lib=False)
+        assert "PASS=0 FAIL=1" in out, out
+
+    def test_called_unconditionally_from_main(self):
+        """At main()'s own indent, not inside `if $full_check` or any other
+        block (a substring match let an 8-space-indented call through)."""
+        body = (REPO_ROOT / "scripts" / "verify_deployment.sh").read_text()
+        main = body[body.index("main() {"):]
+        assert re.search(r"^    check_log_bounds\n", main, re.M), \
+            "check_log_bounds must be called at main()'s top level"
