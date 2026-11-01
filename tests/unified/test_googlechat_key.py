@@ -2,11 +2,26 @@
 Tests for the HAM-118 Google Chat key-file check in verify_deployment.sh.
 
 A missing or empty /home/pi/.googlechat, or a configured channel with no
-matching section in it, disables that step's alerts with no error --
-notifiers logs once and send() becomes a permanent no-op. These tests
-exercise check_googlechat_key() directly by sourcing verify_deployment.sh
-(guarded so sourcing does not run main()) and overriding its key-file and
-config-path lookups via environment variables.
+matching key in it, disables that step's alerts with no error -- notifiers
+logs once and send() becomes a permanent no-op. These tests exercise
+check_googlechat_key() directly by sourcing verify_deployment.sh (with its
+trailing `main "$@"` call stripped, so sourcing does not run main()) and
+overriding its key-file and config-path lookups via environment variables.
+
+The key file is a single [channel] table whose KEYS are channel names
+mapped to webhook URLs, confirmed against a real file on mj03:
+
+    # Webhook attributes for HAMMA Status bot
+
+    [channel]
+
+    # for status channel
+    status = <redacted>
+    # for HAMMA channel
+    # hamma = <redacted>
+
+A commented-out key (`# hamma = ...`) must not count as a configured
+channel.
 """
 
 import os
@@ -25,6 +40,31 @@ BASE_TOML_BOTH_STATUS = textwrap.dedent("""\
 
     [steps.noise_diag]
     channel = "status"
+""")
+
+# Mirrors the real mj03 layout: a header comment, a single [channel] table,
+# a live "status" key, and a commented-out "hamma" key.
+KEY_FILE_STATUS_ONLY = textwrap.dedent("""\
+    # Webhook attributes for HAMMA Status bot
+
+    [channel]
+
+    # for status channel
+    status = https://chat.googleapis.com/v1/spaces/AAA/messages?key=SECRET1
+    # for HAMMA channel
+    # hamma = https://chat.googleapis.com/v1/spaces/BBB/messages?key=SECRET2
+""")
+
+# Mirrors a PAMMA/AUMMA-style file: several live channels in one table.
+KEY_FILE_MULTI_CHANNEL = textwrap.dedent("""\
+    # Webhook attributes for HAMMA Status bot
+
+    [channel]
+
+    status = https://chat.googleapis.com/v1/spaces/AAA/messages?key=SECRET1
+    aumma_status = https://chat.googleapis.com/v1/spaces/CCC/messages?key=SECRET3
+    panama_status = https://chat.googleapis.com/v1/spaces/DDD/messages?key=SECRET4
+    # hamma = https://chat.googleapis.com/v1/spaces/BBB/messages?key=SECRET2
 """)
 
 
@@ -116,12 +156,12 @@ class TestMissingOrEmptyKeyFile:
 
 class TestChannelResolution:
     def test_configured_channel_absent_fails(self, tmp_path):
-        """Key file has sections, but not the one state_monitor/noise_diag use."""
+        """Key file has a [channel] table, but not the key both steps use."""
         result = _run_check(
             tmp_path,
             key_file=textwrap.dedent("""\
-                [other]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
+                [channel]
+                other = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
             """),
         )
         assert result.stdout.count("FAIL") == 2, result.stdout
@@ -129,26 +169,32 @@ class TestChannelResolution:
         assert "not found in key file" in result.stdout
 
     def test_configured_channel_present_passes(self, tmp_path):
-        result = _run_check(
-            tmp_path,
-            key_file=textwrap.dedent("""\
-                [status]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
-            """),
-        )
+        result = _run_check(tmp_path, key_file=KEY_FILE_STATUS_ONLY)
         assert "FAIL" not in result.stdout
         assert result.stdout.count("PASS") >= 2
+
+    def test_commented_channel_does_not_count(self, tmp_path):
+        """A commented-out `# hamma = ...` key must not satisfy a channel
+        named "hamma" -- it must still FAIL as not found."""
+        base_toml = textwrap.dedent("""\
+            [steps.state_monitor]
+            channel = "hamma"
+
+            [steps.noise_diag]
+            channel = "status"
+        """)
+        result = _run_check(tmp_path, key_file=KEY_FILE_STATUS_ONLY, base_toml=base_toml)
+        assert "FAIL" in result.stdout
+        assert "'hamma'" in result.stdout
+        assert "not found in key file" in result.stdout
+        # noise_diag's "status" is live, so it still passes.
+        assert "'status'" in result.stdout
 
     def test_per_unit_override_channel_present_passes(self, tmp_path):
         """Override moves state_monitor to a different channel; key file has it."""
         result = _run_check(
             tmp_path,
-            key_file=textwrap.dedent("""\
-                [aumma_status]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
-                [status]
-                default = https://chat.googleapis.com/v1/spaces/CCC/messages?key=DDD
-            """),
+            key_file=KEY_FILE_MULTI_CHANNEL,
             local_toml=textwrap.dedent("""\
                 [steps.state_monitor]
                 channel = "aumma_status"
@@ -163,10 +209,7 @@ class TestChannelResolution:
         """Override moves state_monitor to a channel the key file lacks."""
         result = _run_check(
             tmp_path,
-            key_file=textwrap.dedent("""\
-                [status]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
-            """),
+            key_file=KEY_FILE_STATUS_ONLY,
             local_toml=textwrap.dedent("""\
                 [steps.state_monitor]
                 channel = "panama_status"
@@ -182,37 +225,20 @@ class TestChannelResolution:
 class TestPermissions:
     def test_group_world_readable_warns_not_fails(self, tmp_path):
         """Every unit today is pi:pi 644 -- this must WARN, never FAIL."""
-        result = _run_check(
-            tmp_path,
-            key_file=textwrap.dedent("""\
-                [status]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
-            """),
-            key_file_mode=0o644,
-        )
+        result = _run_check(tmp_path, key_file=KEY_FILE_STATUS_ONLY, key_file_mode=0o644)
         assert "WARN" in result.stdout
         assert "group/world readable" in result.stdout
         assert "FAIL" not in result.stdout
 
     def test_owner_only_permissions_pass(self, tmp_path):
-        result = _run_check(
-            tmp_path,
-            key_file=textwrap.dedent("""\
-                [status]
-                default = https://chat.googleapis.com/v1/spaces/AAA/messages?key=BBB
-            """),
-            key_file_mode=0o600,
-        )
+        result = _run_check(tmp_path, key_file=KEY_FILE_STATUS_ONLY, key_file_mode=0o600)
         assert "Google Chat key file permissions (600) restrict read access" in result.stdout
 
 
 class TestNeverPrintsSecrets:
     def test_webhook_url_never_in_output(self, tmp_path):
-        webhook = "https://chat.googleapis.com/v1/spaces/AAAAA/messages?key=SECRETVALUE"
-        result = _run_check(
-            tmp_path,
-            key_file="[status]\ndefault = {}\n".format(webhook),
-        )
-        assert webhook not in result.stdout
-        assert "SECRETVALUE" not in result.stdout
+        result = _run_check(tmp_path, key_file=KEY_FILE_MULTI_CHANNEL)
+        assert "SECRET1" not in result.stdout
+        assert "SECRET3" not in result.stdout
+        assert "SECRET4" not in result.stdout
         assert "chat.googleapis.com" not in result.stdout

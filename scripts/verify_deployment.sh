@@ -498,11 +498,46 @@ _gchat_effective_channel() {
     echo "$channel"
 }
 
+# The Google Chat key file is a single [channel] table whose KEYS are
+# channel names mapped to webhook URLs, e.g.:
+#   [channel]
+#   status = https://chat.googleapis.com/...
+#   # hamma = https://chat.googleapis.com/...
+# Prints each live (uncommented) key under [channel], one per line, and
+# nothing else -- callers must never read or print the values on the right
+# of "=".
+_gchat_keyfile_channels() {
+    local file="$1"
+
+    [[ -f "$file" ]] || return 0
+
+    awk '
+        /^[ \t]*#/ { next }
+        /^[ \t]*\[/ {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            sub(/[ \t]+$/, "", line)
+            insec = (line == "[channel]")
+            next
+        }
+        insec {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line == "") next
+            if (line ~ /^[A-Za-z0-9_.-]+[ \t]*=/) {
+                key = line
+                sub(/[ \t]*=.*/, "", key)
+                print key
+            }
+        }
+    ' "$file" 2>/dev/null || true
+}
+
 # HAM-118: state_monitor and noise_diag both alert over Google Chat via a
-# key file of [channel] sections holding webhook URLs. A missing/empty key
-# file, or a configured channel with no matching section in it, disables
-# that step's alerts with no error -- notifiers logs once and send() becomes
-# a permanent no-op.
+# key file whose [channel] table maps channel names to webhook URLs. A
+# missing/empty key file, or a configured channel with no matching key in
+# that table, disables that step's alerts with no error -- notifiers logs
+# once and send() becomes a permanent no-op.
 check_googlechat_key() {
     print_section "Google Chat Alerts"
 
@@ -526,7 +561,7 @@ check_googlechat_key() {
     # Channel NAMES only -- never read or print the webhook URLs the key
     # file holds.
     local keyfile_channels
-    keyfile_channels="$(grep -oE '^\[[A-Za-z0-9_-]+\]' "$key_file" 2>/dev/null | tr -d '[]' || true)"
+    keyfile_channels="$(_gchat_keyfile_channels "$key_file")"
 
     local step channel
     for step in state_monitor noise_diag; do
