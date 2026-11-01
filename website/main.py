@@ -37,8 +37,9 @@ SENSOR_NUMBERS = [
     ]
 SENSORS = [f"hamma{sensor_number}" for sensor_number in SENSOR_NUMBERS]
 
-# PAMMA sensors (50-56)
-PAMMA_SENSOR_NUMBERS = [50, 51, 52, 53, 54, 55, 56]
+# PAMMA sensors (50-56). mj55 is left off: no data since 2023-04, and
+# pamma_status.html omits it too (PB, 2026-11-01).
+PAMMA_SENSOR_NUMBERS = [50, 51, 52, 53, 54, 56]
 PAMMA_SENSORS = [f"hamma{number}" for number in PAMMA_SENSOR_NUMBERS]
 
 # AUMMA sensors (41-43)
@@ -1718,7 +1719,7 @@ OVERVIEW_DASHBOARD_ARGS = {
     }
 
 
-# --- PAMMA Overview Dashboard (sensors 50-56) ---
+# --- PAMMA Overview Dashboard (sensors 50-54, 56) ---
 
 PAMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
     PAMMA_SENSORS, OVERVIEW_ROWS, OVERVIEW_COLUMNS)
@@ -1726,7 +1727,7 @@ PAMMA_OVERVIEW_DASHBOARD_PLOTS = create_overview_dashboard(
 PAMMA_OVERVIEW_DASHBOARD_METADATA = {
     "section_title": "PAMMA Sensor Overview Dashboard",
     "section_description": (
-        "Live status of all PAMMA sensors (50-56), "
+        "Live status of all PAMMA sensors (50-54, 56), "
         f"updated dynamically every {STATUS_UPDATE_INTERVAL_SERVER_SECONDS} s."
         " Click a sensor for detailed information."
         + status_page_link("pamma")),

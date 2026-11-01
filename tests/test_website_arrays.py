@@ -49,7 +49,9 @@ def test_each_array_page_links_its_status_page(server_pages, page, array):
 ARRAYS = {
     "": ["hamma{}".format(n) for n in range(1, 10)],
     "aumma": ["hamma41", "hamma42", "hamma43"],
-    "pamma": ["hamma{}".format(n) for n in range(50, 57)],
+    # mj55 has not reported since 2023-04 and pamma_status.html leaves it
+    # out too; off the grid by PB's decision (2026-11-01).
+    "pamma": ["hamma{}".format(n) for n in (50, 51, 52, 53, 54, 56)],
 }
 
 
