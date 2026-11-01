@@ -1,6 +1,44 @@
 # Mjolnir-Hamma Changelog
 
 
+## Version 0.5.0 (2026-11-01)
+
+35 PRs merged to `0.4.x` since 0.4.0. Changes are grouped by area, most important first; dates are when each landed on `0.4.x`.
+
+**Noise diagnostics**
+* **Slow-channel noise tracked alongside fast** — `noise_diag` adds `slow_offset`, `slow_noise`, `slow_vpp`, `slow_snr`; existing CSVs are upgraded in place. (2026-10-30 #110)
+* **noise_diag CSVs pushed to the VPS** on a dedicated, jittered, skip-if-unchanged rsync pipeline (`hamma.dev:/home/pi/noise_diag`). (2026-10-30 #113)
+* NoiseDiag uses the public `hamma.diagnostic_data`. (2026-09-03 #67)
+* Noise alert uses a time-based 30-min sustain to stop false alarms. (2026-07-08 #75)
+* Website: fast-channel noise floor + DC offset panel and gauges; gauges report NA when noise data is missing or stale. (2026-07-02 #68, 2026-10-30 #116)
+
+**Alerting and data-loss detection (state_monitor)**
+* **No page for a sensor that is deliberately off** (science ingest disabled). (2026-10-29 #102, HAM-114)
+* Alert when the relay and brokkr's mode disagree. (2026-08-12 #87, HAM-182)
+* Alert when brokkr's drive target disagrees with the labelled partitions (silent science-data loss). (2026-08-12 #88)
+* Capacity and drive alert wording: split by urgency, drop overclaims. (2026-08-14 #95, #96)
+
+**Fleet operations**
+* **Daily fleet configuration probe** (`server/fleet_probe.py`): fleet-consistency digest, collapsed reachability, pending actions surfaced the day a unit returns, refresh-before-publish with a banner on failure, install-mode and release-drift columns, installable with scheduling docs. (2026-09-03 #97; #99, #104, #107, #109, #114, #106 through 2026-11-01; HAM-189, HAM-205)
+* **Server-side threshold & gain control** (`mjol_array` + `ags.py`). (2026-07-08 #70)
+* `sensors.py`: `nochargecontroller` stays set across `--on/--off`. (2026-10-30 #101, HAM-184)
+* VPS `array_status` plugin tracked in the repo; bounded ssh calls that wedged it; `mjol_array` status no longer needs numpy. (2026-09-01 #94, 2026-08-14 #92, 2026-07-09 #77)
+* Website: PAMMA and AUMMA overview pages, array links in the top nav. (2026-11-01 #117)
+
+**Disk, logs and scrub**
+* **Bound `/var/log`** so log spam cannot fill the SD card; pin persistent journald storage and flag a RAM-only journal; `verify_deployment.sh` reports on the bounds. (2026-07-31 #73, 2026-10-30 #115, #105; HAM-113, HAM-216, HAM-181)
+* Scrub resilience: silent scrub failure made visible and self-healing; `--audit-loss` reconciliation gate. (2026-07-15 #82, 2026-10-04 #103, HAM-164)
+* `verify_deployment.sh` detects the AGS writing to SD instead of the data stick. (2026-09-10 #100, HAM-166)
+
+**Install and config**
+* Pin `gpiozero<2.0` on Python 3.7. (2026-08-06 #83, HAM-84)
+* Bootstrap guards the paths passed to `rm -rf` / `find -delete`. (2026-08-12 #90)
+* `daily_compression` disabled by default; compression docs no longer quote a fixed ratio. (2026-07-01 #71, 2026-10-30 #111)
+* Docs: fleet deployment plan for threshold/gain control. (2026-08-07 #76)
+
+**Deploy note:** requires the `hamma` package **0.3.0** (unchanged from 0.4.0; provides `diagnostic_data`), brokkr ≥ 0.4.0, sindri 0.3.x. Restart `brokkr-hamma-default` after updating; the first record after a restart gets no noise_diag row.
+
+
 ## Version 0.4.0 (2026-06-25)
 
 First tagged release since 0.3.0, consolidating a large backlog of sensor-software, tooling, and reliability work. Changes are ordered by importance; dates are when each landed on `0.3.x`.

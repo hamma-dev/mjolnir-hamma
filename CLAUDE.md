@@ -18,12 +18,12 @@
 
 ## Branching Convention
 
-Feature branches should come off of the **current version branch** (currently `0.3.x`), NOT `master`.
+Feature branches should come off of the **current version branch** (currently `0.5.x`), NOT `master`.
 
 Branches only get merged to `master` when we release a version.
 
 ```
-feature-branch --> 0.3.x --> master (on release)
+feature-branch --> 0.5.x --> master (on release)
 ```
 
 ---
