@@ -55,8 +55,11 @@ KEY_FILE_STATUS_ONLY = textwrap.dedent("""\
 def _stat_stub(tmp_path):
     """GNU `stat -c %U|%a FILE` shim; optionally overrides the reported
     owner via FAKE_STAT_OWNER so ownership-mismatch tests don't need real
-    chown/root. verify_deployment.sh only ever runs on Raspbian (GNU
-    coreutils); macOS ships BSD stat with no -c option."""
+    chown/root, or makes the %U query itself fail via FAKE_STAT_OWNER_FAIL
+    (simulating a real `stat` failure, which is how verify_deployment.sh's
+    own `|| echo "unknown"` fallback is actually reached in production).
+    verify_deployment.sh only ever runs on Raspbian (GNU coreutils);
+    macOS ships BSD stat with no -c option."""
     bin_dir = tmp_path / "stubbin"
     bin_dir.mkdir(exist_ok=True)
     stub = bin_dir / "stat"
@@ -67,6 +70,8 @@ def _stat_stub(tmp_path):
         fmt, path = args[0], args[1]
         if fmt == "-c":
             fmt, path = args[1], args[2]
+        if fmt == "%U" and os.environ.get("FAKE_STAT_OWNER_FAIL"):
+            sys.exit(1)
         s = os.stat(path)
         if fmt == "%U":
             print(os.environ.get("FAKE_STAT_OWNER")
@@ -78,28 +83,41 @@ def _stat_stub(tmp_path):
     return str(bin_dir)
 
 
-def _python_interpreter(tmp_path, missing=False, no_tomli=False):
+def _python_interpreter(tmp_path, missing=False, no_tomli=False,
+                         not_executable=False, tomli_only_missing=False):
     """Stand-in for /home/pi/dev/ltgenv/bin/python.
 
-    no_tomli builds a launcher that poisons sys.modules for 'tomli' and
-    'tomllib' *before* running the target script, so "tomli unavailable"
-    can be exercised deterministically regardless of what the real test
-    interpreter (which always has at least tomllib, Python >= 3.11) ships.
+    no_tomli builds a launcher that poisons sys.modules for both 'tomli'
+    and 'tomllib' *before* running the target script, so "neither is
+    available" can be exercised deterministically regardless of what the
+    real test interpreter (which always has at least tomllib, Python >=
+    3.11) ships. tomli_only_missing poisons only 'tomli', leaving the
+    tomllib fallback importable, to distinguish "fall back to tomllib"
+    from "nothing is available".
     """
     if missing:
         return str(tmp_path / "no-such-python")
-    if not no_tomli:
+    if not_executable:
+        stub = tmp_path / "python_not_executable"
+        stub.write_text("#!/bin/bash\nexec {} \"$@\"\n".format(sys.executable))
+        stub.chmod(0o644)  # exists, but not executable
+        return str(stub)
+    if not no_tomli and not tomli_only_missing:
         return sys.executable
-    stub = tmp_path / "python_no_tomli"
+    stub = tmp_path / "python_tomli_stub"
+    poison = (
+        'sys.modules["tomli"] = None\nsys.modules["tomllib"] = None\n'
+        if no_tomli else
+        'sys.modules["tomli"] = None\n'
+    )
     stub.write_text(textwrap.dedent("""\
         #!/usr/bin/env python3
         import sys, runpy
-        sys.modules["tomli"] = None
-        sys.modules["tomllib"] = None
+        {poison}
         target = sys.argv[1]
         sys.argv = sys.argv[1:]
         runpy.run_path(target, run_name="__main__")
-    """))
+    """).format(poison=poison))
     stub.chmod(0o755)
     return str(stub)
 
@@ -116,10 +134,12 @@ def _sourceable_script(tmp_path, source_path=None):
 
 
 def _run_check(tmp_path, python_missing=False, no_tomli=False,
+                python_not_executable=False, tomli_only_missing=False,
                 helper_override=None, key_file=None, key_file_mode=0o644,
                 default_key_file=None, system_main_toml=None,
                 system_mode_toml=None, local_main_toml=None,
-                local_mode_toml=None, fake_stat_owner=None, extra_shell=""):
+                local_mode_toml=None, fake_stat_owner=None,
+                fake_stat_owner_fail=False, extra_shell="", extra_env=None):
     sourceable = _sourceable_script(tmp_path)
 
     key_path = tmp_path / "googlechat"
@@ -138,7 +158,9 @@ def _run_check(tmp_path, python_missing=False, no_tomli=False,
     env = os.environ.copy()
     env["PATH"] = "{}:{}".format(_stat_stub(tmp_path), env["PATH"])
     env["GOOGLECHAT_PYTHON"] = _python_interpreter(
-        tmp_path, missing=python_missing, no_tomli=no_tomli)
+        tmp_path, missing=python_missing, no_tomli=no_tomli,
+        not_executable=python_not_executable,
+        tomli_only_missing=tomli_only_missing)
     env["GOOGLECHAT_HELPER"] = (
         helper_override if helper_override is not None else str(HELPER_SCRIPT))
     env["GOOGLECHAT_DEFAULT_KEY_FILE"] = default_key_file or str(key_path)
@@ -149,6 +171,10 @@ def _run_check(tmp_path, python_missing=False, no_tomli=False,
     env["GOOGLECHAT_LOCAL_MODE_TOML"] = _maybe_write("local_mode.toml", local_mode_toml)
     if fake_stat_owner:
         env["FAKE_STAT_OWNER"] = fake_stat_owner
+    if fake_stat_owner_fail:
+        env["FAKE_STAT_OWNER_FAIL"] = "1"
+    if extra_env:
+        env.update(extra_env)
 
     script = 'source "$1"; check_googlechat_key' + (
         ("; " + extra_shell) if extra_shell else "")
@@ -157,6 +183,53 @@ def _run_check(tmp_path, python_missing=False, no_tomli=False,
         capture_output=True, text=True, env=env, timeout=30,
     )
     return result
+
+
+def _isolated_helper_env(tmp_path, default_key_file=None, **overrides):
+    """Environment for invoking verify_googlechat_channels.py directly
+    (not through the bash wrapper), with EVERY path constant pointed
+    somewhere under tmp_path or at a path that cannot exist -- so a test
+    that forgets to override one path can never fall through to a real
+    unit's config/mode.toml or ~/.config/brokkr files."""
+    env = os.environ.copy()
+    env["GOOGLECHAT_PI_HOME"] = str(tmp_path)
+    env["GOOGLECHAT_DEFAULT_KEY_FILE"] = (
+        default_key_file or str(tmp_path / "no-such-default-key"))
+    env["GOOGLECHAT_SYSTEM_MAIN_TOML"] = str(tmp_path / "no-such-system-main.toml")
+    env["GOOGLECHAT_SYSTEM_MODE_TOML"] = str(tmp_path / "no-such-system-mode.toml")
+    env["GOOGLECHAT_LOCAL_MAIN_TOML"] = str(tmp_path / "no-such-local-main.toml")
+    env["GOOGLECHAT_LOCAL_MODE_TOML"] = str(tmp_path / "no-such-local-mode.toml")
+    env.update(overrides)
+    return env
+
+
+def _run_and_report_with_main_raising(exc):
+    """Imports the helper module directly, monkeypatches main() to raise
+    `exc`, calls run_and_report() (the function __main__ calls), and
+    returns its captured stdout. run_and_report() must never itself
+    raise, regardless of what main() raised."""
+    sys.path.insert(0, str(HELPER_SCRIPT.parent))
+    try:
+        import importlib
+        import verify_googlechat_channels as helper_module
+        importlib.reload(helper_module)
+
+        def _boom():
+            raise exc
+
+        original_main = helper_module.main
+        helper_module.main = _boom
+        try:
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                helper_module.run_and_report()
+            return buf.getvalue()
+        finally:
+            helper_module.main = original_main
+    finally:
+        sys.path.remove(str(HELPER_SCRIPT.parent))
 
 
 def _step_toml(channel, method='"gchat"', key_file=None, step="state_monitor",
@@ -253,38 +326,28 @@ class TestKeyFileChecks:
         assert "None" not in result.stdout
         assert "crashed unexpectedly" not in result.stdout
         assert "'status'" in result.stdout
+
+    def test_empty_string_channel_fails_rather_than_being_silently_skipped(
+            self, tmp_path):
+        """channel = "" is not None, so it must still be checked (and
+        FAIL, since "" is never a real option) -- not silently treated
+        the same as "no channel key at all"."""
+        toml = _step_toml("", key_file=None)
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, system_main_toml=toml)
+        assert "FAIL" in result.stdout
+        assert "''" in result.stdout
         assert "PASS" in result.stdout
 
     def test_run_and_report_survives_an_unexpected_crash_in_main(self):
         """The helper must always exit 0 and report via its own output,
         even if main() raises something nothing else anticipated -- not
         just the specific error types caught inside main()'s own logic.
-        Imports the module directly and monkeypatches main() itself to
-        raise, so this doesn't depend on finding a real bug to trigger
-        the outermost catch-all (run_and_report, called from __main__)."""
-        sys.path.insert(0, str(HELPER_SCRIPT.parent))
-        try:
-            import verify_googlechat_channels as helper_module
-            import importlib
-            importlib.reload(helper_module)
-
-            def _boom():
-                raise RuntimeError("nothing anticipated this")
-
-            original_main = helper_module.main
-            helper_module.main = _boom
-            try:
-                import io
-                import contextlib
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    helper_module.run_and_report()  # must not raise
-                output = buf.getvalue()
-            finally:
-                helper_module.main = original_main
-        finally:
-            sys.path.remove(str(HELPER_SCRIPT.parent))
-
+        Monkeypatches main() itself to raise, so this doesn't depend on
+        finding a real bug to trigger the outermost catch-all
+        (run_and_report, called from __main__)."""
+        output = _run_and_report_with_main_raising(
+            RuntimeError("nothing anticipated this"))
         assert "FAIL" in output
         assert "crashed unexpectedly" in output
         assert "RuntimeError" in output
@@ -399,6 +462,15 @@ class TestChannelMatching:
             system_main_toml=_step_toml("not_a_real_channel", method='"slack"'))
         assert "not_a_real_channel" not in result.stdout
 
+    def test_a_third_non_gchat_method_is_also_not_checked(self, tmp_path):
+        """Not just "slack" specifically -- any method other than gchat
+        (or absent) is out of scope. Guards against a filter that only
+        excludes the one method name a test happened to use."""
+        result = _run_check(
+            tmp_path, key_file="[channel]\nstatus = https://x/\n",
+            system_main_toml=_step_toml("not_a_real_channel", method='"email"'))
+        assert "not_a_real_channel" not in result.stdout
+
     def test_absent_method_defaults_to_gchat(self, tmp_path):
         """config/main.toml declares every notifier step's method
         explicitly, but a step with channel set and no method key must
@@ -407,7 +479,15 @@ class TestChannelMatching:
             tmp_path, key_file="[channel]\nstatus = https://x/\n",
             system_main_toml=_step_toml("status", method=None))
         assert "FAIL" not in result.stdout
-        assert "PASS" in result.stdout
+        # Specifically the channel PASS line, not merely *some* PASS --
+        # the unconditional default-key-file tier-1 check also PASSes
+        # and would satisfy a bare "PASS" check even if the method-absent
+        # step were silently skipped rather than treated as gchat.
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
 
     def test_step_own_key_file_is_used_not_the_default(self, tmp_path):
         """A step naming its own key_file must be checked against THAT
@@ -429,6 +509,244 @@ class TestChannelMatching:
         pass_lines = [l for l in result.stdout.splitlines() if "PASS" in l]
         assert any("'status'" in l for l in pass_lines), result.stdout
 
+    def test_channel_only_in_local_mode_toml(self, tmp_path):
+        """Distinct from system mode.toml and local main.toml -- this is
+        specifically ~/.config/brokkr/hamma/mode.toml, guarding against
+        the local mode path constant pointing at the wrong file."""
+        mode_toml = textwrap.dedent("""\
+            [aumma]
+                [aumma.main.steps.state_monitor]
+                method = "gchat"
+                channel = "aumma_status"
+        """)
+        result = _run_check(
+            tmp_path, key_file="[channel]\naumma_status = https://x/\n",
+            local_mode_toml=mode_toml)
+        assert "FAIL" not in result.stdout
+        assert "'aumma_status'" in result.stdout
+        assert "mode.toml (local override)" in result.stdout
+
+    def test_second_mode_table_is_checked(self, tmp_path):
+        """A channel in the SECOND mode table in the file must still be
+        found -- guards against a scan that stops after the first one."""
+        mode_toml = textwrap.dedent("""\
+            [aumma]
+                [aumma.main.steps.state_monitor]
+                method = "gchat"
+                channel = "aumma_status"
+
+            [panama]
+                [panama.main.steps.state_monitor]
+                method = "gchat"
+                channel = "panama_status"
+        """)
+        result = _run_check(
+            tmp_path,
+            key_file="[channel]\naumma_status = https://x/\npanama_status = https://y/\n",
+            system_mode_toml=mode_toml)
+        assert "FAIL" not in result.stdout
+        assert "'aumma_status'" in result.stdout
+        assert "'panama_status'" in result.stdout
+
+    def test_second_step_within_a_mode_is_checked(self, tmp_path):
+        """A channel on the SECOND step under one mode's [mode.main.steps]
+        table must still be found -- guards against a scan that stops
+        after the first step in a mode."""
+        mode_toml = textwrap.dedent("""\
+            [panama]
+                [panama.main.steps.state_monitor]
+                method = "gchat"
+                channel = "panama_status"
+
+                [panama.main.steps.noise_diag]
+                method = "gchat"
+                channel = "panama_noise"
+        """)
+        result = _run_check(
+            tmp_path,
+            key_file="[channel]\npanama_status = https://x/\npanama_noise = https://y/\n",
+            system_mode_toml=mode_toml)
+        assert "FAIL" not in result.stdout
+        assert "'panama_status'" in result.stdout
+        assert "'panama_noise'" in result.stdout
+
+    def test_non_string_channel_fails_that_entry_only(self, tmp_path):
+        """channel = 5 crashes configparser's optionxform (.lower() on an
+        int) if ever handed to it directly -- must FAIL that one entry,
+        naming the table, and still check the next entry."""
+        toml = textwrap.dedent("""\
+            [steps.state_monitor]
+            method = "gchat"
+            channel = 5
+
+            [steps.noise_diag]
+            method = "gchat"
+            channel = "status"
+        """)
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, system_main_toml=toml)
+        assert "crashed" not in result.stdout
+        assert "channel in" in result.stdout
+        assert "is not a string" in result.stdout
+        assert "steps.state_monitor" in result.stdout
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
+
+    def test_non_string_method_fails_that_entry_only(self, tmp_path):
+        toml = textwrap.dedent("""\
+            [steps.state_monitor]
+            method = 5
+            channel = "status"
+
+            [steps.noise_diag]
+            method = "gchat"
+            channel = "status"
+        """)
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, system_main_toml=toml)
+        assert "crashed" not in result.stdout
+        assert "method in" in result.stdout
+        assert "is not a string" in result.stdout
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
+
+    def test_non_string_key_file_fails_that_entry_only(self, tmp_path):
+        toml = textwrap.dedent("""\
+            [steps.state_monitor]
+            method = "gchat"
+            channel = "status"
+            key_file = 5
+
+            [steps.noise_diag]
+            method = "gchat"
+            channel = "status"
+        """)
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, system_main_toml=toml)
+        assert "crashed" not in result.stdout
+        assert "key_file in" in result.stdout
+        assert "is not a string" in result.stdout
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
+
+
+class TestTildeExpansion:
+    """'~' must always expand to PI_HOME, even as root (HOME=/root)."""
+
+    def test_bare_tilde_expands_to_pi_home(self, tmp_path):
+        pi_home = tmp_path / "home_pi"
+        pi_home.mkdir()
+        key_path = pi_home / ".googlechat"
+        key_path.write_text("[channel]\nstatus = https://x/\n")
+        toml = _step_toml("status", key_file="~")
+        result = _run_check(
+            tmp_path, key_file=None, default_key_file=str(tmp_path / "unused"),
+            system_main_toml=toml, extra_env={"GOOGLECHAT_PI_HOME": str(pi_home)})
+        # key_file="~" resolves to the directory itself, which has no
+        # [channel] section of its own -- resolution is what's tested
+        # here, not a realistic value, so just confirm it was resolved
+        # to PI_HOME and not left as a literal "~".
+        assert "~" not in result.stdout
+
+    def test_tilde_slash_path_expands_to_pi_home(self, tmp_path):
+        pi_home = tmp_path / "home_pi"
+        pi_home.mkdir()
+        key_path = pi_home / ".googlechat"
+        key_path.write_text("[channel]\nstatus = https://x/\n")
+        toml = _step_toml("status", key_file="~/.googlechat")
+        # default_key_file points at the same real file, so the
+        # unconditional tier-1 check doesn't add an unrelated FAIL noise
+        # line for a "default" this test isn't exercising.
+        result = _run_check(
+            tmp_path, key_file=None, default_key_file=str(key_path),
+            system_main_toml=toml, extra_env={"GOOGLECHAT_PI_HOME": str(pi_home)})
+        assert "FAIL" not in result.stdout
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
+
+    def test_tilde_expansion_ignores_home_even_when_home_is_root(self, tmp_path):
+        """A root-owned key file at a fake "/root/.googlechat" must NOT
+        be the one checked -- expand_pi_home must use PI_HOME, never
+        os.environ["HOME"] (which this test deliberately sets to a
+        decoy "/root" directory containing a DIFFERENT channel)."""
+        pi_home = tmp_path / "home_pi"
+        pi_home.mkdir()
+        (pi_home / ".googlechat").write_text("[channel]\nstatus = https://x/\n")
+        fake_root_home = tmp_path / "root_decoy"
+        fake_root_home.mkdir()
+        (fake_root_home / ".googlechat").write_text(
+            "[channel]\nwrong_channel_from_root_home = https://y/\n")
+
+        toml = _step_toml("status", key_file="~/.googlechat")
+        result = _run_check(
+            tmp_path, key_file=None, default_key_file=str(pi_home / ".googlechat"),
+            system_main_toml=toml,
+            extra_env={"GOOGLECHAT_PI_HOME": str(pi_home), "HOME": str(fake_root_home)})
+        assert "FAIL" not in result.stdout
+        # Specifically the channel PASS message (never emitted by a
+        # FAIL), not an adjacency check on "PASS" + ":" -- the bash
+        # pass() helper puts an ANSI reset code between them.
+        assert "channel 'status'" in result.stdout
+        assert "present in key file" in result.stdout
+        assert "wrong_channel_from_root_home" not in result.stdout
+
+
+class TestProductionDefaults:
+    """The hardcoded production paths, with every GOOGLECHAT_* override
+    unset -- these are what actually runs on a sensor."""
+
+    def test_pi_home_and_default_key_file_constants(self):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GOOGLECHAT_")}
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             "import verify_googlechat_channels as m; "
+             "print(m.PI_HOME); print(m.DEFAULT_KEY_FILE)",
+             str(HELPER_SCRIPT.parent)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        lines = result.stdout.splitlines()
+        assert lines[0] == "/home/pi"
+        assert lines[1] == "/home/pi/.googlechat"
+
+    def test_local_toml_path_constants_point_at_distinct_correct_files(self):
+        """LOCAL_MAIN_TOML and LOCAL_MODE_TOML must be two different
+        paths, each named correctly -- every other test overrides both
+        via environment variables, so a constant pointing at the wrong
+        file (e.g. local mode.toml wired to main.toml) would otherwise
+        never surface."""
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GOOGLECHAT_")}
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             "import verify_googlechat_channels as m; "
+             "print(m.LOCAL_MAIN_TOML); print(m.LOCAL_MODE_TOML); "
+             "print(m.SYSTEM_MAIN_TOML); print(m.SYSTEM_MODE_TOML)",
+             str(HELPER_SCRIPT.parent)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        local_main, local_mode, system_main, system_mode = result.stdout.splitlines()
+        assert local_main != local_mode
+        assert local_main.endswith("main.toml")
+        assert local_mode.endswith("mode.toml")
+        assert system_main != system_mode
+        assert system_main.endswith("main.toml")
+        assert system_mode.endswith("mode.toml")
+
 
 # --- Helper robustness: crash, empty/unexpected output, missing deps ----
 
@@ -448,6 +766,27 @@ class TestHelperRobustness:
         assert "tomli not available" in result.stdout
         # The default key file is still checked -- that part needs no TOML.
         assert "is readable and has a [channel] section" in result.stdout
+
+    def test_tomli_missing_falls_back_to_tomllib_and_still_scans(self, tmp_path):
+        """Distinct from the previous test: only 'tomli' is poisoned here,
+        leaving 'tomllib' importable, so the scan must succeed via the
+        fallback -- not SKIP. A no_tomli stub that always poisons both
+        together could never distinguish "tomllib fallback broken" from
+        "neither is available"."""
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, tomli_only_missing=True,
+            system_main_toml=_step_toml("status"))
+        assert "SKIP" not in result.stdout
+        assert "present in key file" in result.stdout
+
+    def test_interpreter_exists_but_not_executable_skips(self, tmp_path):
+        """Distinct from "does not exist at all" -- a real file at the
+        configured path that lacks the execute bit must also SKIP, not
+        be invoked and fail some other way."""
+        result = _run_check(tmp_path, python_not_executable=True)
+        assert "SKIP" in result.stdout
+        assert "ltgenv python not found" in result.stdout
+        assert "FAIL" not in result.stdout
 
     def test_helper_exit_nonzero_is_a_fail_not_a_skip_or_abort(self, tmp_path):
         crashy = tmp_path / "crashy_helper.py"
@@ -520,6 +859,18 @@ class TestPermissions:
         assert "WARN" in result.stdout
         assert "not owned by pi" in result.stdout
 
+    def test_owner_unknown_does_not_warn(self, tmp_path):
+        """"unknown" is verify_deployment.sh's own `stat ... || echo
+        unknown` fallback when `stat` itself fails -- that must not be
+        treated the same as a real non-pi owner. The stub's %U query
+        exits 1 (simulating a real `stat` failure), so bash's own
+        fallback produces "unknown", not this test faking the string."""
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, key_file_mode=0o644,
+            fake_stat_owner_fail=True)
+        assert "WARN" not in result.stdout
+        assert "FAIL" not in result.stdout
+
 
 # --- Never print webhook values, in stdout OR stderr ---------------------
 
@@ -540,13 +891,16 @@ class TestNeverPrintsSecrets:
         """ParsingError's own str() embeds the offending source line --
         the helper must only ever print the exception's type name. Call
         the helper directly (not through bash) so stdout and stderr are
-        captured as two genuinely separate streams, not merged."""
+        captured as two genuinely separate streams, not merged.
+
+        Every path constant is overridden to somewhere under tmp_path (or
+        a path that cannot exist): this must never fall through to a real
+        unit's config/mode.toml or ~/.config/brokkr files just because
+        one override was left at its production default."""
         key_path = tmp_path / "googlechat"
         key_path.write_text(
             "status_with_SECRETVALUE_in_the_bad_line = https://x/\n[channel]\n")
-        env = os.environ.copy()
-        env["GOOGLECHAT_DEFAULT_KEY_FILE"] = str(key_path)
-        env["GOOGLECHAT_SYSTEM_MAIN_TOML"] = str(tmp_path / "no-such.toml")
+        env = _isolated_helper_env(tmp_path, default_key_file=str(key_path))
         result = subprocess.run(
             [sys.executable, str(HELPER_SCRIPT)],
             capture_output=True, text=True, env=env, timeout=30,
@@ -555,6 +909,80 @@ class TestNeverPrintsSecrets:
         assert "SECRETVALUE" not in result.stdout
         assert "SECRETVALUE" not in result.stderr
         assert "FAIL" in result.stdout
+
+    def test_decode_error_branch_never_leaks_sentinel(self, tmp_path):
+        """A sentinel placed right next to the invalid bytes that trigger
+        UnicodeDecodeError must not surface in either stream."""
+        key_path = tmp_path / "googlechat"
+        key_path.write_bytes(
+            b"[channel]\nstatus = SENTINELVALUE\xff\xfe-not-valid-utf8\n")
+        env = _isolated_helper_env(tmp_path, default_key_file=str(key_path))
+        result = subprocess.run(
+            [sys.executable, str(HELPER_SCRIPT)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert result.returncode == 0
+        assert "could not be decoded" in result.stdout
+        assert "SENTINELVALUE" not in result.stdout
+        assert "SENTINELVALUE" not in result.stderr
+
+    def test_catch_all_branch_never_leaks_a_sentinel_from_the_exceptions_own_message(
+            self, tmp_path):
+        """Even if some future bug raised an exception whose own message
+        happened to embed a secret-looking value, the catch-all in
+        run_and_report() must never print str(exc) -- only the type
+        name. Monkeypatches main() to raise exactly such an exception."""
+        sentinel = "SENTINELVALUE-inside-the-exception-message"
+        output = _run_and_report_with_main_raising(
+            ValueError("url was https://chat.googleapis.com/{}".format(sentinel)))
+        assert "FAIL" in output
+        assert "ValueError" in output
+        assert sentinel not in output
+        assert "chat.googleapis.com" not in output
+
+    def test_systemexit_in_main_is_caught_and_reported(self):
+        """BaseException (not Exception) is caught deliberately --
+        SystemExit is not an Exception subclass."""
+        output = _run_and_report_with_main_raising(SystemExit(3))
+        assert "FAIL" in output
+        assert "crashed unexpectedly" in output
+        assert "SystemExit" in output
+
+    def test_keyboardinterrupt_in_main_is_caught_and_reported(self):
+        output = _run_and_report_with_main_raising(KeyboardInterrupt())
+        assert "FAIL" in output
+        assert "crashed unexpectedly" in output
+        assert "KeyboardInterrupt" in output
+
+    def test_missing_section_header_error_specific_message(self, tmp_path):
+        """A value line before any [section] header is specifically a
+        MissingSectionHeaderError (a configparser.Error subclass)."""
+        result = _run_check(tmp_path, key_file="status = https://x/\n[channel]\n")
+        assert "failed to parse (MissingSectionHeaderError)" in result.stdout
+
+    def test_generic_parsing_error_specific_message(self, tmp_path):
+        """A line with no '=' or ':' delimiter, not indented (so not a
+        continuation) and inside a known section (so not a missing
+        header), is a bare ParsingError -- not one of the
+        Duplicate*/MissingSectionHeader subclasses."""
+        key_file = "[channel]\nstatus = https://x/\nnot_a_valid_line_without_delimiter\n"
+        result = _run_check(tmp_path, key_file=key_file)
+        assert "failed to parse (ParsingError)" in result.stdout
+
+    def test_missing_default_key_file_with_a_configured_channel_fails_via_intended_branch(
+            self, tmp_path):
+        """The channel-level FAIL must say the key file is missing, not
+        fall through to a generic/crash message -- confirms the two
+        checks (the unconditional default-file check, and each channel's
+        own key-file check) independently reach the same correct cause."""
+        result = _run_check(
+            tmp_path, default_key_file=str(tmp_path / "does-not-exist"),
+            key_file=None, system_main_toml=_step_toml("status"))
+        assert "crashed" not in result.stdout
+        fail_lines = [l for l in result.stdout.splitlines()
+                      if "FAIL" in l and "'status'" in l]
+        assert fail_lines, result.stdout
+        assert all("is missing" in l for l in fail_lines), fail_lines
 
 
 # --- main() wiring: a commented-out call must not satisfy this -----------
@@ -581,6 +1009,24 @@ class TestMainWiring:
             if not line.strip().startswith("#")
         ]
         assert "check_googlechat_key" not in lines
+
+    def test_call_is_outside_the_full_check_branch(self):
+        """The call must run unconditionally, not only under `--full` --
+        it must appear, at main()'s own 4-space indent, strictly BEFORE
+        the real `if $full_check; then` block (same indent as
+        check_log_bounds, the other unconditional check immediately
+        before it). Anchored on the 4-space-indented line specifically:
+        an earlier line in main() prints the Mode banner via
+        "$(if $full_check; then echo 'Full ...'; ...)", which contains
+        the same substring but is not the branch being guarded against."""
+        body = VERIFY_SCRIPT.read_text()
+        main_body = body[body.index("main() {"):body.index("\n}", body.index("main() {"))]
+        full_check_idx = main_body.index("\n    if $full_check; then\n")
+        call_idx = main_body.index("\n    check_googlechat_key\n")
+        assert call_idx != -1
+        assert call_idx < full_check_idx, (
+            "check_googlechat_key must run before/outside the --full "
+            "branch, not only when --full is passed")
 
 
 # --- Symlinked deployment (mj51, mj54 run via /usr/local/bin symlink) ---
@@ -620,3 +1066,68 @@ class TestSymlinkInvocation:
         )
         assert "verify_googlechat_channels.py not found" not in result.stdout
         assert "is readable and has a [channel] section" in result.stdout
+
+    def test_relative_symlink_target_still_resolves(self, tmp_path):
+        """readlink -f canonicalizes to an absolute path; plain readlink
+        (no -f) just prints the symlink's raw target text. A symlink
+        whose target is written as a RELATIVE path makes that
+        difference observable: plain readlink's relative output, then
+        `cd`'d from a cwd that isn't link_dir, fails to resolve and the
+        helper is reported not found."""
+        real_dir = tmp_path / "realdir2"
+        link_dir = tmp_path / "linkdir2"
+        real_dir.mkdir()
+        link_dir.mkdir()
+
+        stripped = _sourceable_script(real_dir)
+        (real_dir / "verify_googlechat_channels.py").write_text(
+            HELPER_SCRIPT.read_text())
+        (real_dir / "verify_googlechat_channels.py").chmod(0o755)
+
+        symlink = link_dir / "verify_deployment.sh"
+        symlink.symlink_to(os.path.join("..", "realdir2", stripped.name))
+
+        key_path = tmp_path / "googlechat"
+        key_path.write_text(KEY_FILE_STATUS_ONLY)
+
+        env = os.environ.copy()
+        env["PATH"] = "{}:{}".format(_stat_stub(tmp_path), env["PATH"])
+        env["GOOGLECHAT_PYTHON"] = sys.executable
+        env["GOOGLECHAT_DEFAULT_KEY_FILE"] = str(key_path)
+        env["GOOGLECHAT_SYSTEM_MAIN_TOML"] = str(tmp_path / "no-such.toml")
+        env["GOOGLECHAT_SYSTEM_MODE_TOML"] = str(tmp_path / "no-such2.toml")
+        env["GOOGLECHAT_LOCAL_MAIN_TOML"] = str(tmp_path / "no-such3.toml")
+        env["GOOGLECHAT_LOCAL_MODE_TOML"] = str(tmp_path / "no-such4.toml")
+
+        # cwd is deliberately tmp_path, NOT link_dir -- a relative
+        # resolution from the wrong directory is exactly the failure
+        # mode this guards against.
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; check_googlechat_key', "_", str(symlink)],
+            capture_output=True, text=True, env=env, timeout=30, cwd=str(tmp_path),
+        )
+        assert "verify_googlechat_channels.py not found" not in result.stdout
+        assert "is readable and has a [channel] section" in result.stdout
+
+    def test_failing_readlink_falls_back_and_does_not_abort(self, tmp_path):
+        """readlink -f exits non-zero on some inputs (e.g. a dangling
+        symlink); under set -euo pipefail that aborts the whole script
+        at `self_path="$(readlink -f ...)"` unless it's guarded, which
+        means the `[[ -z "$self_path" ]]` fallback right below it is
+        never reached. Stubs `readlink` to always fail, then asserts
+        BOTH that the helper is still found (the fallback worked) AND
+        that a later command in the same invocation still runs (the
+        script did not abort)."""
+        bin_dir = tmp_path / "stubbin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "readlink").write_text("#!/bin/bash\nexit 1\n")
+        (bin_dir / "readlink").chmod(0o755)
+
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY,
+            system_main_toml=_step_toml("status"),
+            extra_shell="echo REACHED_AFTER_CHECK")
+        assert "verify_googlechat_channels.py not found" not in result.stdout
+        assert "present in key file" in result.stdout
+        assert "REACHED_AFTER_CHECK" in result.stdout, (
+            "a failing readlink must not abort the rest of verify_deployment.sh")

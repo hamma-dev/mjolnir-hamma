@@ -207,17 +207,38 @@ def main():
             continue
 
         for table_path, step in find_step_tables(data):
+            source = "{} {}".format(label, table_path)
+
             channel = step.get("channel")
             if channel is None:
                 continue
+            if not isinstance(channel, str):
+                # A TOML value can legally be an int/bool/array/table, and
+                # configparser's optionxform crashes (AttributeError) on a
+                # non-string option -- FAIL this one entry and keep going,
+                # rather than letting one bad entry drop every later
+                # source into the single generic "crashed" FAIL.
+                print("FAIL channel in ({}) is not a string (got {})".format(
+                    source, type(channel).__name__))
+                continue
+
             method = step.get("method")
+            if method is not None and not isinstance(method, str):
+                print("FAIL method in ({}) is not a string (got {})".format(
+                    source, type(method).__name__))
+                continue
             if method is not None and method != "gchat":
                 continue
 
-            key_file = expand_pi_home(str(step.get("key_file") or DEFAULT_KEY_FILE))
+            key_file_raw = step.get("key_file")
+            if key_file_raw is not None and not isinstance(key_file_raw, str):
+                print("FAIL key_file in ({}) is not a string (got {})".format(
+                    source, type(key_file_raw).__name__))
+                continue
+
+            key_file = expand_pi_home(key_file_raw or DEFAULT_KEY_FILE)
             report_keyfile(key_file)
 
-            source = "{} {}".format(label, table_path)
             result = load_key_file(key_file, cache)
             if not result.ok:
                 print("FAIL channel {!r} ({}) -- key file {} {}".format(

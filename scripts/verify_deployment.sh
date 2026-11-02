@@ -483,7 +483,7 @@ check_googlechat_key() {
     # units (mj51, mj54) -- so the helper is found next to the real
     # checkout, not the symlink's own directory.
     local self_path script_dir helper
-    self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+    self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)" || true
     [[ -z "$self_path" ]] && self_path="${BASH_SOURCE[0]}"
     script_dir="$(cd "$(dirname "$self_path")" 2>/dev/null && pwd || true)"
     helper="${GOOGLECHAT_HELPER:-${script_dir:-/home/pi/dev/mjolnir-hamma/scripts}/verify_googlechat_channels.py}"
