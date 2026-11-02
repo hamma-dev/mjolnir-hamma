@@ -451,6 +451,116 @@ check_log_bounds() {
     fi
 }
 
+# HAM-118: state_monitor and noise_diag alert over Google Chat via a key
+# file read by the notifiers package with configparser, under a channel
+# name that can come from config/main.toml, a local override, or any mode
+# overlay. A missing key, an empty value, or a key file that fails to
+# parse disables that step's alerts with no error -- notifiers logs once
+# and send() becomes a permanent no-op.
+#
+# Read-only, by design: an earlier version imported brokkr's own config
+# renderer to resolve the "effective" channel, but that import can WRITE
+# a missing local config file (FileConfigLevel writes defaults back), so
+# as root it could create root-owned files under /home/pi/.config or a
+# new /root/.config entirely of its own. verify_deployment.sh must never
+# write anything. scripts/verify_googlechat_channels.py instead scans
+# config/main.toml, the local override, and every mode.toml table
+# read-only with tomli, and flags a channel if it is missing from the key
+# file ANYWHERE it is declared -- deliberately stricter than "the
+# currently effective channel", so a channel only reachable through an
+# inactive mode is still caught.
+check_googlechat_key() {
+    print_section "Google Chat Alerts"
+
+    local ltgenv_py="${GOOGLECHAT_PYTHON:-/home/pi/dev/ltgenv/bin/python}"
+    if [[ ! -x "$ltgenv_py" ]]; then
+        skip "ltgenv python not found ($ltgenv_py) -- skipping Google Chat check"
+        return 0
+    fi
+
+    # Resolve this script's real location through any symlink -- it is
+    # deployed as a symlink at /usr/local/bin/verify_deployment.sh on some
+    # units (mj51, mj54) -- so the helper is found next to the real
+    # checkout, not the symlink's own directory.
+    local self_path script_dir helper
+    self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)" || true
+    [[ -z "$self_path" ]] && self_path="${BASH_SOURCE[0]}"
+    script_dir="$(cd "$(dirname "$self_path")" 2>/dev/null && pwd || true)"
+    helper="${GOOGLECHAT_HELPER:-${script_dir:-/home/pi/dev/mjolnir-hamma/scripts}/verify_googlechat_channels.py}"
+    if [[ ! -f "$helper" ]]; then
+        skip "verify_googlechat_channels.py not found ($helper) -- checkout may be incomplete"
+        return 0
+    fi
+
+    # Abort-proof: the helper is designed to always exit 0 and report any
+    # problem through its own output, but this call must not trust that --
+    # a nonzero exit or empty output is reported as a FAIL, never allowed
+    # to abort the rest of verify_deployment.sh under set -e. stderr is
+    # discarded here, never merged into $output, so a traceback can never
+    # be mistaken for (or leak into) a parsed result line.
+    local output rc=0
+    output="$("$ltgenv_py" "$helper" 2>/dev/null)" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        fail "Google Chat check helper crashed (exit $rc)"
+        return 0
+    fi
+    if [[ -z "$output" ]]; then
+        fail "Google Chat check helper produced no output"
+        return 0
+    fi
+
+    # Every key file the helper actually opened is reported once via a
+    # "KEYFILE_PATH <path>" line, so permissions are checked on exactly
+    # what was examined -- never a hardcoded guess.
+    local status detail
+    local -a keyfiles=()
+    while IFS=' ' read -r status detail; do
+        [[ -z "$status" ]] && continue
+        if [[ "$status" == "KEYFILE_PATH" ]]; then
+            local kf="$detail" already=0 existing
+            for existing in "${keyfiles[@]-}"; do
+                [[ -n "$existing" && "$existing" == "$kf" ]] && already=1 && break
+            done
+            [[ "$already" -eq 0 && -n "$kf" ]] && keyfiles+=("$kf")
+            continue
+        fi
+        case "$status" in
+            PASS) pass "$detail" ;;
+            FAIL) fail "$detail" ;;
+            SKIP) skip "$detail" ;;
+            *) fail "unexpected helper output: $status $detail" ;;
+        esac
+    done <<< "$output"
+
+    # Ownership/permissions. Every unit today is pi:pi 644: that's expected
+    # across the fleet, so it's informational, not a WARN that would fire
+    # on every run. A non-pi owner is still unexpected and worth a WARN.
+    local key_file
+    for key_file in "${keyfiles[@]-}"; do
+        [[ -n "$key_file" && -e "$key_file" ]] || continue
+
+        local owner perms
+        owner="$(stat -c %U "$key_file" 2>/dev/null || echo "unknown")"
+        perms="$(stat -c %a "$key_file" 2>/dev/null || echo "unknown")"
+
+        if [[ "$owner" != "pi" && "$owner" != "unknown" ]]; then
+            warn "Google Chat key file not owned by pi (owned by $owner): $key_file"
+        fi
+
+        if [[ "$perms" =~ ^[0-7]{3,4}$ ]]; then
+            local group_bit="${perms: -2:1}" other_bit="${perms: -1}"
+            if (( (group_bit & 4) != 0 || (other_bit & 4) != 0 )); then
+                info "Google Chat key file is group/world readable (perms $perms) -- expected across the fleet today: $key_file"
+            else
+                pass "Google Chat key file permissions ($perms) restrict read access: $key_file"
+            fi
+        fi
+    done
+
+    return 0
+}
+
 check_server_connection() {
     print_section "Server Connection"
 
@@ -592,6 +702,7 @@ main() {
     check_brokkr_status
     check_ags_data_mount
     check_log_bounds
+    check_googlechat_key
 
     if $full_check; then
         check_server_connection
