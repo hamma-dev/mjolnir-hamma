@@ -185,6 +185,15 @@ def _run_check(tmp_path, python_missing=False, no_tomli=False,
     return result
 
 
+def _assert_fail_line(stdout, needle):
+    """Every output line containing `needle` must be a FAIL line, so
+    demoting that report to SKIP/PASS/WARN is caught."""
+    lines = [l for l in stdout.splitlines() if needle in l]
+    assert lines, "no line contains {!r}".format(needle)
+    for line in lines:
+        assert "✗ FAIL" in line, "not a FAIL line: {!r}".format(line)
+
+
 def _isolated_helper_env(tmp_path, default_key_file=None, **overrides):
     """Environment for invoking verify_googlechat_channels.py directly
     (not through the bash wrapper), with EVERY path constant pointed
@@ -588,6 +597,7 @@ class TestChannelMatching:
         assert "crashed" not in result.stdout
         assert "channel in" in result.stdout
         assert "is not a string" in result.stdout
+        _assert_fail_line(result.stdout, "is not a string")
         assert "steps.state_monitor" in result.stdout
         # Specifically the channel PASS message (never emitted by a
         # FAIL), not an adjacency check on "PASS" + ":" -- the bash
@@ -610,11 +620,28 @@ class TestChannelMatching:
         assert "crashed" not in result.stdout
         assert "method in" in result.stdout
         assert "is not a string" in result.stdout
+        _assert_fail_line(result.stdout, "is not a string")
         # Specifically the channel PASS message (never emitted by a
         # FAIL), not an adjacency check on "PASS" + ":" -- the bash
         # pass() helper puts an ANSI reset code between them.
         assert "channel 'status'" in result.stdout
         assert "present in key file" in result.stdout
+
+    def test_empty_key_file_fails_not_default(self, tmp_path):
+        """key_file = "" must FAIL that entry, not silently fall back to
+        the default key file (which would PASS here)."""
+        toml = textwrap.dedent("""\
+            [steps.state_monitor]
+            method = "gchat"
+            channel = "status"
+            key_file = ""
+        """)
+        result = _run_check(
+            tmp_path, key_file=KEY_FILE_STATUS_ONLY, system_main_toml=toml)
+        assert "crashed" not in result.stdout
+        _assert_fail_line(result.stdout, "key_file in")
+        assert "is empty" in result.stdout
+        assert "present in key file" not in result.stdout
 
     def test_non_string_key_file_fails_that_entry_only(self, tmp_path):
         toml = textwrap.dedent("""\
@@ -632,6 +659,7 @@ class TestChannelMatching:
         assert "crashed" not in result.stdout
         assert "key_file in" in result.stdout
         assert "is not a string" in result.stdout
+        _assert_fail_line(result.stdout, "is not a string")
         # Specifically the channel PASS message (never emitted by a
         # FAIL), not an adjacency check on "PASS" + ":" -- the bash
         # pass() helper puts an ANSI reset code between them.
@@ -1131,3 +1159,42 @@ class TestSymlinkInvocation:
         assert "present in key file" in result.stdout
         assert "REACHED_AFTER_CHECK" in result.stdout, (
             "a failing readlink must not abort the rest of verify_deployment.sh")
+
+    def test_failing_readlink_uses_bash_source_fallback(self, tmp_path):
+        """With readlink failing AND no GOOGLECHAT_HELPER override, the
+        helper can only be found through the `[[ -z "$self_path" ]]`
+        fallback to BASH_SOURCE. cwd is NOT the script directory, so
+        deleting or breaking the fallback leaves the helper not found."""
+        real_dir = tmp_path / "realdir3"
+        real_dir.mkdir()
+        stripped = _sourceable_script(real_dir)
+        (real_dir / "verify_googlechat_channels.py").write_text(
+            HELPER_SCRIPT.read_text())
+        (real_dir / "verify_googlechat_channels.py").chmod(0o755)
+
+        key_path = tmp_path / "googlechat"
+        key_path.write_text(KEY_FILE_STATUS_ONLY)
+
+        stub_dir = _stat_stub(tmp_path)
+        (Path(stub_dir) / "readlink").write_text("#!/bin/bash\nexit 1\n")
+        (Path(stub_dir) / "readlink").chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = "{}:{}".format(stub_dir, env["PATH"])
+        env["GOOGLECHAT_PYTHON"] = sys.executable
+        env["GOOGLECHAT_DEFAULT_KEY_FILE"] = str(key_path)
+        env["GOOGLECHAT_PI_HOME"] = str(tmp_path)
+        for name in ("SYSTEM_MAIN", "SYSTEM_MODE", "LOCAL_MAIN", "LOCAL_MODE"):
+            env["GOOGLECHAT_{}_TOML".format(name)] = str(
+                tmp_path / ("no-such-" + name.lower()))
+        env.pop("GOOGLECHAT_HELPER", None)
+
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; check_googlechat_key; echo REACHED',
+             "_", str(stripped)],
+            capture_output=True, text=True, env=env, timeout=30,
+            cwd=str(tmp_path),
+        )
+        assert "verify_googlechat_channels.py not found" not in result.stdout
+        assert "is readable and has a [channel] section" in result.stdout
+        assert "REACHED" in result.stdout

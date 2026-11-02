@@ -235,6 +235,9 @@ def main():
                 print("FAIL key_file in ({}) is not a string (got {})".format(
                     source, type(key_file_raw).__name__))
                 continue
+            if key_file_raw == "":
+                print("FAIL key_file in ({}) is empty".format(source))
+                continue
 
             key_file = expand_pi_home(key_file_raw or DEFAULT_KEY_FILE)
             report_keyfile(key_file)
