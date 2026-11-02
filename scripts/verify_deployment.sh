@@ -451,77 +451,74 @@ check_log_bounds() {
     fi
 }
 
-# HAM-118: state_monitor and noise_diag both alert over Google Chat via a
-# key file parsed by the notifiers package with configparser, under a
-# channel name read from brokkr's own rendered config (presets + system
-# config/main.toml + local override + the active mode overlay). A missing
-# key, an empty value, or a key file that fails to parse disables that
-# step's alerts with no error -- notifiers logs once and send() becomes a
-# permanent no-op.
+# HAM-118: state_monitor and noise_diag alert over Google Chat via a key
+# file read by the notifiers package with configparser, under a channel
+# name that can come from config/main.toml, a local override, or any mode
+# overlay. A missing key, an empty value, or a key file that fails to
+# parse disables that step's alerts with no error -- notifiers logs once
+# and send() becomes a permanent no-op.
 #
-# The channel/method/key_file resolution and the key-file parsing are both
-# delegated to real parsers (brokkr's config renderer, Python's
-# configparser) via scripts/verify_googlechat_channels.py, run under
-# brokkr's own interpreter -- re-deriving either in bash is what produced
-# the false FAILs this check shipped with originally (channel names are
-# config options, not TOML/INI section headers).
+# Read-only, by design: an earlier version imported brokkr's own config
+# renderer to resolve the "effective" channel, but that import can WRITE
+# a missing local config file (FileConfigLevel writes defaults back), so
+# as root it could create root-owned files under /home/pi/.config or a
+# new /root/.config entirely of its own. verify_deployment.sh must never
+# write anything. scripts/verify_googlechat_channels.py instead scans
+# config/main.toml, the local override, and every mode.toml table
+# read-only with tomli, and flags a channel if it is missing from the key
+# file ANYWHERE it is declared -- deliberately stricter than "the
+# currently effective channel", so a channel only reachable through an
+# inactive mode is still caught.
 check_googlechat_key() {
     print_section "Google Chat Alerts"
 
     local ltgenv_py="${GOOGLECHAT_PYTHON:-/home/pi/dev/ltgenv/bin/python}"
     if [[ ! -x "$ltgenv_py" ]]; then
-        skip "ltgenv python not found ($ltgenv_py) -- cannot render brokkr config, skipping Google Chat check"
+        skip "ltgenv python not found ($ltgenv_py) -- skipping Google Chat check"
         return 0
     fi
 
-    local script_dir helper
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    # Resolve this script's real location through any symlink -- it is
+    # deployed as a symlink at /usr/local/bin/verify_deployment.sh on some
+    # units (mj51, mj54) -- so the helper is found next to the real
+    # checkout, not the symlink's own directory.
+    local self_path script_dir helper
+    self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+    [[ -z "$self_path" ]] && self_path="${BASH_SOURCE[0]}"
+    script_dir="$(cd "$(dirname "$self_path")" 2>/dev/null && pwd || true)"
     helper="${GOOGLECHAT_HELPER:-${script_dir:-/home/pi/dev/mjolnir-hamma/scripts}/verify_googlechat_channels.py}"
     if [[ ! -f "$helper" ]]; then
         skip "verify_googlechat_channels.py not found ($helper) -- checkout may be incomplete"
         return 0
     fi
 
-    # Resolve the unit's active brokkr mode the way brokkr itself resolves
-    # it at import time: CLI --mode (baked into ExecStart) outranks
-    # Environment=BROKKR_MODE (the mode.conf drop-in sensors.py writes),
-    # which outranks brokkr's own mode.toml precedence -- so only the first
-    # two need resolving here; absent both, importing brokkr applies its
-    # own system/local mode.toml default unassisted.
-    local brokkr_service="brokkr-hamma-default.service"
-    local mode="" execstart env_prop
-    execstart="$(systemctl show "$brokkr_service" --property=ExecStart 2>/dev/null || true)"
-    if [[ "$execstart" =~ --mode[=\ ]+([^[:space:];}]+) ]]; then
-        mode="${BASH_REMATCH[1]}"
-    fi
-    if [[ -z "$mode" ]]; then
-        env_prop="$(systemctl show "$brokkr_service" --property=Environment 2>/dev/null || true)"
-        if [[ "$env_prop" =~ BROKKR_MODE=([^[:space:]]+) ]]; then
-            mode="${BASH_REMATCH[1]}"
-        fi
-    fi
+    # Abort-proof: the helper is designed to always exit 0 and report any
+    # problem through its own output, but this call must not trust that --
+    # a nonzero exit or empty output is reported as a FAIL, never allowed
+    # to abort the rest of verify_deployment.sh under set -e. stderr is
+    # discarded here, never merged into $output, so a traceback can never
+    # be mistaken for (or leak into) a parsed result line.
+    local output rc=0
+    output="$("$ltgenv_py" "$helper" 2>/dev/null)" || rc=$?
 
-    local output
-    if [[ -n "$mode" ]]; then
-        output="$(BROKKR_MODE="$mode" "$ltgenv_py" "$helper" 2>&1)"
-    else
-        output="$("$ltgenv_py" "$helper" 2>&1)"
+    if [[ $rc -ne 0 ]]; then
+        fail "Google Chat check helper crashed (exit $rc)"
+        return 0
     fi
-
     if [[ -z "$output" ]]; then
-        skip "verify_googlechat_channels.py produced no output"
+        fail "Google Chat check helper produced no output"
         return 0
     fi
 
-    # Each step that reaches the parsing stage also emits a "KEYFILE <path>"
-    # line, so permissions are checked on the file brokkr's own config
-    # actually resolved for that step -- never a hardcoded guess.
-    local step status detail
+    # Every key file the helper actually opened is reported once via a
+    # "KEYFILE_PATH <path>" line, so permissions are checked on exactly
+    # what was examined -- never a hardcoded guess.
+    local status detail
     local -a keyfiles=()
-    while IFS=' ' read -r step status detail; do
-        [[ -z "$step" ]] && continue
-        if [[ "$step" == "KEYFILE" ]]; then
-            local kf="$status" already=0 existing
+    while IFS=' ' read -r status detail; do
+        [[ -z "$status" ]] && continue
+        if [[ "$status" == "KEYFILE_PATH" ]]; then
+            local kf="$detail" already=0 existing
             for existing in "${keyfiles[@]-}"; do
                 [[ -n "$existing" && "$existing" == "$kf" ]] && already=1 && break
             done
@@ -529,10 +526,10 @@ check_googlechat_key() {
             continue
         fi
         case "$status" in
-            PASS) pass "steps.$step: $detail" ;;
-            FAIL) fail "steps.$step: $detail" ;;
-            SKIP) skip "steps.$step: $detail" ;;
-            *) fail "steps.$step: unexpected helper output ($status $detail)" ;;
+            PASS) pass "$detail" ;;
+            FAIL) fail "$detail" ;;
+            SKIP) skip "$detail" ;;
+            *) fail "unexpected helper output: $status $detail" ;;
         esac
     done <<< "$output"
 
