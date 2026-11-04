@@ -539,6 +539,12 @@ def field_report(rows, field):
     return "\n".join(lines)
 
 
+def _cell(row, field):
+    """A row's value as snapshot text: None -> "", anything else str()."""
+    value = row.get(field)
+    return "" if value is None else str(value)
+
+
 def diff(previous, current):
     """[(unit, field, old, new)] for every changed field.
 
@@ -579,13 +585,13 @@ def diff(previous, current):
                 # entirely (a schema upgrade) -- not a change. Applies to
                 # any future column, not just the *_install ones below.
                 continue
-            # `.get(field) or ""` rather than `.get(field, "")`: a short CSV
-            # row (fewer cells than the header) makes csv.DictReader fill
-            # the missing trailing cells with None, not "" -- a bare
-            # `.get(field, "")` default only ever applies to a MISSING key,
-            # not a PRESENT None value, and str(None) == "None" would then
-            # print as a literal "None -> value" change line.
-            old_val = old.get(field) or ""
+            # _cell(), not `.get(field, "")` or `.get(field) or ""`: a short
+            # CSV row makes csv.DictReader fill missing cells with None
+            # (str(None) would print "None -> value"), and `or ""` blanks
+            # the parser's falsy 0 / 0.0. Both sides are compared as text,
+            # since `old` is CSV strings and `new` carries the AGS parser's
+            # float/int (66.4 != "66.4").
+            old_val = _cell(old, field)
             # *_install only: a row carried forward across the schema
             # upgrade without being re-measured has "" here, not a real
             # value -- render() backfills blank rather than fabricating
@@ -595,7 +601,7 @@ def diff(previous, current):
             # and must still be reported if it changes.
             if field in INSTALL_FIELDS and not old_val:
                 continue
-            new_val = new.get(field) or ""
+            new_val = _cell(new, field)
             if old_val != new_val:
                 if front_changed and field in POWER_DERIVED_FIELDS:
                     continue
