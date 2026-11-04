@@ -178,6 +178,20 @@ class TestDiffEdges:
         state = {"mjolnir02": row(fp, "mjolnir02")}
         assert fp.diff(state, dict(state)) == []
 
+    def test_parser_numbers_match_their_snapshot_strings(self, fp):
+        """The snapshot is read back as CSV strings; the live probe carries
+        parse_startup_state()'s float/int. 66.4 vs "66.4" and 0.0/0 (falsy)
+        vs "0.0"/"0" are the same value, not changes (2026-11-04 digest)."""
+        prev = {"mjolnir53": row(fp, "mjolnir53", t1="66.4", t2="0.0",
+                                 gf="0", gs="2")}
+        cur = {"mjolnir53": row(fp, "mjolnir53", t1=66.4, t2=0.0, gf=0, gs=2)}
+        assert fp.diff(prev, cur) == []
+
+    def test_parser_number_that_really_changed_is_reported(self, fp):
+        prev = {"mjolnir03": row(fp, "mjolnir03", gf="2")}
+        cur = {"mjolnir03": row(fp, "mjolnir03", gf=0)}
+        assert fp.diff(prev, cur) == [("mjolnir03", "gain_fast", "2", "0")]
+
 
 # --------------------------------------------------------------------------
 # merge() -- unreachable-preserves-row
